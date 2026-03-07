@@ -1,0 +1,54 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&family=Inter:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Noto Serif SC", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  
+  --color-bg: var(--theme-bg);
+  --color-surface: var(--theme-surface);
+  --color-surface2: var(--theme-surface2);
+  --color-border: var(--theme-border);
+  --color-text-main: var(--theme-text-main);
+  --color-text2: var(--theme-text2);
+  --color-text3: var(--theme-text3);
+  --color-accent: var(--theme-accent);
+  --color-accent-light: var(--theme-accent-light);
+  --color-accent2: var(--theme-accent2);
+  --color-accent2-light: var(--theme-accent2-light);
+}
+
+:root {
+  --theme-bg: #F7F5F0;
+  --theme-surface: #FFFFFF;
+  --theme-surface2: #F0EDE6;
+  --theme-border: #E2DDD6;
+  --theme-text-main: #1C1916;
+  --theme-text2: #6B6560;
+  --theme-text3: #A09890;
+  --theme-accent: #2B6CB0;
+  --theme-accent-light: #EBF4FF;
+  --theme-accent2: #2F855A;
+  --theme-accent2-light: #F0FFF4;
+}
+
+.dark {
+  --theme-bg: #1C1916;
+  --theme-surface: #2A2621;
+  --theme-surface2: #38332D;
+  --theme-border: #4A443C;
+  --theme-text-main: #F7F5F0;
+  --theme-text2: #A09890;
+  --theme-text3: #6B6560;
+  --theme-accent: #63B3ED;
+  --theme-accent-light: rgba(43, 108, 176, 0.25);
+  --theme-accent2: #48BB78;
+  --theme-accent2-light: rgba(47, 133, 90, 0.25);
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text-main);
+  font-family: var(--font-sans);
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
