@@ -195,6 +195,9 @@ const SOURCE_PRIORITY: Record<string, number> = {
   'XYZ播客': 3.8,
   '数字生命卡兹克': 3.8,
   '新智元': 3.8,
+  'Lex Fridman': 3.5,
+  'Y Combinator': 3.2,
+  'Andrej Karpathy': 3.2,
   '人人都是产品经理': 2.5,
   '即刻话题': 1.5,
   '少数派': 1.2
@@ -539,7 +542,16 @@ async function fetchRSSFeeds(): Promise<Article[]> {
         ]),
         8000
       ),
-      parser.parseURL('https://feed.xyzfm.space/dk4yh3pkpjp3')
+      parser.parseURL('https://feed.xyzfm.space/dk4yh3pkpjp3'),
+      parseWithRetry([
+          'https://api.xgo.ing/rss/user/adf65931519340f795e2336910b4cd15'
+        ], 20000, 2),
+      parseWithRetry([
+          'rsshub://youtube/user/%40ycombinator'
+        ], 20000, 2),
+      parseWithRetry([
+          'rsshub://youtube/user/@AndrejKarpathy'
+        ], 20000, 2)
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
       ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0)
@@ -571,6 +583,15 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     const xyzfmArticles = results[9].status === 'fulfilled'
       ? normalizeFeedItems(results[9].value.items, 'XYZ播客', 'Podcast', 9000)
       : [];
+    const lexArticles = results[10].status === 'fulfilled'
+      ? normalizeFeedItems(results[10].value.items, 'Lex Fridman', 'Podcast', 10000)
+      : [];
+    const ycArticles = results[11].status === 'fulfilled'
+      ? normalizeFeedItems(results[11].value.items, 'Y Combinator', 'YouTube', 11000)
+      : [];
+    const karpathyArticles = results[12].status === 'fulfilled'
+      ? normalizeFeedItems(results[12].value.items, 'Andrej Karpathy', 'YouTube', 12000)
+      : [];
     console.log('RSS counts:', {
       sspai: sspaiArticles.length,
       woshipm: woshipmArticles.length,
@@ -581,7 +602,10 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       jike: jikeArticles.length,
       github: githubArticles.length,
       sama: samaArticles.length,
-      xyzfm: xyzfmArticles.length
+      xyzfm: xyzfmArticles.length,
+      lex: lexArticles.length,
+      yc: ycArticles.length,
+      karpathy: karpathyArticles.length
     });
     if (results[0].status === 'rejected') {
       console.error('Failed to fetch RSS from sspai:', results[0].reason);
@@ -613,6 +637,15 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     if (results[9].status === 'rejected') {
       console.error('Failed to fetch RSS from XYZ播客:', results[9].reason);
     }
+    if (results[10].status === 'rejected') {
+      console.error('Failed to fetch RSS from Lex Fridman:', results[10].reason);
+    }
+    if (results[11].status === 'rejected') {
+      console.error('Failed to fetch RSS from Y Combinator:', results[11].reason);
+    }
+    if (results[12].status === 'rejected') {
+      console.error('Failed to fetch RSS from Andrej Karpathy:', results[12].reason);
+    }
     const merged = [
       ...sspaiArticles,
       ...woshipmArticles,
@@ -623,7 +656,10 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ...jikeArticles,
       ...githubArticles,
       ...samaArticles,
-      ...xyzfmArticles
+      ...xyzfmArticles,
+      ...lexArticles,
+      ...ycArticles,
+      ...karpathyArticles
     ];
     const ordered = rankArticles(merged);
     return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
