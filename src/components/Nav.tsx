@@ -20,6 +20,7 @@ type SourceEntry = {
   name: string;
   color: string;
   rssUrl?: string;
+  icon?: string;
 };
 
 type CollectionEntry = {
@@ -67,15 +68,83 @@ const BASE_SOURCES: Array<{ name: string; color: string }> = [
   { name: 'Andrej Karpathy', color: '#FF0000' }
 ];
 
-const createSourceEntry = (name: string, color: string, rssUrl?: string): SourceEntry => ({
+const createSourceEntry = (name: string, color: string, rssUrl?: string, icon?: string): SourceEntry => ({
   id: `source:${name}`,
   type: 'source',
   name,
   color,
-  rssUrl
+  rssUrl,
+  icon
 });
 
-const createDefaultEntries = (): NavEntry[] => BASE_SOURCES.map(source => createSourceEntry(source.name, source.color));
+const createDefaultEntries = (): NavEntry[] => {
+  // 创建默认的合集结构
+  const collections: NavEntry[] = [
+    {
+      id: 'collection:国内媒体',
+      type: 'collection',
+      name: '国内媒体',
+      collapsed: true,
+      children: [
+        createSourceEntry('36氪', '#E53E3E'),
+        createSourceEntry('虎嗅', '#DD6B20'),
+        createSourceEntry('少数派', '#553C9A'),
+        createSourceEntry('人人都是产品经理', '#2B6CB0'),
+        createSourceEntry('即刻话题', '#38A169')
+      ]
+    },
+    {
+      id: 'collection:播客',
+      type: 'collection',
+      name: '播客',
+      collapsed: true,
+      children: [
+        createSourceEntry('张小珺商业访谈录', '#FF6B6B')
+      ]
+    },
+    {
+      id: 'collection:X',
+      type: 'collection',
+      name: 'X',
+      collapsed: true,
+      children: [
+        createSourceEntry('Sam Altman', '#1DA1F2')
+      ]
+    },
+    {
+      id: 'collection:YouTube',
+      type: 'collection',
+      name: 'YouTube',
+      collapsed: true,
+      children: [
+        createSourceEntry('Y Combinator', '#FF0000'),
+        createSourceEntry('Andrej Karpathy', '#FF0000'),
+        createSourceEntry('Lex Fridman', '#000000')
+      ]
+    },
+    {
+      id: 'collection:公众号',
+      type: 'collection',
+      name: '公众号',
+      collapsed: true,
+      children: [
+        createSourceEntry('数字生命卡兹克', '#6B46C1'),
+        createSourceEntry('新智元', '#2F855A')
+      ]
+    },
+    {
+      id: 'collection:其他',
+      type: 'collection',
+      name: '其他',
+      collapsed: true,
+      children: [
+        createSourceEntry('GitHub Blog', '#24292F')
+      ]
+    }
+  ];
+  
+  return collections;
+};
 
 const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
   if (!Array.isArray(raw)) return createDefaultEntries();
@@ -206,7 +275,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     window.localStorage.setItem(SOURCE_LAYOUT_STORAGE_KEY, JSON.stringify(sourceEntries));
   }, [sourceEntries]);
 
-  const handleTabClick = (tab: 'feed' | 'knowledge' | 'write') => {
+  const handleTabClick = (tab: 'feed' | 'knowledge' | 'write' | 'discover') => {
     setActiveTab(tab);
     if (tab === 'feed') {
       setActiveSource(null);
@@ -463,7 +532,9 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     }
     const rssUrl = kind === 'rsshub' || kind === 'rss' || kind === 'url' ? normalizedInput : undefined;
     const nextSource = createSourceEntry(name, generateColorFromName(name), rssUrl);
-    setSourceEntries(prev => [nextSource, ...prev]);
+    
+    // 将新源添加到所有合集的下方（末尾）
+    setSourceEntries(prev => [...prev, nextSource]);
     setShowAddSourceModal(false);
     setNewSourceInput('');
     setNewSourceAlias('');

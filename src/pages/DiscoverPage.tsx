@@ -6,7 +6,7 @@ import { cn } from '../components/Nav';
 interface SourceRecommendation {
   name: string;
   description: string;
-  categories: Array<'国内媒体' | '播客' | 'X' | 'YouTube' | '公众号'>;
+  categories: Array<'国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'>;
   url: string;
   color: string;
   icon?: string;
@@ -18,7 +18,7 @@ const RECOMMENDED_SOURCES: SourceRecommendation[] = [
   { name: '虎嗅', description: '商业深度分析', categories: ['国内媒体'], url: 'https://www.huxiu.com/rss/0.xml', color: '#DD6B20', icon: '🐯' },
   { name: '少数派', description: '科技生活方式', categories: ['国内媒体'], url: 'rsshub://sspai/index', color: '#553C9A', icon: '⚡' },
   { name: '人人都是产品经理', description: '产品运营知识', categories: ['国内媒体'], url: 'https://www.woshipm.com/feed', color: '#2B6CB0', icon: '📱' },
-  { name: 'GitHub Blog', description: '技术前沿动态', categories: ['国内媒体'], url: 'https://github.blog/feed/', color: '#24292F', icon: '💻' },
+  { name: '即刻话题', description: '热门话题讨论', categories: ['国内媒体'], url: 'rsshub://jike/topic/63579abb6724cc583b9bba9a', color: '#38A169', icon: '💬' },
   
   // 播客
   { name: '张小珺商业访谈录', description: '深度商业访谈节目', categories: ['播客'], url: 'https://feed.xyzfm.space/dk4yh3pkpjp3', color: '#FF6B6B', icon: '🎙️' },
@@ -34,11 +34,14 @@ const RECOMMENDED_SOURCES: SourceRecommendation[] = [
   // 公众号
   { name: '数字生命卡兹克', description: '科技人文思考', categories: ['公众号'], url: 'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml', color: '#6B46C1', icon: '📮' },
   { name: '新智元', description: 'AI 前沿资讯', categories: ['公众号'], url: 'https://plink.anyfeeder.com/weixin/AI_era', color: '#2F855A', icon: '🤖' },
+  
+  // 其他
+  { name: 'GitHub Blog', description: '技术前沿动态', categories: ['其他'], url: 'https://github.blog/feed/', color: '#24292F', icon: '💻' },
 ];
 
 export const DiscoverPage: React.FC = () => {
   const { showToast, reloadArticles } = useAppContext();
-  const [selectedCategory, setSelectedCategory] = useState<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号'>('全部');
+  const [selectedCategory, setSelectedCategory] = useState<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'>('全部');
   const [addedSources, setAddedSources] = useState<Set<string>>(new Set());
   const [loadingSources, setLoadingSources] = useState<Set<string>>(new Set());
 
@@ -106,7 +109,8 @@ export const DiscoverPage: React.FC = () => {
         color: source.color,
         rssUrl: source.url
       };
-      parsed.unshift(newSource);
+      // 添加到所有合集的下方（末尾）
+      parsed.push(newSource);
       localStorage.setItem('atomflow:source-layout:v1', JSON.stringify(parsed));
 
       setAddedSources(prev => new Set(prev).add(source.name));
@@ -127,7 +131,7 @@ export const DiscoverPage: React.FC = () => {
     }
   };
 
-  const categories: Array<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号'> = ['全部', '国内媒体', '播客', 'X', 'YouTube', '公众号'];
+  const categories: Array<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'> = ['全部', '国内媒体', '播客', 'X', 'YouTube', '公众号', '其他'];
 
   return (
     <div className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6 w-full">
