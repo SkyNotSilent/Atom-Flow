@@ -1,20 +1,158 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# AtomFlow（原子流）
 
-# Run and deploy your AI Studio app
+AtomFlow 是一款面向内容创作者、产品经理和知识工作者的「阅读 → 提炼 → 沉淀 → 写作」工具。  
+它的目标不是“收藏更多信息”，而是把高价值信息转成可复用的原子知识资产。
 
-This contains everything you need to run your app locally.
+## 文档导航
 
-View your app in AI Studio: https://ai.studio/apps/6e4ec099-7fca-40b8-88be-0d32486701fd
+- 对外发布版文档：[docs/README_PUBLIC.md](file:///F:/AI产品经理/AtomFlow/docs/README_PUBLIC.md)
+- 团队内部文档：[docs/README_INTERNAL.md](file:///F:/AI产品经理/AtomFlow/docs/README_INTERNAL.md)
+- 版本变更记录：[CHANGELOG.md](file:///F:/AI产品经理/AtomFlow/CHANGELOG.md)
 
-## Run Locally
+---
 
-**Prerequisites:**  Node.js
+## 产品理念
 
+在信息过载时代，真正稀缺的不是内容，而是可复用的认知结构。  
+AtomFlow 的核心理念是：
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+- 从“被动阅读”升级为“主动提炼”
+- 从“碎片收藏”升级为“结构化知识”
+- 从“临时创作”升级为“资产复利”
+
+一句话：**让每一篇看过的内容，都能在未来持续产生价值。**
+
+---
+
+## 核心能力
+
+### 1) 今日推送（信息入口）
+- 聚合多个来源的内容流
+- 支持按来源浏览与排序
+- 支持快速查看全文
+- 支持一键“存入知识库”
+
+### 2) 知识库（沉淀中心）
+- 自动生成原子卡片，类型统一为：
+  - 观点
+  - 数据
+  - 金句
+  - 故事
+- 支持搜索、编辑、删除、新建
+- 支持来源回溯（从卡片回看原文）
+- 支持按类型、来源进行筛选
+
+### 3) 魔法写作（复用出口）
+- 从知识卡片中召回素材
+- 组织写作画布
+- 生成可导出内容
+
+### 4) 三栏联动布局
+- 左侧导航 / 中间工作区 / 右侧阅读区
+- 支持栏宽拖动调整，提高多任务并行效率
+
+---
+
+## 快速开始（本地运行）
+
+### 环境要求
+- Node.js 18+
+- npm 9+
+
+### 安装依赖
+
+```bash
+npm install
+```
+
+### 启动开发环境
+
+```bash
+npm run dev
+```
+
+默认在本地启动前后端一体服务（Express + Vite）。
+
+---
+
+## 常用脚本
+
+```bash
+npm run dev       # 开发模式
+npm run build     # 前端构建
+npm run preview   # 构建产物预览
+npm run lint      # TypeScript 类型检查
+```
+
+---
+
+## 项目结构（简版）
+
+```text
+AtomFlow/
+├─ src/
+│  ├─ components/      # 通用组件（导航、阅读器、提示等）
+│  ├─ pages/           # 页面（推送、知识库、写作）
+│  ├─ context/         # 全局状态管理
+│  ├─ utils/           # 业务工具函数
+│  ├─ data/            # mock 数据
+│  ├─ types.ts         # 类型定义
+│  └─ constants.ts     # 常量与主题色
+├─ server.ts           # 后端服务与 API（RSS 抓取、全文提取、卡片生成）
+├─ package.json
+└─ README.md
+```
+
+---
+
+## 当前 API 概览（节选）
+
+- `GET /api/articles`：获取推送文章
+- `GET /api/articles/:id/full`：抓取/返回全文
+- `POST /api/articles/:id/save`：存入知识库并生成卡片
+- `GET /api/cards`：获取知识卡片
+- `POST /api/cards`：新建卡片
+- `PUT /api/cards/:id`：更新卡片
+- `DELETE /api/cards/:id`：删除卡片
+
+---
+
+## 版本记录（建议规范）
+
+建议采用 `语义化版本`：`MAJOR.MINOR.PATCH`
+
+- **MAJOR**：不兼容改动（如核心数据结构调整）
+- **MINOR**：向下兼容功能新增（如新增来源模式视图）
+- **PATCH**：向下兼容问题修复（如拖拽体验、样式修正）
+
+### 最近一次迭代（示例）
+
+**v0.3.0**
+- 知识库卡片类型统一为：观点 / 数据 / 金句 / 故事
+- 知识库新增来源回溯能力
+- 三栏布局支持拖拽调节宽度
+- 存入知识库流程增加阶段化反馈与状态可视化
+
+---
+
+## 面向国内用户的使用建议
+
+- 先在“今日推送”完成高质量输入
+- 只存入真正有复用价值的内容
+- 每条卡片至少补 1~2 个标签，方便后续检索
+- 写作前先按主题召回卡片，再组织结构
+
+---
+
+## 维护说明
+
+- 本项目当前优先保证：可读性、可追溯性、可复用性
+- 若需接入真实大模型，请优先保留“失败回退到规则提取”的兜底策略
+- 文档维护建议：每次发版同步更新“版本记录”与“能力变更”
+
+---
+
+## License
+
+本项目采用 MIT License。  
+完整协议见 [LICENSE](file:///F:/AI产品经理/AtomFlow/LICENSE)。

@@ -1,25 +1,44 @@
 import React, { useEffect, useRef } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { Check, X, Bookmark, Share, MoreHorizontal, Loader2 } from 'lucide-react';
+import { Check, X, Bookmark, Share, MoreHorizontal, Loader2, ExternalLink, Sparkles } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
+import { cn } from './Nav';
+import { getDisplaySource } from '../utils/articleDisplay';
 
 export const ReaderPane: React.FC = () => {
-  const { readingArticle, setReadingArticle, saveArticle } = useAppContext();
+  const { readingArticle, setReadingArticle, saveArticle, showToast, isSavingArticle, getSavingStageText, articles } = useAppContext();
   const contentRef = useRef<HTMLDivElement>(null);
+  const currentArticle = readingArticle ? (articles.find(article => article.id === readingArticle.id) || readingArticle) : null;
+  const displaySource = currentArticle ? getDisplaySource(currentArticle) : '未知来源';
+  const shouldShowLoading = Boolean(currentArticle && !currentArticle.fullFetched && !currentArticle.content && !currentArticle.markdownContent);
 
   useEffect(() => {
-    if (contentRef.current && readingArticle) {
+    if (contentRef.current && currentArticle) {
       const links = contentRef.current.querySelectorAll('a');
       links.forEach(link => {
         link.setAttribute('target', '_blank');
         link.setAttribute('rel', 'noopener noreferrer');
       });
+      const handleImageError = (event: Event) => {
+        const img = event.currentTarget as HTMLImageElement;
+        img.style.display = 'none';
+      };
+      const images = contentRef.current.querySelectorAll('img');
+      images.forEach(image => {
+        image.addEventListener('error', handleImageError);
+        if (image.complete && image.naturalWidth === 0) {
+          image.style.display = 'none';
+        }
+      });
+      return () => {
+        images.forEach(image => image.removeEventListener('error', handleImageError));
+      };
     }
-  }, [readingArticle]);
+  }, [currentArticle]);
 
-  if (!readingArticle) return (
+  if (!currentArticle) return (
     <div className="flex-1 hidden lg:flex flex-col items-center justify-center bg-surface border-l border-border">
       <div className="w-24 h-24 mb-6 opacity-20">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round">
@@ -31,6 +50,41 @@ export const ReaderPane: React.FC = () => {
   );
 
   const handleClose = () => setReadingArticle(null);
+
+  const handleBookmark = async () => {
+    if (!currentArticle) return;
+    if (currentArticle.saved) {
+      showToast('已收藏');
+      return;
+    }
+    await saveArticle(currentArticle.id);
+    showToast('已收藏');
+  };
+
+  const handleShare = async () => {
+    if (!currentArticle?.url) {
+      showToast('暂无原文链接');
+      return;
+    }
+    const shareData = { title: currentArticle.title, url: currentArticle.url };
+    if (navigator.share) {
+      try {
+        await navigator.share(shareData);
+        showToast('已唤起分享');
+        return;
+      } catch {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(currentArticle.url);
+          showToast('已复制链接');
+          return;
+        }
+      }
+    }
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(currentArticle.url);
+      showToast('已复制链接');
+    }
+  };
 
   return (
     <div className="flex-1 flex flex-col bg-surface border-l border-border h-full overflow-hidden relative z-50">
@@ -46,10 +100,20 @@ export const ReaderPane: React.FC = () => {
         </div>
         
         <div className="flex items-center gap-1">
-          <button className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
+          {currentArticle.url && (
+            <a
+              href={currentArticle.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-2.5 h-8 rounded-full border border-border flex items-center gap-1 text-[12px] text-text2 hover:bg-surface2 transition-colors"
+            >
+              原文 <ExternalLink size={12} />
+            </a>
+          )}
+          <button onClick={handleShare} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
             <Share size={16} />
           </button>
-          <button className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
+          <button onClick={handleBookmark} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
             <Bookmark size={16} />
           </button>
           <button className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
@@ -63,28 +127,29 @@ export const ReaderPane: React.FC = () => {
         <div className="max-w-3xl mx-auto py-10 px-6 sm:px-12 min-h-full">
           <div className="mb-8">
             <h1 className="font-serif text-2xl sm:text-[32px] font-bold text-text-main leading-[1.4] mb-4">
-              {readingArticle.title}
+              {currentArticle.title}
             </h1>
             <div className="flex items-center gap-2 mb-8 text-[13px] text-text3">
-              <span className="font-medium text-accent">{readingArticle.source}</span>
+              <span className="font-medium text-accent">{displaySource}</span>
               <span>·</span>
-              <span>{readingArticle.time}</span>
+              <span>{currentArticle.time}</span>
             </div>
 
-            {/* AI Summary Box */}
             <div className="p-5 bg-accent-light/30 rounded-2xl border border-accent/10 mb-10">
               <div className="flex items-center gap-2 mb-3 text-accent font-medium text-[14px]">
                 <span>✦</span> AI 总结
               </div>
               <div className="text-[14px] text-text2 leading-relaxed">
-                {readingArticle.excerpt}
+                {currentArticle.excerpt}
               </div>
-              {!readingArticle.saved ? (
+              {!currentArticle.saved ? (
                 <button 
-                  onClick={() => saveArticle(readingArticle.id)}
-                  className="mt-4 px-4 py-2 rounded-xl text-[13px] font-medium bg-accent text-white hover:bg-opacity-90 transition-colors flex items-center gap-1.5 shadow-sm"
+                  onClick={() => void saveArticle(currentArticle.id)}
+                  disabled={isSavingArticle(currentArticle.id)}
+                  className="mt-4 px-4 py-2 rounded-xl text-[13px] font-medium bg-accent text-white hover:bg-opacity-90 transition-colors flex items-center gap-1.5 shadow-sm disabled:cursor-wait"
                 >
-                  <span>✦</span> 一键存入知识库
+                  <Sparkles size={14} className={cn(isSavingArticle(currentArticle.id) && "animate-spin")} />
+                  {isSavingArticle(currentArticle.id) ? getSavingStageText(currentArticle.id) || '处理中...' : '一键存入知识库'}
                 </button>
               ) : (
                 <button 
@@ -95,19 +160,24 @@ export const ReaderPane: React.FC = () => {
                 </button>
               )}
             </div>
+            {currentArticle.readabilityUsed && (
+              <div className="mb-8 rounded-xl border border-border bg-surface2 px-4 py-3 text-[12px] text-text3 leading-relaxed">
+                此内容由 Readability 提供。如果你发现排版异常，请访问源站查看原始内容。
+              </div>
+            )}
           </div>
 
-          {!readingArticle.fullFetched ? (
+          {shouldShowLoading ? (
             <div className="flex flex-col items-center justify-center py-20 text-text3">
               <Loader2 className="w-8 h-8 animate-spin mb-4 text-accent" />
-              <p className="text-[14px]">正在通过 Jina Reader 提取全文...</p>
+              <p className="text-[14px]">正在提取全文...</p>
             </div>
           ) : (
             <div 
               ref={contentRef}
               className="text-[15px] sm:text-[16px] leading-[1.8] sm:leading-[2] text-text-main prose prose-p:mb-6 prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-img:rounded-xl prose-img:my-8 max-w-none pb-20 [&_section[data-footnotes]]:hidden [&_.footnotes]:hidden"
             >
-              {readingArticle.markdownContent ? (
+              {currentArticle.markdownContent ? (
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   rehypePlugins={[rehypeRaw]}
@@ -165,11 +235,18 @@ export const ReaderPane: React.FC = () => {
                       // To prevent double-superscripting, we just render the children directly.
                       return <>{children}</>;
                     },
-                    img: ({node, src, ...props}) => {
+                    img: ({node, src, onError, ...props}) => {
                       // Use our own backend proxy to bypass strict CSP (img-src 'self') and hotlink protection
-                      const proxySrc = src?.startsWith('http') 
-                        ? `/api/image-proxy?url=${encodeURIComponent(src)}` 
-                        : src;
+                      let normalizedSrc = src || '';
+                      if (normalizedSrc.startsWith('//')) {
+                        normalizedSrc = `https:${normalizedSrc}`;
+                      } else if (normalizedSrc.startsWith('/')) {
+                        const articleHost = currentArticle?.url ? new URL(currentArticle.url).origin : '';
+                        normalizedSrc = articleHost ? `${articleHost}${normalizedSrc}` : normalizedSrc;
+                      }
+                      const proxySrc = normalizedSrc.startsWith('http')
+                        ? `/api/image-proxy?url=${encodeURIComponent(normalizedSrc)}&referer=${encodeURIComponent(currentArticle?.url || '')}`
+                        : normalizedSrc;
                       return (
                         <img 
                           {...props} 
@@ -177,15 +254,22 @@ export const ReaderPane: React.FC = () => {
                           referrerPolicy="no-referrer" 
                           className="w-full rounded-xl my-8 object-cover bg-surface2 min-h-[100px]" 
                           loading="lazy"
+                          onError={(event) => {
+                            const target = event.currentTarget as HTMLImageElement;
+                            target.style.display = 'none';
+                            if (typeof onError === 'function') {
+                              onError(event);
+                            }
+                          }}
                         />
                       );
                     }
                   }}
                 >
-                  {readingArticle.markdownContent}
+                  {currentArticle.markdownContent}
                 </ReactMarkdown>
               ) : (
-                <div dangerouslySetInnerHTML={{ __html: readingArticle.content }} />
+                <div dangerouslySetInnerHTML={{ __html: currentArticle.content }} />
               )}
             </div>
           )}

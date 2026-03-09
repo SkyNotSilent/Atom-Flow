@@ -123,8 +123,7 @@ export const WritePage: React.FC = () => {
       <p>在探讨“${topic}”这个话题时，我们首先需要理解其背后的深层逻辑。</p>
       ${canvasCards.some(c => c.type === '观点') ? `<h3>问题的根源</h3><p>${canvasCards.filter(c => c.type === '观点').map(c => c.content).join(' ')}</p>` : ''}
       ${canvasCards.some(c => c.type === '数据') ? `<h3>数据说明了什么</h3><p>${canvasCards.filter(c => c.type === '数据').map(c => c.content).join(' ')}</p>` : ''}
-      ${canvasCards.some(c => c.type === '案例') ? `<h3>可以参考的路径</h3><p>${canvasCards.filter(c => c.type === '案例').map(c => c.content).join(' ')}</p>` : ''}
-      ${canvasCards.some(c => c.type === '论据') ? `<h3>为什么这条路是对的</h3><p>${canvasCards.filter(c => c.type === '论据').map(c => c.content).join(' ')}</p>` : ''}
+      ${canvasCards.some(c => c.type === '故事') ? `<h3>可以参考的路径</h3><p>${canvasCards.filter(c => c.type === '故事').map(c => c.content).join(' ')}</p>` : ''}
       ${canvasCards.some(c => c.type === '金句') ? `<h3>最后想说的</h3><p>正如那句话所说：${canvasCards.filter(c => c.type === '金句').map(c => c.content).join(' ')}</p>` : ''}
       <p>综上所述，解决“${topic}”的关键在于将理论与实践相结合，持续迭代。</p>
     `;

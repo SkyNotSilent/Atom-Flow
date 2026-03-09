@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+.cache/
+tmp_*.json
+articles.json

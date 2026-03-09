@@ -1,5 +1,7 @@
 import { Article } from "../types";
 
+const now = Date.now();
+
 export const MOCK_ARTICLES: Article[] = [
   {
     id: 1,
@@ -7,6 +9,7 @@ export const MOCK_ARTICLES: Article[] = [
     source: "少数派",
     topic: "产品思维",
     time: "09:14",
+    publishedAt: now - 2 * 60 * 60 * 1000,
     title: "为什么你的收藏夹是一个知识坟墓？",
     excerpt:
       "我们每天都在疯狂地收藏文章，但真正转化为自己知识的却寥寥无几。这背后的原因是什么？",
@@ -24,7 +27,7 @@ export const MOCK_ARTICLES: Article[] = [
         tags: ["知识管理"],
       },
       {
-        type: "论据",
+        type: "数据",
         content: "整篇文章的信息密度过高，没有被拆解和重组，难以直接用于创作。",
         tags: ["内容创作", "方法论"],
       },
@@ -36,6 +39,7 @@ export const MOCK_ARTICLES: Article[] = [
     source: "虎嗅网",
     topic: "商业洞察",
     time: "昨天 18:30",
+    publishedAt: now - 20 * 60 * 60 * 1000,
     title: "中国内容创作者的变现困境：流量有了，钱在哪里？",
     excerpt: "在流量红利见顶的今天，内容创作者面临着前所未有的变现压力。",
     content:
@@ -52,7 +56,7 @@ export const MOCK_ARTICLES: Article[] = [
         tags: ["商业变现"],
       },
       {
-        type: "论据",
+        type: "数据",
         content: "流量红利见顶，内容平台对商业化的限制日益严格。",
         tags: ["行业趋势"],
       },
@@ -64,6 +68,7 @@ export const MOCK_ARTICLES: Article[] = [
     source: "科技爱好者周刊",
     topic: "AI 方向",
     time: "昨天 10:00",
+    publishedAt: now - 28 * 60 * 60 * 1000,
     title: "用 AI 写的文章，为什么一眼就能看出来？",
     excerpt: "AI 生成的内容往往带有一种独特的“AI 腔”，让人一眼就能识破。",
     content:
@@ -80,7 +85,7 @@ export const MOCK_ARTICLES: Article[] = [
         tags: ["写作思考"],
       },
       {
-        type: "案例",
+        type: "故事",
         content: "某知名公众号全量使用 AI 写作，阅读量一个月内暴跌 50%。",
         tags: ["AI应用", "反面案例"],
       },
@@ -92,6 +97,7 @@ export const MOCK_ARTICLES: Article[] = [
     source: "少数派",
     topic: "产品思维",
     time: "03-05",
+    publishedAt: now - 3 * 24 * 60 * 60 * 1000,
     title: "第二大脑的幻觉：我们为什么建了知识库却不用它？",
     excerpt:
       "构建第二大脑成为了效率圈的显学，但很多人建完之后就再也没有打开过。",
@@ -111,6 +117,7 @@ export const MOCK_ARTICLES: Article[] = [
     source: "虎嗅网",
     topic: "商业洞察",
     time: "03-04",
+    publishedAt: now - 4 * 24 * 60 * 60 * 1000,
     title: "Newsletter 的复兴：当读者愿意为内容付费",
     excerpt:
       "在算法推荐疲劳的当下，Newsletter 作为一种去中心化的内容分发方式正在复兴。",
@@ -130,6 +137,7 @@ export const MOCK_ARTICLES: Article[] = [
     source: "科技爱好者周刊",
     topic: "内容创作",
     time: "03-03",
+    publishedAt: now - 5 * 24 * 60 * 60 * 1000,
     title: "输入决定输出：为什么大量阅读是创作的基础设施",
     excerpt: "没有高质量的输入，就不可能有持续的高质量输出。",
     content:

@@ -15,8 +15,15 @@ interface AppState {
   toggleTheme: () => void;
   readingArticle: Article | null;
   setReadingArticle: (article: Article | null) => void;
-  activeTopic: string;
-  setActiveTopic: (topic: string) => void;
+  activeSource: string | null;
+  setActiveSource: (source: string | null) => void;
+  reloadArticles: () => Promise<void>;
+  isSavingArticle: (articleId: number) => boolean;
+  getSavingStageText: (articleId: number) => string | null;
+  knowledgeTypeFilter: string;
+  setKnowledgeTypeFilter: (filter: string) => void;
+  knowledgeSourceFilter: string;
+  setKnowledgeSourceFilter: (filter: string) => void;
 }
 
 const AppContext = createContext<AppState | undefined>(undefined);
@@ -27,39 +34,71 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [readingArticle, setReadingArticleState] = useState<Article | null>(null);
+  const [activeSource, setActiveSource] = useState<string | null>(null);
+  const [savingState, setSavingState] = useState<{ articleId: number | null; stage: string | null }>({ articleId: null, stage: null });
+  const [knowledgeTypeFilter, setKnowledgeTypeFilter] = useState('来源');
+  const [knowledgeSourceFilter, setKnowledgeSourceFilter] = useState('全部');
+  const quickOpenMode = true;
+  const forceRefetchInTesting = false;
+  const saveStages = ['提取全文', '识别要点', '原子化拆分', '提炼入库'];
+
+  const reloadArticles = async () => {
+    const articlesRes = await fetch('/api/articles');
+    if (articlesRes.ok) {
+      setArticles(await articlesRes.json());
+    }
+  };
   
   const setReadingArticle = async (article: Article | null) => {
     setReadingArticleState(article);
+    if (quickOpenMode) {
+      return;
+    }
     
-    // If we just selected an article and it hasn't been fully fetched yet
-    if (article && !article.fullFetched) {
+    const shouldForceRefetch = Boolean(article && article.url && forceRefetchInTesting);
+    const fullApiUrl = article
+      ? `/api/articles/${article.id}/full${shouldForceRefetch ? `?force=1&t=${Date.now()}` : ''}`
+      : '';
+    if (article && (!article.fullFetched || shouldForceRefetch)) {
       try {
-        const res = await fetch(`/api/articles/${article.id}/full`);
+        const res = await fetch(fullApiUrl, { cache: 'no-store' });
         if (res.ok) {
           const data = await res.json();
-          // Update the articles list with the fetched full content
           setArticles(prev => prev.map(a => a.id === article.id ? data.article : a));
-          // Update the currently reading article state so the UI re-renders
           setReadingArticleState(data.article);
+          return;
+        }
+        const articlesRes = await fetch('/api/articles');
+        if (articlesRes.ok) {
+          const freshArticles = await articlesRes.json();
+          setArticles(freshArticles);
+          const matched = freshArticles.find((a: Article) => a.url && article.url && a.url === article.url)
+            || freshArticles.find((a: Article) => a.title === article.title);
+          if (matched) {
+            setReadingArticleState(matched);
+            const shouldRefetchMatched = Boolean(matched.url && forceRefetchInTesting);
+            if (!matched.fullFetched || shouldRefetchMatched) {
+              const retryRes = await fetch(`/api/articles/${matched.id}/full${shouldRefetchMatched ? `?force=1&t=${Date.now()}` : ''}`, { cache: 'no-store' });
+              if (retryRes.ok) {
+                const data = await retryRes.json();
+                setArticles((prev: Article[]) => prev.map(a => a.id === matched.id ? data.article : a));
+                setReadingArticleState(data.article);
+              }
+            }
+          }
         }
       } catch (error) {
         console.error("Failed to fetch full article:", error);
       }
     }
   };
-  const [activeTopic, setActiveTopic] = useState('全部');
-
   // Fetch initial data
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [articlesRes, cardsRes] = await Promise.all([
-          fetch('/api/articles'),
-          fetch('/api/cards')
-        ]);
-        const articlesData = await articlesRes.json();
+        const cardsRes = await fetch('/api/cards');
+        await reloadArticles();
         const cardsData = await cardsRes.json();
-        setArticles(articlesData);
         setSavedCards(cardsData);
       } catch (error) {
         console.error("Failed to fetch initial data:", error);
@@ -79,9 +118,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const toggleTheme = () => setTheme(prev => prev === 'light' ? 'dark' : 'light');
 
   const saveArticle = async (articleId: number) => {
+    if (savingState.articleId !== null) return;
     try {
+      setSavingState({ articleId, stage: saveStages[0] });
+      const targetArticle = articles.find(a => a.id === articleId);
+      if (quickOpenMode && targetArticle?.url) {
+        const fullRes = await fetch(`/api/articles/${articleId}/full?force=1&t=${Date.now()}`, { cache: 'no-store' });
+        if (fullRes.ok) {
+          const fullData = await fullRes.json();
+          setArticles(prev => prev.map(a => a.id === articleId ? fullData.article : a));
+          if (readingArticle?.id === articleId) {
+            setReadingArticleState(fullData.article);
+          }
+        }
+      }
+      setSavingState({ articleId, stage: saveStages[1] });
+      await new Promise(resolve => setTimeout(resolve, 220));
+      setSavingState({ articleId, stage: saveStages[2] });
       const res = await fetch(`/api/articles/${articleId}/save`, { method: 'POST' });
       if (res.ok) {
+        setSavingState({ articleId, stage: saveStages[3] });
         // Refresh data to get the new cards and updated article state
         const [articlesRes, cardsRes] = await Promise.all([
           fetch('/api/articles'),
@@ -92,8 +148,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     } catch (error) {
       console.error("Failed to save article:", error);
+    } finally {
+      await new Promise(resolve => setTimeout(resolve, 260));
+      setSavingState({ articleId: null, stage: null });
     }
   };
+
+  const isSavingArticle = (articleId: number) => savingState.articleId === articleId;
+  const getSavingStageText = (articleId: number) => savingState.articleId === articleId ? savingState.stage : null;
 
   const addCards = (cards: AtomCard[]) => {
     // This is mostly handled by saveArticle now, but keeping for compatibility if needed
@@ -155,7 +217,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       articles, savedCards, saveArticle, addCards, addCard, updateCard, deleteCard, 
       showToast, toastMsg, theme, toggleTheme,
       readingArticle, setReadingArticle,
-      activeTopic, setActiveTopic
+      activeSource, setActiveSource,
+      reloadArticles,
+      isSavingArticle,
+      getSavingStageText,
+      knowledgeTypeFilter,
+      setKnowledgeTypeFilter,
+      knowledgeSourceFilter,
+      setKnowledgeSourceFilter
     }}>
       {children}
     </AppContext.Provider>

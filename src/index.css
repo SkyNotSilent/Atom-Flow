@@ -52,3 +52,22 @@ body {
   font-family: var(--font-sans);
   transition: background-color 0.3s ease, color 0.3s ease;
 }
+
+@keyframes atomflow-stream {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 180% 50%;
+  }
+}
+
+.atomflow-flow-char {
+  background-image: linear-gradient(90deg, #1d4ed8 0%, #3b82f6 32%, #7dd3fc 50%, #3b82f6 68%, #1d4ed8 100%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  display: inline-block;
+  animation: atomflow-stream 2.2s linear infinite;
+}
