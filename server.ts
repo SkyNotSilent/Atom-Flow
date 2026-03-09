@@ -245,7 +245,36 @@ function rankArticles(articles: Article[]) {
   return [...prioritized, ...randomized];
 }
 
-function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: string, idOffset: number) {
+function extractFeedIcon(parsed: Parser.Output<any>): string | undefined {
+  // 尝试从多个可能的字段提取图标
+  const feed = parsed as any;
+  
+  // iTunes podcast image
+  if (feed.itunes?.image) return feed.itunes.image;
+  
+  // Standard RSS image
+  if (feed.image?.url) return feed.image.url;
+  
+  // Atom feed icon
+  if (feed.icon) return feed.icon;
+  
+  // Feed logo
+  if (feed.logo) return feed.logo;
+  
+  // 从link提取favicon
+  if (feed.link) {
+    try {
+      const url = new URL(feed.link);
+      return `${url.origin}/favicon.ico`;
+    } catch {
+      // ignore
+    }
+  }
+  
+  return undefined;
+}
+
+function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: string, idOffset: number, feedIcon?: string) {
   const maxItems = source === '36氪' || source === '虎嗅' ? 8 : 12;
   return items.slice(0, maxItems).map((item, index) => {
     const rawContent = item['content:encoded'] || item.content || item.contentSnippet || '';
@@ -273,6 +302,7 @@ function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: 
       id: Date.now() + idOffset + index,
       saved: false,
       source,
+      sourceIcon: feedIcon,
       topic,
       time: timeStr,
       publishedAt,
