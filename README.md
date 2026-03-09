@@ -1,158 +1,159 @@
 # AtomFlow（原子流）
 
-AtomFlow 是一款面向内容创作者、产品经理和知识工作者的「阅读 → 提炼 → 沉淀 → 写作」工具。  
-它的目标不是“收藏更多信息”，而是把高价值信息转成可复用的原子知识资产。
+AtomFlow 是一款轻量级的 RSS 订阅聚合工具，帮助你高效获取和阅读来自多个信息源的优质内容。
 
-## 文档导航
+## 当前版本说明
 
-- 对外发布版文档：[docs/README_PUBLIC.md](file:///F:/AI产品经理/AtomFlow/docs/README_PUBLIC.md)
-- 团队内部文档：[docs/README_INTERNAL.md](file:///F:/AI产品经理/AtomFlow/docs/README_INTERNAL.md)
-- 版本变更记录：[CHANGELOG.md](file:///F:/AI产品经理/AtomFlow/CHANGELOG.md)
+这是 AtomFlow 的早期版本，专注于核心的信息聚合功能：
 
----
-
-## 产品理念
-
-在信息过载时代，真正稀缺的不是内容，而是可复用的认知结构。  
-AtomFlow 的核心理念是：
-
-- 从“被动阅读”升级为“主动提炼”
-- 从“碎片收藏”升级为“结构化知识”
-- 从“临时创作”升级为“资产复利”
-
-一句话：**让每一篇看过的内容，都能在未来持续产生价值。**
+- ✅ RSS 订阅聚合 - 支持多个中文科技/产品媒体源
+- ✅ 全文阅读 - 自动提取文章完整内容
+- ✅ 来源管理 - 按来源浏览和筛选文章
+- ⏳ 知识卡片功能 - 开发中
+- ⏳ 写作辅助功能 - 规划中
 
 ---
 
-## 核心能力
+## 功能特性
 
-### 1) 今日推送（信息入口）
-- 聚合多个来源的内容流
-- 支持按来源浏览与排序
-- 支持快速查看全文
-- 支持一键“存入知识库”
+### RSS 订阅源
 
-### 2) 知识库（沉淀中心）
-- 自动生成原子卡片，类型统一为：
-  - 观点
-  - 数据
-  - 金句
-  - 故事
-- 支持搜索、编辑、删除、新建
-- 支持来源回溯（从卡片回看原文）
-- 支持按类型、来源进行筛选
+内置优质中文信息源：
+- 36氪 - 创投商业资讯
+- 少数派 - 科技生活方式
+- 人人都是产品经理 - 产品运营
+- 虎嗅 - 商业深度分析
+- 即刻话题 - 社区热门讨论
+- 公众号订阅（通过 RSS 服务）
 
-### 3) 魔法写作（复用出口）
-- 从知识卡片中召回素材
-- 组织写作画布
-- 生成可导出内容
+### 阅读体验
 
-### 4) 三栏联动布局
-- 左侧导航 / 中间工作区 / 右侧阅读区
-- 支持栏宽拖动调整，提高多任务并行效率
+- 三栏布局：导航 / 文章列表 / 阅读区
+- 智能全文提取（支持 Readability）
+- 图片代理加载（解决防盗链问题）
+- 按来源筛选和排序
 
 ---
 
-## 快速开始（本地运行）
+## 快速开始
 
 ### 环境要求
 - Node.js 18+
 - npm 9+
 
-### 安装依赖
+### 本地运行
 
 ```bash
+# 1. 克隆项目
+git clone https://github.com/SkyNotSilent/Atom-Flow.git
+cd Atom-Flow
+
+# 2. 安装依赖
 npm install
-```
 
-### 启动开发环境
-
-```bash
+# 3. 启动开发服务器
 npm run dev
 ```
 
-默认在本地启动前后端一体服务（Express + Vite）。
+访问 http://localhost:3001 即可使用。
 
 ---
 
-## 常用脚本
+## 部署到线上
 
+AtomFlow 是一个全栈应用（前端 + 后端），需要部署到支持 Node.js 的平台。
+
+### 推荐平台
+
+**Railway（推荐）**
+1. 访问 [Railway.app](https://railway.app)
+2. 连接 GitHub 仓库
+3. 自动部署（已配置 railway.json）
+
+**Render**
+1. 访问 [Render.com](https://render.com)
+2. 创建 Web Service
+3. 连接仓库（已配置 render.yaml）
+
+**Docker 部署**
 ```bash
-npm run dev       # 开发模式
-npm run build     # 前端构建
-npm run preview   # 构建产物预览
-npm run lint      # TypeScript 类型检查
+docker build -t atomflow .
+docker run -d -p 3001:3001 atomflow
 ```
 
+详细部署说明请查看 [DEPLOYMENT.md](DEPLOYMENT.md)
+
 ---
 
-## 项目结构（简版）
+## 项目结构
 
 ```text
 AtomFlow/
 ├─ src/
-│  ├─ components/      # 通用组件（导航、阅读器、提示等）
+│  ├─ components/      # React 组件
 │  ├─ pages/           # 页面（推送、知识库、写作）
-│  ├─ context/         # 全局状态管理
-│  ├─ utils/           # 业务工具函数
-│  ├─ data/            # mock 数据
-│  ├─ types.ts         # 类型定义
-│  └─ constants.ts     # 常量与主题色
-├─ server.ts           # 后端服务与 API（RSS 抓取、全文提取、卡片生成）
+│  ├─ context/         # 全局状态
+│  ├─ utils/           # 工具函数
+│  └─ types.ts         # 类型定义
+├─ server.ts           # Express 后端服务
 ├─ package.json
 └─ README.md
 ```
 
 ---
 
-## 当前 API 概览（节选）
+## 技术栈
 
-- `GET /api/articles`：获取推送文章
-- `GET /api/articles/:id/full`：抓取/返回全文
-- `POST /api/articles/:id/save`：存入知识库并生成卡片
-- `GET /api/cards`：获取知识卡片
-- `POST /api/cards`：新建卡片
-- `PUT /api/cards/:id`：更新卡片
-- `DELETE /api/cards/:id`：删除卡片
+- **前端**: React 19 + TypeScript + Vite + Tailwind CSS
+- **后端**: Express + Node.js
+- **RSS 解析**: rss-parser
+- **全文提取**: @mozilla/readability + jsdom
+- **数据存储**: 本地 JSON 缓存（.cache/articles.json）
 
 ---
 
-## 版本记录（建议规范）
+## 常用命令
 
-建议采用 `语义化版本`：`MAJOR.MINOR.PATCH`
-
-- **MAJOR**：不兼容改动（如核心数据结构调整）
-- **MINOR**：向下兼容功能新增（如新增来源模式视图）
-- **PATCH**：向下兼容问题修复（如拖拽体验、样式修正）
-
-### 最近一次迭代（示例）
-
-**v0.3.0**
-- 知识库卡片类型统一为：观点 / 数据 / 金句 / 故事
-- 知识库新增来源回溯能力
-- 三栏布局支持拖拽调节宽度
-- 存入知识库流程增加阶段化反馈与状态可视化
+```bash
+npm run dev       # 开发模式（前后端一体）
+npm run build     # 构建前端
+npm run lint      # TypeScript 类型检查
+```
 
 ---
 
-## 面向国内用户的使用建议
+## 常见问题
 
-- 先在“今日推送”完成高质量输入
-- 只存入真正有复用价值的内容
-- 每条卡片至少补 1~2 个标签，方便后续检索
-- 写作前先按主题召回卡片，再组织结构
+### Q: 为什么部署后只有前端页面，RSS 不显示？
+A: 需要确保后端服务正常运行。静态托管平台（如 Vercel/Netlify）不支持，请使用 Railway/Render 等支持 Node.js 的平台。
+
+### Q: 如何添加自定义 RSS 源？
+A: 当前版本暂不支持前端添加，可以修改 `server.ts` 中的 `fetchRSSFeeds()` 函数添加新的订阅源。
+
+### Q: 数据存储在哪里？
+A: 当前版本使用本地 JSON 文件缓存（`.cache/articles.json`），重启服务不会丢失数据。
 
 ---
 
-## 维护说明
+## 开发路线图
 
-- 本项目当前优先保证：可读性、可追溯性、可复用性
-- 若需接入真实大模型，请优先保留“失败回退到规则提取”的兜底策略
-- 文档维护建议：每次发版同步更新“版本记录”与“能力变更”
+- [x] RSS 订阅聚合
+- [x] 全文阅读
+- [x] 来源管理
+- [ ] 知识卡片自动提取
+- [ ] 卡片标签系统
+- [ ] 写作辅助功能
+- [ ] 数据库持久化
+- [ ] 用户自定义订阅源
 
 ---
 
 ## License
 
-本项目采用 MIT License。  
-完整协议见 [LICENSE](file:///F:/AI产品经理/AtomFlow/LICENSE)。
+本项目采用 MIT License。详见 [LICENSE](LICENSE)。
+
+---
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！
