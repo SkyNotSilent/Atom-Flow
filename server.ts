@@ -776,6 +776,34 @@ async function startServer() {
     }
   });
 
+  app.post("/api/sources/retry", async (req, res) => {
+    const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
+    const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
+    if (!source || !input) {
+      return res.status(400).json({ error: "source and input are required" });
+    }
+    try {
+      // 使用60秒超时重试
+      const parsed = await parseWithRetry([input], 60000, 1);
+      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, extractFeedIcon(parsed));
+      const combined = [...fetched, ...articles];
+      const dedup = new Map<string, Article>();
+      for (const article of combined) {
+        const key = article.url ? `url:${article.url}` : `st:${article.source}:${article.title}`;
+        if (!dedup.has(key)) dedup.set(key, article);
+      }
+      articles = rankArticles(Array.from(dedup.values()));
+      await saveArticlesCache(articles);
+      return res.json({ success: true, added: fetched.length });
+    } catch (error: any) {
+      console.error(`Failed to retry source ${source}:`, error);
+      return res.status(502).json({ 
+        error: "获取失败", 
+        details: error?.message || '未知错误'
+      });
+    }
+  });
+
   app.delete("/api/sources/:source", async (req, res) => {
     const source = decodeURIComponent(req.params.source || '').trim();
     if (!source) return res.status(400).json({ error: "source is required" });

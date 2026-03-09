@@ -6,10 +6,29 @@ import { Check, LayoutGrid, List, Sparkles } from 'lucide-react';
 import { getDisplaySource, sourceMatches } from '../utils/articleDisplay';
 
 export const FeedPage: React.FC = () => {
-  const { articles, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText } = useAppContext();
+  const { articles, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText, showToast, reloadArticles } = useAppContext();
   const [showSrcModal, setShowSrcModal] = useState(false);
   const [viewMode, setViewMode] = useState<'card' | 'compact'>('card');
   const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [isRetrying, setIsRetrying] = useState(false);
+
+  // 源名称到RSS URL的映射
+  const SOURCE_RSS_MAP: Record<string, string> = {
+    '少数派': 'rsshub://sspai/index',
+    '36氪': 'rsshub://36kr/hot-list',
+    '虎嗅': 'https://www.huxiu.com/rss/0.xml',
+    '人人都是产品经理': 'https://www.woshipm.com/feed',
+    '数字生命卡兹克': 'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml',
+    '新智元': 'https://plink.anyfeeder.com/weixin/AI_era',
+    '即刻话题': 'rsshub://jike/topic/63579abb6724cc583b9bba9a',
+    'GitHub Blog': 'https://github.blog/feed/',
+    'Sam Altman': 'rsshub://twitter/user/sama',
+    '张小珺商业访谈录': 'https://feed.xyzfm.space/dk4yh3pkpjp3',
+    'Lex Fridman': 'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA',
+    'Y Combinator': 'rsshub://youtube/user/%40ycombinator',
+    'Andrej Karpathy': 'rsshub://youtube/user/@AndrejKarpathy',
+    '极客公园': 'rsshub://geekpark/breakingnews'
+  };
 
   // 检测初始加载状态
   React.useEffect(() => {
@@ -17,6 +36,40 @@ export const FeedPage: React.FC = () => {
       setIsInitialLoading(false);
     }
   }, [articles]);
+
+  const handleRetrySource = async () => {
+    if (!activeSource || isRetrying) return;
+    
+    const rssUrl = SOURCE_RSS_MAP[activeSource];
+    if (!rssUrl) {
+      showToast('该信息源不支持重试');
+      return;
+    }
+
+    setIsRetrying(true);
+    showToast('正在重新获取，最多等待60秒...');
+    
+    try {
+      const res = await fetch('/api/sources/retry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: activeSource, input: rssUrl })
+      });
+      
+      if (res.ok) {
+        const data = await res.json();
+        await reloadArticles();
+        showToast(`成功获取 ${data.added} 篇文章`);
+      } else {
+        const error = await res.json();
+        showToast(`获取失败：${error.details || error.error}`);
+      }
+    } catch (error) {
+      showToast('网络错误，请稍后重试');
+    } finally {
+      setIsRetrying(false);
+    }
+  };
 
   const SOURCE_PRIORITY: Record<string, number> = {
     '36氪': 5,
@@ -77,6 +130,10 @@ export const FeedPage: React.FC = () => {
               <Sparkles className="text-accent animate-spin" size={14} />
               <p className="text-[11px] sm:text-[12px] text-accent">正在聚合信息源，请稍等...</p>
             </div>
+          ) : activeSource && filteredArticles.length === 0 ? (
+            <div className="flex items-center gap-2 mt-1">
+              <p className="text-[11px] sm:text-[12px] text-red-500">获取信息源失败，点击下方重试</p>
+            </div>
           ) : (
             <p className="text-[11px] sm:text-[12px] text-text3 mt-1">2026年3月7日 · 已聚合 {filteredArticles.length} 篇内容</p>
           )}
@@ -98,10 +155,24 @@ export const FeedPage: React.FC = () => {
           <p className="text-text3 text-[13px]">首次加载可能需要几秒钟...</p>
         </div>
       ) : filteredArticles.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-20">
-          <div className="text-[48px] mb-4 opacity-20">📭</div>
-          <p className="text-text3 text-[14px]">暂无内容</p>
-        </div>
+        activeSource ? (
+          <div className="flex flex-col items-center justify-center py-20">
+            <div className="text-[48px] mb-4 opacity-20">⚠️</div>
+            <p className="text-text2 text-[15px] font-medium mb-2">获取信息源失败</p>
+            <button
+              onClick={handleRetrySource}
+              disabled={isRetrying}
+              className="mt-4 px-4 py-2 bg-accent text-white rounded-lg text-[13px] font-medium hover:bg-accent/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isRetrying ? '正在重试...' : '点击重试'}
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center py-20">
+            <div className="text-[48px] mb-4 opacity-20">📭</div>
+            <p className="text-text3 text-[14px]">暂无内容</p>
+          </div>
+        )
       ) : (
         <div className="flex flex-col gap-2.5">
         {viewMode === 'card' ? filteredArticles.map(article => (
