@@ -489,9 +489,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ),
       parser.parseURL('https://www.woshipm.com/feed'),
       parseWithRetry([
+          'rsshub://36kr/hot-list',
           'https://36kr.com/feed',
-          'rsshub://36kr/news',
-          'rsshub://36kr/newsflash'
+          'rsshub://36kr/news'
         ], 15000, 2),
       parser.parseURL('https://www.huxiu.com/rss/0.xml'),
       parser.parseURL('https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml'),
