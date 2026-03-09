@@ -19,6 +19,8 @@ export interface Article {
   content: string;
   markdownContent?: string;
   url?: string;
+  audioUrl?: string;
+  audioDuration?: string;
   fullFetched?: boolean;
   readabilityUsed?: boolean;
   cards: Omit<AtomCard, "id" | "articleTitle" | "articleId">[];

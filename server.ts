@@ -259,6 +259,12 @@ function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: 
       }
     }
     const publishedAt = date ? date.getTime() : Date.now() - index;
+    
+    // 提取音频信息（播客）
+    const enclosure = item.enclosure;
+    const audioUrl = enclosure?.url;
+    const audioDuration = (item as any).itunes?.duration;
+    
     return {
       id: Date.now() + idOffset + index,
       saved: false,
@@ -270,6 +276,8 @@ function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: 
       excerpt,
       content: rawContent,
       url: item.link,
+      audioUrl,
+      audioDuration,
       cards: []
     };
   });

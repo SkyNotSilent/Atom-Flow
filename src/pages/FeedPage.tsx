@@ -105,6 +105,7 @@ export const FeedPage: React.FC = () => {
                 </div>
 
                 <h2 className="font-serif text-[14px] sm:text-[15.5px] font-semibold text-text-main mb-1.5 leading-snug">
+                  {article.audioUrl && <span className="mr-1">🎙️</span>}
                   {article.title}
                 </h2>
                 <p className="text-[12px] sm:text-[13px] text-text2 leading-[1.7] line-clamp-2">
