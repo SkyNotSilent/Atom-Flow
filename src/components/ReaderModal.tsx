@@ -1,6 +1,6 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { Check, X, Bookmark, Share, MoreHorizontal, Loader2, ExternalLink, Sparkles } from 'lucide-react';
+import { Check, X, Bookmark, Share, MoreHorizontal, Loader2, ExternalLink, Sparkles, Languages } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
@@ -10,6 +10,9 @@ import { getDisplaySource } from '../utils/articleDisplay';
 export const ReaderPane: React.FC = () => {
   const { readingArticle, setReadingArticle, saveArticle, showToast, isSavingArticle, getSavingStageText, articles } = useAppContext();
   const contentRef = useRef<HTMLDivElement>(null);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [translatedContent, setTranslatedContent] = useState<string | null>(null);
+  const [showOriginal, setShowOriginal] = useState(false);
   const currentArticle = readingArticle ? (articles.find(article => article.id === readingArticle.id) || readingArticle) : null;
   const displaySource = currentArticle ? getDisplaySource(currentArticle) : '未知来源';
   const shouldShowLoading = Boolean(currentArticle && !currentArticle.fullFetched && !currentArticle.content && !currentArticle.markdownContent);
@@ -49,7 +52,44 @@ export const ReaderPane: React.FC = () => {
     </div>
   );
 
-  const handleClose = () => setReadingArticle(null);
+  const handleClose = () => {
+    setReadingArticle(null);
+    setTranslatedContent(null);
+    setShowOriginal(false);
+  };
+
+  const handleTranslate = async () => {
+    if (!currentArticle) return;
+    
+    if (translatedContent) {
+      setShowOriginal(!showOriginal);
+      return;
+    }
+
+    setIsTranslating(true);
+    try {
+      const contentToTranslate = currentArticle.markdownContent || currentArticle.content;
+      const response = await fetch('/api/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: contentToTranslate, targetLang: 'zh-CN' })
+      });
+
+      if (!response.ok) {
+        throw new Error('Translation failed');
+      }
+
+      const data = await response.json();
+      setTranslatedContent(data.translatedContent);
+      setShowOriginal(false);
+      showToast('翻译完成');
+    } catch (error) {
+      console.error('Translation error:', error);
+      showToast('翻译失败，请稍后重试');
+    } finally {
+      setIsTranslating(false);
+    }
+  };
 
   const handleBookmark = async () => {
     if (!currentArticle) return;
@@ -110,6 +150,22 @@ export const ReaderPane: React.FC = () => {
               原文 <ExternalLink size={12} />
             </a>
           )}
+          <button 
+            onClick={handleTranslate}
+            disabled={isTranslating}
+            className={cn(
+              "px-2.5 h-8 rounded-full border flex items-center gap-1 text-[12px] transition-colors",
+              translatedContent 
+                ? "border-accent bg-accent-light text-accent hover:bg-accent hover:text-white" 
+                : "border-border text-text2 hover:bg-surface2",
+              isTranslating && "cursor-wait opacity-70"
+            )}
+          >
+            <Languages size={14} className={cn(isTranslating && "animate-pulse")} />
+            <span className="hidden sm:inline">
+              {isTranslating ? '翻译中...' : translatedContent ? (showOriginal ? '查看译文' : '查看原文') : '翻译'}
+            </span>
+          </button>
           <button onClick={handleShare} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
             <Share size={16} />
           </button>
@@ -177,7 +233,20 @@ export const ReaderPane: React.FC = () => {
               ref={contentRef}
               className="text-[15px] sm:text-[16px] leading-[1.8] sm:leading-[2] text-text-main prose prose-p:mb-6 prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-img:rounded-xl prose-img:my-8 max-w-none pb-20 [&_section[data-footnotes]]:hidden [&_.footnotes]:hidden"
             >
-              {currentArticle.markdownContent ? (
+              {translatedContent && !showOriginal ? (
+                <div>
+                  <div className="mb-6 p-3 bg-accent-light/30 rounded-xl border border-accent/20 text-[13px] text-accent flex items-center gap-2">
+                    <Languages size={16} />
+                    <span>以下为 AI 翻译内容</span>
+                  </div>
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[rehypeRaw]}
+                  >
+                    {translatedContent}
+                  </ReactMarkdown>
+                </div>
+              ) : currentArticle.markdownContent ? (
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   rehypePlugins={[rehypeRaw]}

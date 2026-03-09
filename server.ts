@@ -506,7 +506,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
           'rsshub://jike/topic/63579abb6724cc583b9bba9a'
         ]),
         8000
-      )
+      ),
+      parser.parseURL('https://github.blog/feed/')
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
       ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0)
@@ -529,6 +530,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     const jikeArticles = results[6].status === 'fulfilled'
       ? normalizeFeedItems(results[6].value.items, '即刻话题', 'Jike', 6000)
       : [];
+    const githubArticles = results[7].status === 'fulfilled'
+      ? normalizeFeedItems(results[7].value.items, 'GitHub Blog', 'Tech', 7000)
+      : [];
     console.log('RSS counts:', {
       sspai: sspaiArticles.length,
       woshipm: woshipmArticles.length,
@@ -536,7 +540,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       huxiu: huxiuArticles.length,
       zslren: zslrenArticles.length,
       xzy: xzyArticles.length,
-      jike: jikeArticles.length
+      jike: jikeArticles.length,
+      github: githubArticles.length
     });
     if (results[0].status === 'rejected') {
       console.error('Failed to fetch RSS from sspai:', results[0].reason);
@@ -559,6 +564,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     if (results[6].status === 'rejected') {
       console.error('Failed to fetch RSS from jike topic:', results[6].reason);
     }
+    if (results[7].status === 'rejected') {
+      console.error('Failed to fetch RSS from GitHub Blog:', results[7].reason);
+    }
     const merged = [
       ...sspaiArticles,
       ...woshipmArticles,
@@ -566,7 +574,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ...huxiuArticles,
       ...zslrenArticles,
       ...xzyArticles,
-      ...jikeArticles
+      ...jikeArticles,
+      ...githubArticles
     ];
     const ordered = rankArticles(merged);
     return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
@@ -907,6 +916,45 @@ async function startServer() {
     const { id } = req.params;
     savedCards = savedCards.filter(c => c.id !== id);
     res.json({ success: true });
+  });
+
+  // Translate article content
+  app.post("/api/translate", async (req, res) => {
+    const { content, targetLang = 'zh-CN' } = req.body;
+    
+    if (!content) {
+      return res.status(400).json({ error: "Content is required" });
+    }
+
+    try {
+      const { GoogleGenerativeAI } = await import('@google/genai');
+      const apiKey = process.env.GEMINI_API_KEY;
+      
+      if (!apiKey) {
+        return res.status(500).json({ error: "Translation service not configured" });
+      }
+
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+
+      const prompt = `请将以下内容翻译成${targetLang === 'zh-CN' ? '简体中文' : targetLang}。保持原文的格式和结构，只翻译文字内容。如果是Markdown格式，保留所有Markdown标记。
+
+内容：
+${content}`;
+
+      const result = await model.generateContent(prompt);
+      const translatedText = result.response.text();
+
+      res.json({ 
+        success: true, 
+        translatedContent: translatedText,
+        originalLength: content.length,
+        translatedLength: translatedText.length
+      });
+    } catch (error) {
+      console.error('Translation error:', error);
+      res.status(500).json({ error: "Translation failed" });
+    }
   });
 
   // Vite middleware for development
