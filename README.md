@@ -211,4 +211,4 @@ npm run lint    # TypeScript 类型检查
 
 ---
 
-**AtomFlow v0.2 · 2026年3月**
+**AtomFlow v0.3 · 2026年3月**
