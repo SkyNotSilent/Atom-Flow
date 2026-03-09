@@ -52,8 +52,19 @@ function AppContent() {
   const [centerWidth, setCenterWidth] = useState(560);
   const [dragging, setDragging] = useState<"nav-center" | "center-right" | null>(null);
   const [hoverCenterRightEdge, setHoverCenterRightEdge] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
   const EDGE_DRAG_ZONE = 16;
   const SPLITTER = 8;
+
+  useEffect(() => {
+    const checkMobile = () => {
+      setIsMobile(window.innerWidth < 768);
+    };
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
 
   useEffect(() => {
     if (!dragging) return;
@@ -101,6 +112,7 @@ function AppContent() {
       className="flex h-screen overflow-hidden bg-bg text-text-main font-sans"
       style={{ cursor: hoverCenterRightEdge || dragging === "center-right" ? "col-resize" : undefined }}
       onMouseMove={(event) => {
+        if (isMobile) return;
         const container = containerRef.current;
         if (!container) return;
         const rect = container.getBoundingClientRect();
@@ -109,7 +121,7 @@ function AppContent() {
       }}
       onMouseLeave={() => setHoverCenterRightEdge(false)}
       onMouseDownCapture={(event) => {
-        if (event.button !== 0) return;
+        if (isMobile || event.button !== 0) return;
         const container = containerRef.current;
         if (!container) return;
         const rect = container.getBoundingClientRect();
@@ -120,24 +132,80 @@ function AppContent() {
         }
       }}
     >
-      <div className="shrink-0 h-full" style={{ width: navWidth }}>
-        <Nav activeTab={activeTab} setActiveTab={setActiveTab} />
-      </div>
-      <div
-        className="w-2 shrink-0 cursor-col-resize hover:bg-accent/30 transition-colors"
-        onMouseDown={() => setDragging("nav-center")}
-      />
-      <div
-        className="flex flex-col overflow-hidden shrink-0 border-r border-border"
-        style={{ width: centerWidth }}
+      {/* 移动端导航抽屉 */}
+      {isMobile && mobileNavOpen && (
+        <div 
+          className="fixed inset-0 bg-black/40 z-40"
+          onClick={() => setMobileNavOpen(false)}
+        />
+      )}
+      
+      {/* 导航栏 */}
+      <div 
+        className={`
+          ${isMobile ? 'fixed top-0 left-0 h-full z-50 transition-transform duration-300' : 'shrink-0 h-full'}
+          ${isMobile && !mobileNavOpen ? '-translate-x-full' : 'translate-x-0'}
+        `}
+        style={{ width: isMobile ? '280px' : navWidth }}
       >
+        <Nav 
+          activeTab={activeTab} 
+          setActiveTab={(tab) => {
+            setActiveTab(tab);
+            if (isMobile) setMobileNavOpen(false);
+          }} 
+        />
+      </div>
+
+      {/* 桌面端分隔条 */}
+      {!isMobile && (
+        <div
+          className="w-2 shrink-0 cursor-col-resize hover:bg-accent/30 transition-colors"
+          onMouseDown={() => setDragging("nav-center")}
+        />
+      )}
+
+      {/* 中间内容区 */}
+      <div
+        className={`
+          flex flex-col overflow-hidden
+          ${isMobile ? 'flex-1' : 'shrink-0 border-r border-border'}
+          ${isMobile && readingArticle ? 'hidden' : ''}
+        `}
+        style={{ width: isMobile ? '100%' : centerWidth }}
+      >
+        {/* 移动端顶部栏 */}
+        {isMobile && (
+          <div className="flex items-center gap-3 px-4 py-3 border-b border-border bg-surface">
+            <button
+              onClick={() => setMobileNavOpen(true)}
+              className="p-2 hover:bg-surface2 rounded-lg transition-colors"
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="3" y1="12" x2="21" y2="12"/>
+                <line x1="3" y1="6" x2="21" y2="6"/>
+                <line x1="3" y1="18" x2="21" y2="18"/>
+              </svg>
+            </button>
+            <h1 className="font-serif text-[16px] font-bold text-text-main">AtomFlow</h1>
+          </div>
+        )}
+        
         {activeTab === "feed" && <FeedPage />}
         {activeTab === "knowledge" && <KnowledgePage />}
         {activeTab === "write" && <WritePage />}
       </div>
-      <div className="flex-1 min-w-[320px] overflow-hidden bg-surface">
+
+      {/* 右侧阅读区 */}
+      <div 
+        className={`
+          ${isMobile ? 'fixed inset-0 z-30 bg-surface' : 'flex-1 min-w-[320px]'}
+          overflow-hidden bg-surface
+          ${isMobile && !readingArticle ? 'hidden' : ''}
+        `}
+      >
         {readingArticle ? (
-          <ReaderPane />
+          <ReaderPane onClose={isMobile ? () => {} : undefined} />
         ) : (
           <div className="h-full flex flex-col items-center justify-center bg-surface border-l border-border">
             <div className="w-24 h-24 mb-6 opacity-20">

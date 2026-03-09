@@ -60,11 +60,11 @@ export const FeedPage: React.FC = () => {
   };
 
   return (
-    <div className="flex-1 overflow-y-auto p-4 md:p-6 w-full">
-      <div className="mb-6 flex items-center justify-between">
+    <div className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6 w-full">
+      <div className="mb-4 sm:mb-6 flex items-center justify-between">
         <div>
-          <h1 className="font-serif text-[20px] font-bold text-text-main">{activeSource || '今日推送'}</h1>
-          <p className="text-[12px] text-text3 mt-1">2026年3月7日 · 已聚合 {filteredArticles.length} 篇内容</p>
+          <h1 className="font-serif text-[18px] sm:text-[20px] font-bold text-text-main">{activeSource || '今日推送'}</h1>
+          <p className="text-[11px] sm:text-[12px] text-text3 mt-1">2026年3月7日 · 已聚合 {filteredArticles.length} 篇内容</p>
         </div>
         <div className="flex items-center gap-1 bg-surface2 p-1 rounded-lg">
           <button onClick={() => setViewMode('card')} className={cn("p-1 rounded transition-colors", viewMode === 'card' ? "bg-surface shadow-sm text-text-main" : "text-text3 hover:text-text-main")}>
@@ -82,39 +82,39 @@ export const FeedPage: React.FC = () => {
                 key={article.id}
                 onClick={() => setReadingArticle(article)}
                 className={cn(
-                  "bg-surface rounded-xl border p-[18px_20px] transition-all duration-150 cursor-pointer",
+                  "bg-surface rounded-xl border p-3 sm:p-[18px_20px] transition-all duration-150 cursor-pointer",
                   article.saved ? "border-accent2" : "border-border hover:border-accent hover:shadow-[0_1px_4px_rgba(0,0,0,0.07),0_4px_16px_rgba(0,0,0,0.05)] hover:-translate-y-[1px]"
                 )}
               >
-                <div className="flex items-center justify-between mb-2">
-                  <div className="flex items-center gap-2">
-                    <span className="bg-accent-light text-accent text-[11.5px] font-semibold px-2 py-0.5 rounded">
+                <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="bg-accent-light text-accent text-[11px] sm:text-[11.5px] font-semibold px-2 py-0.5 rounded">
                       {getDisplaySource(article)}
                     </span>
-                    <span className="bg-surface2 text-text2 text-[11px] px-[7px] py-0.5 rounded">
+                    <span className="bg-surface2 text-text2 text-[10px] sm:text-[11px] px-[7px] py-0.5 rounded">
                       {article.topic}
                     </span>
-                    <span className="text-[12px] text-text3 ml-1">{article.time}</span>
+                    <span className="text-[11px] sm:text-[12px] text-text3">{article.time}</span>
                   </div>
                   {article.saved && (
-                    <div className="flex items-center gap-1 text-accent2 text-[12px]">
+                    <div className="flex items-center gap-1 text-accent2 text-[11px] sm:text-[12px]">
                       <Check size={14} />
-                      <span>已存入</span>
+                      <span className="hidden sm:inline">已存入</span>
                     </div>
                   )}
                 </div>
 
-                <h2 className="font-serif text-[15.5px] font-semibold text-text-main mb-1.5 leading-snug">
+                <h2 className="font-serif text-[14px] sm:text-[15.5px] font-semibold text-text-main mb-1.5 leading-snug">
                   {article.title}
                 </h2>
-                <p className="text-[13px] text-text2 leading-[1.7] line-clamp-2">
+                <p className="text-[12px] sm:text-[13px] text-text2 leading-[1.7] line-clamp-2">
                   {article.excerpt}
                 </p>
 
                 <div className="mt-3 flex gap-2" onClick={e => e.stopPropagation()}>
                   <button 
                     onClick={() => setReadingArticle(article)}
-                    className="px-3 py-1.5 rounded-lg text-[13px] font-medium border border-border text-text2 hover:bg-surface2 transition-colors"
+                    className="px-3 py-1.5 rounded-lg text-[12px] sm:text-[13px] font-medium border border-border text-text2 hover:bg-surface2 transition-colors"
                   >
                     阅读全文
                   </button>
@@ -123,21 +123,22 @@ export const FeedPage: React.FC = () => {
                       onClick={() => void handleSave(article)}
                       disabled={isSavingArticle(article.id)}
                       className={cn(
-                        "px-3 py-1.5 rounded-lg text-[13px] font-medium transition-colors flex items-center gap-1.5",
+                        "px-3 py-1.5 rounded-lg text-[12px] sm:text-[13px] font-medium transition-colors flex items-center gap-1.5",
                         isSavingArticle(article.id)
                           ? "bg-accent text-white cursor-wait"
                           : "bg-accent-light text-accent hover:bg-accent hover:text-white"
                       )}
                     >
                       <Sparkles size={14} className={cn(isSavingArticle(article.id) && "animate-spin")} />
-                      {isSavingArticle(article.id) ? getSavingStageText(article.id) || '处理中...' : '存入知识库'}
+                      <span className="hidden sm:inline">{isSavingArticle(article.id) ? getSavingStageText(article.id) || '处理中...' : '存入知识库'}</span>
+                      <span className="sm:hidden">{isSavingArticle(article.id) ? '处理中' : '存入'}</span>
                     </button>
                   ) : (
                     <button 
                       disabled
-                      className="px-3 py-1.5 rounded-lg text-[13px] font-medium bg-accent2-light text-accent2 flex items-center gap-1 opacity-70 cursor-not-allowed"
+                      className="px-3 py-1.5 rounded-lg text-[12px] sm:text-[13px] font-medium bg-accent2-light text-accent2 flex items-center gap-1 opacity-70 cursor-not-allowed"
                     >
-                      <Check size={14} /> 已存入知识库
+                      <Check size={14} /> <span className="hidden sm:inline">已存入知识库</span><span className="sm:hidden">已存入</span>
                     </button>
                   )}
                 </div>
@@ -147,13 +148,13 @@ export const FeedPage: React.FC = () => {
                 key={article.id}
                 onClick={() => setReadingArticle(article)}
                 className={cn(
-                  "flex items-center gap-3 p-3 bg-surface rounded-lg border cursor-pointer transition-colors",
+                  "flex items-center gap-2 sm:gap-3 p-2.5 sm:p-3 bg-surface rounded-lg border cursor-pointer transition-colors",
                   article.saved ? "border-accent2" : "border-border hover:border-accent"
                 )}
               >
-                <span className="text-[11px] bg-surface2 px-2 py-0.5 rounded text-text2 shrink-0">{getDisplaySource(article)}</span>
-                <span className="text-[14px] font-medium text-text-main truncate flex-1">{article.title}</span>
-                <span className="text-[12px] text-text3 shrink-0">{article.time}</span>
+                <span className="text-[10px] sm:text-[11px] bg-surface2 px-1.5 sm:px-2 py-0.5 rounded text-text2 shrink-0">{getDisplaySource(article)}</span>
+                <span className="text-[13px] sm:text-[14px] font-medium text-text-main truncate flex-1">{article.title}</span>
+                <span className="text-[11px] sm:text-[12px] text-text3 shrink-0 hidden sm:inline">{article.time}</span>
                 {article.saved && <Check size={14} className="text-accent2 shrink-0" />}
               </div>
             ))}
