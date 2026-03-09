@@ -198,6 +198,7 @@ const SOURCE_PRIORITY: Record<string, number> = {
   'Lex Fridman': 3.5,
   'Y Combinator': 3.2,
   'Andrej Karpathy': 3.2,
+  '极客公园': 2.8,
   '人人都是产品经理': 2.5,
   '即刻话题': 1.5,
   '少数派': 1.2
@@ -547,50 +548,61 @@ async function fetchRSSFeeds(): Promise<Article[]> {
           'https://api.xgo.ing/rss/user/adf65931519340f795e2336910b4cd15'
         ], 20000, 2),
       parseWithRetry([
-          'rsshub://youtube/user/%40ycombinator'
+          'rsshub://youtube/user/%40ycombinator',
+          'https://www.youtube.com/feeds/videos.xml?channel_id=UCcefcZRL2oaA_uBNeo5UOWg'
         ], 20000, 2),
       parseWithRetry([
-          'rsshub://youtube/user/@AndrejKarpathy'
-        ], 20000, 2)
+          'rsshub://youtube/user/@AndrejKarpathy',
+          'https://www.youtube.com/feeds/videos.xml?channel_id=UCYO_jab_esuFRV4b17AJtAw'
+        ], 20000, 2),
+      withTimeout(
+        parseFirstAvailable([
+          'rsshub://geekpark/breakingnews'
+        ]),
+        8000
+      )
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
-      ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0)
+      ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0, extractFeedIcon(results[0].value))
       : [];
     const woshipmArticles = results[1].status === 'fulfilled'
-      ? normalizeFeedItems(results[1].value.items, '人人都是产品经理', '产品运营', 1000)
+      ? normalizeFeedItems(results[1].value.items, '人人都是产品经理', '产品运营', 1000, extractFeedIcon(results[1].value))
       : [];
     const krArticles = results[2].status === 'fulfilled'
-      ? normalizeFeedItems(results[2].value.items, '36氪', '创投商业', 2000)
+      ? normalizeFeedItems(results[2].value.items, '36氪', '创投商业', 2000, extractFeedIcon(results[2].value))
       : [];
     const huxiuArticles = results[3].status === 'fulfilled'
-      ? normalizeFeedItems(results[3].value.items, '虎嗅', '商业资讯', 3000)
+      ? normalizeFeedItems(results[3].value.items, '虎嗅', '商业资讯', 3000, extractFeedIcon(results[3].value))
       : [];
     const zslrenArticles = results[4].status === 'fulfilled'
-      ? normalizeFeedItems(results[4].value.items, '数字生命卡兹克', '公众号', 4000)
+      ? normalizeFeedItems(results[4].value.items, '数字生命卡兹克', '公众号', 4000, extractFeedIcon(results[4].value))
       : [];
     const xzyArticles = results[5].status === 'fulfilled'
-      ? normalizeFeedItems(results[5].value.items, '新智元', '公众号', 4500)
+      ? normalizeFeedItems(results[5].value.items, '新智元', '公众号', 4500, extractFeedIcon(results[5].value))
       : [];
     const jikeArticles = results[6].status === 'fulfilled'
-      ? normalizeFeedItems(results[6].value.items, '即刻话题', 'Jike', 6000)
+      ? normalizeFeedItems(results[6].value.items, '即刻话题', 'Jike', 6000, extractFeedIcon(results[6].value))
       : [];
     const githubArticles = results[7].status === 'fulfilled'
-      ? normalizeFeedItems(results[7].value.items, 'GitHub Blog', 'Tech', 7000)
+      ? normalizeFeedItems(results[7].value.items, 'GitHub Blog', 'Tech', 7000, extractFeedIcon(results[7].value))
       : [];
     const samaArticles = results[8].status === 'fulfilled'
-      ? normalizeFeedItems(results[8].value.items, 'Sam Altman', 'Twitter', 8000)
+      ? normalizeFeedItems(results[8].value.items, 'Sam Altman', 'Twitter', 8000, extractFeedIcon(results[8].value))
       : [];
     const xyzfmArticles = results[9].status === 'fulfilled'
-      ? normalizeFeedItems(results[9].value.items, 'XYZ播客', 'Podcast', 9000)
+      ? normalizeFeedItems(results[9].value.items, 'XYZ播客', 'Podcast', 9000, extractFeedIcon(results[9].value))
       : [];
     const lexArticles = results[10].status === 'fulfilled'
-      ? normalizeFeedItems(results[10].value.items, 'Lex Fridman', 'Podcast', 10000)
+      ? normalizeFeedItems(results[10].value.items, 'Lex Fridman', 'Podcast', 10000, extractFeedIcon(results[10].value))
       : [];
     const ycArticles = results[11].status === 'fulfilled'
-      ? normalizeFeedItems(results[11].value.items, 'Y Combinator', 'YouTube', 11000)
+      ? normalizeFeedItems(results[11].value.items, 'Y Combinator', 'YouTube', 11000, extractFeedIcon(results[11].value))
       : [];
     const karpathyArticles = results[12].status === 'fulfilled'
-      ? normalizeFeedItems(results[12].value.items, 'Andrej Karpathy', 'YouTube', 12000)
+      ? normalizeFeedItems(results[12].value.items, 'Andrej Karpathy', 'YouTube', 12000, extractFeedIcon(results[12].value))
+      : [];
+    const geekparkArticles = results[13].status === 'fulfilled'
+      ? normalizeFeedItems(results[13].value.items, '极客公园', '科技资讯', 13000, extractFeedIcon(results[13].value))
       : [];
     console.log('RSS counts:', {
       sspai: sspaiArticles.length,
@@ -605,7 +617,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       xyzfm: xyzfmArticles.length,
       lex: lexArticles.length,
       yc: ycArticles.length,
-      karpathy: karpathyArticles.length
+      karpathy: karpathyArticles.length,
+      geekpark: geekparkArticles.length
     });
     if (results[0].status === 'rejected') {
       console.error('Failed to fetch RSS from sspai:', results[0].reason);
@@ -646,6 +659,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     if (results[12].status === 'rejected') {
       console.error('Failed to fetch RSS from Andrej Karpathy:', results[12].reason);
     }
+    if (results[13].status === 'rejected') {
+      console.error('Failed to fetch RSS from 极客公园:', results[13].reason);
+    }
     const merged = [
       ...sspaiArticles,
       ...woshipmArticles,
@@ -659,7 +675,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ...xyzfmArticles,
       ...lexArticles,
       ...ycArticles,
-      ...karpathyArticles
+      ...karpathyArticles,
+      ...geekparkArticles
     ];
     const ordered = rankArticles(merged);
     return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
