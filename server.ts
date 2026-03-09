@@ -192,6 +192,7 @@ const SOURCE_PRIORITY: Record<string, number> = {
   'GitHub Blog': 4.5,
   'Sam Altman': 4.5,
   '36氪': 4,
+  'XYZ播客': 3.8,
   '数字生命卡兹克': 3.8,
   '新智元': 3.8,
   '人人都是产品经理': 2.5,
@@ -529,7 +530,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
           'rsshub://twitter/user/sama'
         ]),
         8000
-      )
+      ),
+      parser.parseURL('https://feed.xyzfm.space/dk4yh3pkpjp3')
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
       ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0)
@@ -558,6 +560,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     const samaArticles = results[8].status === 'fulfilled'
       ? normalizeFeedItems(results[8].value.items, 'Sam Altman', 'Twitter', 8000)
       : [];
+    const xyzfmArticles = results[9].status === 'fulfilled'
+      ? normalizeFeedItems(results[9].value.items, 'XYZ播客', 'Podcast', 9000)
+      : [];
     console.log('RSS counts:', {
       sspai: sspaiArticles.length,
       woshipm: woshipmArticles.length,
@@ -567,7 +572,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       xzy: xzyArticles.length,
       jike: jikeArticles.length,
       github: githubArticles.length,
-      sama: samaArticles.length
+      sama: samaArticles.length,
+      xyzfm: xyzfmArticles.length
     });
     if (results[0].status === 'rejected') {
       console.error('Failed to fetch RSS from sspai:', results[0].reason);
@@ -596,6 +602,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     if (results[8].status === 'rejected') {
       console.error('Failed to fetch RSS from Sam Altman Twitter:', results[8].reason);
     }
+    if (results[9].status === 'rejected') {
+      console.error('Failed to fetch RSS from XYZ播客:', results[9].reason);
+    }
     const merged = [
       ...sspaiArticles,
       ...woshipmArticles,
@@ -605,7 +614,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ...xzyArticles,
       ...jikeArticles,
       ...githubArticles,
-      ...samaArticles
+      ...samaArticles,
+      ...xyzfmArticles
     ];
     const ordered = rankArticles(merged);
     return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
