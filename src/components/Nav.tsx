@@ -10,8 +10,8 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 interface NavProps {
-  activeTab: 'feed' | 'knowledge' | 'write';
-  setActiveTab: (tab: 'feed' | 'knowledge' | 'write') => void;
+  activeTab: 'feed' | 'knowledge' | 'write' | 'discover';
+  setActiveTab: (tab: 'feed' | 'knowledge' | 'write' | 'discover') => void;
 }
 
 type SourceEntry = {
@@ -753,6 +753,10 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
       
       <div className="flex-1 overflow-y-auto py-4 px-3 flex flex-col gap-1">
         <TabButton active={activeTab === 'feed'} onClick={() => handleTabClick('feed')} badge={unreadCount} fullWidth>今日推送</TabButton>
+        <TabButton active={activeTab === 'discover'} onClick={() => handleTabClick('discover')} fullWidth>
+          <Plus size={14} className="inline mr-1" />
+          发现订阅源
+        </TabButton>
         <TabButton active={activeTab === 'knowledge'} onClick={() => handleTabClick('knowledge')} badge={savedCards.length} fullWidth>我的知识库</TabButton>
         <TabButton active={activeTab === 'write'} onClick={() => handleTabClick('write')} fullWidth>魔法写作</TabButton>
 
@@ -761,8 +765,9 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
             <div className="flex items-center justify-between mb-2 px-3">
               <div className="text-[11px] font-semibold uppercase text-text3">我的订阅源</div>
               <button 
-                onClick={() => setShowAddSourceModal(true)}
+                onClick={() => setActiveTab('discover')}
                 className="w-5 h-5 rounded-full bg-accent-light text-accent flex items-center justify-center hover:bg-accent hover:text-white transition-colors"
+                title="发现更多订阅源"
               >
                 <Plus size={12} />
               </button>

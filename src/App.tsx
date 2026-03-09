@@ -10,6 +10,7 @@ import { Toast } from "./components/Toast";
 import { FeedPage } from "./pages/FeedPage";
 import { KnowledgePage } from "./pages/KnowledgePage";
 import { WritePage } from "./pages/WritePage";
+import { DiscoverPage } from "./pages/DiscoverPage";
 import { ReaderPane } from "./components/ReaderModal";
 
 class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
@@ -43,7 +44,7 @@ class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { has
 }
 
 function AppContent() {
-  const [activeTab, setActiveTab] = useState<"feed" | "knowledge" | "write">(
+  const [activeTab, setActiveTab] = useState<"feed" | "knowledge" | "write" | "discover">(
     "feed",
   );
   const { readingArticle } = useAppContext();
@@ -194,6 +195,7 @@ function AppContent() {
         {activeTab === "feed" && <FeedPage />}
         {activeTab === "knowledge" && <KnowledgePage />}
         {activeTab === "write" && <WritePage />}
+        {activeTab === "discover" && <DiscoverPage />}
       </div>
 
       {/* 右侧阅读区 */}
