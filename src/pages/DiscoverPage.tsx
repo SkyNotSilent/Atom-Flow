@@ -18,7 +18,6 @@ const RECOMMENDED_SOURCES: SourceRecommendation[] = [
   { name: '虎嗅', description: '商业深度分析', categories: ['国内媒体'], url: 'https://www.huxiu.com/rss/0.xml', color: '#DD6B20', icon: '🐯' },
   { name: '少数派', description: '科技生活方式', categories: ['国内媒体'], url: 'rsshub://sspai/index', color: '#553C9A', icon: '⚡' },
   { name: '人人都是产品经理', description: '产品运营知识', categories: ['国内媒体'], url: 'https://www.woshipm.com/feed', color: '#2B6CB0', icon: '📱' },
-  { name: '极客公园', description: '科技创新资讯', categories: ['国内媒体'], url: 'rsshub://geekpark/breakingnews', color: '#00B96B', icon: '🚀' },
   { name: 'GitHub Blog', description: '技术前沿动态', categories: ['国内媒体'], url: 'https://github.blog/feed/', color: '#24292F', icon: '💻' },
   
   // 播客

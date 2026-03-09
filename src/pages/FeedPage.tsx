@@ -26,8 +26,7 @@ export const FeedPage: React.FC = () => {
     '张小珺商业访谈录': 'https://feed.xyzfm.space/dk4yh3pkpjp3',
     'Lex Fridman': 'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA',
     'Y Combinator': 'rsshub://youtube/user/%40ycombinator',
-    'Andrej Karpathy': 'rsshub://youtube/user/@AndrejKarpathy',
-    '极客公园': 'rsshub://geekpark/breakingnews'
+    'Andrej Karpathy': 'rsshub://youtube/user/@AndrejKarpathy'
   };
 
   // 检测初始加载状态

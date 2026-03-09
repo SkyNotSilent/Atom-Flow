@@ -201,7 +201,6 @@ const SOURCE_PRIORITY: Record<string, number> = {
   'Lex Fridman': 3.5,
   'Y Combinator': 3.2,
   'Andrej Karpathy': 3.2,
-  '极客公园': 2.8,
   '人人都是产品经理': 2.5,
   '即刻话题': 1.5,
   '少数派': 1.2
@@ -576,9 +575,6 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       parseWithRetry([
           'rsshub://youtube/user/@AndrejKarpathy',
           'https://www.youtube.com/feeds/videos.xml?channel_id=UCYO_jab_esuFRV4b17AJtAw'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://geekpark/breakingnews'
         ], 20000, 2)
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
@@ -620,9 +616,6 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     const karpathyArticles = results[12].status === 'fulfilled'
       ? normalizeFeedItems(results[12].value.items, 'Andrej Karpathy', 'YouTube', 12000, extractFeedIcon(results[12].value))
       : [];
-    const geekparkArticles = results[13].status === 'fulfilled'
-      ? normalizeFeedItems(results[13].value.items, '极客公园', '科技资讯', 13000, extractFeedIcon(results[13].value))
-      : [];
     console.log('RSS counts:', {
       sspai: sspaiArticles.length,
       woshipm: woshipmArticles.length,
@@ -636,8 +629,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       xyzfm: xyzfmArticles.length,
       lex: lexArticles.length,
       yc: ycArticles.length,
-      karpathy: karpathyArticles.length,
-      geekpark: geekparkArticles.length
+      karpathy: karpathyArticles.length
     });
     if (results[0].status === 'rejected') {
       console.error('Failed to fetch RSS from sspai:', results[0].reason);
@@ -678,9 +670,6 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     if (results[12].status === 'rejected') {
       console.error('Failed to fetch RSS from Andrej Karpathy:', results[12].reason);
     }
-    if (results[13].status === 'rejected') {
-      console.error('Failed to fetch RSS from 极客公园:', results[13].reason);
-    }
     const merged = [
       ...sspaiArticles,
       ...woshipmArticles,
@@ -694,8 +683,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ...xyzfmArticles,
       ...lexArticles,
       ...ycArticles,
-      ...karpathyArticles,
-      ...geekparkArticles
+      ...karpathyArticles
     ];
     const ordered = rankArticles(merged);
     return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
