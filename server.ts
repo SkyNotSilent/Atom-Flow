@@ -223,7 +223,20 @@ function rankArticles(articles: Article[]) {
     const pos = Math.min(positions[i], rest.length);
     rest.splice(pos, 0, promotedLow[i]);
   }
-  return [...rest, ...remainingLow];
+  const combined = [...rest, ...remainingLow];
+  
+  // 增加随机性：一半文章按优先级排序，一半随机打乱
+  const halfPoint = Math.floor(combined.length / 2);
+  const prioritized = combined.slice(0, halfPoint);
+  const randomized = combined.slice(halfPoint);
+  
+  // Fisher-Yates 洗牌算法
+  for (let i = randomized.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [randomized[i], randomized[j]] = [randomized[j], randomized[i]];
+  }
+  
+  return [...prioritized, ...randomized];
 }
 
 function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: string, idOffset: number) {
