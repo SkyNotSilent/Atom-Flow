@@ -190,6 +190,7 @@ async function saveArticlesCache(articles: Article[]) {
 const SOURCE_PRIORITY: Record<string, number> = {
   '虎嗅': 5,
   'GitHub Blog': 4.5,
+  'Sam Altman': 4.5,
   '36氪': 4,
   '数字生命卡兹克': 3.8,
   '新智元': 3.8,
@@ -522,7 +523,13 @@ async function fetchRSSFeeds(): Promise<Article[]> {
         ]),
         8000
       ),
-      parser.parseURL('https://github.blog/feed/')
+      parser.parseURL('https://github.blog/feed/'),
+      withTimeout(
+        parseFirstAvailable([
+          'rsshub://twitter/user/sama'
+        ]),
+        8000
+      )
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
       ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0)
@@ -548,6 +555,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     const githubArticles = results[7].status === 'fulfilled'
       ? normalizeFeedItems(results[7].value.items, 'GitHub Blog', 'Tech', 7000)
       : [];
+    const samaArticles = results[8].status === 'fulfilled'
+      ? normalizeFeedItems(results[8].value.items, 'Sam Altman', 'Twitter', 8000)
+      : [];
     console.log('RSS counts:', {
       sspai: sspaiArticles.length,
       woshipm: woshipmArticles.length,
@@ -556,7 +566,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       zslren: zslrenArticles.length,
       xzy: xzyArticles.length,
       jike: jikeArticles.length,
-      github: githubArticles.length
+      github: githubArticles.length,
+      sama: samaArticles.length
     });
     if (results[0].status === 'rejected') {
       console.error('Failed to fetch RSS from sspai:', results[0].reason);
@@ -582,6 +593,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     if (results[7].status === 'rejected') {
       console.error('Failed to fetch RSS from GitHub Blog:', results[7].reason);
     }
+    if (results[8].status === 'rejected') {
+      console.error('Failed to fetch RSS from Sam Altman Twitter:', results[8].reason);
+    }
     const merged = [
       ...sspaiArticles,
       ...woshipmArticles,
@@ -590,7 +604,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ...zslrenArticles,
       ...xzyArticles,
       ...jikeArticles,
-      ...githubArticles
+      ...githubArticles,
+      ...samaArticles
     ];
     const ordered = rankArticles(merged);
     return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
