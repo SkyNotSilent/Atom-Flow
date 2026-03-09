@@ -188,11 +188,12 @@ async function saveArticlesCache(articles: Article[]) {
 }
 
 const SOURCE_PRIORITY: Record<string, number> = {
-  '36氪': 5,
   '虎嗅': 4,
   '即刻话题': 3.6,
   '数字生命卡兹克': 3.6,
   '新智元': 3.6,
+  '36氪': 3.5,
+  'GitHub Blog': 3.0,
   '少数派': 1.6,
   '人人都是产品经理': 1.5
 };
@@ -226,7 +227,8 @@ function rankArticles(articles: Article[]) {
 }
 
 function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: string, idOffset: number) {
-  return items.slice(0, 20).map((item, index) => {
+  const maxItems = source === '36氪' || source === '虎嗅' ? 8 : 12;
+  return items.slice(0, maxItems).map((item, index) => {
     const rawContent = item['content:encoded'] || item.content || item.contentSnippet || '';
     const formattedContent = source === '即刻话题' ? formatJikeContent(rawContent) : rawContent;
     const excerpt = formattedContent.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').substring(0, 120) + '...';
