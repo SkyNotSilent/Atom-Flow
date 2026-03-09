@@ -2,6 +2,7 @@ services:
   - type: web
     name: atomflow
     env: node
+    runtime: node
     buildCommand: npm install && npm run build
     startCommand: npm run dev
     envVars:
@@ -9,3 +10,5 @@ services:
         value: production
       - key: PORT
         value: 3001
+      - key: NODE_VERSION
+        value: 20
