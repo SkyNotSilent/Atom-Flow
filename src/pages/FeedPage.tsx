@@ -108,11 +108,15 @@ export const FeedPage: React.FC = () => {
     return [...rest, ...remainingLow];
   };
 
-  const filteredArticles = activeSource
-    ? [...articles]
+  // 当查看特定信息源时，只按时间排序，不应用复杂的排序逻辑
+  const filteredArticles = React.useMemo(() => {
+    if (activeSource) {
+      return [...articles]
         .filter(a => sourceMatches(a, activeSource || ''))
-        .sort((a, b) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0))
-    : rankArticles(articles);
+        .sort((a, b) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0));
+    }
+    return rankArticles(articles);
+  }, [articles, activeSource]);
 
   const handleSave = async (article: Article) => {
     if (article.saved || isSavingArticle(article.id)) return;

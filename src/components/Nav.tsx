@@ -81,10 +81,17 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
   if (!Array.isArray(raw)) return createDefaultEntries();
   const parsed: NavEntry[] = [];
   const baseColorMap = new Map(BASE_SOURCES.map(item => [item.name, item.color]));
+  
+  // 已删除的源列表
+  const DELETED_SOURCES = new Set(['XYZ播客', '极客公园']);
+  
   for (const item of raw) {
     if (!item || typeof item !== 'object') continue;
     const entry = item as Record<string, unknown>;
     if (entry.type === 'source' && typeof entry.name === 'string') {
+      // 跳过已删除的源
+      if (DELETED_SOURCES.has(entry.name)) continue;
+      
       const color = typeof entry.color === 'string' ? entry.color : (baseColorMap.get(entry.name) || '#718096');
       const rssUrl = typeof entry.rssUrl === 'string' ? entry.rssUrl : undefined;
       const icon = typeof entry.icon === 'string' ? entry.icon : undefined;
@@ -96,6 +103,7 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
         .filter(child => child && typeof child === 'object')
         .map(child => child as Record<string, unknown>)
         .filter(child => child.type === 'source' && typeof child.name === 'string')
+        .filter(child => !DELETED_SOURCES.has(child.name as string)) // 过滤已删除的源
         .map(child => {
           const childName = child.name as string;
           const color = typeof child.color === 'string' ? child.color : (baseColorMap.get(childName) || '#718096');
