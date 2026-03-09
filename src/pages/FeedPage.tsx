@@ -9,6 +9,14 @@ export const FeedPage: React.FC = () => {
   const { articles, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText } = useAppContext();
   const [showSrcModal, setShowSrcModal] = useState(false);
   const [viewMode, setViewMode] = useState<'card' | 'compact'>('card');
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+
+  // 检测初始加载状态
+  React.useEffect(() => {
+    if (articles.length > 0) {
+      setIsInitialLoading(false);
+    }
+  }, [articles]);
 
   const SOURCE_PRIORITY: Record<string, number> = {
     '36氪': 5,
@@ -64,7 +72,14 @@ export const FeedPage: React.FC = () => {
       <div className="mb-4 sm:mb-6 flex items-center justify-between">
         <div>
           <h1 className="font-serif text-[18px] sm:text-[20px] font-bold text-text-main">{activeSource || '今日推送'}</h1>
-          <p className="text-[11px] sm:text-[12px] text-text3 mt-1">2026年3月7日 · 已聚合 {filteredArticles.length} 篇内容</p>
+          {isInitialLoading && filteredArticles.length === 0 ? (
+            <div className="flex items-center gap-2 mt-1">
+              <Sparkles className="text-accent animate-spin" size={14} />
+              <p className="text-[11px] sm:text-[12px] text-accent">正在聚合信息源，请稍等...</p>
+            </div>
+          ) : (
+            <p className="text-[11px] sm:text-[12px] text-text3 mt-1">2026年3月7日 · 已聚合 {filteredArticles.length} 篇内容</p>
+          )}
         </div>
         <div className="flex items-center gap-1 bg-surface2 p-1 rounded-lg">
           <button onClick={() => setViewMode('card')} className={cn("p-1 rounded transition-colors", viewMode === 'card' ? "bg-surface shadow-sm text-text-main" : "text-text3 hover:text-text-main")}>
@@ -76,7 +91,19 @@ export const FeedPage: React.FC = () => {
         </div>
       </div>
 
-      <div className="flex flex-col gap-2.5">
+      {isInitialLoading && filteredArticles.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20">
+          <Sparkles className="w-16 h-16 text-accent animate-spin mb-4" />
+          <p className="text-text2 text-[15px] font-medium mb-2">正在聚合信息源</p>
+          <p className="text-text3 text-[13px]">首次加载可能需要几秒钟...</p>
+        </div>
+      ) : filteredArticles.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20">
+          <div className="text-[48px] mb-4 opacity-20">📭</div>
+          <p className="text-text3 text-[14px]">暂无内容</p>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2.5">
         {viewMode === 'card' ? filteredArticles.map(article => (
               <div 
                 key={article.id}
@@ -159,7 +186,8 @@ export const FeedPage: React.FC = () => {
                 {article.saved && <Check size={14} className="text-accent2 shrink-0" />}
               </div>
             ))}
-          </div>
+        </div>
+      )}
 
       {showSrcModal && (
         <SourceModal onClose={() => setShowSrcModal(false)} />
