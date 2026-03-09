@@ -188,17 +188,17 @@ async function saveArticlesCache(articles: Article[]) {
 }
 
 const SOURCE_PRIORITY: Record<string, number> = {
-  '虎嗅': 4,
-  '即刻话题': 3.6,
-  '数字生命卡兹克': 3.6,
-  '新智元': 3.6,
-  '36氪': 3.5,
-  'GitHub Blog': 3.0,
-  '少数派': 1.6,
-  '人人都是产品经理': 1.5
+  '虎嗅': 5,
+  'GitHub Blog': 4.5,
+  '36氪': 4,
+  '数字生命卡兹克': 3.8,
+  '新智元': 3.8,
+  '人人都是产品经理': 2.5,
+  '即刻话题': 1.5,
+  '少数派': 1.2
 };
 
-const LOW_PRIORITY_SOURCES = new Set(['少数派', '人人都是产品经理']);
+const LOW_PRIORITY_SOURCES = new Set(['少数派', '即刻话题']);
 
 function getPriority(article: Article) {
   if (SOURCE_PRIORITY[article.source] !== undefined) return SOURCE_PRIORITY[article.source];
