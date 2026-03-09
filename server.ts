@@ -578,7 +578,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ),
       parser.parseURL('https://feed.xyzfm.space/dk4yh3pkpjp3'),
       parseWithRetry([
-          'https://lexfridman.com/feed/podcast/',
+          'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA',
           'rsshub://youtube/user/@lexfridman'
         ], 20000, 2),
       parseWithRetry([
