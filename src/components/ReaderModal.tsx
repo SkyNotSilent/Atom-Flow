@@ -75,11 +75,18 @@ export const ReaderPane: React.FC = () => {
         body: JSON.stringify({ content: contentToTranslate, targetLang: 'zh-CN' })
       });
 
+      const data = await response.json();
+
       if (!response.ok) {
-        throw new Error('Translation failed');
+        console.error('Translation API error:', data);
+        if (data.details?.includes('GEMINI_API_KEY')) {
+          showToast('翻译服务未配置，请联系管理员');
+        } else {
+          showToast(`翻译失败: ${data.details || data.error || '未知错误'}`);
+        }
+        return;
       }
 
-      const data = await response.json();
       setTranslatedContent(data.translatedContent);
       setShowOriginal(false);
       showToast('翻译完成');

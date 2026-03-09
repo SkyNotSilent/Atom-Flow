@@ -931,7 +931,11 @@ async function startServer() {
       const apiKey = process.env.GEMINI_API_KEY;
       
       if (!apiKey) {
-        return res.status(500).json({ error: "Translation service not configured" });
+        console.error('Translation failed: GEMINI_API_KEY not configured');
+        return res.status(500).json({ 
+          error: "Translation service not configured",
+          details: "GEMINI_API_KEY environment variable is missing"
+        });
       }
 
       const genAI = new GoogleGenerativeAI(apiKey);
@@ -951,9 +955,16 @@ ${content}`;
         originalLength: content.length,
         translatedLength: translatedText.length
       });
-    } catch (error) {
+    } catch (error: any) {
       console.error('Translation error:', error);
-      res.status(500).json({ error: "Translation failed" });
+      const errorMessage = error?.message || 'Unknown error';
+      const errorDetails = error?.response?.data || error?.toString() || '';
+      
+      res.status(500).json({ 
+        error: "Translation failed",
+        details: errorMessage,
+        debug: errorDetails
+      });
     }
   });
 
