@@ -926,6 +926,26 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
                   </div>
                 )}
               </div>
+              <button
+                onClick={() => {
+                  // 取消合集：将所有子源移到顶层，删除合集
+                  setSourceEntries(prev => {
+                    const collectionIndex = prev.findIndex(entry => entry.type === 'collection' && entry.id === contextTargetCollection.id);
+                    if (collectionIndex < 0) return prev;
+                    const collection = prev[collectionIndex] as CollectionEntry;
+                    const working = [...prev];
+                    working.splice(collectionIndex, 1);
+                    // 将子源插入到原合集位置
+                    working.splice(collectionIndex, 0, ...collection.children);
+                    return working;
+                  });
+                  setContextMenu(null);
+                  showToast('已取消合集');
+                }}
+                className="w-full text-left px-3 py-2 text-[13px] text-red-500 rounded-lg hover:bg-surface2"
+              >
+                取消合集
+              </button>
             </>
           )}
           {contextMenu.target.kind === 'source' && contextTargetSource && (
