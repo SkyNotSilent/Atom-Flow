@@ -543,39 +543,27 @@ const get36KrArticleId = (url?: string) => {
 async function fetchRSSFeeds(): Promise<Article[]> {
   try {
     const results = await Promise.allSettled([
-      withTimeout(
-        parseFirstAvailable([
+      parseWithRetry([
           'rsshub://sspai/index'
-        ]),
-        8000
-      ),
+        ], 20000, 2),
       parser.parseURL('https://www.woshipm.com/feed'),
       parseWithRetry([
           'rsshub://36kr/hot-list',
           'https://36kr.com/feed',
           'rsshub://36kr/news'
-        ], 15000, 2),
+        ], 20000, 2),
       parser.parseURL('https://www.huxiu.com/rss/0.xml'),
       parser.parseURL('https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml'),
-      withTimeout(
-        parseFirstAvailable([
+      parseWithRetry([
           'https://plink.anyfeeder.com/weixin/AI_era'
-        ]),
-        8000
-      ),
-      withTimeout(
-        parseFirstAvailable([
+        ], 20000, 2),
+      parseWithRetry([
           'rsshub://jike/topic/63579abb6724cc583b9bba9a'
-        ]),
-        8000
-      ),
+        ], 20000, 2),
       parser.parseURL('https://github.blog/feed/'),
-      withTimeout(
-        parseFirstAvailable([
+      parseWithRetry([
           'rsshub://twitter/user/sama'
-        ]),
-        8000
-      ),
+        ], 20000, 2),
       parser.parseURL('https://feed.xyzfm.space/dk4yh3pkpjp3'),
       parseWithRetry([
           'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA',
@@ -589,12 +577,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
           'rsshub://youtube/user/@AndrejKarpathy',
           'https://www.youtube.com/feeds/videos.xml?channel_id=UCYO_jab_esuFRV4b17AJtAw'
         ], 20000, 2),
-      withTimeout(
-        parseFirstAvailable([
+      parseWithRetry([
           'rsshub://geekpark/breakingnews'
-        ]),
-        8000
-      )
+        ], 20000, 2)
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
       ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0, extractFeedIcon(results[0].value))
