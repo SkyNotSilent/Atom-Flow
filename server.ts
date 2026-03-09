@@ -195,7 +195,7 @@ const SOURCE_PRIORITY: Record<string, number> = {
   'GitHub Blog': 4.5,
   'Sam Altman': 4.5,
   '36氪': 4,
-  'XYZ播客': 3.8,
+  '张小珺商业访谈录': 3.8,
   '数字生命卡兹克': 3.8,
   '新智元': 3.8,
   'Lex Fridman': 3.5,
@@ -578,7 +578,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ),
       parser.parseURL('https://feed.xyzfm.space/dk4yh3pkpjp3'),
       parseWithRetry([
-          'https://api.xgo.ing/rss/user/adf65931519340f795e2336910b4cd15'
+          'https://lexfridman.com/feed/podcast/',
+          'rsshub://youtube/user/@lexfridman'
         ], 20000, 2),
       parseWithRetry([
           'rsshub://youtube/user/%40ycombinator',
@@ -623,7 +624,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ? normalizeFeedItems(results[8].value.items, 'Sam Altman', 'Twitter', 8000, extractFeedIcon(results[8].value))
       : [];
     const xyzfmArticles = results[9].status === 'fulfilled'
-      ? normalizeFeedItems(results[9].value.items, 'XYZ播客', 'Podcast', 9000, extractFeedIcon(results[9].value))
+      ? normalizeFeedItems(results[9].value.items, '张小珺商业访谈录', 'Podcast', 9000, extractFeedIcon(results[9].value))
       : [];
     const lexArticles = results[10].status === 'fulfilled'
       ? normalizeFeedItems(results[10].value.items, 'Lex Fridman', 'Podcast', 10000, extractFeedIcon(results[10].value))
@@ -681,7 +682,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       console.error('Failed to fetch RSS from Sam Altman Twitter:', results[8].reason);
     }
     if (results[9].status === 'rejected') {
-      console.error('Failed to fetch RSS from XYZ播客:', results[9].reason);
+      console.error('Failed to fetch RSS from 张小珺商业访谈录:', results[9].reason);
     }
     if (results[10].status === 'rejected') {
       console.error('Failed to fetch RSS from Lex Fridman:', results[10].reason);
