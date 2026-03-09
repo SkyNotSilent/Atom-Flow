@@ -7,6 +7,9 @@ import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import { promises as fs } from "fs";
 import path from "path";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const parser = new Parser({
   headers: {
@@ -733,11 +736,22 @@ async function startServer() {
   // Load RSS feeds on startup
   console.log('Fetching RSS feeds...');
   const refreshFeeds = async () => {
-    const fresh = await fetchRSSFeeds();
-    const withFallback = mergeWithSourceFallback(articles, fresh);
-    articles = mergeArticles(articles, rankArticles(withFallback));
-    await saveArticlesCache(articles);
-    console.log(`Loaded ${articles.length} articles.`);
+    try {
+      const fresh = await fetchRSSFeeds();
+      console.log(`Fetched ${fresh.length} fresh articles`);
+      
+      // 只有当新数据不为空时才合并
+      if (fresh.length > 0) {
+        const withFallback = mergeWithSourceFallback(articles, fresh);
+        articles = mergeArticles(articles, rankArticles(withFallback));
+        await saveArticlesCache(articles);
+        console.log(`Loaded ${articles.length} articles.`);
+      } else {
+        console.log('No fresh articles fetched, keeping existing data');
+      }
+    } catch (error) {
+      console.error('Failed to refresh feeds, keeping existing data:', error);
+    }
   };
   await refreshFeeds();
   setInterval(() => {
