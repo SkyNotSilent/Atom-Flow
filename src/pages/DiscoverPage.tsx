@@ -1,39 +1,44 @@
 import React, { useState, useMemo } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { Check, Plus, Search } from 'lucide-react';
+import { Check, Plus } from 'lucide-react';
 import { cn } from '../components/Nav';
 
 interface SourceRecommendation {
   name: string;
   description: string;
-  category: '媒体' | '播客' | '平台';
+  categories: Array<'国内媒体' | '播客' | 'X' | 'YouTube' | '公众号'>;
   url: string;
   color: string;
   icon?: string;
 }
 
 const RECOMMENDED_SOURCES: SourceRecommendation[] = [
-  // 媒体
-  { name: '36氪', description: '创投商业资讯', category: '媒体', url: 'rsshub://36kr/hot-list', color: '#E53E3E', icon: '📰' },
-  { name: '虎嗅', description: '商业深度分析', category: '媒体', url: 'https://www.huxiu.com/rss/0.xml', color: '#DD6B20', icon: '🐯' },
-  { name: '少数派', description: '科技生活方式', category: '媒体', url: 'rsshub://sspai/index', color: '#553C9A', icon: '⚡' },
-  { name: '人人都是产品经理', description: '产品运营知识', category: '媒体', url: 'https://www.woshipm.com/feed', color: '#2B6CB0', icon: '📱' },
-  { name: 'GitHub Blog', description: '技术前沿动态', category: '媒体', url: 'https://github.blog/feed/', color: '#24292F', icon: '💻' },
-  { name: '新智元', description: 'AI 前沿资讯', category: '媒体', url: 'https://plink.anyfeeder.com/weixin/AI_era', color: '#2F855A', icon: '🤖' },
+  // 国内媒体
+  { name: '36氪', description: '创投商业资讯', categories: ['国内媒体'], url: 'rsshub://36kr/hot-list', color: '#E53E3E', icon: '📰' },
+  { name: '虎嗅', description: '商业深度分析', categories: ['国内媒体'], url: 'https://www.huxiu.com/rss/0.xml', color: '#DD6B20', icon: '🐯' },
+  { name: '少数派', description: '科技生活方式', categories: ['国内媒体'], url: 'rsshub://sspai/index', color: '#553C9A', icon: '⚡' },
+  { name: '人人都是产品经理', description: '产品运营知识', categories: ['国内媒体'], url: 'https://www.woshipm.com/feed', color: '#2B6CB0', icon: '📱' },
+  { name: 'GitHub Blog', description: '技术前沿动态', categories: ['国内媒体'], url: 'https://github.blog/feed/', color: '#24292F', icon: '💻' },
   
   // 播客
-  { name: 'XYZ播客', description: '商业访谈节目', category: '播客', url: 'https://feed.xyzfm.space/dk4yh3pkpjp3', color: '#FF6B6B', icon: '🎙️' },
-  { name: '数字生命卡兹克', description: '科技人文思考', category: '播客', url: 'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml', color: '#6B46C1', icon: '🎧' },
+  { name: '张小珺商业访谈录', description: '深度商业访谈节目', categories: ['播客'], url: 'https://feed.xyzfm.space/dk4yh3pkpjp3', color: '#FF6B6B', icon: '🎙️' },
+  { name: 'Lex Fridman', description: 'AI & 科技深度对话', categories: ['播客', 'YouTube'], url: 'https://api.xgo.ing/rss/user/adf65931519340f795e2336910b4cd15', color: '#000000', icon: '🎧' },
   
-  // 平台
-  { name: 'Sam Altman', description: 'OpenAI CEO 推特', category: '平台', url: 'rsshub://twitter/user/sama', color: '#1DA1F2', icon: '🐦' },
-  { name: '即刻话题', description: '社区热门讨论', category: '平台', url: 'rsshub://jike/topic/63579abb6724cc583b9bba9a', color: '#38A169', icon: '💬' },
+  // X (Twitter)
+  { name: 'Sam Altman', description: 'OpenAI CEO 推特', categories: ['X'], url: 'rsshub://twitter/user/sama', color: '#1DA1F2', icon: '🐦' },
+  
+  // YouTube
+  { name: 'Y Combinator', description: '创业孵化器官方频道', categories: ['YouTube'], url: 'rsshub://youtube/user/%40ycombinator', color: '#FF0000', icon: '▶️' },
+  { name: 'Andrej Karpathy', description: 'AI 研究与教学', categories: ['YouTube'], url: 'rsshub://youtube/user/@AndrejKarpathy', color: '#FF0000', icon: '▶️' },
+  
+  // 公众号
+  { name: '数字生命卡兹克', description: '科技人文思考', categories: ['公众号'], url: 'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml', color: '#6B46C1', icon: '📮' },
+  { name: '新智元', description: 'AI 前沿资讯', categories: ['公众号'], url: 'https://plink.anyfeeder.com/weixin/AI_era', color: '#2F855A', icon: '🤖' },
 ];
 
 export const DiscoverPage: React.FC = () => {
   const { showToast, reloadArticles } = useAppContext();
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedCategory, setSelectedCategory] = useState<'全部' | '媒体' | '播客' | '平台'>('全部');
+  const [selectedCategory, setSelectedCategory] = useState<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号'>('全部');
   const [addedSources, setAddedSources] = useState<Set<string>>(new Set());
   const [loadingSources, setLoadingSources] = useState<Set<string>>(new Set());
 
@@ -66,19 +71,11 @@ export const DiscoverPage: React.FC = () => {
     let sources = RECOMMENDED_SOURCES;
     
     if (selectedCategory !== '全部') {
-      sources = sources.filter(s => s.category === selectedCategory);
-    }
-    
-    if (searchQuery) {
-      const query = searchQuery.toLowerCase();
-      sources = sources.filter(s => 
-        s.name.toLowerCase().includes(query) || 
-        s.description.toLowerCase().includes(query)
-      );
+      sources = sources.filter(s => s.categories.includes(selectedCategory));
     }
     
     return sources;
-  }, [selectedCategory, searchQuery]);
+  }, [selectedCategory]);
 
   const handleAddSource = async (source: SourceRecommendation) => {
     if (existingSources.has(source.name) || loadingSources.has(source.name)) return;
@@ -130,7 +127,7 @@ export const DiscoverPage: React.FC = () => {
     }
   };
 
-  const categories: Array<'全部' | '媒体' | '播客' | '平台'> = ['全部', '媒体', '播客', '平台'];
+  const categories: Array<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号'> = ['全部', '国内媒体', '播客', 'X', 'YouTube', '公众号'];
 
   return (
     <div className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6 w-full">
@@ -139,19 +136,8 @@ export const DiscoverPage: React.FC = () => {
         <p className="text-[12px] sm:text-[13px] text-text3">精选优质信息源，一键添加到你的订阅列表</p>
       </div>
 
-      {/* 搜索和分类 */}
-      <div className="mb-6 space-y-3">
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-text3" size={16} />
-          <input
-            type="text"
-            placeholder="搜索订阅源..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2.5 bg-surface border border-border rounded-xl text-[14px] text-text-main placeholder:text-text3 focus:outline-none focus:border-accent transition-colors"
-          />
-        </div>
-
+      {/* 分类筛选 */}
+      <div className="mb-6">
         <div className="flex gap-2 overflow-x-auto pb-2">
           {categories.map(category => (
             <button
@@ -193,13 +179,15 @@ export const DiscoverPage: React.FC = () => {
                 </div>
                 
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
+                  <div className="flex items-center gap-2 mb-1 flex-wrap">
                     <h3 className="font-semibold text-[14px] text-text-main truncate">
                       {source.name}
                     </h3>
-                    <span className="text-[11px] px-2 py-0.5 rounded bg-surface2 text-text3 shrink-0">
-                      {source.category}
-                    </span>
+                    {source.categories.map(cat => (
+                      <span key={cat} className="text-[11px] px-2 py-0.5 rounded bg-surface2 text-text3 shrink-0">
+                        {cat}
+                      </span>
+                    ))}
                   </div>
                   <p className="text-[12px] text-text2 mb-3 line-clamp-2">
                     {source.description}
@@ -237,8 +225,8 @@ export const DiscoverPage: React.FC = () => {
 
       {filteredSources.length === 0 && (
         <div className="text-center py-20">
-          <div className="text-[48px] mb-4 opacity-20">🔍</div>
-          <p className="text-text3 text-[14px]">没有找到匹配的订阅源</p>
+          <div className="text-[48px] mb-4 opacity-20">📭</div>
+          <p className="text-text3 text-[14px]">该分类暂无订阅源</p>
         </div>
       )}
     </div>

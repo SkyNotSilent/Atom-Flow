@@ -61,7 +61,10 @@ const BASE_SOURCES: Array<{ name: string; color: string }> = [
   { name: '即刻话题', color: '#38A169' },
   { name: 'GitHub Blog', color: '#24292F' },
   { name: 'Sam Altman', color: '#1DA1F2' },
-  { name: 'XYZ播客', color: '#FF6B6B' }
+  { name: '张小珺商业访谈录', color: '#FF6B6B' },
+  { name: 'Lex Fridman', color: '#000000' },
+  { name: 'Y Combinator', color: '#FF0000' },
+  { name: 'Andrej Karpathy', color: '#FF0000' }
 ];
 
 const createSourceEntry = (name: string, color: string, rssUrl?: string): SourceEntry => ({
