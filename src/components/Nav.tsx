@@ -87,7 +87,8 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
     if (entry.type === 'source' && typeof entry.name === 'string') {
       const color = typeof entry.color === 'string' ? entry.color : (baseColorMap.get(entry.name) || '#718096');
       const rssUrl = typeof entry.rssUrl === 'string' ? entry.rssUrl : undefined;
-      parsed.push(createSourceEntry(entry.name, color, rssUrl));
+      const icon = typeof entry.icon === 'string' ? entry.icon : undefined;
+      parsed.push(createSourceEntry(entry.name, color, rssUrl, icon));
       continue;
     }
     if (entry.type === 'collection' && typeof entry.name === 'string' && Array.isArray(entry.children)) {
@@ -99,7 +100,8 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
           const childName = child.name as string;
           const color = typeof child.color === 'string' ? child.color : (baseColorMap.get(childName) || '#718096');
           const rssUrl = typeof child.rssUrl === 'string' ? child.rssUrl : undefined;
-          return createSourceEntry(childName, color, rssUrl);
+          const icon = typeof child.icon === 'string' ? child.icon : undefined;
+          return createSourceEntry(childName, color, rssUrl, icon);
         });
       if (children.length > 0) {
         parsed.push({
@@ -157,6 +159,39 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const pointerSessionRef = useRef<{ entryId: string; pointerId: number; startX: number; startY: number; active: boolean } | null>(null);
   const suppressClickRef = useRef(false);
   const unreadCount = articles.filter(a => !a.saved).length;
+
+  // 从articles中提取sourceIcon并更新到sourceEntries
+  useEffect(() => {
+    const sourceIconMap = new Map<string, string>();
+    articles.forEach(article => {
+      if (article.sourceIcon && !sourceIconMap.has(article.source)) {
+        sourceIconMap.set(article.source, article.sourceIcon);
+      }
+    });
+    
+    if (sourceIconMap.size > 0) {
+      setSourceEntries(prev => prev.map(entry => {
+        if (entry.type === 'source') {
+          const icon = sourceIconMap.get(entry.name);
+          if (icon && icon !== entry.icon) {
+            return { ...entry, icon };
+          }
+        } else if (entry.type === 'collection') {
+          const updatedChildren = entry.children.map(child => {
+            const icon = sourceIconMap.get(child.name);
+            if (icon && icon !== child.icon) {
+              return { ...child, icon };
+            }
+            return child;
+          });
+          if (updatedChildren.some((child, i) => child !== entry.children[i])) {
+            return { ...entry, children: updatedChildren };
+          }
+        }
+        return entry;
+      }));
+    }
+  }, [articles]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -729,7 +764,26 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
       )}
     >
       <div className="flex items-center gap-2">
-        <div className="w-[6px] h-[6px] rounded-full" style={{ backgroundColor: source.color }} />
+        {source.icon ? (
+          <img 
+            src={source.icon} 
+            alt={source.name}
+            className="w-4 h-4 rounded-sm object-cover"
+            onError={(e) => {
+              // 如果图标加载失败，显示颜色圆点
+              e.currentTarget.style.display = 'none';
+              const dot = e.currentTarget.nextElementSibling as HTMLElement;
+              if (dot) dot.style.display = 'block';
+            }}
+          />
+        ) : null}
+        <div 
+          className="w-[6px] h-[6px] rounded-full" 
+          style={{ 
+            backgroundColor: source.color,
+            display: source.icon ? 'none' : 'block'
+          }} 
+        />
         <span>{source.name}</span>
         {loadingSourceId === source.id && (
           <span className="text-[10px] text-text3">更新中</span>

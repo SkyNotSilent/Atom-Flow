@@ -11,6 +11,7 @@ export interface Article {
   id: number;
   saved: boolean;
   source: string;
+  sourceIcon?: string;
   topic: string;
   time: string;
   publishedAt?: number;
