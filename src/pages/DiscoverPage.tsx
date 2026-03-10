@@ -44,6 +44,9 @@ export const DiscoverPage: React.FC = () => {
   const [selectedCategory, setSelectedCategory] = useState<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'>('全部');
   const [addedSources, setAddedSources] = useState<Set<string>>(new Set());
   const [loadingSources, setLoadingSources] = useState<Set<string>>(new Set());
+  const [customInput, setCustomInput] = useState('');
+  const [customAlias, setCustomAlias] = useState('');
+  const [isAddingCustom, setIsAddingCustom] = useState(false);
 
   // 从 localStorage 获取已添加的源
   const existingSources = useMemo(() => {
@@ -144,6 +147,74 @@ export const DiscoverPage: React.FC = () => {
     }
   };
 
+  const handleAddCustomSource = async () => {
+    const input = customInput.trim();
+    const alias = customAlias.trim();
+    
+    if (!input) {
+      showToast('请输入RSS链接或RSSHub路由');
+      return;
+    }
+    
+    const sourceName = alias || input;
+    
+    if (existingSources.has(sourceName)) {
+      showToast('该信息源已存在');
+      return;
+    }
+    
+    setIsAddingCustom(true);
+    
+    try {
+      const response = await fetch('/api/sources/fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          source: sourceName, 
+          input: input 
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to add source');
+      }
+
+      // 更新 localStorage
+      const stored = localStorage.getItem('atomflow:source-layout:v1');
+      const parsed = stored ? JSON.parse(stored) : { version: 2, entries: [] };
+      const entries = parsed.version ? parsed.entries : parsed;
+      
+      const newSource = {
+        id: `source:${sourceName}`,
+        type: 'source',
+        name: sourceName,
+        color: '#718096',
+        rssUrl: input
+      };
+      
+      entries.push(newSource);
+      
+      localStorage.setItem('atomflow:source-layout:v1', JSON.stringify({
+        version: 2,
+        entries: entries
+      }));
+
+      setAddedSources(prev => new Set(prev).add(sourceName));
+      await reloadArticles();
+      showToast(`已添加 ${sourceName}`);
+      setCustomInput('');
+      setCustomAlias('');
+      
+      // 触发页面刷新以更新导航栏
+      window.location.reload();
+    } catch (error) {
+      console.error('Failed to add custom source:', error);
+      showToast('添加失败，请检查链接是否正确');
+    } finally {
+      setIsAddingCustom(false);
+    }
+  };
+
   const categories: Array<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'> = ['全部', '国内媒体', '播客', 'X', 'YouTube', '公众号', '其他'];
 
   return (
@@ -153,8 +224,54 @@ export const DiscoverPage: React.FC = () => {
         <p className="text-[12px] sm:text-[13px] text-text3">精选优质信息源，一键添加到你的订阅列表</p>
       </div>
 
+      {/* 自定义添加订阅源 */}
+      <div className="mb-6 p-4 bg-surface rounded-xl border border-border">
+        <h2 className="text-[14px] font-semibold text-text-main mb-3">添加订阅源</h2>
+        <div className="flex flex-col gap-2">
+          <input
+            type="text"
+            value={customInput}
+            onChange={(e) => setCustomInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !isAddingCustom) {
+                handleAddCustomSource();
+              }
+            }}
+            placeholder="输入 RSS 链接或 RSSHub 路由（如：rsshub://sspai/index）"
+            className="w-full px-3 py-2 rounded-lg border border-border bg-bg text-[13px] text-text-main outline-none focus:border-accent transition-colors"
+          />
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={customAlias}
+              onChange={(e) => setCustomAlias(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !isAddingCustom) {
+                  handleAddCustomSource();
+                }
+              }}
+              placeholder="自定义名称（可选）"
+              className="flex-1 px-3 py-2 rounded-lg border border-border bg-bg text-[13px] text-text-main outline-none focus:border-accent transition-colors"
+            />
+            <button
+              onClick={handleAddCustomSource}
+              disabled={isAddingCustom || !customInput.trim()}
+              className={cn(
+                "px-4 py-2 rounded-lg text-[13px] font-medium transition-colors",
+                isAddingCustom || !customInput.trim()
+                  ? "bg-surface2 text-text3 cursor-not-allowed"
+                  : "bg-accent text-white hover:bg-accent/90"
+              )}
+            >
+              {isAddingCustom ? '添加中...' : '添加'}
+            </button>
+          </div>
+        </div>
+      </div>
+
       {/* 分类筛选 */}
       <div className="mb-6">
+        <h2 className="text-[14px] font-semibold text-text-main mb-3">推荐订阅源</h2>
         <div className="flex gap-2 overflow-x-auto pb-2">
           {categories.map(category => (
             <button
