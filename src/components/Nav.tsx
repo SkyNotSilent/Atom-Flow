@@ -191,16 +191,21 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
       }
     }
   }
+  
+  // 检查是否有缺失的BASE_SOURCES，如果有，说明用户数据不完整，直接返回默认结构
   const usedNames = new Set<string>();
   parsed.forEach(entry => {
     if (entry.type === 'source') usedNames.add(entry.name);
     if (entry.type === 'collection') entry.children.forEach(child => usedNames.add(child.name));
   });
-  for (const source of BASE_SOURCES) {
-    if (!usedNames.has(source.name)) {
-      parsed.push(createSourceEntry(source.name, source.color));
-    }
+  
+  const missingBaseSources = BASE_SOURCES.filter(source => !usedNames.has(source.name));
+  
+  // 如果有缺失的基础源，说明是旧版本数据或不完整数据，返回默认合集结构
+  if (missingBaseSources.length > 0) {
+    return createDefaultEntries();
   }
+  
   return parsed.length > 0 ? parsed : createDefaultEntries();
 };
 

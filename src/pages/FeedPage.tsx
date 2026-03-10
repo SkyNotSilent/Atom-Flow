@@ -71,16 +71,20 @@ export const FeedPage: React.FC = () => {
   };
 
   const SOURCE_PRIORITY: Record<string, number> = {
-    '36氪': 5,
-    '虎嗅': 4,
+    '虎嗅': 5,
+    'GitHub Blog': 4.5,
+    'Sam Altman': 4.5,
+    '36氪': 4,
+    '张小珺商业访谈录': 3.8,
     '即刻话题': 3.6,
     '数字生命卡兹克': 3.6,
     '新智元': 3.6,
+    'Y Combinator': 3.5,
+    'Andrej Karpathy': 3.5,
+    'Lex Fridman': 3.5,
     '少数派': 1.6,
     '人人都是产品经理': 1.5
   };
-
-  const LOW_PRIORITY_SOURCES = new Set(['少数派', '人人都是产品经理']);
 
   const getPriority = (article: Article) => {
     if (SOURCE_PRIORITY[article.source] !== undefined) return SOURCE_PRIORITY[article.source];
@@ -89,23 +93,13 @@ export const FeedPage: React.FC = () => {
   };
 
   const rankArticles = (items: Article[]) => {
-    const sorted = [...items].sort((a, b) => {
+    // 纯粹按优先级和时间排序，不做复杂的插入操作
+    return [...items].sort((a, b) => {
       const pa = getPriority(a);
       const pb = getPriority(b);
       if (pb !== pa) return pb - pa;
       return (b.publishedAt ?? 0) - (a.publishedAt ?? 0);
     });
-    const low = sorted.filter(item => LOW_PRIORITY_SOURCES.has(item.source));
-    const rest = sorted.filter(item => !LOW_PRIORITY_SOURCES.has(item.source));
-    const promotedLow = low.slice(0, 2);
-    const remainingLow = low.slice(2);
-    const positions = [2, 7];
-    const limit = Math.min(promotedLow.length, positions.length);
-    for (let i = 0; i < limit; i += 1) {
-      const pos = Math.min(positions[i], rest.length);
-      rest.splice(pos, 0, promotedLow[i]);
-    }
-    return [...rest, ...remainingLow];
   };
 
   // 当查看特定信息源时，只按时间排序，不应用复杂的排序逻辑
