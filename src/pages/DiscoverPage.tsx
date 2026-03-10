@@ -14,29 +14,29 @@ interface SourceRecommendation {
 
 const RECOMMENDED_SOURCES: SourceRecommendation[] = [
   // 国内媒体
-  { name: '36氪', description: '创投商业资讯', categories: ['国内媒体'], url: 'rsshub://36kr/hot-list', color: '#E53E3E', icon: '📰' },
-  { name: '虎嗅', description: '商业深度分析', categories: ['国内媒体'], url: 'https://www.huxiu.com/rss/0.xml', color: '#DD6B20', icon: '🐯' },
-  { name: '少数派', description: '科技生活方式', categories: ['国内媒体'], url: 'rsshub://sspai/index', color: '#553C9A', icon: '⚡' },
-  { name: '人人都是产品经理', description: '产品运营知识', categories: ['国内媒体'], url: 'https://www.woshipm.com/feed', color: '#2B6CB0', icon: '📱' },
-  { name: '即刻话题', description: '热门话题讨论', categories: ['国内媒体'], url: 'rsshub://jike/topic/63579abb6724cc583b9bba9a', color: '#38A169', icon: '💬' },
+  { name: '36氪', description: '创投商业资讯', categories: ['国内媒体'], url: 'rsshub://36kr/hot-list', color: '#E53E3E', icon: 'https://36kr.com/favicon.ico' },
+  { name: '虎嗅', description: '商业深度分析', categories: ['国内媒体'], url: 'https://www.huxiu.com/rss/0.xml', color: '#DD6B20', icon: 'https://www.huxiu.com/favicon.ico' },
+  { name: '少数派', description: '科技生活方式', categories: ['国内媒体'], url: 'rsshub://sspai/index', color: '#553C9A', icon: 'https://cdn.sspai.com/sspai/assets/img/favicon.ico' },
+  { name: '人人都是产品经理', description: '产品运营知识', categories: ['国内媒体'], url: 'https://www.woshipm.com/feed', color: '#2B6CB0', icon: 'https://www.woshipm.com/favicon.ico' },
+  { name: '即刻话题', description: '热门话题讨论', categories: ['国内媒体'], url: 'rsshub://jike/topic/63579abb6724cc583b9bba9a', color: '#38A169', icon: 'https://web.okjike.com/favicon.ico' },
   
   // 播客
-  { name: '张小珺商业访谈录', description: '深度商业访谈节目', categories: ['播客'], url: 'https://feed.xyzfm.space/dk4yh3pkpjp3', color: '#FF6B6B', icon: '🎙️' },
-  { name: 'Lex Fridman', description: 'AI & 科技深度对话', categories: ['播客', 'YouTube'], url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA', color: '#000000', icon: '🎧' },
+  { name: '张小珺商业访谈录', description: '深度商业访谈节目', categories: ['播客'], url: 'https://feed.xyzfm.space/dk4yh3pkpjp3', color: '#FF6B6B', icon: 'https://xyzfm.space/favicon.ico' },
+  { name: 'Lex Fridman', description: 'AI & 科技深度对话', categories: ['播客', 'YouTube'], url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA', color: '#000000', icon: 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png' },
   
   // X (Twitter)
-  { name: 'Sam Altman', description: 'OpenAI CEO 推特', categories: ['X'], url: 'rsshub://twitter/user/sama', color: '#1DA1F2', icon: '🐦' },
+  { name: 'Sam Altman', description: 'OpenAI CEO 推特', categories: ['X'], url: 'rsshub://twitter/user/sama', color: '#1DA1F2', icon: 'https://abs.twimg.com/favicons/twitter.3.ico' },
   
   // YouTube
-  { name: 'Y Combinator', description: '创业孵化器官方频道', categories: ['YouTube'], url: 'rsshub://youtube/user/%40ycombinator', color: '#FF0000', icon: '▶️' },
-  { name: 'Andrej Karpathy', description: 'AI 研究与教学', categories: ['YouTube'], url: 'rsshub://youtube/user/@AndrejKarpathy', color: '#FF0000', icon: '▶️' },
+  { name: 'Y Combinator', description: '创业孵化器官方频道', categories: ['YouTube'], url: 'rsshub://youtube/user/%40ycombinator', color: '#FF0000', icon: 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png' },
+  { name: 'Andrej Karpathy', description: 'AI 研究与教学', categories: ['YouTube'], url: 'rsshub://youtube/user/@AndrejKarpathy', color: '#FF0000', icon: 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png' },
   
   // 公众号
-  { name: '数字生命卡兹克', description: '科技人文思考', categories: ['公众号'], url: 'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml', color: '#6B46C1', icon: '📮' },
-  { name: '新智元', description: 'AI 前沿资讯', categories: ['公众号'], url: 'https://plink.anyfeeder.com/weixin/AI_era', color: '#2F855A', icon: '🤖' },
+  { name: '数字生命卡兹克', description: '科技人文思考', categories: ['公众号'], url: 'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml', color: '#6B46C1', icon: 'https://bestblogs.dev/favicon.ico' },
+  { name: '新智元', description: 'AI 前沿资讯', categories: ['公众号'], url: 'https://plink.anyfeeder.com/weixin/AI_era', color: '#2F855A', icon: 'https://plink.anyfeeder.com/favicon.ico' },
   
   // 其他
-  { name: 'GitHub Blog', description: '技术前沿动态', categories: ['其他'], url: 'https://github.blog/feed/', color: '#24292F', icon: '💻' },
+  { name: 'GitHub Blog', description: '技术前沿动态', categories: ['其他'], url: 'https://github.blog/feed/', color: '#24292F', icon: 'https://github.githubassets.com/favicons/favicon.svg' },
 ];
 
 export const DiscoverPage: React.FC = () => {
@@ -189,10 +189,27 @@ export const DiscoverPage: React.FC = () => {
             >
               <div className="flex items-start gap-3">
                 <div 
-                  className="w-12 h-12 rounded-xl flex items-center justify-center text-2xl shrink-0"
+                  className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0 overflow-hidden"
                   style={{ backgroundColor: `${source.color}20` }}
                 >
-                  {source.icon || '📡'}
+                  {source.icon ? (
+                    <img 
+                      src={source.icon} 
+                      alt={source.name}
+                      className="w-8 h-8 object-contain"
+                      onError={(e) => {
+                        // 如果图标加载失败，显示默认emoji
+                        e.currentTarget.style.display = 'none';
+                        const parent = e.currentTarget.parentElement;
+                        if (parent) {
+                          parent.innerHTML = '📡';
+                          parent.style.fontSize = '24px';
+                        }
+                      }}
+                    />
+                  ) : (
+                    <span className="text-2xl">📡</span>
+                  )}
                 </div>
                 
                 <div className="flex-1 min-w-0">
