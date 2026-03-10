@@ -880,104 +880,24 @@ async function startServer() {
     }
 
     try {
-      // YouTube视频源直接使用RSS内容，不需要全文提取
-      const isYouTubeSource = article.source === 'Lex Fridman' || 
-                              article.source === 'Y Combinator' || 
-                              article.source === 'Andrej Karpathy';
-      
-      if (isYouTubeSource) {
-        article.markdownContent = article.content || article.excerpt;
-        article.readabilityUsed = false;
-        article.fullFetched = true;
-        return res.json({ success: true, article });
-      }
-      
+      // 所有源都直接使用RSS内容，不进行网页抓取
       if (article.source === '即刻话题') {
         article.markdownContent = formatJikeContent(article.content);
-        article.readabilityUsed = false;
-        article.fullFetched = true;
-        return res.json({ success: true, article });
-      }
-      if (article.url) {
-        const preferJina = article.source === '数字生命卡兹克' || article.source === '新智元';
-        if (preferJina) {
-          const rssSnapshot = cleanBlockedNoiseLines(article.content || '');
-          if (!isBlockedPageContent(rssSnapshot) && rssSnapshot.replace(/\s+/g, '').length > 120) {
-            article.markdownContent = rssSnapshot;
-            article.readabilityUsed = false;
-            article.fullFetched = true;
-            return res.json({ success: true, article });
-          }
-          const jinaResponse = await fetch(`https://r.jina.ai/${article.url}`, {
-            headers: {
-              'X-Remove-Selector': '.comment-list, .comments, footer, nav, .related-posts, .article-related, .user-card, .author-info, .footnotes, #footnotes, .article-footnotes, .reference',
-              'X-Return-Format': 'markdown',
-            }
-          });
-          if (jinaResponse.ok) {
-            let markdown = await jinaResponse.text();
-            markdown = markdown.replace(/!\[.*?\]\([^)]*\/community\/[^)]*\)/gi, '');
-            markdown = markdown.replace(/\n发表首评\n/g, '\n');
-            markdown = markdown.replace(/\n发表评论\n/g, '\n');
-            markdown = markdown.replace(/\n全部讨论[\s\S]*?(?=\n\* \* \*|\n*$)/g, '');
-            markdown = markdown.replace(/\n{3,}/g, '\n\n');
-            markdown = cleanBlockedNoiseLines(markdown);
-            if (!isBlockedPageContent(markdown) && markdown.trim()) {
-              article.markdownContent = markdown.trim();
-              article.readabilityUsed = false;
-              article.fullFetched = true;
-              return res.json({ success: true, article });
-            }
-          }
-        }
-        const response = await fetch(article.url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-          }
-        });
-        if (response.ok) {
-          const html = await response.text();
-          const dom = new JSDOM(html, { url: article.url });
-          const reader = new Readability(dom.window.document);
-          const parsed = reader.parse();
-          let markdown = parsed?.content || article.content;
-          markdown = cleanBlockedNoiseLines(markdown);
-          const blockedByCaptcha = isBlockedPageContent(markdown);
-          const isWoshipm = article.url.includes('woshipm.com');
-          if (isWoshipm) {
-            markdown = cleanWoshipmContent(markdown, article.title);
-          }
-          if (is36KrArticle(article)) {
-            markdown = clean36KrTail(markdown);
-          }
-          article.markdownContent = markdown.trim();
-          if (isWoshipm) {
-            const updatedExcerpt = buildExcerptFromContent(article.markdownContent, 200);
-            if (updatedExcerpt) {
-              article.excerpt = updatedExcerpt;
-            }
-          }
-          article.readabilityUsed = !blockedByCaptcha;
-          if (blockedByCaptcha) {
-            article.markdownContent = article.content;
-          }
-        } else {
-          article.markdownContent = article.content;
-          article.readabilityUsed = false;
-        }
       } else {
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        article.markdownContent = `## 时代变化太快...\n\n(此为无链接文章的模拟内容)`;
-        article.readabilityUsed = false;
+        article.markdownContent = article.content || article.excerpt || '暂无内容';
       }
-    } catch (error) {
-      console.error('Failed to fetch full content:', error);
-      article.markdownContent = article.content;
+      
       article.readabilityUsed = false;
+      article.fullFetched = true;
+      
+      return res.json({ success: true, article });
+    } catch (error) {
+      console.error('Failed to process article content:', error);
+      article.markdownContent = article.content || article.excerpt || '暂无内容';
+      article.readabilityUsed = false;
+      article.fullFetched = true;
+      return res.json({ success: true, article });
     }
-
-    article.fullFetched = true;
-    res.json({ success: true, article });
   });
 
   // Image proxy to bypass CSP and hotlink protection
