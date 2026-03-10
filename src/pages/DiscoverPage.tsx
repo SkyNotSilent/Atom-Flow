@@ -22,7 +22,7 @@ const RECOMMENDED_SOURCES: SourceRecommendation[] = [
   
   // 播客
   { name: '张小珺商业访谈录', description: '深度商业访谈节目', categories: ['播客'], url: 'https://feed.xyzfm.space/dk4yh3pkpjp3', color: '#FF6B6B', icon: 'https://xyzfm.space/favicon.ico' },
-  { name: 'Lex Fridman', description: 'AI & 科技深度对话', categories: ['播客', 'YouTube'], url: 'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA', color: '#000000', icon: 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png' },
+  { name: 'Lex Fridman', description: 'AI & 科技深度对话', categories: ['播客', 'YouTube'], url: 'rsshub://youtube/user/%40lexfridman', color: '#000000', icon: 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png' },
   
   // X (Twitter)
   { name: 'Sam Altman', description: 'OpenAI CEO 推特', categories: ['X'], url: 'rsshub://twitter/user/sama', color: '#1DA1F2', icon: 'https://abs.twimg.com/favicons/twitter.3.ico' },

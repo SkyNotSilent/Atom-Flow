@@ -24,7 +24,7 @@ export const FeedPage: React.FC = () => {
     'GitHub Blog': 'https://github.blog/feed/',
     'Sam Altman': 'rsshub://twitter/user/sama',
     '张小珺商业访谈录': 'https://feed.xyzfm.space/dk4yh3pkpjp3',
-    'Lex Fridman': 'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA',
+    'Lex Fridman': 'rsshub://youtube/user/%40lexfridman',
     'Y Combinator': 'rsshub://youtube/user/%40ycombinator',
     'Andrej Karpathy': 'rsshub://youtube/user/@AndrejKarpathy'
   };
