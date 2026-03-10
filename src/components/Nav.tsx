@@ -259,6 +259,30 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const iconUpdateDoneRef = useRef(false); // 标记icon是否已更新过
   const unreadCount = articles.filter(a => !a.saved).length;
 
+  // 处理图标加载失败，永久删除无效的 icon URL
+  const handleIconError = React.useCallback((sourceId: string) => {
+    setSourceEntries(prev => prev.map(entry => {
+      if (entry.type === 'source' && entry.id === sourceId) {
+        const updated = { ...entry };
+        delete updated.icon;
+        return updated;
+      } else if (entry.type === 'collection') {
+        const updatedChildren = entry.children.map(child => {
+          if (child.id === sourceId) {
+            const updated = { ...child };
+            delete updated.icon;
+            return updated;
+          }
+          return child;
+        });
+        if (updatedChildren.some((child, i) => child !== entry.children[i])) {
+          return { ...entry, children: updatedChildren };
+        }
+      }
+      return entry;
+    }));
+  }, []);
+
   // 从articles中提取sourceIcon并更新到sourceEntries（只在首次有数据时执行一次）
   useEffect(() => {
     // 如果已经更新过，或者没有文章数据，则跳过
@@ -880,26 +904,24 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
         )}
       >
         <div className="flex items-center gap-2">
-          {source.icon ? (
-            <img 
-              src={source.icon} 
-              alt={source.name}
-              className="w-4 h-4 rounded-sm object-cover"
-              onError={(e) => {
-                // 如果图标加载失败，显示颜色圆点
-                e.currentTarget.style.display = 'none';
-                const dot = e.currentTarget.nextElementSibling as HTMLElement;
-                if (dot) dot.style.display = 'block';
-              }}
-            />
-          ) : null}
-          <div 
-            className="w-[6px] h-[6px] rounded-full" 
-            style={{ 
-              backgroundColor: source.color,
-              display: source.icon ? 'none' : 'block'
-            }} 
-          />
+          {/* 固定尺寸的图标容器，始终占据 16x16px 空间 */}
+          <div className="relative w-4 h-4 shrink-0 flex items-center justify-center">
+            {source.icon ? (
+              // 有图标：显示图标
+              <img 
+                src={source.icon} 
+                alt={source.name}
+                className="w-4 h-4 rounded-sm object-cover"
+                onError={() => handleIconError(source.id)}
+              />
+            ) : (
+              // 无图标：显示颜色点
+              <div 
+                className="w-[10px] h-[10px] rounded-full" 
+                style={{ backgroundColor: source.color }}
+              />
+            )}
+          </div>
           <span>{source.name}</span>
           {loadingSourceId === source.id && (
             <span className="text-[10px] text-text3">更新中</span>

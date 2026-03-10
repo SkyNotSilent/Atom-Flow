@@ -11,6 +11,27 @@ export const FeedPage: React.FC = () => {
   const [viewMode, setViewMode] = useState<'card' | 'compact'>('card');
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [isRetrying, setIsRetrying] = useState(false);
+  const [currentDate, setCurrentDate] = useState('');
+
+  // 实时更新日期
+  React.useEffect(() => {
+    const updateDate = () => {
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = now.getMonth() + 1;
+      const day = now.getDate();
+      setCurrentDate(`${year}年${month}月${day}日`);
+    };
+    
+    updateDate(); // 立即更新一次
+    
+    // 每分钟检查一次是否需要更新日期
+    const timer = setInterval(() => {
+      updateDate();
+    }, 60000); // 60秒
+    
+    return () => clearInterval(timer);
+  }, []);
 
   // 源名称到RSS URL的映射
   const SOURCE_RSS_MAP: Record<string, string> = {
@@ -132,7 +153,7 @@ export const FeedPage: React.FC = () => {
               <p className="text-[11px] sm:text-[12px] text-red-500">获取信息源失败，点击下方重试</p>
             </div>
           ) : (
-            <p className="text-[11px] sm:text-[12px] text-text3 mt-1">2026年3月7日 · 已聚合 {filteredArticles.length} 篇内容</p>
+            <p className="text-[11px] sm:text-[12px] text-text3 mt-1">{currentDate} · 已聚合 {filteredArticles.length} 篇内容</p>
           )}
         </div>
         <div className="flex items-center gap-1 bg-surface2 p-1 rounded-lg">

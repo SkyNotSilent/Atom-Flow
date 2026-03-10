@@ -196,41 +196,7 @@ export const ReaderPane: React.FC = () => {
               <span className="font-medium text-accent">{displaySource}</span>
               <span>·</span>
               <span>{currentArticle.time}</span>
-              {currentArticle.audioDuration && (
-                <>
-                  <span>·</span>
-                  <span>🎙️ {currentArticle.audioDuration}</span>
-                </>
-              )}
             </div>
-
-            {currentArticle.audioUrl && (
-              <div className="mb-8 p-4 bg-surface2 rounded-2xl border border-border">
-                <div className="flex items-center gap-3 mb-3">
-                  <div className="w-10 h-10 rounded-full bg-accent-light flex items-center justify-center text-accent">
-                    🎙️
-                  </div>
-                  <div className="flex-1">
-                    <div className="text-[13px] font-medium text-text-main">播客音频</div>
-                    <div className="text-[12px] text-text3">
-                      {currentArticle.audioDuration || '点击播放'}
-                    </div>
-                  </div>
-                </div>
-                <audio 
-                  controls 
-                  className="w-full"
-                  preload="metadata"
-                  style={{
-                    height: '40px',
-                    borderRadius: '8px'
-                  }}
-                >
-                  <source src={currentArticle.audioUrl} type="audio/mpeg" />
-                  您的浏览器不支持音频播放
-                </audio>
-              </div>
-            )}
 
             <div className="p-5 bg-accent-light/30 rounded-2xl border border-accent/10 mb-10">
               <div className="flex items-center gap-2 mb-3 text-accent font-medium text-[14px]">
