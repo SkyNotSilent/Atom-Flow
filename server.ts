@@ -880,6 +880,18 @@ async function startServer() {
     }
 
     try {
+      // YouTube视频源直接使用RSS内容，不需要全文提取
+      const isYouTubeSource = article.source === 'Lex Fridman' || 
+                              article.source === 'Y Combinator' || 
+                              article.source === 'Andrej Karpathy';
+      
+      if (isYouTubeSource) {
+        article.markdownContent = article.content || article.excerpt;
+        article.readabilityUsed = false;
+        article.fullFetched = true;
+        return res.json({ success: true, article });
+      }
+      
       if (article.source === '即刻话题') {
         article.markdownContent = formatJikeContent(article.content);
         article.readabilityUsed = false;
