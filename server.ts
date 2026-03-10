@@ -565,17 +565,14 @@ async function fetchRSSFeeds(): Promise<Article[]> {
         ], 20000, 2),
       parser.parseURL('https://feed.xyzfm.space/dk4yh3pkpjp3'),
       parseWithRetry([
-          'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA',
-          'rsshub://youtube/user/@lexfridman'
-        ], 20000, 2),
+          'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA'
+        ], 15000, 1),
       parseWithRetry([
-          'rsshub://youtube/user/%40ycombinator',
           'https://www.youtube.com/feeds/videos.xml?channel_id=UCcefcZRL2oaA_uBNeo5UOWg'
-        ], 20000, 2),
+        ], 15000, 1),
       parseWithRetry([
-          'rsshub://youtube/user/@AndrejKarpathy',
           'https://www.youtube.com/feeds/videos.xml?channel_id=UCYO_jab_esuFRV4b17AJtAw'
-        ], 20000, 2)
+        ], 15000, 1)
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
       ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0, extractFeedIcon(results[0].value))
