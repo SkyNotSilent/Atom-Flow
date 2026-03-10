@@ -256,10 +256,14 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const holdTimerRef = useRef<number | null>(null);
   const pointerSessionRef = useRef<{ entryId: string; pointerId: number; startX: number; startY: number; active: boolean } | null>(null);
   const suppressClickRef = useRef(false);
+  const iconUpdateDoneRef = useRef(false); // 标记icon是否已更新过
   const unreadCount = articles.filter(a => !a.saved).length;
 
-  // 从articles中提取sourceIcon并更新到sourceEntries
+  // 从articles中提取sourceIcon并更新到sourceEntries（只在首次有数据时执行一次）
   useEffect(() => {
+    // 如果已经更新过，或者没有文章数据，则跳过
+    if (iconUpdateDoneRef.current || articles.length === 0) return;
+    
     const sourceIconMap = new Map<string, string>();
     articles.forEach(article => {
       if (article.sourceIcon && !sourceIconMap.has(article.source)) {
@@ -267,28 +271,31 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
       }
     });
     
-    if (sourceIconMap.size > 0) {
-      setSourceEntries(prev => prev.map(entry => {
-        if (entry.type === 'source') {
-          const icon = sourceIconMap.get(entry.name);
-          if (icon && icon !== entry.icon) {
-            return { ...entry, icon };
-          }
-        } else if (entry.type === 'collection') {
-          const updatedChildren = entry.children.map(child => {
-            const icon = sourceIconMap.get(child.name);
-            if (icon && icon !== child.icon) {
-              return { ...child, icon };
-            }
-            return child;
-          });
-          if (updatedChildren.some((child, i) => child !== entry.children[i])) {
-            return { ...entry, children: updatedChildren };
-          }
+    if (sourceIconMap.size === 0) return;
+    
+    setSourceEntries(prev => prev.map(entry => {
+      if (entry.type === 'source') {
+        const icon = sourceIconMap.get(entry.name);
+        if (icon && !entry.icon) { // 只在没有icon时才设置
+          return { ...entry, icon };
         }
-        return entry;
-      }));
-    }
+      } else if (entry.type === 'collection') {
+        const updatedChildren = entry.children.map(child => {
+          const icon = sourceIconMap.get(child.name);
+          if (icon && !child.icon) { // 只在没有icon时才设置
+            return { ...child, icon };
+          }
+          return child;
+        });
+        if (updatedChildren.some((child, i) => child !== entry.children[i])) {
+          return { ...entry, children: updatedChildren };
+        }
+      }
+      return entry;
+    }));
+    
+    // 标记为已更新
+    iconUpdateDoneRef.current = true;
   }, [articles]);
 
   useEffect(() => {
