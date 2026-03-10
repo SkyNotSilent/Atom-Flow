@@ -51,6 +51,7 @@ type RenameDialogState =
   | null;
 
 const SOURCE_LAYOUT_STORAGE_KEY = 'atomflow:source-layout:v1';
+const SOURCE_LAYOUT_VERSION = 2; // 版本2：合集结构
 
 const BASE_SOURCES: Array<{ name: string; color: string }> = [
   { name: '少数派', color: '#553C9A' },
@@ -214,7 +215,22 @@ const loadEntriesFromStorage = (): NavEntry[] => {
   try {
     const raw = window.localStorage.getItem(SOURCE_LAYOUT_STORAGE_KEY);
     if (!raw) return createDefaultEntries();
-    return sanitizeStoredEntries(JSON.parse(raw));
+    
+    const parsed = JSON.parse(raw);
+    
+    // 检查版本号，如果是旧版本数据，强制使用新的合集结构
+    if (parsed.version !== SOURCE_LAYOUT_VERSION) {
+      console.log('检测到旧版本数据，重置为合集结构');
+      const defaultEntries = createDefaultEntries();
+      // 保存新版本数据
+      window.localStorage.setItem(SOURCE_LAYOUT_STORAGE_KEY, JSON.stringify({
+        version: SOURCE_LAYOUT_VERSION,
+        entries: defaultEntries
+      }));
+      return defaultEntries;
+    }
+    
+    return sanitizeStoredEntries(parsed.entries);
   } catch {
     return createDefaultEntries();
   }
@@ -277,7 +293,10 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    window.localStorage.setItem(SOURCE_LAYOUT_STORAGE_KEY, JSON.stringify(sourceEntries));
+    window.localStorage.setItem(SOURCE_LAYOUT_STORAGE_KEY, JSON.stringify({
+      version: SOURCE_LAYOUT_VERSION,
+      entries: sourceEntries
+    }));
   }, [sourceEntries]);
 
   const handleTabClick = (tab: 'feed' | 'knowledge' | 'write' | 'discover') => {
@@ -830,51 +849,58 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     return 'bg-accent-light/60';
   };
 
-  const SourceRow: React.FC<{ source: SourceEntry; nested?: boolean; parentCollectionId?: string }> = ({ source, nested = false, parentCollectionId }) => (
-    <div
-      data-drag-entry-id={source.id}
-      onPointerDown={(event) => {
-        event.stopPropagation();
-        handlePointerDown(event, source.id);
-      }}
-      onClick={() => handleSourceClick(source)}
-      onContextMenu={(event) => openContextMenu(event, { kind: 'source', sourceId: source.id, inCollectionId: parentCollectionId })}
-      title={nested ? source.name : '长按并拖动可排序，拖到其他源上可建合集'}
-      className={cn(
-        'group flex items-center gap-2 px-3 py-1.5 rounded-lg text-[13px] text-text2 hover:bg-surface2 cursor-pointer border border-transparent transition-all duration-150 select-none',
-        nested && 'ml-5 py-1',
-        draggingId === source.id && 'opacity-25 scale-[0.98]',
-        getDropClass(source.id)
-      )}
-    >
-      <div className="flex items-center gap-2">
-        {source.icon ? (
-          <img 
-            src={source.icon} 
-            alt={source.name}
-            className="w-4 h-4 rounded-sm object-cover"
-            onError={(e) => {
-              // 如果图标加载失败，显示颜色圆点
-              e.currentTarget.style.display = 'none';
-              const dot = e.currentTarget.nextElementSibling as HTMLElement;
-              if (dot) dot.style.display = 'block';
-            }}
-          />
-        ) : null}
-        <div 
-          className="w-[6px] h-[6px] rounded-full" 
-          style={{ 
-            backgroundColor: source.color,
-            display: source.icon ? 'none' : 'block'
-          }} 
-        />
-        <span>{source.name}</span>
-        {loadingSourceId === source.id && (
-          <span className="text-[10px] text-text3">更新中</span>
+  const SourceRow: React.FC<{ source: SourceEntry; nested?: boolean; parentCollectionId?: string }> = ({ source, nested = false, parentCollectionId }) => {
+    const isActive = activeSource === source.name;
+    
+    return (
+      <div
+        data-drag-entry-id={source.id}
+        onPointerDown={(event) => {
+          event.stopPropagation();
+          handlePointerDown(event, source.id);
+        }}
+        onClick={() => handleSourceClick(source)}
+        onContextMenu={(event) => openContextMenu(event, { kind: 'source', sourceId: source.id, inCollectionId: parentCollectionId })}
+        title={nested ? source.name : '长按并拖动可排序，拖到其他源上可建合集'}
+        className={cn(
+          'group flex items-center gap-2 px-3 py-1.5 rounded-lg text-[13px] cursor-pointer border transition-all duration-150 select-none',
+          nested && 'ml-5 py-1',
+          draggingId === source.id && 'opacity-25 scale-[0.98]',
+          isActive 
+            ? 'bg-accent-light text-accent border-accent/30' 
+            : 'text-text2 hover:bg-surface2 border-transparent',
+          getDropClass(source.id)
         )}
+      >
+        <div className="flex items-center gap-2">
+          {source.icon ? (
+            <img 
+              src={source.icon} 
+              alt={source.name}
+              className="w-4 h-4 rounded-sm object-cover"
+              onError={(e) => {
+                // 如果图标加载失败，显示颜色圆点
+                e.currentTarget.style.display = 'none';
+                const dot = e.currentTarget.nextElementSibling as HTMLElement;
+                if (dot) dot.style.display = 'block';
+              }}
+            />
+          ) : null}
+          <div 
+            className="w-[6px] h-[6px] rounded-full" 
+            style={{ 
+              backgroundColor: source.color,
+              display: source.icon ? 'none' : 'block'
+            }} 
+          />
+          <span>{source.name}</span>
+          {loadingSourceId === source.id && (
+            <span className="text-[10px] text-text3">更新中</span>
+          )}
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   return (
     <nav className="w-full h-full bg-surface border-r border-border flex flex-col shrink-0 transition-colors">

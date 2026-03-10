@@ -52,8 +52,12 @@ export const DiscoverPage: React.FC = () => {
       if (!stored) return new Set<string>();
       const parsed = JSON.parse(stored);
       const names = new Set<string>();
-      if (Array.isArray(parsed)) {
-        parsed.forEach((entry: any) => {
+      
+      // 处理新版本格式（带version字段）
+      const entries = parsed.version ? parsed.entries : parsed;
+      
+      if (Array.isArray(entries)) {
+        entries.forEach((entry: any) => {
           if (entry.type === 'source' && entry.name) {
             names.add(entry.name);
           }
@@ -101,7 +105,11 @@ export const DiscoverPage: React.FC = () => {
 
       // 更新 localStorage
       const stored = localStorage.getItem('atomflow:source-layout:v1');
-      const parsed = stored ? JSON.parse(stored) : [];
+      const parsed = stored ? JSON.parse(stored) : { version: 2, entries: [] };
+      
+      // 处理新版本格式
+      const entries = parsed.version ? parsed.entries : parsed;
+      
       const newSource = {
         id: `source:${source.name}`,
         type: 'source',
@@ -109,9 +117,14 @@ export const DiscoverPage: React.FC = () => {
         color: source.color,
         rssUrl: source.url
       };
+      
       // 添加到所有合集的下方（末尾）
-      parsed.push(newSource);
-      localStorage.setItem('atomflow:source-layout:v1', JSON.stringify(parsed));
+      entries.push(newSource);
+      
+      localStorage.setItem('atomflow:source-layout:v1', JSON.stringify({
+        version: 2,
+        entries: entries
+      }));
 
       setAddedSources(prev => new Set(prev).add(source.name));
       await reloadArticles();
