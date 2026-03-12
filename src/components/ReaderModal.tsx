@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { Check, X, Bookmark, Share, MoreHorizontal, Loader2, ExternalLink, Sparkles, Languages } from 'lucide-react';
+import { Check, X, Bookmark, Share, MoreHorizontal, Loader2, ExternalLink, Sparkles, Languages, Play, Pause } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
@@ -10,12 +10,17 @@ import { getDisplaySource } from '../utils/articleDisplay';
 export const ReaderPane: React.FC = () => {
   const { readingArticle, setReadingArticle, saveArticle, showToast, isSavingArticle, getSavingStageText, articles } = useAppContext();
   const contentRef = useRef<HTMLDivElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
   const [isTranslating, setIsTranslating] = useState(false);
   const [translatedContent, setTranslatedContent] = useState<string | null>(null);
   const [showOriginal, setShowOriginal] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
   const currentArticle = readingArticle ? (articles.find(article => article.id === readingArticle.id) || readingArticle) : null;
   const displaySource = currentArticle ? getDisplaySource(currentArticle) : '未知来源';
   const shouldShowLoading = Boolean(currentArticle && !currentArticle.fullFetched && !currentArticle.content && !currentArticle.markdownContent);
+  const isPodcast = currentArticle?.source === '张小珺商业访谈录' && currentArticle?.audioUrl;
 
   useEffect(() => {
     if (contentRef.current && currentArticle) {
@@ -40,6 +45,61 @@ export const ReaderPane: React.FC = () => {
       };
     }
   }, [currentArticle]);
+
+  // Audio player effects
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || !isPodcast) return;
+
+    const updateTime = () => setCurrentTime(audio.currentTime);
+    const updateDuration = () => setDuration(audio.duration);
+    const handleEnded = () => setIsPlaying(false);
+
+    audio.addEventListener('timeupdate', updateTime);
+    audio.addEventListener('loadedmetadata', updateDuration);
+    audio.addEventListener('ended', handleEnded);
+
+    return () => {
+      audio.removeEventListener('timeupdate', updateTime);
+      audio.removeEventListener('loadedmetadata', updateDuration);
+      audio.removeEventListener('ended', handleEnded);
+    };
+  }, [isPodcast, currentArticle?.audioUrl]);
+
+  // Reset audio state when article changes
+  useEffect(() => {
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+  }, [currentArticle?.id]);
+
+  const togglePlay = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    if (isPlaying) {
+      audio.pause();
+    } else {
+      audio.play().catch(console.error);
+    }
+    setIsPlaying(!isPlaying);
+  };
+
+  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    const newTime = parseFloat(e.target.value);
+    audio.currentTime = newTime;
+    setCurrentTime(newTime);
+  };
+
+  const formatTime = (time: number) => {
+    if (!time || isNaN(time)) return '00:00';
+    const minutes = Math.floor(time / 60);
+    const seconds = Math.floor(time % 60);
+    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+  };
 
   if (!currentArticle) return (
     <div className="flex-1 hidden lg:flex flex-col items-center justify-center bg-surface border-l border-border">
@@ -198,7 +258,7 @@ export const ReaderPane: React.FC = () => {
               <span>{currentArticle.time}</span>
             </div>
 
-            <div className="p-5 bg-accent-light/30 rounded-2xl border border-accent/10 mb-10">
+            <div className="p-5 bg-accent-light/30 rounded-2xl border border-accent/10 mb-6">
               <div className="flex items-center gap-2 mb-3 text-accent font-medium text-[14px]">
                 <span>✦</span> AI 总结
               </div>
@@ -223,6 +283,38 @@ export const ReaderPane: React.FC = () => {
                 </button>
               )}
             </div>
+
+            {/* Audio Player for Podcast */}
+            {isPodcast && (
+              <div className="mb-10 p-5 bg-surface2 rounded-2xl border border-border">
+                <audio ref={audioRef} src={currentArticle.audioUrl} preload="metadata" />
+                <div className="flex items-center gap-4">
+                  <button
+                    onClick={togglePlay}
+                    className="w-12 h-12 flex items-center justify-center rounded-full bg-accent text-white hover:bg-accent/90 transition-colors shadow-sm"
+                  >
+                    {isPlaying ? <Pause size={20} /> : <Play size={20} className="ml-0.5" />}
+                  </button>
+                  <div className="flex-1">
+                    <div className="flex items-center justify-between mb-2 text-[12px] text-text3">
+                      <span>{formatTime(currentTime)}</span>
+                      <span>{formatTime(duration)}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={duration || 0}
+                      value={currentTime}
+                      onChange={handleSeek}
+                      className="w-full h-1.5 bg-border rounded-full appearance-none cursor-pointer accent-accent hover:accent-accent/80"
+                      style={{
+                        background: `linear-gradient(to right, #0ea5e9 0%, #0ea5e9 ${(currentTime / (duration || 1)) * 100}%, #e2e8f0 ${(currentTime / (duration || 1)) * 100}%, #e2e8f0 100%)`
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
             {currentArticle.readabilityUsed && (
               <div className="mb-8 rounded-xl border border-border bg-surface2 px-4 py-3 text-[12px] text-text3 leading-relaxed">
                 此内容由 Readability 提供。如果你发现排版异常，请访问源站查看原始内容。

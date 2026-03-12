@@ -92,19 +92,19 @@ export const FeedPage: React.FC = () => {
   };
 
   const SOURCE_PRIORITY: Record<string, number> = {
-    '虎嗅': 5,
-    'GitHub Blog': 4.5,
-    'Sam Altman': 4.5,
-    '36氪': 4,
+    '36氪': 5,
+    'Lex Fridman': 4.8,
+    'Y Combinator': 4.6,
+    'Andrej Karpathy': 4.4,
+    'GitHub Blog': 4.2,
+    'Sam Altman': 4.0,
     '张小珺商业访谈录': 3.8,
     '即刻话题': 3.6,
     '数字生命卡兹克': 3.6,
     '新智元': 3.6,
-    'Y Combinator': 3.5,
-    'Andrej Karpathy': 3.5,
-    'Lex Fridman': 3.5,
     '少数派': 1.6,
-    '人人都是产品经理': 1.5
+    '人人都是产品经理': 1.5,
+    '虎嗅': 0
   };
 
   const getPriority = (article: Article) => {

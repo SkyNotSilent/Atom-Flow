@@ -191,19 +191,19 @@ async function saveArticlesCache(articles: Article[]) {
 }
 
 const SOURCE_PRIORITY: Record<string, number> = {
-  '虎嗅': 5,
-  'GitHub Blog': 4.5,
-  'Sam Altman': 4.5,
-  '36氪': 4,
+  '36氪': 5,
+  'Lex Fridman': 4.8,
+  'Y Combinator': 4.6,
+  'Andrej Karpathy': 4.4,
+  'GitHub Blog': 4.2,
+  'Sam Altman': 4.0,
   '张小珺商业访谈录': 3.8,
   '数字生命卡兹克': 3.8,
   '新智元': 3.8,
-  'Lex Fridman': 3.5,
-  'Y Combinator': 3.2,
-  'Andrej Karpathy': 3.2,
   '人人都是产品经理': 2.5,
   '即刻话题': 1.5,
-  '少数派': 1.2
+  '少数派': 1.2,
+  '虎嗅': 0
 };
 
 const LOW_PRIORITY_SOURCES = new Set(['少数派', '即刻话题']);
