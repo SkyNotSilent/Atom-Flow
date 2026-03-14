@@ -41,11 +41,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const quickOpenMode = true;
   const forceRefetchInTesting = false;
   const saveStages = ['提取全文', '识别要点', '原子化拆分', '提炼入库'];
+  const triggerAuthRequired = () => window.dispatchEvent(new CustomEvent('auth-required'));
 
   const reloadArticles = async () => {
     const articlesRes = await fetch('/api/articles');
     if (articlesRes.ok) {
-      setArticles(await articlesRes.json());
+      const next = await articlesRes.json();
+      setArticles(Array.isArray(next) ? next : []);
     }
   };
   
@@ -98,8 +100,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const cardsRes = await fetch('/api/cards');
         await reloadArticles();
-        const cardsData = await cardsRes.json();
-        setSavedCards(cardsData);
+        if (cardsRes.ok) {
+          const cardsData = await cardsRes.json();
+          setSavedCards(Array.isArray(cardsData) ? cardsData : []);
+        } else {
+          setSavedCards([]);
+        }
       } catch (error) {
         console.error("Failed to fetch initial data:", error);
       }
@@ -143,8 +149,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           fetch('/api/articles'),
           fetch('/api/cards')
         ]);
-        setArticles(await articlesRes.json());
-        setSavedCards(await cardsRes.json());
+        if (articlesRes.ok) {
+          const nextArticles = await articlesRes.json();
+          setArticles(Array.isArray(nextArticles) ? nextArticles : []);
+        }
+        if (cardsRes.ok) {
+          const nextCards = await cardsRes.json();
+          setSavedCards(Array.isArray(nextCards) ? nextCards : []);
+        }
+      } else if (res.status === 401) {
+        triggerAuthRequired();
       }
     } catch (error) {
       console.error("Failed to save article:", error);
@@ -172,6 +186,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (res.ok) {
         const newCard = await res.json();
         setSavedCards(prev => [newCard, ...prev]);
+      } else if (res.status === 401) {
+        triggerAuthRequired();
       }
     } catch (error) {
       console.error("Failed to add card:", error);
@@ -188,6 +204,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (res.ok) {
         const updatedCard = await res.json();
         setSavedCards(prev => prev.map(c => c.id === id ? updatedCard : c));
+      } else if (res.status === 401) {
+        triggerAuthRequired();
       }
     } catch (error) {
       console.error("Failed to update card:", error);
@@ -199,6 +217,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const res = await fetch(`/api/cards/${id}`, { method: 'DELETE' });
       if (res.ok) {
         setSavedCards(prev => prev.filter(c => c.id !== id));
+      } else if (res.status === 401) {
+        triggerAuthRequired();
       }
     } catch (error) {
       console.error("Failed to delete card:", error);

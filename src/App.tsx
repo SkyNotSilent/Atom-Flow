@@ -13,6 +13,11 @@ import { WritePage } from "./pages/WritePage";
 import { DiscoverPage } from "./pages/DiscoverPage";
 import { ReaderPane } from "./components/ReaderModal";
 
+interface AuthUser {
+  id: string;
+  email: string;
+}
+
 class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
   state = { hasError: false };
 
@@ -207,7 +212,7 @@ function AppContent() {
         `}
       >
         {readingArticle ? (
-          <ReaderPane onClose={isMobile ? () => {} : undefined} />
+          <ReaderPane />
         ) : (
           <div className="h-full flex flex-col items-center justify-center bg-surface border-l border-border">
             <div className="w-24 h-24 mb-6 opacity-20">
@@ -225,11 +230,154 @@ function AppContent() {
   );
 }
 
+function AuthScreen({
+  onSuccess,
+  onClose,
+  canClose
+}: {
+  onSuccess: (user: AuthUser) => void;
+  onClose: () => void;
+  canClose: boolean;
+}) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const submit = async () => {
+    if (loading) return;
+    setError("");
+    setLoading(true);
+    try {
+      const endpoint = mode === "login" ? "/api/auth/login" : "/api/auth/register";
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(typeof data?.error === "string" ? data.error : "登录失败");
+        return;
+      }
+      if (data?.user?.id && data?.user?.email) {
+        onSuccess(data.user);
+      } else {
+        setError("登录状态异常，请重试");
+      }
+    } catch {
+      setError("网络异常，请稍后重试");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="w-full max-w-md rounded-2xl border border-border bg-surface p-6 md:p-8 shadow-sm">
+      {canClose && (
+        <div className="flex justify-end -mt-1 mb-1">
+          <button onClick={onClose} className="text-text3 hover:text-text-main text-[16px] leading-none">×</button>
+        </div>
+      )}
+      <h1 className="font-serif text-[22px] font-bold mb-2">原子流笔记</h1>
+      <p className="text-[13px] text-text3 mb-6">邮箱登录后，知识库卡片会按用户隔离存储。</p>
+      <div className="space-y-3">
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="邮箱"
+          className="w-full bg-bg border border-border rounded-xl px-3 py-2.5 text-[14px] outline-none focus:border-accent"
+        />
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder={mode === "login" ? "密码" : "密码（至少8位）"}
+          className="w-full bg-bg border border-border rounded-xl px-3 py-2.5 text-[14px] outline-none focus:border-accent"
+        />
+        {error && <div className="text-[12px] text-red-500">{error}</div>}
+        <button
+          onClick={submit}
+          disabled={loading || !email.trim() || !password.trim()}
+          className="w-full h-10 rounded-xl bg-accent text-white text-[14px] font-medium disabled:opacity-50"
+        >
+          {loading ? "处理中..." : mode === "login" ? "登录" : "注册并登录"}
+        </button>
+      </div>
+      <button
+        onClick={() => {
+          setMode(prev => prev === "login" ? "register" : "login");
+          setError("");
+        }}
+        className="mt-4 text-[12px] text-accent hover:underline"
+      >
+        {mode === "login" ? "没有账号？去注册" : "已有账号？去登录"}
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+
+  useEffect(() => {
+    const init = async () => {
+      try {
+        const res = await fetch("/api/auth/me");
+        const data = await res.json();
+        if (data?.user?.id && data?.user?.email) {
+          setAuthUser(data.user);
+        }
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+    init();
+  }, []);
+
+  useEffect(() => {
+    const handler = () => setAuthModalOpen(true);
+    window.addEventListener('auth-required', handler as EventListener);
+    return () => window.removeEventListener('auth-required', handler as EventListener);
+  }, []);
+
+  const logout = async () => {
+    await fetch("/api/auth/logout", { method: "POST" });
+    setAuthUser(null);
+  };
+
   return (
     <ErrorBoundary>
-      <AppProvider>
+      <AppProvider key={authUser?.id || 'guest'}>
+        <div className="fixed bottom-3 left-3 z-[80] flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1.5">
+          {authLoading ? (
+            <span className="text-[11px] text-text3">...</span>
+          ) : authUser ? (
+            <>
+              <span className="text-[11px] text-text2 max-w-[180px] truncate">{authUser.email}</span>
+              <button onClick={logout} className="text-[11px] text-accent hover:underline">退出</button>
+            </>
+          ) : (
+            <button onClick={() => setAuthModalOpen(true)} className="text-[11px] text-accent hover:underline">登录</button>
+          )}
+        </div>
         <AppContent />
+        {authModalOpen && (
+          <div className="fixed inset-0 z-[120] bg-black/40 p-4 flex items-center justify-center">
+            <AuthScreen
+              onSuccess={(user) => {
+                setAuthUser(user);
+                setAuthModalOpen(false);
+              }}
+              onClose={() => setAuthModalOpen(false)}
+              canClose
+            />
+          </div>
+        )}
       </AppProvider>
     </ErrorBoundary>
   );

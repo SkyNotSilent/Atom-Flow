@@ -1,4 +1,4 @@
-import express from "express";
+import express, { Request, Response } from "express";
 import { createServer as createViteServer } from "vite";
 import { MOCK_ARTICLES } from "./src/data/mock.js";
 import { AtomCard, Article } from "./src/types.js";
@@ -8,6 +8,8 @@ import { Readability } from "@mozilla/readability";
 import { promises as fs } from "fs";
 import path from "path";
 import dotenv from "dotenv";
+import crypto from "crypto";
+import Database from "better-sqlite3";
 
 dotenv.config();
 
@@ -29,6 +31,71 @@ const RSSHUB_BASES = Array.from(new Set([
   'https://rsshub.app'
 ].filter(Boolean))) as string[];
 const CACHE_FILE = path.join(process.cwd(), ".cache", "articles.json");
+const DB_FILE = path.join(process.cwd(), ".cache", "atomflow.db");
+const SESSION_COOKIE_NAME = "atomflow_session";
+const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
+
+interface AuthUser {
+  id: string;
+  email: string;
+}
+
+interface CardRow {
+  id: string;
+  type: "观点" | "数据" | "金句" | "故事";
+  content: string;
+  tags_json: string;
+  article_title: string;
+  article_id: number | null;
+}
+
+const normalizeEmail = (email: string) => email.trim().toLowerCase();
+
+const parseCookies = (cookieHeader?: string) => {
+  const cookies: Record<string, string> = {};
+  if (!cookieHeader) return cookies;
+  const pairs = cookieHeader.split(";");
+  for (const pair of pairs) {
+    const index = pair.indexOf("=");
+    if (index <= 0) continue;
+    const key = pair.slice(0, index).trim();
+    const value = pair.slice(index + 1).trim();
+    cookies[key] = decodeURIComponent(value);
+  }
+  return cookies;
+};
+
+const hashPassword = (password: string) => {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+};
+
+const verifyPassword = (password: string, storedHash: string) => {
+  const [salt, hash] = storedHash.split(":");
+  if (!salt || !hash) return false;
+  const candidate = crypto.scryptSync(password, salt, 64).toString("hex");
+  const hashBuf = Buffer.from(hash, "hex");
+  const candidateBuf = Buffer.from(candidate, "hex");
+  if (hashBuf.length !== candidateBuf.length) return false;
+  return crypto.timingSafeEqual(hashBuf, candidateBuf);
+};
+
+const toCard = (row: CardRow): AtomCard => ({
+  id: row.id,
+  type: row.type,
+  content: row.content,
+  tags: (() => {
+    try {
+      const parsed = JSON.parse(row.tags_json);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })(),
+  articleTitle: row.article_title,
+  articleId: row.article_id ?? undefined
+});
 
 function expandFeedUrls(url: string) {
   if (url.startsWith('rsshub://')) {
@@ -699,9 +766,91 @@ async function startServer() {
 
   app.use(express.json());
 
-  // In-memory database for prototype
+  await fs.mkdir(path.dirname(DB_FILE), { recursive: true });
+  const db = new Database(DB_FILE);
+  db.pragma("journal_mode = WAL");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS cards (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tags_json TEXT NOT NULL,
+      article_title TEXT NOT NULL,
+      article_id INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS article_saves (
+      user_id TEXT NOT NULL,
+      article_id INTEGER NOT NULL,
+      saved_at INTEGER NOT NULL,
+      PRIMARY KEY(user_id, article_id),
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+  `);
+
+  const setSessionCookie = (res: Response, token: string) => {
+    const secure = process.env.NODE_ENV === "production";
+    res.setHeader(
+      "Set-Cookie",
+      `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure ? "; Secure" : ""}`
+    );
+  };
+
+  const clearSessionCookie = (res: Response) => {
+    const secure = process.env.NODE_ENV === "production";
+    res.setHeader(
+      "Set-Cookie",
+      `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`
+    );
+  };
+
+  const getAuthUser = (req: Request): AuthUser | null => {
+    const token = parseCookies(req.headers.cookie)[SESSION_COOKIE_NAME];
+    if (!token) return null;
+    const now = Date.now();
+    const row = db.prepare(`
+      SELECT users.id as id, users.email as email
+      FROM sessions
+      JOIN users ON users.id = sessions.user_id
+      WHERE sessions.token = ? AND sessions.expires_at > ?
+      LIMIT 1
+    `).get(token, now) as AuthUser | undefined;
+    if (!row) {
+      db.prepare("DELETE FROM sessions WHERE token = ?").run(token);
+      return null;
+    }
+    return row;
+  };
+
+  const requireAuthUser = (req: Request, res: Response) => {
+    const user = getAuthUser(req);
+    if (!user) {
+      res.status(401).json({ error: "Unauthorized" });
+      return null;
+    }
+    return user;
+  };
+
   let articles: Article[] = [];
-  let savedCards: AtomCard[] = [];
   const cachedArticles = await loadArticlesCache();
   if (cachedArticles.length > 0) {
     articles = cachedArticles;
@@ -733,12 +882,88 @@ async function startServer() {
   }, 10 * 60 * 1000);
 
   // API Routes
-  
+  app.get("/api/auth/me", (req, res) => {
+    const user = getAuthUser(req);
+    if (!user) return res.json({ user: null });
+    return res.json({ user });
+  });
+
+  app.post("/api/auth/register", (req, res) => {
+    const emailRaw = typeof req.body?.email === "string" ? req.body.email : "";
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
+    const email = normalizeEmail(emailRaw);
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ error: "邮箱格式不正确" });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ error: "密码至少 8 位" });
+    }
+    const existed = db.prepare("SELECT id FROM users WHERE email = ? LIMIT 1").get(email) as { id: string } | undefined;
+    if (existed) {
+      return res.status(409).json({ error: "邮箱已注册" });
+    }
+    const now = Date.now();
+    const userId = crypto.randomUUID();
+    const passwordHash = hashPassword(password);
+    db.prepare("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)").run(userId, email, passwordHash, now);
+    const token = crypto.randomBytes(32).toString("hex");
+    db.prepare("INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)").run(
+      token,
+      userId,
+      now + SESSION_TTL_MS,
+      now
+    );
+    setSessionCookie(res, token);
+    return res.json({ user: { id: userId, email } });
+  });
+
+  app.post("/api/auth/login", (req, res) => {
+    const emailRaw = typeof req.body?.email === "string" ? req.body.email : "";
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
+    const email = normalizeEmail(emailRaw);
+    if (!email || !password) {
+      return res.status(400).json({ error: "请输入邮箱和密码" });
+    }
+    const user = db.prepare("SELECT id, email, password_hash FROM users WHERE email = ? LIMIT 1").get(email) as {
+      id: string;
+      email: string;
+      password_hash: string;
+    } | undefined;
+    if (!user || !verifyPassword(password, user.password_hash)) {
+      return res.status(401).json({ error: "邮箱或密码错误" });
+    }
+    const now = Date.now();
+    const token = crypto.randomBytes(32).toString("hex");
+    db.prepare("INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)").run(
+      token,
+      user.id,
+      now + SESSION_TTL_MS,
+      now
+    );
+    setSessionCookie(res, token);
+    return res.json({ user: { id: user.id, email: user.email } });
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    const token = parseCookies(req.headers.cookie)[SESSION_COOKIE_NAME];
+    if (token) {
+      db.prepare("DELETE FROM sessions WHERE token = ?").run(token);
+    }
+    clearSessionCookie(res);
+    return res.json({ success: true });
+  });
+
   // Get all articles
   app.get("/api/articles", async (req, res) => {
-    // Optional: Refresh feeds periodically or on request
-    // if (articles.length === 0) articles = await fetchRSSFeeds();
-    res.json(articles);
+    const user = getAuthUser(req);
+    if (!user) {
+      const anonymous = articles.map(article => ({ ...article, saved: false }));
+      return res.json(anonymous);
+    }
+    const rows = db.prepare("SELECT article_id FROM article_saves WHERE user_id = ?").all(user.id) as Array<{ article_id: number }>;
+    const savedIds = new Set(rows.map(item => item.article_id));
+    const mapped = articles.map(article => ({ ...article, saved: savedIds.has(article.id) }));
+    return res.json(mapped);
   });
 
   app.post("/api/sources/fetch", async (req, res) => {
@@ -841,6 +1066,8 @@ async function startServer() {
 
   // Save an article (mark as saved and extract cards)
   app.post("/api/articles/:id/save", (req, res) => {
+    const user = requireAuthUser(req, res);
+    if (!user) return;
     const articleId = parseInt(req.params.id);
     const article = articles.find(a => a.id === articleId);
     
@@ -848,26 +1075,36 @@ async function startServer() {
       return res.status(404).json({ error: "Article not found" });
     }
 
-    if (!article.saved) {
-      article.saved = true;
-      
+    const existed = db.prepare("SELECT 1 FROM article_saves WHERE user_id = ? AND article_id = ? LIMIT 1").get(user.id, articleId);
+    if (!existed) {
       let cardsToSave = article.cards;
       if (!cardsToSave || cardsToSave.length === 0) {
         cardsToSave = buildCardsFromArticleContent(article);
         article.cards = cardsToSave;
       }
 
-      const newCards: AtomCard[] = cardsToSave.map(c => ({
-        ...c,
-        id: Math.random().toString(36).substr(2, 9),
-        articleTitle: article.title,
-        articleId: article.id
-      }));
-      
-      savedCards = [...newCards, ...savedCards];
+      const now = Date.now();
+      db.prepare("INSERT INTO article_saves (user_id, article_id, saved_at) VALUES (?, ?, ?)").run(user.id, articleId, now);
+      const insertCardStmt = db.prepare(`
+        INSERT INTO cards (id, user_id, type, content, tags_json, article_title, article_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const card of cardsToSave) {
+        insertCardStmt.run(
+          crypto.randomUUID(),
+          user.id,
+          card.type,
+          card.content,
+          JSON.stringify(card.tags || []),
+          article.title,
+          article.id,
+          now,
+          now
+        );
+      }
     }
 
-    res.json({ success: true, article });
+    res.json({ success: true, article: { ...article, saved: true } });
   });
 
   // Fetch full content for an article
@@ -963,37 +1200,103 @@ async function startServer() {
 
   // Get all saved cards
   app.get("/api/cards", (req, res) => {
-    res.json(savedCards);
+    const user = requireAuthUser(req, res);
+    if (!user) return;
+    const rows = db.prepare(`
+      SELECT id, type, content, tags_json, article_title, article_id
+      FROM cards
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+    `).all(user.id) as CardRow[];
+    res.json(rows.map(toCard));
   });
 
   // Add a new manual card
   app.post("/api/cards", (req, res) => {
+    const user = requireAuthUser(req, res);
+    if (!user) return;
+    const now = Date.now();
+    const type = req.body?.type as AtomCard["type"];
+    const content = typeof req.body?.content === "string" ? req.body.content.trim() : "";
+    const tags = Array.isArray(req.body?.tags) ? req.body.tags.filter((tag: unknown) => typeof tag === "string") as string[] : [];
+    const articleTitle = typeof req.body?.articleTitle === "string" && req.body.articleTitle.trim()
+      ? req.body.articleTitle.trim()
+      : "手动录入";
+    const articleId = Number.isFinite(Number(req.body?.articleId)) ? Number(req.body.articleId) : null;
+    if (!content || !["观点", "数据", "金句", "故事"].includes(type)) {
+      return res.status(400).json({ error: "Invalid card payload" });
+    }
+    const id = crypto.randomUUID();
+    db.prepare(`
+      INSERT INTO cards (id, user_id, type, content, tags_json, article_title, article_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, user.id, type, content, JSON.stringify(tags), articleTitle, articleId, now, now);
     const newCard: AtomCard = {
-      ...req.body,
-      id: Math.random().toString(36).substr(2, 9),
-      articleTitle: req.body.articleTitle || "手动录入"
+      id,
+      type,
+      content,
+      tags,
+      articleTitle,
+      articleId: articleId ?? undefined
     };
-    savedCards = [newCard, ...savedCards];
     res.json(newCard);
   });
 
   // Update a card
   app.put("/api/cards/:id", (req, res) => {
+    const user = requireAuthUser(req, res);
+    if (!user) return;
     const { id } = req.params;
-    const index = savedCards.findIndex(c => c.id === id);
-    
-    if (index === -1) {
+    const existing = db.prepare(`
+      SELECT id, type, content, tags_json, article_title, article_id
+      FROM cards
+      WHERE id = ? AND user_id = ?
+      LIMIT 1
+    `).get(id, user.id) as CardRow | undefined;
+    if (!existing) {
       return res.status(404).json({ error: "Card not found" });
     }
-
-    savedCards[index] = { ...savedCards[index], ...req.body };
-    res.json(savedCards[index]);
+    const nextType = req.body?.type && ["观点", "数据", "金句", "故事"].includes(req.body.type) ? req.body.type : existing.type;
+    const nextContent = typeof req.body?.content === "string" ? req.body.content : existing.content;
+    const nextTags = Array.isArray(req.body?.tags)
+      ? req.body.tags.filter((tag: unknown) => typeof tag === "string") as string[]
+      : (() => {
+          try {
+            const parsed = JSON.parse(existing.tags_json);
+            return Array.isArray(parsed) ? parsed : [];
+          } catch {
+            return [];
+          }
+        })();
+    const nextArticleTitle = typeof req.body?.articleTitle === "string" && req.body.articleTitle.trim()
+      ? req.body.articleTitle.trim()
+      : existing.article_title;
+    const nextArticleId = req.body?.articleId === undefined
+      ? existing.article_id
+      : Number.isFinite(Number(req.body.articleId))
+        ? Number(req.body.articleId)
+        : null;
+    db.prepare(`
+      UPDATE cards
+      SET type = ?, content = ?, tags_json = ?, article_title = ?, article_id = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?
+    `).run(nextType, nextContent, JSON.stringify(nextTags), nextArticleTitle, nextArticleId, Date.now(), id, user.id);
+    res.json({
+      id,
+      type: nextType,
+      content: nextContent,
+      tags: nextTags,
+      articleTitle: nextArticleTitle,
+      articleId: nextArticleId ?? undefined
+    } as AtomCard);
   });
 
   // Delete a card
   app.delete("/api/cards/:id", (req, res) => {
+    const user = requireAuthUser(req, res);
+    if (!user) return;
     const { id } = req.params;
-    savedCards = savedCards.filter(c => c.id !== id);
+    db.prepare("DELETE FROM cards WHERE id = ? AND user_id = ?").run(id, user.id);
     res.json({ success: true });
   });
 
@@ -1006,31 +1309,37 @@ async function startServer() {
     }
 
     try {
-      const { GoogleGenerativeAI } = await import('@google/genai');
-      const apiKey = process.env.GEMINI_API_KEY;
-      
-      if (!apiKey) {
-        console.error('Translation failed: GEMINI_API_KEY not configured');
-        return res.status(500).json({ 
-          error: "Translation service not configured",
-          details: "GEMINI_API_KEY environment variable is missing"
+      const decodeHtmlEntities = (text: string) => text
+        .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&amp;/g, "&");
+
+      const googleTranslateUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(content)}`;
+      const googleTranslateResponse = await fetch(googleTranslateUrl);
+      if (!googleTranslateResponse.ok) {
+        return res.status(502).json({
+          error: "Translation failed",
+          details: "Google Translate request failed"
         });
       }
-
-      const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
-
-      const prompt = `请将以下内容翻译成${targetLang === 'zh-CN' ? '简体中文' : targetLang}。保持原文的格式和结构，只翻译文字内容。如果是Markdown格式，保留所有Markdown标记。
-
-内容：
-${content}`;
-
-      const result = await model.generateContent(prompt);
-      const translatedText = result.response.text();
-
-      res.json({ 
-        success: true, 
-        translatedContent: translatedText,
+      const googleTranslateData = await googleTranslateResponse.json() as unknown;
+      const translatedText = Array.isArray(googleTranslateData) && Array.isArray(googleTranslateData[0])
+        ? (googleTranslateData[0] as unknown[])
+            .map(part => Array.isArray(part) ? String(part[0] || '') : '')
+            .join('')
+        : '';
+      if (!translatedText.trim()) {
+        return res.status(502).json({
+          error: "Translation failed",
+          details: "Google Translate returned empty content"
+        });
+      }
+      res.json({
+        success: true,
+        translatedContent: decodeHtmlEntities(translatedText),
         originalLength: content.length,
         translatedLength: translatedText.length
       });

@@ -139,11 +139,7 @@ export const ReaderPane: React.FC = () => {
 
       if (!response.ok) {
         console.error('Translation API error:', data);
-        if (data.details?.includes('GEMINI_API_KEY')) {
-          showToast('翻译服务未配置，请联系管理员');
-        } else {
-          showToast(`翻译失败: ${data.details || data.error || '未知错误'}`);
-        }
+        showToast(`翻译失败: ${data.details || data.error || '未知错误'}`);
         return;
       }
 

@@ -1296,7 +1296,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
       )}
       
       <div className="p-4 border-t border-border flex items-center justify-between shrink-0">
-        <div className="text-[12px] text-text3">演示原型 · v0.3</div>
+        <div className="text-[12px] text-text3">v0.3</div>
         <button onClick={toggleTheme} className="p-2 rounded-md text-text2 hover:bg-surface2 transition-colors">
           {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
         </button>
