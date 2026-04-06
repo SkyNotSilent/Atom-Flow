@@ -10,6 +10,7 @@ import { getDisplaySource } from '../utils/articleDisplay';
 export const ReaderPane: React.FC = () => {
   const { readingArticle, setReadingArticle, saveArticle, showToast, isSavingArticle, getSavingStageText, articles } = useAppContext();
   const contentRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const [isTranslating, setIsTranslating] = useState(false);
   const [translatedContent, setTranslatedContent] = useState<string | null>(null);
@@ -66,8 +67,9 @@ export const ReaderPane: React.FC = () => {
     };
   }, [isPodcast, currentArticle?.audioUrl]);
 
-  // Reset audio state when article changes
+  // Reset scroll position and audio state when article changes
   useEffect(() => {
+    scrollRef.current?.scrollTo(0, 0);
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
@@ -246,7 +248,7 @@ export const ReaderPane: React.FC = () => {
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto bg-surface">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto bg-surface">
         <div className="max-w-3xl mx-auto py-10 px-6 sm:px-12 min-h-full">
           <div className="mb-8">
             <h1 className="font-serif text-2xl sm:text-[32px] font-bold text-text-main leading-[1.4] mb-4">

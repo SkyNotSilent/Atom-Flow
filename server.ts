@@ -42,9 +42,11 @@ async function parseFirstAvailable(urls: string[]) {
   let lastError: unknown;
   for (const url of urls) {
     const expanded = expandFeedUrls(url);
+    // RSSHub 镜像多，每个给 5s；直连源只有 1 个 URL，给 10s
+    const perCandidateTimeout = expanded.length > 1 ? 5000 : 10000;
     for (const candidate of expanded) {
       try {
-        const parsed = await parser.parseURL(candidate);
+        const parsed = await withTimeout(parser.parseURL(candidate), perCandidateTimeout);
         const itemCount = parsed.items?.length ?? 0;
         if (itemCount > 0) {
           return parsed;
@@ -545,25 +547,37 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       parseWithRetry([
           'rsshub://sspai/index'
         ], 20000, 2),
-      parser.parseURL('https://www.woshipm.com/feed'),
+      parseWithRetry([
+          'https://www.woshipm.com/feed',
+          'rsshub://woshipm/popular'
+        ], 20000, 2),
       parseWithRetry([
           'rsshub://36kr/hot-list',
           'https://36kr.com/feed',
           'rsshub://36kr/news'
         ], 20000, 2),
-      parser.parseURL('https://www.huxiu.com/rss/0.xml'),
-      parser.parseURL('https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml'),
+      parseWithRetry([
+          'https://www.huxiu.com/rss/0.xml',
+          'rsshub://huxiu/article'
+        ], 20000, 2),
+      parseWithRetry([
+          'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml'
+        ], 20000, 2),
       parseWithRetry([
           'https://plink.anyfeeder.com/weixin/AI_era'
         ], 20000, 2),
       parseWithRetry([
           'rsshub://jike/topic/63579abb6724cc583b9bba9a'
         ], 20000, 2),
-      parser.parseURL('https://github.blog/feed/'),
+      parseWithRetry([
+          'https://github.blog/feed/'
+        ], 20000, 2),
       parseWithRetry([
           'rsshub://twitter/user/sama'
         ], 20000, 2),
-      parser.parseURL('https://feed.xyzfm.space/dk4yh3pkpjp3'),
+      parseWithRetry([
+          'https://feed.xyzfm.space/dk4yh3pkpjp3'
+        ], 20000, 2),
       parseWithRetry([
           'rsshub://youtube/user/%40lexfridman',
           'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA'
@@ -713,7 +727,7 @@ async function startServer() {
     try {
       const fresh = await fetchRSSFeeds();
       console.log(`Fetched ${fresh.length} fresh articles`);
-      
+
       // 只有当新数据不为空时才合并
       if (fresh.length > 0) {
         const withFallback = mergeWithSourceFallback(articles, fresh);
@@ -727,7 +741,13 @@ async function startServer() {
       console.error('Failed to refresh feeds, keeping existing data:', error);
     }
   };
-  await refreshFeeds();
+  // 如果有缓存数据，不阻塞启动，后台异步刷新
+  if (articles.length > 0) {
+    console.log(`Using ${articles.length} cached articles, refreshing in background...`);
+    refreshFeeds();
+  } else {
+    await refreshFeeds();
+  }
   setInterval(() => {
     refreshFeeds().catch(error => console.error('Failed to refresh feeds:', error));
   }, 10 * 60 * 1000);
