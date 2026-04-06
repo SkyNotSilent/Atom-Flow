@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { Article } from '../types';
 import { cn } from '../components/Nav';
@@ -12,6 +12,7 @@ export const FeedPage: React.FC = () => {
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [isRetrying, setIsRetrying] = useState(false);
   const [currentDate, setCurrentDate] = useState('');
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   // 实时更新日期
   React.useEffect(() => {
@@ -133,13 +134,18 @@ export const FeedPage: React.FC = () => {
     return rankArticles(articles);
   }, [articles, activeSource]);
 
+  // 切换信息源时滚动到顶部
+  useEffect(() => {
+    scrollRef.current?.scrollTo(0, 0);
+  }, [activeSource]);
+
   const handleSave = async (article: Article) => {
     if (article.saved || isSavingArticle(article.id)) return;
     await saveArticle(article.id);
   };
 
   return (
-    <div className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6 w-full">
+    <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6 w-full">
       <div className="mb-4 sm:mb-6 flex items-center justify-between">
         <div>
           <h1 className="font-serif text-[18px] sm:text-[20px] font-bold text-text-main">{activeSource || '今日推送'}</h1>
