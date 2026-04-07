@@ -24,6 +24,13 @@ interface AppState {
   setKnowledgeTypeFilter: (filter: string) => void;
   knowledgeSourceFilter: string;
   setKnowledgeSourceFilter: (filter: string) => void;
+  user: { id: number; email: string } | null;
+  isAuthLoading: boolean;
+  showLoginModal: boolean;
+  setShowLoginModal: (show: boolean) => void;
+  loginAndDo: (action: () => void) => void;
+  handleLoginSuccess: (user: { id: number; email: string }) => void;
+  logout: () => Promise<void>;
 }
 
 const AppContext = createContext<AppState | undefined>(undefined);
@@ -38,6 +45,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [savingState, setSavingState] = useState<{ articleId: number | null; stage: string | null }>({ articleId: null, stage: null });
   const [knowledgeTypeFilter, setKnowledgeTypeFilter] = useState('来源');
   const [knowledgeSourceFilter, setKnowledgeSourceFilter] = useState('全部');
+  const [user, setUser] = useState<{ id: number; email: string } | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
   const quickOpenMode = true;
   const forceRefetchInTesting = false;
   const saveStages = ['提取全文', '识别要点', '原子化拆分', '提炼入库'];
@@ -96,12 +107,30 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const cardsRes = await fetch('/api/cards');
+        // Check auth status first
+        const authRes = await fetch('/api/auth/me');
+        let loggedIn = false;
+        if (authRes.ok) {
+          const authData = await authRes.json();
+          if (authData.user) {
+            setUser(authData.user);
+            loggedIn = true;
+          }
+        }
+        setIsAuthLoading(false);
+
         await reloadArticles();
-        const cardsData = await cardsRes.json();
-        setSavedCards(cardsData);
+
+        // Only fetch cards if logged in
+        if (loggedIn) {
+          const cardsRes = await fetch('/api/cards');
+          if (cardsRes.ok) {
+            setSavedCards(await cardsRes.json());
+          }
+        }
       } catch (error) {
         console.error("Failed to fetch initial data:", error);
+        setIsAuthLoading(false);
       }
     };
     fetchData();
@@ -118,6 +147,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const toggleTheme = () => setTheme(prev => prev === 'light' ? 'dark' : 'light');
 
   const saveArticle = async (articleId: number) => {
+    if (!user) {
+      setPendingAction(() => () => { void saveArticle(articleId); });
+      setShowLoginModal(true);
+      return;
+    }
     if (savingState.articleId !== null) return;
     try {
       setSavingState({ articleId, stage: saveStages[0] });
@@ -205,6 +239,40 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
+  const loginAndDo = (action: () => void) => {
+    if (user) {
+      action();
+      return;
+    }
+    setPendingAction(() => action);
+    setShowLoginModal(true);
+  };
+
+  const handleLoginSuccess = async (userData: { id: number; email: string }) => {
+    setUser(userData);
+    setShowLoginModal(false);
+    // Fetch cards now that user is logged in
+    try {
+      const cardsRes = await fetch('/api/cards');
+      if (cardsRes.ok) {
+        setSavedCards(await cardsRes.json());
+      }
+    } catch {}
+    // Execute pending action
+    if (pendingAction) {
+      pendingAction();
+      setPendingAction(null);
+    }
+  };
+
+  const logout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {}
+    setUser(null);
+    setSavedCards([]);
+  };
+
   const showToast = (msg: string) => {
     setToastMsg(msg);
     setTimeout(() => {
@@ -213,8 +281,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   return (
-    <AppContext.Provider value={{ 
-      articles, savedCards, saveArticle, addCards, addCard, updateCard, deleteCard, 
+    <AppContext.Provider value={{
+      articles, savedCards, saveArticle, addCards, addCard, updateCard, deleteCard,
       showToast, toastMsg, theme, toggleTheme,
       readingArticle, setReadingArticle,
       activeSource, setActiveSource,
@@ -224,7 +292,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       knowledgeTypeFilter,
       setKnowledgeTypeFilter,
       knowledgeSourceFilter,
-      setKnowledgeSourceFilter
+      setKnowledgeSourceFilter,
+      user, isAuthLoading, showLoginModal, setShowLoginModal,
+      loginAndDo, handleLoginSuccess, logout
     }}>
       {children}
     </AppContext.Provider>

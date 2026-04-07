@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X } from 'lucide-react';
+import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut, User } from 'lucide-react';
 import { getKnowledgeLinkedArticles } from '../utils/articleDisplay';
 
 export function cn(...inputs: ClassValue[]) {
@@ -239,7 +239,8 @@ const loadEntriesFromStorage = (): NavEntry[] => {
 export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const {
     articles, savedCards, theme, toggleTheme, setActiveSource, showToast, reloadArticles, activeSource,
-    knowledgeTypeFilter, setKnowledgeTypeFilter, setKnowledgeSourceFilter
+    knowledgeTypeFilter, setKnowledgeTypeFilter, setKnowledgeSourceFilter,
+    user, loginAndDo, logout
   } = useAppContext();
   const [sourceEntries, setSourceEntries] = useState<NavEntry[]>(() => loadEntriesFromStorage());
   const [draggingId, setDraggingId] = useState<string | null>(null);
@@ -331,6 +332,10 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   }, [sourceEntries]);
 
   const handleTabClick = (tab: 'feed' | 'knowledge' | 'write' | 'discover') => {
+    if ((tab === 'knowledge' || tab === 'write') && !user) {
+      loginAndDo(() => setActiveTab(tab));
+      return;
+    }
     setActiveTab(tab);
     if (tab === 'feed') {
       setActiveSource(null);
@@ -1296,8 +1301,28 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
       )}
       
       <div className="p-4 border-t border-border flex items-center justify-between shrink-0">
-        <div className="text-[12px] text-text3">演示原型 · v0.3</div>
-        <button onClick={toggleTheme} className="p-2 rounded-md text-text2 hover:bg-surface2 transition-colors">
+        {user ? (
+          <div className="flex items-center gap-2 min-w-0">
+            <User size={14} className="text-text3 shrink-0" />
+            <span className="text-[12px] text-text2 truncate">{user.email}</span>
+            <button
+              onClick={() => void logout()}
+              className="p-1 rounded-md text-text3 hover:text-red-500 hover:bg-surface2 transition-colors shrink-0"
+              title="登出"
+            >
+              <LogOut size={14} />
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => loginAndDo(() => {})}
+            className="flex items-center gap-1.5 text-[12px] text-accent hover:opacity-80 transition-opacity"
+          >
+            <LogIn size={14} />
+            登录 / 注册
+          </button>
+        )}
+        <button onClick={toggleTheme} className="p-2 rounded-md text-text2 hover:bg-surface2 transition-colors shrink-0">
           {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
         </button>
       </div>

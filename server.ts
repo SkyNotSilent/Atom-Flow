@@ -8,8 +8,59 @@ import { Readability } from "@mozilla/readability";
 import { promises as fs } from "fs";
 import path from "path";
 import dotenv from "dotenv";
+import Database from "better-sqlite3";
+import session from "express-session";
+import { Store } from "express-session";
+import { Resend } from "resend";
+import nodemailer from "nodemailer";
 
 dotenv.config();
+
+// Extend express-session types
+declare module "express-session" {
+  interface SessionData {
+    userId?: number;
+    email?: string;
+  }
+}
+
+// --- Inline SQLite Session Store ---
+class SqliteSessionStore extends Store {
+  private db: Database.Database;
+  constructor(db: Database.Database) {
+    super();
+    this.db = db;
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        sid TEXT PRIMARY KEY,
+        sess TEXT NOT NULL,
+        expired TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_expired ON sessions(expired);
+    `);
+    this.db.prepare('DELETE FROM sessions WHERE expired < datetime(?)').run(new Date().toISOString());
+  }
+  get(sid: string, callback: (err: any, session?: session.SessionData | null) => void) {
+    try {
+      const row = this.db.prepare('SELECT sess FROM sessions WHERE sid = ? AND expired > datetime(?)').get(sid, new Date().toISOString()) as any;
+      callback(null, row ? JSON.parse(row.sess) : null);
+    } catch (err) { callback(err); }
+  }
+  set(sid: string, sess: session.SessionData, callback?: (err?: any) => void) {
+    try {
+      const maxAge = sess.cookie?.maxAge || 86400000 * 7;
+      const expired = new Date(Date.now() + maxAge).toISOString();
+      this.db.prepare('REPLACE INTO sessions (sid, sess, expired) VALUES (?, ?, datetime(?))').run(sid, JSON.stringify(sess), expired);
+      callback?.();
+    } catch (err) { callback?.(err); }
+  }
+  destroy(sid: string, callback?: (err?: any) => void) {
+    try {
+      this.db.prepare('DELETE FROM sessions WHERE sid = ?').run(sid);
+      callback?.();
+    } catch (err) { callback?.(err); }
+  }
+}
 
 const parser = new Parser({
   headers: {
@@ -711,7 +762,53 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3001);
 
+  // --- Database init ---
+  const dbPath = path.join(process.cwd(), ".cache", "atomflow.db");
+  await fs.mkdir(path.dirname(dbPath), { recursive: true });
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS verification_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      code TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_vc_email ON verification_codes(email, used, expires_at);
+  `);
+
+  const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+
+  // Gmail SMTP transporter (preferred over Resend for free usage)
+  const smtpTransporter = process.env.SMTP_USER && process.env.SMTP_PASS
+    ? nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+      })
+    : null;
+
   app.use(express.json());
+
+  // --- Session middleware ---
+  app.use(session({
+    store: new SqliteSessionStore(db),
+    secret: process.env.SESSION_SECRET || 'atomflow-dev-secret-change-in-prod',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    }
+  }));
 
   // In-memory database for prototype
   let articles: Article[] = [];
@@ -751,6 +848,114 @@ async function startServer() {
   setInterval(() => {
     refreshFeeds().catch(error => console.error('Failed to refresh feeds:', error));
   }, 10 * 60 * 1000);
+
+  // --- Auth Routes ---
+
+  app.post("/api/auth/send-code", async (req, res) => {
+    const email = (req.body?.email || '').trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: '请输入有效的邮箱地址' });
+    }
+    if (!smtpTransporter && !resend) {
+      return res.status(500).json({ error: '邮件服务未配置' });
+    }
+
+    const now = new Date().toISOString();
+    const recent = db.prepare(
+      "SELECT id FROM verification_codes WHERE email = ? AND created_at > datetime(?, '-60 seconds') AND used = 0"
+    ).get(email, now) as any;
+    if (recent) {
+      return res.status(429).json({ error: '发送过于频繁，请 60 秒后再试' });
+    }
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    db.prepare('INSERT INTO verification_codes (email, code, expires_at) VALUES (?, ?, ?)').run(email, code, expiresAt);
+
+    console.log(`[AUTH] 验证码 → ${email}: ${code}`);
+
+    const htmlContent = `
+      <div style="font-family: sans-serif; max-width: 400px; margin: 0 auto; padding: 20px;">
+        <h2 style="color: #1C1916;">AtomFlow 验证码</h2>
+        <p style="color: #6B6560; font-size: 14px;">你的验证码是：</p>
+        <div style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #2B6CB0; padding: 16px 0;">${code}</div>
+        <p style="color: #A09890; font-size: 12px;">验证码有效期 10 分钟，请尽快使用。</p>
+      </div>
+    `;
+
+    try {
+      if (smtpTransporter) {
+        await smtpTransporter.sendMail({
+          from: `AtomFlow <${process.env.SMTP_USER}>`,
+          to: email,
+          subject: '你的 AtomFlow 登录验证码',
+          html: htmlContent
+        });
+      } else if (resend) {
+        await resend.emails.send({
+          from: 'AtomFlow <onboarding@resend.dev>',
+          to: email,
+          subject: '你的 AtomFlow 登录验证码',
+          html: htmlContent
+        });
+      }
+      return res.json({ success: true });
+    } catch (error) {
+      console.error('Failed to send verification code:', error);
+      return res.status(500).json({ error: '发送验证码失败，请稍后再试' });
+    }
+  });
+
+  app.post("/api/auth/verify", (req, res) => {
+    const email = (req.body?.email || '').trim().toLowerCase();
+    const code = (req.body?.code || '').trim();
+    if (!email || !code) {
+      return res.status(400).json({ error: '请输入邮箱和验证码' });
+    }
+
+    const now = new Date().toISOString();
+    const record = db.prepare(
+      'SELECT id FROM verification_codes WHERE email = ? AND code = ? AND used = 0 AND expires_at > datetime(?)'
+    ).get(email, code, now) as any;
+    if (!record) {
+      return res.status(400).json({ error: '验证码无效或已过期' });
+    }
+
+    db.prepare('UPDATE verification_codes SET used = 1 WHERE id = ?').run(record.id);
+
+    let user = db.prepare('SELECT id, email FROM users WHERE email = ?').get(email) as any;
+    if (!user) {
+      const result = db.prepare('INSERT INTO users (email) VALUES (?)').run(email);
+      user = { id: result.lastInsertRowid, email };
+    }
+
+    req.session.userId = user.id as number;
+    req.session.email = user.email as string;
+    return res.json({ success: true, user: { id: user.id, email: user.email } });
+  });
+
+  app.get("/api/auth/me", (req, res) => {
+    if (!req.session.userId) {
+      return res.json({ user: null });
+    }
+    return res.json({ user: { id: req.session.userId, email: req.session.email } });
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    req.session.destroy((err) => {
+      if (err) return res.status(500).json({ error: '登出失败' });
+      res.clearCookie('connect.sid');
+      return res.json({ success: true });
+    });
+  });
+
+  // --- Auth middleware ---
+  const requireAuth: express.RequestHandler = (req, res, next) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: '请先登录' });
+    }
+    next();
+  };
 
   // API Routes
   
@@ -860,7 +1065,7 @@ async function startServer() {
   });
 
   // Save an article (mark as saved and extract cards)
-  app.post("/api/articles/:id/save", (req, res) => {
+  app.post("/api/articles/:id/save", requireAuth, (req, res) => {
     const articleId = parseInt(req.params.id);
     const article = articles.find(a => a.id === articleId);
     
@@ -982,12 +1187,12 @@ async function startServer() {
   });
 
   // Get all saved cards
-  app.get("/api/cards", (req, res) => {
+  app.get("/api/cards", requireAuth, (req, res) => {
     res.json(savedCards);
   });
 
   // Add a new manual card
-  app.post("/api/cards", (req, res) => {
+  app.post("/api/cards", requireAuth, (req, res) => {
     const newCard: AtomCard = {
       ...req.body,
       id: Math.random().toString(36).substr(2, 9),
@@ -998,7 +1203,7 @@ async function startServer() {
   });
 
   // Update a card
-  app.put("/api/cards/:id", (req, res) => {
+  app.put("/api/cards/:id", requireAuth, (req, res) => {
     const { id } = req.params;
     const index = savedCards.findIndex(c => c.id === id);
     
@@ -1011,14 +1216,14 @@ async function startServer() {
   });
 
   // Delete a card
-  app.delete("/api/cards/:id", (req, res) => {
+  app.delete("/api/cards/:id", requireAuth, (req, res) => {
     const { id } = req.params;
     savedCards = savedCards.filter(c => c.id !== id);
     res.json({ success: true });
   });
 
   // Translate article content
-  app.post("/api/translate", async (req, res) => {
+  app.post("/api/translate", requireAuth, async (req, res) => {
     const { content, targetLang = 'zh-CN' } = req.body;
     
     if (!content) {
