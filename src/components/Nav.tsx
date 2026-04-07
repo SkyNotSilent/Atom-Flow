@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut, User } from 'lucide-react';
+import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut } from 'lucide-react';
 import { getKnowledgeLinkedArticles } from '../utils/articleDisplay';
 
 export function cn(...inputs: ClassValue[]) {
@@ -240,7 +240,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const {
     articles, savedCards, theme, toggleTheme, setActiveSource, showToast, reloadArticles, activeSource,
     knowledgeTypeFilter, setKnowledgeTypeFilter, setKnowledgeSourceFilter,
-    user, loginAndDo, logout
+    user, loginAndDo, logout, setShowProfileModal
   } = useAppContext();
   const [sourceEntries, setSourceEntries] = useState<NavEntry[]>(() => loadEntriesFromStorage());
   const [draggingId, setDraggingId] = useState<string | null>(null);
@@ -1303,8 +1303,25 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
       <div className="p-4 border-t border-border flex items-center justify-between shrink-0">
         {user ? (
           <div className="flex items-center gap-2 min-w-0">
-            <User size={14} className="text-text3 shrink-0" />
-            <span className="text-[12px] text-text2 truncate">{user.email}</span>
+            <button
+              onClick={() => setShowProfileModal(true)}
+              className="flex items-center gap-2 min-w-0 hover:opacity-80 transition-opacity"
+            >
+              {user.avatar_url ? (
+                <img
+                  src={user.avatar_url}
+                  alt=""
+                  className="w-6 h-6 rounded-full object-cover shrink-0"
+                />
+              ) : (
+                <div className="w-6 h-6 rounded-full bg-accent text-white flex items-center justify-center text-[11px] font-medium shrink-0">
+                  {(user.nickname || user.email)[0].toUpperCase()}
+                </div>
+              )}
+              <span className="text-[12px] text-text2 truncate">
+                {user.nickname || user.email.split('@')[0]}
+              </span>
+            </button>
             <button
               onClick={() => void logout()}
               className="p-1 rounded-md text-text3 hover:text-red-500 hover:bg-surface2 transition-colors shrink-0"

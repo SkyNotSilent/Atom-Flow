@@ -1,7 +1,8 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { MOCK_ARTICLES } from "./src/data/mock.js";
-import { AtomCard, Article } from "./src/types.js";
+import { AtomCard, Article, User } from "./src/types.js";
+import multer from "multer";
 import Parser from "rss-parser";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
@@ -760,7 +761,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
 
 async function startServer() {
   const app = express();
-  const PORT = Number(process.env.PORT || 3001);
+  const PORT = Number(process.env.PORT || 3000);
 
   // --- Database init ---
   const dbPath = path.join(process.cwd(), ".cache", "atomflow.db");
@@ -784,6 +785,28 @@ async function startServer() {
     CREATE INDEX IF NOT EXISTS idx_vc_email ON verification_codes(email, used, expires_at);
   `);
 
+  // Migrate: add profile columns to users table
+  try { db.exec('ALTER TABLE users ADD COLUMN nickname TEXT'); } catch {}
+  try { db.exec('ALTER TABLE users ADD COLUMN avatar_url TEXT'); } catch {}
+
+  // Backfill: set default nickname for existing users who don't have one
+  db.prepare("UPDATE users SET nickname = substr(email, 1, instr(email, '@') - 1) WHERE nickname IS NULL").run();
+  // Create saved_cards table for per-user card persistence
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS saved_cards (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tags TEXT NOT NULL DEFAULT '[]',
+      article_title TEXT NOT NULL DEFAULT '',
+      article_id INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_saved_cards_user ON saved_cards(user_id);
+  `);
+
   const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
   // Gmail SMTP transporter (preferred over Resend for free usage)
@@ -793,6 +816,27 @@ async function startServer() {
         auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
       })
     : null;
+
+  // Avatar upload setup
+  const avatarsDir = path.join(process.cwd(), '.cache', 'avatars');
+  await fs.mkdir(avatarsDir, { recursive: true });
+
+  const avatarStorage = multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, avatarsDir),
+    filename: (req: any, _file, cb) => {
+      const ext = path.extname(_file.originalname) || '.jpg';
+      cb(null, `${req.session.userId}-${Date.now()}${ext}`);
+    }
+  });
+
+  const avatarUpload = multer({
+    storage: avatarStorage,
+    limits: { fileSize: 2 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+      cb(null, allowed.includes(file.mimetype));
+    }
+  });
 
   app.use(express.json());
 
@@ -812,7 +856,6 @@ async function startServer() {
 
   // In-memory database for prototype
   let articles: Article[] = [];
-  let savedCards: AtomCard[] = [];
   const cachedArticles = await loadArticlesCache();
   if (cachedArticles.length > 0) {
     articles = cachedArticles;
@@ -923,22 +966,27 @@ async function startServer() {
 
     db.prepare('UPDATE verification_codes SET used = 1 WHERE id = ?').run(record.id);
 
-    let user = db.prepare('SELECT id, email FROM users WHERE email = ?').get(email) as any;
+    let user = db.prepare('SELECT id, email, nickname, avatar_url FROM users WHERE email = ?').get(email) as any;
     if (!user) {
-      const result = db.prepare('INSERT INTO users (email) VALUES (?)').run(email);
-      user = { id: result.lastInsertRowid, email };
+      const nickname = email.split('@')[0];
+      const result = db.prepare('INSERT INTO users (email, nickname) VALUES (?, ?)').run(email, nickname);
+      user = { id: result.lastInsertRowid, email, nickname, avatar_url: null };
     }
 
     req.session.userId = user.id as number;
     req.session.email = user.email as string;
-    return res.json({ success: true, user: { id: user.id, email: user.email } });
+    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
   });
 
   app.get("/api/auth/me", (req, res) => {
     if (!req.session.userId) {
       return res.json({ user: null });
     }
-    return res.json({ user: { id: req.session.userId, email: req.session.email } });
+    const user = db.prepare('SELECT id, email, nickname, avatar_url FROM users WHERE id = ?').get(req.session.userId) as any;
+    if (!user) {
+      return res.json({ user: null });
+    }
+    return res.json({ user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
   });
 
   app.post("/api/auth/logout", (req, res) => {
@@ -956,6 +1004,40 @@ async function startServer() {
     }
     next();
   };
+
+  // --- Profile routes ---
+
+  app.put("/api/auth/profile", requireAuth, (req, res) => {
+    const nickname = (req.body?.nickname || '').trim();
+    if (!nickname || nickname.length > 30) {
+      return res.status(400).json({ error: '昵称不能为空且不超过30个字符' });
+    }
+    db.prepare('UPDATE users SET nickname = ? WHERE id = ?').run(nickname, req.session.userId);
+    const user = db.prepare('SELECT id, email, nickname, avatar_url FROM users WHERE id = ?').get(req.session.userId) as any;
+    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
+  });
+
+  app.post("/api/auth/avatar", requireAuth, avatarUpload.single('avatar'), async (req: any, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: '请上传有效的图片文件（JPG/PNG/GIF/WebP，最大2MB）' });
+    }
+    const avatarUrl = `/api/avatars/${req.file.filename}`;
+
+    // Delete old avatar file
+    const oldUser = db.prepare('SELECT avatar_url FROM users WHERE id = ?').get(req.session.userId) as any;
+    if (oldUser?.avatar_url) {
+      const oldFilename = oldUser.avatar_url.replace('/api/avatars/', '');
+      const oldPath = path.join(avatarsDir, oldFilename);
+      await fs.unlink(oldPath).catch(() => {});
+    }
+
+    db.prepare('UPDATE users SET avatar_url = ? WHERE id = ?').run(avatarUrl, req.session.userId);
+    const user = db.prepare('SELECT id, email, nickname, avatar_url FROM users WHERE id = ?').get(req.session.userId) as any;
+    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
+  });
+
+  // Serve avatar files
+  app.use('/api/avatars', express.static(avatarsDir, { maxAge: '7d' }));
 
   // API Routes
   
@@ -1068,14 +1150,16 @@ async function startServer() {
   app.post("/api/articles/:id/save", requireAuth, (req, res) => {
     const articleId = parseInt(req.params.id);
     const article = articles.find(a => a.id === articleId);
-    
+
     if (!article) {
       return res.status(404).json({ error: "Article not found" });
     }
 
-    if (!article.saved) {
+    // Check if this user already saved cards for this article
+    const existingCard = db.prepare('SELECT id FROM saved_cards WHERE user_id = ? AND article_id = ?').get(req.session.userId, articleId) as any;
+    if (!existingCard) {
       article.saved = true;
-      
+
       let cardsToSave = article.cards;
       if (!cardsToSave || cardsToSave.length === 0) {
         cardsToSave = buildCardsFromArticleContent(article);
@@ -1088,8 +1172,14 @@ async function startServer() {
         articleTitle: article.title,
         articleId: article.id
       }));
-      
-      savedCards = [...newCards, ...savedCards];
+
+      const insertStmt = db.prepare('INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
+      const insertMany = db.transaction((cards: AtomCard[]) => {
+        for (const card of cards) {
+          insertStmt.run(card.id, req.session.userId, card.type, card.content, JSON.stringify(card.tags), card.articleTitle, card.articleId || null);
+        }
+      });
+      insertMany(newCards);
     }
 
     res.json({ success: true, article });
@@ -1188,7 +1278,9 @@ async function startServer() {
 
   // Get all saved cards
   app.get("/api/cards", requireAuth, (req, res) => {
-    res.json(savedCards);
+    const rows = db.prepare('SELECT id, type, content, tags, article_title AS articleTitle, article_id AS articleId FROM saved_cards WHERE user_id = ? ORDER BY created_at DESC').all(req.session.userId) as any[];
+    const cards = rows.map((r: any) => ({ ...r, tags: JSON.parse(r.tags) }));
+    res.json(cards);
   });
 
   // Add a new manual card
@@ -1198,27 +1290,37 @@ async function startServer() {
       id: Math.random().toString(36).substr(2, 9),
       articleTitle: req.body.articleTitle || "手动录入"
     };
-    savedCards = [newCard, ...savedCards];
+    db.prepare('INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+      newCard.id, req.session.userId, newCard.type, newCard.content,
+      JSON.stringify(newCard.tags), newCard.articleTitle, newCard.articleId || null
+    );
     res.json(newCard);
   });
 
   // Update a card
   app.put("/api/cards/:id", requireAuth, (req, res) => {
     const { id } = req.params;
-    const index = savedCards.findIndex(c => c.id === id);
-    
-    if (index === -1) {
+    const existing = db.prepare('SELECT id FROM saved_cards WHERE id = ? AND user_id = ?').get(id, req.session.userId) as any;
+    if (!existing) {
       return res.status(404).json({ error: "Card not found" });
     }
 
-    savedCards[index] = { ...savedCards[index], ...req.body };
-    res.json(savedCards[index]);
+    const { type, content, tags } = req.body;
+    if (type !== undefined) db.prepare('UPDATE saved_cards SET type = ? WHERE id = ? AND user_id = ?').run(type, id, req.session.userId);
+    if (content !== undefined) db.prepare('UPDATE saved_cards SET content = ? WHERE id = ? AND user_id = ?').run(content, id, req.session.userId);
+    if (tags !== undefined) db.prepare('UPDATE saved_cards SET tags = ? WHERE id = ? AND user_id = ?').run(JSON.stringify(tags), id, req.session.userId);
+
+    const row = db.prepare('SELECT id, type, content, tags, article_title AS articleTitle, article_id AS articleId FROM saved_cards WHERE id = ? AND user_id = ?').get(id, req.session.userId) as any;
+    res.json({ ...row, tags: JSON.parse(row.tags) });
   });
 
   // Delete a card
   app.delete("/api/cards/:id", requireAuth, (req, res) => {
     const { id } = req.params;
-    savedCards = savedCards.filter(c => c.id !== id);
+    const result = db.prepare('DELETE FROM saved_cards WHERE id = ? AND user_id = ?').run(id, req.session.userId);
+    if (result.changes === 0) {
+      return res.status(404).json({ error: "Card not found" });
+    }
     res.json({ success: true });
   });
 

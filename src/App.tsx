@@ -13,6 +13,7 @@ import { WritePage } from "./pages/WritePage";
 import { DiscoverPage } from "./pages/DiscoverPage";
 import { ReaderPane } from "./components/ReaderModal";
 import { LoginModal } from "./components/LoginModal";
+import { ProfileModal } from "./components/ProfileModal";
 
 class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
   state = { hasError: false };
@@ -48,7 +49,7 @@ function AppContent() {
   const [activeTab, setActiveTab] = useState<"feed" | "knowledge" | "write" | "discover">(
     "feed",
   );
-  const { readingArticle, showLoginModal, setShowLoginModal, handleLoginSuccess } = useAppContext();
+  const { readingArticle, showLoginModal, setShowLoginModal, handleLoginSuccess, showProfileModal, setShowProfileModal } = useAppContext();
   const containerRef = useRef<HTMLDivElement>(null);
   const [navWidth, setNavWidth] = useState(260);
   const [centerWidth, setCenterWidth] = useState(560);
@@ -226,6 +227,10 @@ function AppContent() {
         isOpen={showLoginModal}
         onClose={() => setShowLoginModal(false)}
         onSuccess={(u) => void handleLoginSuccess(u)}
+      />
+      <ProfileModal
+        isOpen={showProfileModal}
+        onClose={() => setShowProfileModal(false)}
       />
     </div>
   );

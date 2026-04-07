@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { Article, AtomCard } from '../types';
+import { Article, AtomCard, User } from '../types';
 
 interface AppState {
   articles: Article[];
@@ -24,13 +24,17 @@ interface AppState {
   setKnowledgeTypeFilter: (filter: string) => void;
   knowledgeSourceFilter: string;
   setKnowledgeSourceFilter: (filter: string) => void;
-  user: { id: number; email: string } | null;
+  user: User | null;
   isAuthLoading: boolean;
   showLoginModal: boolean;
   setShowLoginModal: (show: boolean) => void;
   loginAndDo: (action: () => void) => void;
-  handleLoginSuccess: (user: { id: number; email: string }) => void;
+  handleLoginSuccess: (user: User) => void;
   logout: () => Promise<void>;
+  updateProfile: (nickname: string) => Promise<void>;
+  updateAvatar: (file: File) => Promise<void>;
+  showProfileModal: boolean;
+  setShowProfileModal: (show: boolean) => void;
 }
 
 const AppContext = createContext<AppState | undefined>(undefined);
@@ -45,10 +49,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [savingState, setSavingState] = useState<{ articleId: number | null; stage: string | null }>({ articleId: null, stage: null });
   const [knowledgeTypeFilter, setKnowledgeTypeFilter] = useState('来源');
   const [knowledgeSourceFilter, setKnowledgeSourceFilter] = useState('全部');
-  const [user, setUser] = useState<{ id: number; email: string } | null>(null);
+  const [user, setUser] = useState<User | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+  const [showProfileModal, setShowProfileModal] = useState(false);
   const quickOpenMode = true;
   const forceRefetchInTesting = false;
   const saveStages = ['提取全文', '识别要点', '原子化拆分', '提炼入库'];
@@ -248,7 +253,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setShowLoginModal(true);
   };
 
-  const handleLoginSuccess = async (userData: { id: number; email: string }) => {
+  const handleLoginSuccess = async (userData: User) => {
     setUser(userData);
     setShowLoginModal(false);
     // Fetch cards now that user is logged in
@@ -273,6 +278,35 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setSavedCards([]);
   };
 
+  const updateProfile = async (nickname: string) => {
+    const res = await fetch('/api/auth/profile', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nickname })
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || '保存失败');
+    }
+    const data = await res.json();
+    setUser(data.user);
+  };
+
+  const updateAvatar = async (file: File) => {
+    const formData = new FormData();
+    formData.append('avatar', file);
+    const res = await fetch('/api/auth/avatar', {
+      method: 'POST',
+      body: formData
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || '上传失败');
+    }
+    const data = await res.json();
+    setUser(data.user);
+  };
+
   const showToast = (msg: string) => {
     setToastMsg(msg);
     setTimeout(() => {
@@ -294,7 +328,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       knowledgeSourceFilter,
       setKnowledgeSourceFilter,
       user, isAuthLoading, showLoginModal, setShowLoginModal,
-      loginAndDo, handleLoginSuccess, logout
+      loginAndDo, handleLoginSuccess, logout,
+      updateProfile, updateAvatar, showProfileModal, setShowProfileModal
     }}>
       {children}
     </AppContext.Provider>
