@@ -927,16 +927,16 @@ async function startServer() {
     `;
 
     try {
-      if (smtpTransporter) {
-        await smtpTransporter.sendMail({
-          from: `AtomFlow <${process.env.SMTP_USER}>`,
+      if (resend) {
+        await resend.emails.send({
+          from: 'AtomFlow <onboarding@resend.dev>',
           to: email,
           subject: '你的 AtomFlow 登录验证码',
           html: htmlContent
         });
-      } else if (resend) {
-        await resend.emails.send({
-          from: 'AtomFlow <onboarding@resend.dev>',
+      } else if (smtpTransporter) {
+        await smtpTransporter.sendMail({
+          from: `AtomFlow <${process.env.SMTP_USER}>`,
           to: email,
           subject: '你的 AtomFlow 登录验证码',
           html: htmlContent
