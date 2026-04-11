@@ -929,7 +929,7 @@ async function startServer() {
     try {
       if (resend) {
         await resend.emails.send({
-          from: 'AtomFlow <onboarding@resend.dev>',
+          from: 'AtomFlow <noreply@atomflow.cloud>',
           to: email,
           subject: '你的 AtomFlow 登录验证码',
           html: htmlContent
