@@ -761,7 +761,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
 
 async function startServer() {
   const app = express();
-  const PORT = Number(process.env.PORT || 3000);
+  const PORT = Number(process.env.PORT || 3001);
 
   // --- Database init ---
   const dbPath = path.join(process.cwd(), ".cache", "atomflow.db");
