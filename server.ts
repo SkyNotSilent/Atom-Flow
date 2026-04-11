@@ -9,13 +9,16 @@ import { Readability } from "@mozilla/readability";
 import { promises as fs } from "fs";
 import path from "path";
 import dotenv from "dotenv";
-import Database from "better-sqlite3";
+import pg from "pg";
 import session from "express-session";
-import { Store } from "express-session";
+import connectPgSimple from "connect-pg-simple";
 import { Resend } from "resend";
 import nodemailer from "nodemailer";
 
 dotenv.config();
+
+// Parse BIGINT as number instead of string
+pg.types.setTypeParser(20, v => v === null ? null : Number(v));
 
 // Extend express-session types
 declare module "express-session" {
@@ -25,43 +28,9 @@ declare module "express-session" {
   }
 }
 
-// --- Inline SQLite Session Store ---
-class SqliteSessionStore extends Store {
-  private db: Database.Database;
-  constructor(db: Database.Database) {
-    super();
-    this.db = db;
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
-        sid TEXT PRIMARY KEY,
-        sess TEXT NOT NULL,
-        expired TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_sessions_expired ON sessions(expired);
-    `);
-    this.db.prepare('DELETE FROM sessions WHERE expired < datetime(?)').run(new Date().toISOString());
-  }
-  get(sid: string, callback: (err: any, session?: session.SessionData | null) => void) {
-    try {
-      const row = this.db.prepare('SELECT sess FROM sessions WHERE sid = ? AND expired > datetime(?)').get(sid, new Date().toISOString()) as any;
-      callback(null, row ? JSON.parse(row.sess) : null);
-    } catch (err) { callback(err); }
-  }
-  set(sid: string, sess: session.SessionData, callback?: (err?: any) => void) {
-    try {
-      const maxAge = sess.cookie?.maxAge || 86400000 * 7;
-      const expired = new Date(Date.now() + maxAge).toISOString();
-      this.db.prepare('REPLACE INTO sessions (sid, sess, expired) VALUES (?, ?, datetime(?))').run(sid, JSON.stringify(sess), expired);
-      callback?.();
-    } catch (err) { callback?.(err); }
-  }
-  destroy(sid: string, callback?: (err?: any) => void) {
-    try {
-      this.db.prepare('DELETE FROM sessions WHERE sid = ?').run(sid);
-      callback?.();
-    } catch (err) { callback?.(err); }
-  }
-}
+// Wrap async Express handlers to catch rejections (Express 4 doesn't do this automatically)
+const asyncHandler = (fn: (req: express.Request, res: express.Response, next: express.NextFunction) => Promise<any>): express.RequestHandler =>
+  (req, res, next) => fn(req, res, next).catch(next);
 
 const parser = new Parser({
   headers: {
@@ -763,49 +732,53 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3001);
 
-  // --- Database init ---
-  const dbPath = path.join(process.cwd(), ".cache", "atomflow.db");
-  await fs.mkdir(path.dirname(dbPath), { recursive: true });
-  const db = new Database(dbPath);
-  db.pragma('journal_mode = WAL');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL UNIQUE,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS verification_codes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL,
-      code TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      used INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_vc_email ON verification_codes(email, used, expires_at);
-  `);
+  // --- Database init (PostgreSQL) ---
+  // Note: rejectUnauthorized: false is required for Railway's self-signed PG certs.
+  // If migrating to another platform (Supabase, Neon, etc.), review this setting.
+  const pool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production'
+      ? { rejectUnauthorized: false }
+      : false,
+    max: 10,
+  });
 
-  // Migrate: add profile columns to users table
-  try { db.exec('ALTER TABLE users ADD COLUMN nickname TEXT'); } catch {}
-  try { db.exec('ALTER TABLE users ADD COLUMN avatar_url TEXT'); } catch {}
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id           SERIAL PRIMARY KEY,
+      email        TEXT NOT NULL UNIQUE,
+      nickname     TEXT,
+      avatar_url   TEXT,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS verification_codes (
+      id           SERIAL PRIMARY KEY,
+      email        TEXT NOT NULL,
+      code         TEXT NOT NULL,
+      expires_at   TIMESTAMPTZ NOT NULL,
+      used         BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_vc_email ON verification_codes(email, used, expires_at)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS saved_cards (
+      id             TEXT PRIMARY KEY,
+      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type           TEXT NOT NULL,
+      content        TEXT NOT NULL,
+      tags           JSONB NOT NULL DEFAULT '[]'::jsonb,
+      article_title  TEXT NOT NULL DEFAULT '',
+      article_id     BIGINT,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_user ON saved_cards(user_id)`);
 
   // Backfill: set default nickname for existing users who don't have one
-  db.prepare("UPDATE users SET nickname = substr(email, 1, instr(email, '@') - 1) WHERE nickname IS NULL").run();
-  // Create saved_cards table for per-user card persistence
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS saved_cards (
-      id TEXT PRIMARY KEY,
-      user_id INTEGER NOT NULL,
-      type TEXT NOT NULL,
-      content TEXT NOT NULL,
-      tags TEXT NOT NULL DEFAULT '[]',
-      article_title TEXT NOT NULL DEFAULT '',
-      article_id INTEGER,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY (user_id) REFERENCES users(id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_saved_cards_user ON saved_cards(user_id);
-  `);
+  await pool.query("UPDATE users SET nickname = split_part(email, '@', 1) WHERE nickname IS NULL");
 
   const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
@@ -840,9 +813,11 @@ async function startServer() {
 
   app.use(express.json());
 
-  // --- Session middleware ---
+  // --- Session middleware (PostgreSQL) ---
+  app.set('trust proxy', 1);
+  const PgSession = connectPgSimple(session);
   app.use(session({
-    store: new SqliteSessionStore(db),
+    store: new PgSession({ pool, createTableIfMissing: true }),
     secret: process.env.SESSION_SECRET || 'atomflow-dev-secret-change-in-prod',
     resave: false,
     saveUninitialized: false,
@@ -894,7 +869,7 @@ async function startServer() {
 
   // --- Auth Routes ---
 
-  app.post("/api/auth/send-code", async (req, res) => {
+  app.post("/api/auth/send-code", asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: '请输入有效的邮箱地址' });
@@ -903,17 +878,17 @@ async function startServer() {
       return res.status(500).json({ error: '邮件服务未配置' });
     }
 
-    const now = new Date().toISOString();
-    const recent = db.prepare(
-      "SELECT id FROM verification_codes WHERE email = ? AND created_at > datetime(?, '-60 seconds') AND used = 0"
-    ).get(email, now) as any;
+    const recent = (await pool.query(
+      "SELECT id FROM verification_codes WHERE email = $1 AND created_at > NOW() - INTERVAL '60 seconds' AND used = FALSE",
+      [email]
+    )).rows[0];
     if (recent) {
       return res.status(429).json({ error: '发送过于频繁，请 60 秒后再试' });
     }
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-    db.prepare('INSERT INTO verification_codes (email, code, expires_at) VALUES (?, ?, ?)').run(email, code, expiresAt);
+    await pool.query('INSERT INTO verification_codes (email, code, expires_at) VALUES ($1, $2, $3)', [email, code, expiresAt]);
 
     console.log(`[AUTH] 验证码 → ${email}: ${code}`);
 
@@ -947,47 +922,47 @@ async function startServer() {
       console.error('Failed to send verification code:', error);
       return res.status(500).json({ error: '发送验证码失败，请稍后再试' });
     }
-  });
+  }));
 
-  app.post("/api/auth/verify", (req, res) => {
+  app.post("/api/auth/verify", asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     const code = (req.body?.code || '').trim();
     if (!email || !code) {
       return res.status(400).json({ error: '请输入邮箱和验证码' });
     }
 
-    const now = new Date().toISOString();
-    const record = db.prepare(
-      'SELECT id FROM verification_codes WHERE email = ? AND code = ? AND used = 0 AND expires_at > datetime(?)'
-    ).get(email, code, now) as any;
+    const record = (await pool.query(
+      'SELECT id FROM verification_codes WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW()',
+      [email, code]
+    )).rows[0];
     if (!record) {
       return res.status(400).json({ error: '验证码无效或已过期' });
     }
 
-    db.prepare('UPDATE verification_codes SET used = 1 WHERE id = ?').run(record.id);
+    await pool.query('UPDATE verification_codes SET used = TRUE WHERE id = $1', [record.id]);
 
-    let user = db.prepare('SELECT id, email, nickname, avatar_url FROM users WHERE email = ?').get(email) as any;
+    let user = (await pool.query('SELECT id, email, nickname, avatar_url FROM users WHERE email = $1', [email])).rows[0];
     if (!user) {
       const nickname = email.split('@')[0];
-      const result = db.prepare('INSERT INTO users (email, nickname) VALUES (?, ?)').run(email, nickname);
-      user = { id: result.lastInsertRowid, email, nickname, avatar_url: null };
+      const result = await pool.query('INSERT INTO users (email, nickname) VALUES ($1, $2) RETURNING id', [email, nickname]);
+      user = { id: result.rows[0].id, email, nickname, avatar_url: null };
     }
 
     req.session.userId = user.id as number;
     req.session.email = user.email as string;
     return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
-  });
+  }));
 
-  app.get("/api/auth/me", (req, res) => {
+  app.get("/api/auth/me", asyncHandler(async (req, res) => {
     if (!req.session.userId) {
       return res.json({ user: null });
     }
-    const user = db.prepare('SELECT id, email, nickname, avatar_url FROM users WHERE id = ?').get(req.session.userId) as any;
+    const user = (await pool.query('SELECT id, email, nickname, avatar_url FROM users WHERE id = $1', [req.session.userId])).rows[0];
     if (!user) {
       return res.json({ user: null });
     }
     return res.json({ user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
-  });
+  }));
 
   app.post("/api/auth/logout", (req, res) => {
     req.session.destroy((err) => {
@@ -1007,34 +982,40 @@ async function startServer() {
 
   // --- Profile routes ---
 
-  app.put("/api/auth/profile", requireAuth, (req, res) => {
+  app.put("/api/auth/profile", requireAuth, asyncHandler(async (req, res) => {
     const nickname = (req.body?.nickname || '').trim();
     if (!nickname || nickname.length > 30) {
       return res.status(400).json({ error: '昵称不能为空且不超过30个字符' });
     }
-    db.prepare('UPDATE users SET nickname = ? WHERE id = ?').run(nickname, req.session.userId);
-    const user = db.prepare('SELECT id, email, nickname, avatar_url FROM users WHERE id = ?').get(req.session.userId) as any;
+    const user = (await pool.query(
+      'UPDATE users SET nickname = $1 WHERE id = $2 RETURNING id, email, nickname, avatar_url',
+      [nickname, req.session.userId]
+    )).rows[0];
+    if (!user) return res.status(404).json({ error: '用户不存在' });
     return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
-  });
+  }));
 
-  app.post("/api/auth/avatar", requireAuth, avatarUpload.single('avatar'), async (req: any, res) => {
+  app.post("/api/auth/avatar", requireAuth, avatarUpload.single('avatar'), asyncHandler(async (req: any, res) => {
     if (!req.file) {
       return res.status(400).json({ error: '请上传有效的图片文件（JPG/PNG/GIF/WebP，最大2MB）' });
     }
     const avatarUrl = `/api/avatars/${req.file.filename}`;
 
     // Delete old avatar file
-    const oldUser = db.prepare('SELECT avatar_url FROM users WHERE id = ?').get(req.session.userId) as any;
+    const oldUser = (await pool.query('SELECT avatar_url FROM users WHERE id = $1', [req.session.userId])).rows[0];
     if (oldUser?.avatar_url) {
       const oldFilename = oldUser.avatar_url.replace('/api/avatars/', '');
       const oldPath = path.join(avatarsDir, oldFilename);
       await fs.unlink(oldPath).catch(() => {});
     }
 
-    db.prepare('UPDATE users SET avatar_url = ? WHERE id = ?').run(avatarUrl, req.session.userId);
-    const user = db.prepare('SELECT id, email, nickname, avatar_url FROM users WHERE id = ?').get(req.session.userId) as any;
+    const user = (await pool.query(
+      'UPDATE users SET avatar_url = $1 WHERE id = $2 RETURNING id, email, nickname, avatar_url',
+      [avatarUrl, req.session.userId]
+    )).rows[0];
+    if (!user) return res.status(404).json({ error: '用户不存在' });
     return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
-  });
+  }));
 
   // Serve avatar files
   app.use('/api/avatars', express.static(avatarsDir, { maxAge: '7d' }));
@@ -1147,7 +1128,7 @@ async function startServer() {
   });
 
   // Save an article (mark as saved and extract cards)
-  app.post("/api/articles/:id/save", requireAuth, (req, res) => {
+  app.post("/api/articles/:id/save", requireAuth, asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
     const article = articles.find(a => a.id === articleId);
 
@@ -1156,7 +1137,7 @@ async function startServer() {
     }
 
     // Check if this user already saved cards for this article
-    const existingCard = db.prepare('SELECT id FROM saved_cards WHERE user_id = ? AND article_id = ?').get(req.session.userId, articleId) as any;
+    const existingCard = (await pool.query('SELECT id FROM saved_cards WHERE user_id = $1 AND article_id = $2', [req.session.userId, articleId])).rows[0];
     if (!existingCard) {
       article.saved = true;
 
@@ -1173,17 +1154,26 @@ async function startServer() {
         articleId: article.id
       }));
 
-      const insertStmt = db.prepare('INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
-      const insertMany = db.transaction((cards: AtomCard[]) => {
-        for (const card of cards) {
-          insertStmt.run(card.id, req.session.userId, card.type, card.content, JSON.stringify(card.tags), card.articleTitle, card.articleId || null);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        for (const card of newCards) {
+          await client.query(
+            'INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+            [card.id, req.session.userId, card.type, card.content, JSON.stringify(card.tags), card.articleTitle, card.articleId || null]
+          );
         }
-      });
-      insertMany(newCards);
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
     }
 
     res.json({ success: true, article });
-  });
+  }));
 
   // Fetch full content for an article
   app.get("/api/articles/:id/full", async (req, res) => {
@@ -1277,52 +1267,55 @@ async function startServer() {
   });
 
   // Get all saved cards
-  app.get("/api/cards", requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT id, type, content, tags, article_title AS articleTitle, article_id AS articleId FROM saved_cards WHERE user_id = ? ORDER BY created_at DESC').all(req.session.userId) as any[];
-    const cards = rows.map((r: any) => ({ ...r, tags: JSON.parse(r.tags) }));
-    res.json(cards);
-  });
+  app.get("/api/cards", requireAuth, asyncHandler(async (req, res) => {
+    const rows = (await pool.query(
+      'SELECT id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId" FROM saved_cards WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.session.userId]
+    )).rows;
+    res.json(rows);
+  }));
 
   // Add a new manual card
-  app.post("/api/cards", requireAuth, (req, res) => {
+  app.post("/api/cards", requireAuth, asyncHandler(async (req, res) => {
     const newCard: AtomCard = {
       ...req.body,
       id: Math.random().toString(36).substr(2, 9),
       articleTitle: req.body.articleTitle || "手动录入"
     };
-    db.prepare('INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
-      newCard.id, req.session.userId, newCard.type, newCard.content,
-      JSON.stringify(newCard.tags), newCard.articleTitle, newCard.articleId || null
+    await pool.query(
+      'INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [newCard.id, req.session.userId, newCard.type, newCard.content, JSON.stringify(newCard.tags), newCard.articleTitle, newCard.articleId || null]
     );
     res.json(newCard);
-  });
+  }));
 
-  // Update a card
-  app.put("/api/cards/:id", requireAuth, (req, res) => {
+  // Update a card (single atomic UPDATE)
+  app.put("/api/cards/:id", requireAuth, asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const existing = db.prepare('SELECT id FROM saved_cards WHERE id = ? AND user_id = ?').get(id, req.session.userId) as any;
-    if (!existing) {
-      return res.status(404).json({ error: "Card not found" });
-    }
-
     const { type, content, tags } = req.body;
-    if (type !== undefined) db.prepare('UPDATE saved_cards SET type = ? WHERE id = ? AND user_id = ?').run(type, id, req.session.userId);
-    if (content !== undefined) db.prepare('UPDATE saved_cards SET content = ? WHERE id = ? AND user_id = ?').run(content, id, req.session.userId);
-    if (tags !== undefined) db.prepare('UPDATE saved_cards SET tags = ? WHERE id = ? AND user_id = ?').run(JSON.stringify(tags), id, req.session.userId);
 
-    const row = db.prepare('SELECT id, type, content, tags, article_title AS articleTitle, article_id AS articleId FROM saved_cards WHERE id = ? AND user_id = ?').get(id, req.session.userId) as any;
-    res.json({ ...row, tags: JSON.parse(row.tags) });
-  });
+    const row = (await pool.query(
+      `UPDATE saved_cards SET
+        type = COALESCE($1, type),
+        content = COALESCE($2, content),
+        tags = COALESCE($3, tags)
+      WHERE id = $4 AND user_id = $5
+      RETURNING id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId"`,
+      [type ?? null, content ?? null, tags ? JSON.stringify(tags) : null, id, req.session.userId]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: "Card not found" });
+    res.json(row);
+  }));
 
   // Delete a card
-  app.delete("/api/cards/:id", requireAuth, (req, res) => {
+  app.delete("/api/cards/:id", requireAuth, asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const result = db.prepare('DELETE FROM saved_cards WHERE id = ? AND user_id = ?').run(id, req.session.userId);
-    if (result.changes === 0) {
+    const result = await pool.query('DELETE FROM saved_cards WHERE id = $1 AND user_id = $2', [id, req.session.userId]);
+    if (result.rowCount === 0) {
       return res.status(404).json({ error: "Card not found" });
     }
     res.json({ success: true });
-  });
+  }));
 
   // Translate article content
   app.post("/api/translate", requireAuth, async (req, res) => {
