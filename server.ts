@@ -1142,6 +1142,43 @@ async function startServer() {
     return res.json({ success: true });
   }));
 
+  // --- Reset password (forgot password: verify code + set new password, no auth) ---
+  app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
+    const email = (req.body?.email || '').trim().toLowerCase();
+    const code = (req.body?.code || '').trim();
+    const password = req.body?.password || '';
+    if (!email || !code) {
+      return res.status(400).json({ error: '请输入邮箱和验证码' });
+    }
+    if (!password || password.length < 8) {
+      return res.status(400).json({ error: '密码至少 8 个字符' });
+    }
+
+    const record = (await pool.query(
+      'SELECT id FROM verification_codes WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW() AND password_hash IS NULL',
+      [email, code]
+    )).rows[0];
+    if (!record) {
+      return res.status(400).json({ error: '验证码无效或已过期' });
+    }
+
+    await pool.query('UPDATE verification_codes SET used = TRUE WHERE id = $1', [record.id]);
+
+    const user = (await pool.query('SELECT id FROM users WHERE email = $1', [email])).rows[0];
+    if (!user) {
+      return res.status(404).json({ error: '该邮箱未注册' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, user.id]);
+
+    // Auto login after reset
+    req.session.userId = user.id;
+    req.session.email = email;
+    const updated = (await pool.query('SELECT id, email, nickname, avatar_url, password_hash FROM users WHERE id = $1', [user.id])).rows[0];
+    return res.json({ success: true, user: { id: updated.id, email: updated.email, nickname: updated.nickname, avatar_url: updated.avatar_url, has_password: true } });
+  }));
+
   // --- Profile routes ---
 
   app.put("/api/auth/profile", requireAuth, asyncHandler(async (req, res) => {

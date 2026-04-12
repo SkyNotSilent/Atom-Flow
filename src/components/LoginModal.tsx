@@ -9,14 +9,20 @@ interface LoginModalProps {
   onSuccess: (user: User) => void;
 }
 
-type Mode = 'choose' | 'email-code' | 'password-login' | 'password-register';
+// login: default, email+password
+// register: email+password+confirm → verify code
+// forgot: email → verify code → set new password
+type Mode = 'login' | 'register' | 'forgot';
+type Step = 'form' | 'code' | 'new-password';
 
 export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSuccess }) => {
-  const [mode, setMode] = useState<Mode>('choose');
-  const [step, setStep] = useState<'form' | 'code'>('form');
+  const [mode, setMode] = useState<Mode>('login');
+  const [step, setStep] = useState<Step>('form');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -28,13 +34,11 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
 
   useEffect(() => {
     if (!isOpen) return;
-    if (mode === 'email-code' && step === 'form') {
-      setTimeout(() => emailInputRef.current?.focus(), 100);
-    }
-    if ((mode === 'email-code' && step === 'code') || (mode === 'password-register' && step === 'code')) {
+    if (step === 'code') {
       setTimeout(() => codeInputRef.current?.focus(), 100);
-    }
-    if (mode === 'password-login' || mode === 'password-register') {
+    } else if (mode === 'login') {
+      setTimeout(() => emailInputRef.current?.focus(), 100);
+    } else {
       setTimeout(() => emailInputRef.current?.focus(), 100);
     }
   }, [isOpen, mode, step]);
@@ -47,11 +51,13 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
 
   useEffect(() => {
     if (!isOpen) {
-      setMode('choose');
+      setMode('login');
       setStep('form');
       setEmail('');
       setPassword('');
       setConfirmPassword('');
+      setNewPassword('');
+      setConfirmNewPassword('');
       setCode('');
       setError('');
       setLoading(false);
@@ -60,32 +66,100 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
     }
   }, [isOpen]);
 
-  const goBack = () => {
+  const switchMode = (m: Mode) => {
+    setMode(m);
+    setStep('form');
+    setCode('');
     setError('');
-    if (step === 'code') {
-      setStep('form');
-      setCode('');
-      return;
-    }
-    setMode('choose');
     setPassword('');
     setConfirmPassword('');
+    setNewPassword('');
+    setConfirmNewPassword('');
+    setShowPassword(false);
   };
 
-  // --- Email code flow ---
-  const handleSendCode = async () => {
+  const goBack = () => {
+    setError('');
+    if (step === 'new-password') { setStep('code'); return; }
+    if (step === 'code') { setStep('form'); setCode(''); return; }
+    switchMode('login');
+  };
+
+  const validateEmail = () => {
     const trimmed = email.trim();
     if (!trimmed || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
       setError('请输入有效的邮箱地址');
-      return;
+      return false;
     }
+    return true;
+  };
+
+  // --- Login with password ---
+  const handleLogin = async () => {
+    if (!validateEmail()) return;
+    if (!password) { setError('请输入密码'); return; }
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/auth/login-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim(), password }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || '登录失败'); return; }
+      onSuccess(data.user);
+    } catch { setError('网络错误，请稍后再试'); } finally { setLoading(false); }
+  };
+
+  // --- Register: send code ---
+  const handleRegisterSendCode = async () => {
+    if (!validateEmail()) return;
+    if (!password || password.length < 8) { setError('密码至少 8 个字符'); return; }
+    if (password !== confirmPassword) { setError('两次密码不一致'); return; }
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim(), password }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || '注册失败'); return; }
+      setStep('code');
+      setCountdown(60);
+    } catch { setError('网络错误，请稍后再试'); } finally { setLoading(false); }
+  };
+
+  // --- Register: verify code ---
+  const handleRegisterVerify = async () => {
+    const trimmedCode = code.trim();
+    if (!trimmedCode || trimmedCode.length !== 6) { setError('请输入 6 位验证码'); return; }
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/auth/register/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim(), code: trimmedCode }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || '验证失败'); return; }
+      onSuccess(data.user);
+    } catch { setError('网络错误，请稍后再试'); } finally { setLoading(false); }
+  };
+
+  // --- Forgot: send code ---
+  const handleForgotSendCode = async () => {
+    if (!validateEmail()) return;
     setError('');
     setLoading(true);
     try {
       const res = await fetch('/api/auth/send-code', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: trimmed }),
+        body: JSON.stringify({ email: email.trim() }),
       });
       const data = await res.json();
       if (!res.ok) { setError(data.error || '发送失败'); return; }
@@ -94,13 +168,40 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
     } catch { setError('网络错误，请稍后再试'); } finally { setLoading(false); }
   };
 
+  // --- Forgot: verify code → go to new-password step ---
+  const handleForgotVerifyCode = () => {
+    const trimmedCode = code.trim();
+    if (!trimmedCode || trimmedCode.length !== 6) { setError('请输入 6 位验证码'); return; }
+    setError('');
+    setStep('new-password');
+  };
+
+  // --- Forgot: reset password ---
+  const handleResetPassword = async () => {
+    if (!newPassword || newPassword.length < 8) { setError('密码至少 8 个字符'); return; }
+    if (newPassword !== confirmNewPassword) { setError('两次密码不一致'); return; }
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim(), code: code.trim(), password: newPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || '重置失败'); return; }
+      onSuccess(data.user);
+    } catch { setError('网络错误，请稍后再试'); } finally { setLoading(false); }
+  };
+
+  // --- Resend code ---
   const handleResend = async () => {
     if (countdown > 0) return;
     setError('');
     setLoading(true);
     try {
-      const endpoint = mode === 'password-register' ? '/api/auth/register' : '/api/auth/send-code';
-      const body = mode === 'password-register'
+      const endpoint = mode === 'register' ? '/api/auth/register' : '/api/auth/send-code';
+      const body = mode === 'register'
         ? { email: email.trim(), password }
         : { email: email.trim() };
       const res = await fetch(endpoint, {
@@ -114,79 +215,15 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
     } catch { setError('网络错误，请稍后再试'); } finally { setLoading(false); }
   };
 
-  const handleVerifyCode = async () => {
-    const trimmedCode = code.trim();
-    if (!trimmedCode || trimmedCode.length !== 6) {
-      setError('请输入 6 位验证码');
-      return;
-    }
-    setError('');
-    setLoading(true);
-    try {
-      const endpoint = mode === 'password-register' ? '/api/auth/register/verify' : '/api/auth/verify';
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim(), code: trimmedCode }),
-      });
-      const data = await res.json();
-      if (!res.ok) { setError(data.error || '验证失败'); return; }
-      onSuccess(data.user);
-    } catch { setError('网络错误，请稍后再试'); } finally { setLoading(false); }
-  };
-
-  // --- Password login ---
-  const handlePasswordLogin = async () => {
-    const trimmedEmail = email.trim();
-    if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
-      setError('请输入有效的邮箱地址');
-      return;
-    }
-    if (!password) { setError('请输入密码'); return; }
-    setError('');
-    setLoading(true);
-    try {
-      const res = await fetch('/api/auth/login-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: trimmedEmail, password }),
-      });
-      const data = await res.json();
-      if (!res.ok) { setError(data.error || '登录失败'); return; }
-      onSuccess(data.user);
-    } catch { setError('网络错误，请稍后再试'); } finally { setLoading(false); }
-  };
-
-  // --- Password register ---
-  const handlePasswordRegister = async () => {
-    const trimmedEmail = email.trim();
-    if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
-      setError('请输入有效的邮箱地址');
-      return;
-    }
-    if (!password || password.length < 8) { setError('密码至少 8 个字符'); return; }
-    if (password !== confirmPassword) { setError('两次密码不一致'); return; }
-    setError('');
-    setLoading(true);
-    try {
-      const res = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: trimmedEmail, password }),
-      });
-      const data = await res.json();
-      if (!res.ok) { setError(data.error || '注册失败'); return; }
-      setStep('code');
-      setCountdown(60);
-    } catch { setError('网络错误，请稍后再试'); } finally { setLoading(false); }
-  };
-
   if (!isOpen) return null;
 
-  const title = mode === 'choose' ? '登录 / 注册'
-    : mode === 'email-code' ? (step === 'code' ? '输入验证码' : '验证码登录')
-    : mode === 'password-login' ? '密码登录'
-    : step === 'code' ? '输入验证码' : '注册账号';
+  const title =
+    mode === 'login' ? '登录' :
+    mode === 'register' ? (step === 'code' ? '输入验证码' : '注册账号') :
+    step === 'form' ? '忘记密码' :
+    step === 'code' ? '输入验证码' : '设置新密码';
+
+  const showBackButton = mode !== 'login' || step !== 'form';
 
   return (
     <div className="fixed inset-0 z-[140] bg-black/30 flex items-center justify-center p-4" onClick={onClose}>
@@ -197,7 +234,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
         {/* Header */}
         <div className="px-5 py-4 border-b border-border flex items-center justify-between">
           <div className="flex items-center gap-2">
-            {mode !== 'choose' && (
+            {showBackButton && (
               <button
                 onClick={goBack}
                 className="w-7 h-7 rounded-md hover:bg-surface2 text-text3 flex items-center justify-center"
@@ -217,105 +254,9 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
 
         {/* Body */}
         <div className="p-5">
-          {/* Mode: Choose */}
-          {mode === 'choose' && (
-            <div className="flex flex-col gap-3">
-              <button
-                onClick={() => setMode('email-code')}
-                className="w-full py-3 rounded-xl text-[14px] font-medium border border-border text-text-main hover:bg-surface2 transition-colors flex items-center justify-center gap-2"
-              >
-                <Mail size={16} />
-                验证码登录
-              </button>
-              <button
-                onClick={() => setMode('password-login')}
-                className="w-full py-3 rounded-xl text-[14px] font-medium bg-accent text-white hover:opacity-90 transition-all flex items-center justify-center gap-2"
-              >
-                <Lock size={16} />
-                密码登录
-              </button>
-              <div className="text-center pt-2">
-                <button
-                  onClick={() => setMode('password-register')}
-                  className="text-[13px] text-accent hover:underline"
-                >
-                  新用户？注册账号
-                </button>
-              </div>
-            </div>
-          )}
 
-          {/* Mode: Email Code */}
-          {mode === 'email-code' && step === 'form' && (
-            <>
-              <p className="text-[13px] text-text3 mb-4">输入你的邮箱，我们会发送一个验证码</p>
-              <div className="relative mb-3">
-                <Mail size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-text3" />
-                <input
-                  ref={emailInputRef}
-                  type="email"
-                  value={email}
-                  onChange={e => { setEmail(e.target.value); setError(''); }}
-                  onKeyDown={e => { if (e.key === 'Enter') void handleSendCode(); }}
-                  placeholder="your@email.com"
-                  className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main outline-none focus:border-accent transition-colors"
-                />
-              </div>
-              {error && <p className="text-[12px] text-red-500 mb-3">{error}</p>}
-              <button
-                onClick={() => void handleSendCode()}
-                disabled={loading}
-                className={cn(
-                  "w-full py-2.5 rounded-xl text-[14px] font-medium transition-all flex items-center justify-center gap-2",
-                  loading ? "bg-accent/60 text-white cursor-wait" : "bg-accent text-white hover:opacity-90"
-                )}
-              >
-                {loading && <Loader2 size={16} className="animate-spin" />}
-                {loading ? '发送中...' : '发送验证码'}
-              </button>
-            </>
-          )}
-
-          {/* Code verification (shared by email-code and password-register) */}
-          {(mode === 'email-code' || mode === 'password-register') && step === 'code' && (
-            <>
-              <p className="text-[13px] text-text3 mb-1">验证码已发送至</p>
-              <p className="text-[14px] text-text-main font-medium mb-4">{email}</p>
-              <input
-                ref={codeInputRef}
-                type="text"
-                inputMode="numeric"
-                maxLength={6}
-                value={code}
-                onChange={e => { setCode(e.target.value.replace(/\D/g, '')); setError(''); }}
-                onKeyDown={e => { if (e.key === 'Enter') void handleVerifyCode(); }}
-                placeholder="输入 6 位验证码"
-                className="w-full px-3 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main text-center tracking-[6px] outline-none focus:border-accent transition-colors mb-3"
-              />
-              {error && <p className="text-[12px] text-red-500 mb-3">{error}</p>}
-              <button
-                onClick={() => void handleVerifyCode()}
-                disabled={loading}
-                className={cn(
-                  "w-full py-2.5 rounded-xl text-[14px] font-medium transition-all flex items-center justify-center gap-2 mb-3",
-                  loading ? "bg-accent/60 text-white cursor-wait" : "bg-accent text-white hover:opacity-90"
-                )}
-              >
-                {loading && <Loader2 size={16} className="animate-spin" />}
-                {loading ? '验证中...' : '验证并登录'}
-              </button>
-              <button
-                onClick={() => void handleResend()}
-                disabled={countdown > 0 || loading}
-                className="w-full text-[13px] text-text3 hover:text-accent transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {countdown > 0 ? `${countdown} 秒后可重新发送` : '重新发送验证码'}
-              </button>
-            </>
-          )}
-
-          {/* Mode: Password Login */}
-          {mode === 'password-login' && (
+          {/* ===== LOGIN (default) ===== */}
+          {mode === 'login' && (
             <>
               <div className="relative mb-3">
                 <Mail size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-text3" />
@@ -325,7 +266,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
                   value={email}
                   onChange={e => { setEmail(e.target.value); setError(''); }}
                   onKeyDown={e => { if (e.key === 'Enter') passwordInputRef.current?.focus(); }}
-                  placeholder="your@email.com"
+                  placeholder="邮箱地址"
                   className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main outline-none focus:border-accent transition-colors"
                 />
               </div>
@@ -336,8 +277,8 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
                   type={showPassword ? 'text' : 'password'}
                   value={password}
                   onChange={e => { setPassword(e.target.value); setError(''); }}
-                  onKeyDown={e => { if (e.key === 'Enter') void handlePasswordLogin(); }}
-                  placeholder="输入密码"
+                  onKeyDown={e => { if (e.key === 'Enter') void handleLogin(); }}
+                  placeholder="密码"
                   className="w-full pl-9 pr-10 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main outline-none focus:border-accent transition-colors"
                 />
                 <button
@@ -350,29 +291,35 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
               </div>
               {error && <p className="text-[12px] text-red-500 mb-3">{error}</p>}
               <button
-                onClick={() => void handlePasswordLogin()}
+                onClick={() => void handleLogin()}
                 disabled={loading}
                 className={cn(
-                  "w-full py-2.5 rounded-xl text-[14px] font-medium transition-all flex items-center justify-center gap-2 mb-3",
+                  "w-full py-2.5 rounded-xl text-[14px] font-medium transition-all flex items-center justify-center gap-2",
                   loading ? "bg-accent/60 text-white cursor-wait" : "bg-accent text-white hover:opacity-90"
                 )}
               >
                 {loading && <Loader2 size={16} className="animate-spin" />}
                 {loading ? '登录中...' : '登录'}
               </button>
-              <div className="text-center">
+              <div className="flex items-center justify-between mt-4">
                 <button
-                  onClick={() => { setMode('email-code'); setStep('form'); setError(''); }}
+                  onClick={() => switchMode('register')}
+                  className="text-[13px] text-accent hover:underline"
+                >
+                  注册账号
+                </button>
+                <button
+                  onClick={() => switchMode('forgot')}
                   className="text-[13px] text-text3 hover:text-accent transition-colors"
                 >
-                  没有密码？使用验证码登录
+                  忘记密码
                 </button>
               </div>
             </>
           )}
 
-          {/* Mode: Password Register */}
-          {mode === 'password-register' && step === 'form' && (
+          {/* ===== REGISTER: form ===== */}
+          {mode === 'register' && step === 'form' && (
             <>
               <div className="relative mb-3">
                 <Mail size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-text3" />
@@ -381,7 +328,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
                   type="email"
                   value={email}
                   onChange={e => { setEmail(e.target.value); setError(''); }}
-                  placeholder="your@email.com"
+                  placeholder="邮箱地址"
                   className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main outline-none focus:border-accent transition-colors"
                 />
               </div>
@@ -408,26 +355,26 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
                   type={showPassword ? 'text' : 'password'}
                   value={confirmPassword}
                   onChange={e => { setConfirmPassword(e.target.value); setError(''); }}
-                  onKeyDown={e => { if (e.key === 'Enter') void handlePasswordRegister(); }}
+                  onKeyDown={e => { if (e.key === 'Enter') void handleRegisterSendCode(); }}
                   placeholder="确认密码"
                   className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main outline-none focus:border-accent transition-colors"
                 />
               </div>
               {error && <p className="text-[12px] text-red-500 mb-3">{error}</p>}
               <button
-                onClick={() => void handlePasswordRegister()}
+                onClick={() => void handleRegisterSendCode()}
                 disabled={loading}
                 className={cn(
-                  "w-full py-2.5 rounded-xl text-[14px] font-medium transition-all flex items-center justify-center gap-2 mb-3",
+                  "w-full py-2.5 rounded-xl text-[14px] font-medium transition-all flex items-center justify-center gap-2",
                   loading ? "bg-accent/60 text-white cursor-wait" : "bg-accent text-white hover:opacity-90"
                 )}
               >
                 {loading && <Loader2 size={16} className="animate-spin" />}
-                {loading ? '注册中...' : '注册'}
+                {loading ? '发送验证码...' : '注册'}
               </button>
-              <div className="text-center">
+              <div className="text-center mt-4">
                 <button
-                  onClick={() => { setMode('password-login'); setError(''); }}
+                  onClick={() => switchMode('login')}
                   className="text-[13px] text-text3 hover:text-accent transition-colors"
                 >
                   已有账号？直接登录
@@ -435,8 +382,170 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
               </div>
             </>
           )}
+
+          {/* ===== REGISTER: verify code ===== */}
+          {mode === 'register' && step === 'code' && (
+            <CodeVerifyStep
+              email={email}
+              code={code}
+              setCode={setCode}
+              error={error}
+              setError={setError}
+              loading={loading}
+              countdown={countdown}
+              codeInputRef={codeInputRef}
+              onVerify={handleRegisterVerify}
+              onResend={handleResend}
+            />
+          )}
+
+          {/* ===== FORGOT: enter email ===== */}
+          {mode === 'forgot' && step === 'form' && (
+            <>
+              <p className="text-[13px] text-text3 mb-4">输入你的注册邮箱，我们会发送验证码</p>
+              <div className="relative mb-3">
+                <Mail size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-text3" />
+                <input
+                  ref={emailInputRef}
+                  type="email"
+                  value={email}
+                  onChange={e => { setEmail(e.target.value); setError(''); }}
+                  onKeyDown={e => { if (e.key === 'Enter') void handleForgotSendCode(); }}
+                  placeholder="邮箱地址"
+                  className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main outline-none focus:border-accent transition-colors"
+                />
+              </div>
+              {error && <p className="text-[12px] text-red-500 mb-3">{error}</p>}
+              <button
+                onClick={() => void handleForgotSendCode()}
+                disabled={loading}
+                className={cn(
+                  "w-full py-2.5 rounded-xl text-[14px] font-medium transition-all flex items-center justify-center gap-2",
+                  loading ? "bg-accent/60 text-white cursor-wait" : "bg-accent text-white hover:opacity-90"
+                )}
+              >
+                {loading && <Loader2 size={16} className="animate-spin" />}
+                {loading ? '发送中...' : '发送验证码'}
+              </button>
+            </>
+          )}
+
+          {/* ===== FORGOT: verify code ===== */}
+          {mode === 'forgot' && step === 'code' && (
+            <CodeVerifyStep
+              email={email}
+              code={code}
+              setCode={setCode}
+              error={error}
+              setError={setError}
+              loading={loading}
+              countdown={countdown}
+              codeInputRef={codeInputRef}
+              onVerify={handleForgotVerifyCode}
+              onResend={handleResend}
+              verifyLabel="下一步"
+            />
+          )}
+
+          {/* ===== FORGOT: set new password ===== */}
+          {mode === 'forgot' && step === 'new-password' && (
+            <>
+              <p className="text-[13px] text-text3 mb-4">请设置新密码</p>
+              <div className="relative mb-3">
+                <Lock size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-text3" />
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  value={newPassword}
+                  onChange={e => { setNewPassword(e.target.value); setError(''); }}
+                  placeholder="新密码（至少 8 个字符）"
+                  className="w-full pl-9 pr-10 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main outline-none focus:border-accent transition-colors"
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-text3 hover:text-text-main"
+                >
+                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+              <div className="relative mb-3">
+                <Lock size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-text3" />
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  value={confirmNewPassword}
+                  onChange={e => { setConfirmNewPassword(e.target.value); setError(''); }}
+                  onKeyDown={e => { if (e.key === 'Enter') void handleResetPassword(); }}
+                  placeholder="确认新密码"
+                  className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main outline-none focus:border-accent transition-colors"
+                />
+              </div>
+              {error && <p className="text-[12px] text-red-500 mb-3">{error}</p>}
+              <button
+                onClick={() => void handleResetPassword()}
+                disabled={loading}
+                className={cn(
+                  "w-full py-2.5 rounded-xl text-[14px] font-medium transition-all flex items-center justify-center gap-2",
+                  loading ? "bg-accent/60 text-white cursor-wait" : "bg-accent text-white hover:opacity-90"
+                )}
+              >
+                {loading && <Loader2 size={16} className="animate-spin" />}
+                {loading ? '重置中...' : '重置密码并登录'}
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
   );
 };
+
+// Shared code verification sub-component
+const CodeVerifyStep: React.FC<{
+  email: string;
+  code: string;
+  setCode: (v: string) => void;
+  error: string;
+  setError: (v: string) => void;
+  loading: boolean;
+  countdown: number;
+  codeInputRef: React.RefObject<HTMLInputElement | null>;
+  onVerify: () => void | Promise<void>;
+  onResend: () => void | Promise<void>;
+  verifyLabel?: string;
+}> = ({ email, code, setCode, error, setError, loading, countdown, codeInputRef, onVerify, onResend, verifyLabel = '验证并登录' }) => (
+  <>
+    <p className="text-[13px] text-text3 mb-1">验证码已发送至</p>
+    <p className="text-[14px] text-text-main font-medium mb-4">{email}</p>
+    <input
+      ref={codeInputRef}
+      type="text"
+      inputMode="numeric"
+      maxLength={6}
+      value={code}
+      onChange={e => { setCode(e.target.value.replace(/\D/g, '')); setError(''); }}
+      onKeyDown={e => { if (e.key === 'Enter') void onVerify(); }}
+      placeholder="输入 6 位验证码"
+      className="w-full px-3 py-2.5 rounded-xl border border-border bg-bg text-[14px] text-text-main text-center tracking-[6px] outline-none focus:border-accent transition-colors mb-3"
+    />
+    {error && <p className="text-[12px] text-red-500 mb-3">{error}</p>}
+    <button
+      onClick={() => void onVerify()}
+      disabled={loading}
+      className={cn(
+        "w-full py-2.5 rounded-xl text-[14px] font-medium transition-all flex items-center justify-center gap-2 mb-3",
+        loading ? "bg-accent/60 text-white cursor-wait" : "bg-accent text-white hover:opacity-90"
+      )}
+    >
+      {loading && <Loader2 size={16} className="animate-spin" />}
+      {loading ? '验证中...' : verifyLabel}
+    </button>
+    <button
+      onClick={() => void onResend()}
+      disabled={countdown > 0 || loading}
+      className="w-full text-[13px] text-text3 hover:text-accent transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+    >
+      {countdown > 0 ? `${countdown} 秒后可重新发送` : '重新发送验证码'}
+    </button>
+  </>
+);
