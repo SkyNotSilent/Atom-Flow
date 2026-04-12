@@ -6,9 +6,8 @@ import { Check, LayoutGrid, List, Sparkles } from 'lucide-react';
 import { getDisplaySource, sourceMatches } from '../utils/articleDisplay';
 
 export const FeedPage: React.FC = () => {
-  const { articles, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText, showToast, reloadArticles } = useAppContext();
+  const { articles, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText, showToast, reloadArticles, viewMode, setViewMode } = useAppContext();
   const [showSrcModal, setShowSrcModal] = useState(false);
-  const [viewMode, setViewMode] = useState<'card' | 'compact'>('card');
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [isRetrying, setIsRetrying] = useState(false);
   const [currentDate, setCurrentDate] = useState('');

@@ -3,6 +3,16 @@ export interface User {
   email: string;
   nickname: string | null;
   avatar_url: string | null;
+  has_password?: boolean;
+}
+
+export interface Note {
+  id: number;
+  title: string;
+  content: string;
+  tags: string[];
+  created_at: string;
+  updated_at: string;
 }
 
 export interface AtomCard {

@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { Article, AtomCard, User } from '../types';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
+import { Article, AtomCard, User, Note } from '../types';
 
 interface AppState {
   articles: Article[];
@@ -13,6 +13,8 @@ interface AppState {
   toastMsg: string | null;
   theme: 'light' | 'dark';
   toggleTheme: () => void;
+  viewMode: 'card' | 'compact';
+  setViewMode: (mode: 'card' | 'compact') => void;
   readingArticle: Article | null;
   setReadingArticle: (article: Article | null) => void;
   activeSource: string | null;
@@ -35,6 +37,11 @@ interface AppState {
   updateAvatar: (file: File) => Promise<void>;
   showProfileModal: boolean;
   setShowProfileModal: (show: boolean) => void;
+  notes: Note[];
+  createNote: () => Promise<Note | null>;
+  updateNote: (id: number, data: Partial<{ title: string; content: string; tags: string[] }>) => Promise<void>;
+  deleteNote: (id: number) => Promise<void>;
+  syncPreferences: (prefs: { source_layout?: any; theme?: string; view_mode?: string }) => void;
 }
 
 const AppContext = createContext<AppState | undefined>(undefined);
@@ -54,6 +61,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
   const [showProfileModal, setShowProfileModal] = useState(false);
+  const [viewMode, setViewModeState] = useState<'card' | 'compact'>('card');
+  const [notes, setNotes] = useState<Note[]>([]);
+  const syncTimerRef = useRef<number | null>(null);
   const quickOpenMode = true;
   const forceRefetchInTesting = false;
   const saveStages = ['提取全文', '识别要点', '原子化拆分', '提炼入库'];
@@ -126,9 +136,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
         await reloadArticles();
 
-        // Only fetch cards if logged in
+        // Only fetch cards, preferences, and notes if logged in
         if (loggedIn) {
-          const cardsRes = await fetch('/api/cards');
+          const [cardsRes] = await Promise.all([
+            fetch('/api/cards'),
+            loadPreferences(),
+            loadNotes()
+          ]);
           if (cardsRes.ok) {
             setSavedCards(await cardsRes.json());
           }
@@ -149,7 +163,97 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, [theme]);
 
-  const toggleTheme = () => setTheme(prev => prev === 'light' ? 'dark' : 'light');
+  const toggleTheme = () => setTheme(prev => {
+    const next = prev === 'light' ? 'dark' : 'light';
+    if (user) syncPreferences({ theme: next });
+    return next;
+  });
+
+  const setViewMode = (mode: 'card' | 'compact') => {
+    setViewModeState(mode);
+    if (user) syncPreferences({ view_mode: mode });
+  };
+
+  const syncPreferences = useCallback((prefs: { source_layout?: any; theme?: string; view_mode?: string }) => {
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = window.setTimeout(() => {
+      fetch('/api/preferences', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(prefs)
+      }).catch(err => console.error('Failed to sync preferences:', err));
+    }, 500);
+  }, []);
+
+  const loadPreferences = async () => {
+    try {
+      const res = await fetch('/api/preferences');
+      if (!res.ok) return;
+      const prefs = await res.json();
+      if (prefs.theme && (prefs.theme === 'light' || prefs.theme === 'dark')) {
+        setTheme(prefs.theme);
+      }
+      if (prefs.view_mode && (prefs.view_mode === 'card' || prefs.view_mode === 'compact')) {
+        setViewModeState(prefs.view_mode);
+      }
+      if (prefs.source_layout) {
+        window.localStorage.setItem('atomflow:source-layout:v1', JSON.stringify(prefs.source_layout));
+        window.dispatchEvent(new Event('atomflow:preferences-loaded'));
+      }
+    } catch {}
+  };
+
+  const loadNotes = async () => {
+    try {
+      const res = await fetch('/api/notes');
+      if (res.ok) setNotes(await res.json());
+    } catch {}
+  };
+
+  const createNote = async (): Promise<Note | null> => {
+    try {
+      const res = await fetch('/api/notes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: '', content: '' })
+      });
+      if (res.ok) {
+        const note = await res.json();
+        setNotes(prev => [note, ...prev]);
+        return note;
+      }
+    } catch (error) {
+      console.error('Failed to create note:', error);
+    }
+    return null;
+  };
+
+  const updateNote = async (id: number, data: Partial<{ title: string; content: string; tags: string[] }>) => {
+    try {
+      const res = await fetch(`/api/notes/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setNotes(prev => prev.map(n => n.id === id ? updated : n));
+      }
+    } catch (error) {
+      console.error('Failed to update note:', error);
+    }
+  };
+
+  const deleteNote = async (id: number) => {
+    try {
+      const res = await fetch(`/api/notes/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        setNotes(prev => prev.filter(n => n.id !== id));
+      }
+    } catch (error) {
+      console.error('Failed to delete note:', error);
+    }
+  };
 
   const saveArticle = async (articleId: number) => {
     if (!user) {
@@ -256,9 +360,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const handleLoginSuccess = async (userData: User) => {
     setUser(userData);
     setShowLoginModal(false);
-    // Fetch cards now that user is logged in
+    // Fetch cards, preferences, and notes now that user is logged in
     try {
-      const cardsRes = await fetch('/api/cards');
+      const [cardsRes] = await Promise.all([
+        fetch('/api/cards'),
+        loadPreferences(),
+        loadNotes()
+      ]);
       if (cardsRes.ok) {
         setSavedCards(await cardsRes.json());
       }
@@ -276,6 +384,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } catch {}
     setUser(null);
     setSavedCards([]);
+    setNotes([]);
   };
 
   const updateProfile = async (nickname: string) => {
@@ -318,6 +427,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     <AppContext.Provider value={{
       articles, savedCards, saveArticle, addCards, addCard, updateCard, deleteCard,
       showToast, toastMsg, theme, toggleTheme,
+      viewMode, setViewMode,
       readingArticle, setReadingArticle,
       activeSource, setActiveSource,
       reloadArticles,
@@ -329,7 +439,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setKnowledgeSourceFilter,
       user, isAuthLoading, showLoginModal, setShowLoginModal,
       loginAndDo, handleLoginSuccess, logout,
-      updateProfile, updateAvatar, showProfileModal, setShowProfileModal
+      updateProfile, updateAvatar, showProfileModal, setShowProfileModal,
+      notes, createNote, updateNote, deleteNote, syncPreferences
     }}>
       {children}
     </AppContext.Provider>

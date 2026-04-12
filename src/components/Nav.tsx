@@ -240,9 +240,16 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const {
     articles, savedCards, theme, toggleTheme, setActiveSource, showToast, reloadArticles, activeSource,
     knowledgeTypeFilter, setKnowledgeTypeFilter, setKnowledgeSourceFilter,
-    user, loginAndDo, logout, setShowProfileModal
+    user, loginAndDo, logout, setShowProfileModal, syncPreferences
   } = useAppContext();
   const [sourceEntries, setSourceEntries] = useState<NavEntry[]>(() => loadEntriesFromStorage());
+
+  // Reload source entries when server preferences are loaded
+  useEffect(() => {
+    const handler = () => setSourceEntries(loadEntriesFromStorage());
+    window.addEventListener('atomflow:preferences-loaded', handler);
+    return () => window.removeEventListener('atomflow:preferences-loaded', handler);
+  }, []);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropHint, setDropHint] = useState<{ targetId: string; position: 'before' | 'after' | 'inside' } | null>(null);
   const [dragPreview, setDragPreview] = useState<{ x: number; y: number; text: string } | null>(null);
@@ -325,11 +332,12 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    window.localStorage.setItem(SOURCE_LAYOUT_STORAGE_KEY, JSON.stringify({
-      version: SOURCE_LAYOUT_VERSION,
-      entries: sourceEntries
-    }));
-  }, [sourceEntries]);
+    const layoutData = { version: SOURCE_LAYOUT_VERSION, entries: sourceEntries };
+    window.localStorage.setItem(SOURCE_LAYOUT_STORAGE_KEY, JSON.stringify(layoutData));
+    if (user) {
+      syncPreferences({ source_layout: layoutData });
+    }
+  }, [sourceEntries, user, syncPreferences]);
 
   const handleTabClick = (tab: 'feed' | 'knowledge' | 'write' | 'discover') => {
     if ((tab === 'knowledge' || tab === 'write') && !user) {

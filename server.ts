@@ -12,6 +12,7 @@ import dotenv from "dotenv";
 import pg from "pg";
 import session from "express-session";
 import connectPgSimple from "connect-pg-simple";
+import bcrypt from "bcryptjs";
 import { Resend } from "resend";
 import nodemailer from "nodemailer";
 
@@ -777,6 +778,31 @@ async function startServer() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_user ON saved_cards(user_id)`);
 
+  // --- Schema migrations for password auth, preferences, notes ---
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT`);
+  await pool.query(`ALTER TABLE verification_codes ADD COLUMN IF NOT EXISTS password_hash TEXT`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_preferences (
+      user_id      INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      source_layout JSONB,
+      theme        TEXT DEFAULT 'light',
+      view_mode    TEXT DEFAULT 'card',
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notes (
+      id           SERIAL PRIMARY KEY,
+      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title        TEXT NOT NULL DEFAULT '',
+      content      TEXT NOT NULL DEFAULT '',
+      tags         JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id, updated_at DESC)`);
+
   // Backfill: set default nickname for existing users who don't have one
   await pool.query("UPDATE users SET nickname = split_part(email, '@', 1) WHERE nickname IS NULL");
 
@@ -941,27 +967,27 @@ async function startServer() {
 
     await pool.query('UPDATE verification_codes SET used = TRUE WHERE id = $1', [record.id]);
 
-    let user = (await pool.query('SELECT id, email, nickname, avatar_url FROM users WHERE email = $1', [email])).rows[0];
+    let user = (await pool.query('SELECT id, email, nickname, avatar_url, password_hash FROM users WHERE email = $1', [email])).rows[0];
     if (!user) {
       const nickname = email.split('@')[0];
       const result = await pool.query('INSERT INTO users (email, nickname) VALUES ($1, $2) RETURNING id', [email, nickname]);
-      user = { id: result.rows[0].id, email, nickname, avatar_url: null };
+      user = { id: result.rows[0].id, email, nickname, avatar_url: null, password_hash: null };
     }
 
     req.session.userId = user.id as number;
     req.session.email = user.email as string;
-    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
+    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url, has_password: Boolean(user.password_hash) } });
   }));
 
   app.get("/api/auth/me", asyncHandler(async (req, res) => {
     if (!req.session.userId) {
       return res.json({ user: null });
     }
-    const user = (await pool.query('SELECT id, email, nickname, avatar_url FROM users WHERE id = $1', [req.session.userId])).rows[0];
+    const user = (await pool.query('SELECT id, email, nickname, avatar_url, password_hash FROM users WHERE id = $1', [req.session.userId])).rows[0];
     if (!user) {
       return res.json({ user: null });
     }
-    return res.json({ user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
+    return res.json({ user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url, has_password: Boolean(user.password_hash) } });
   }));
 
   app.post("/api/auth/logout", (req, res) => {
@@ -972,6 +998,131 @@ async function startServer() {
     });
   });
 
+  // --- Password Registration ---
+  app.post("/api/auth/register", asyncHandler(async (req, res) => {
+    const email = (req.body?.email || '').trim().toLowerCase();
+    const password = req.body?.password || '';
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: '请输入有效的邮箱地址' });
+    }
+    if (!password || password.length < 8) {
+      return res.status(400).json({ error: '密码至少 8 个字符' });
+    }
+    if (!smtpTransporter && !resend) {
+      return res.status(500).json({ error: '邮件服务未配置' });
+    }
+
+    const existing = (await pool.query('SELECT id FROM users WHERE email = $1', [email])).rows[0];
+    if (existing) {
+      return res.status(409).json({ error: '该邮箱已注册，请直接登录' });
+    }
+
+    const recent = (await pool.query(
+      "SELECT id FROM verification_codes WHERE email = $1 AND created_at > NOW() - INTERVAL '60 seconds' AND used = FALSE",
+      [email]
+    )).rows[0];
+    if (recent) {
+      return res.status(429).json({ error: '发送过于频繁，请 60 秒后再试' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    await pool.query(
+      'INSERT INTO verification_codes (email, code, expires_at, password_hash) VALUES ($1, $2, $3, $4)',
+      [email, code, expiresAt, passwordHash]
+    );
+
+    console.log(`[AUTH] 注册验证码 → ${email}: ${code}`);
+
+    const htmlContent = `
+      <div style="font-family: sans-serif; max-width: 400px; margin: 0 auto; padding: 20px;">
+        <h2 style="color: #1C1916;">AtomFlow 注册验证码</h2>
+        <p style="color: #6B6560; font-size: 14px;">你的验证码是：</p>
+        <div style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #2B6CB0; padding: 16px 0;">${code}</div>
+        <p style="color: #A09890; font-size: 12px;">验证码有效期 10 分钟，请尽快使用。</p>
+      </div>
+    `;
+
+    try {
+      if (resend) {
+        await resend.emails.send({
+          from: 'AtomFlow <noreply@atomflow.cloud>',
+          to: email,
+          subject: '你的 AtomFlow 注册验证码',
+          html: htmlContent
+        });
+      } else if (smtpTransporter) {
+        await smtpTransporter.sendMail({
+          from: `AtomFlow <${process.env.SMTP_USER}>`,
+          to: email,
+          subject: '你的 AtomFlow 注册验证码',
+          html: htmlContent
+        });
+      }
+      return res.json({ success: true });
+    } catch (error) {
+      console.error('Failed to send registration code:', error);
+      return res.status(500).json({ error: '发送验证码失败，请稍后再试' });
+    }
+  }));
+
+  app.post("/api/auth/register/verify", asyncHandler(async (req, res) => {
+    const email = (req.body?.email || '').trim().toLowerCase();
+    const code = (req.body?.code || '').trim();
+    if (!email || !code) {
+      return res.status(400).json({ error: '请输入邮箱和验证码' });
+    }
+
+    const record = (await pool.query(
+      'SELECT id, password_hash FROM verification_codes WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW() AND password_hash IS NOT NULL',
+      [email, code]
+    )).rows[0];
+    if (!record) {
+      return res.status(400).json({ error: '验证码无效或已过期' });
+    }
+
+    await pool.query('UPDATE verification_codes SET used = TRUE WHERE id = $1', [record.id]);
+
+    const existing = (await pool.query('SELECT id FROM users WHERE email = $1', [email])).rows[0];
+    if (existing) {
+      return res.status(409).json({ error: '该邮箱已注册' });
+    }
+
+    const nickname = email.split('@')[0];
+    const result = await pool.query(
+      'INSERT INTO users (email, nickname, password_hash) VALUES ($1, $2, $3) RETURNING id',
+      [email, nickname, record.password_hash]
+    );
+    const user = { id: result.rows[0].id, email, nickname, avatar_url: null, has_password: true };
+
+    req.session.userId = user.id;
+    req.session.email = user.email;
+    return res.json({ success: true, user });
+  }));
+
+  app.post("/api/auth/login-password", asyncHandler(async (req, res) => {
+    const email = (req.body?.email || '').trim().toLowerCase();
+    const password = req.body?.password || '';
+    if (!email || !password) {
+      return res.status(400).json({ error: '请输入邮箱和密码' });
+    }
+
+    const user = (await pool.query('SELECT id, email, nickname, avatar_url, password_hash FROM users WHERE email = $1', [email])).rows[0];
+    if (!user || !user.password_hash) {
+      return res.status(401).json({ error: '邮箱或密码错误' });
+    }
+
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ error: '邮箱或密码错误' });
+    }
+
+    req.session.userId = user.id;
+    req.session.email = user.email;
+    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url, has_password: true } });
+  }));
+
   // --- Auth middleware ---
   const requireAuth: express.RequestHandler = (req, res, next) => {
     if (!req.session.userId) {
@@ -979,6 +1130,17 @@ async function startServer() {
     }
     next();
   };
+
+  // --- Set/Change password (requires auth) ---
+  app.put("/api/auth/set-password", requireAuth, asyncHandler(async (req, res) => {
+    const password = req.body?.password || '';
+    if (!password || password.length < 8) {
+      return res.status(400).json({ error: '密码至少 8 个字符' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, req.session.userId]);
+    return res.json({ success: true });
+  }));
 
   // --- Profile routes ---
 
@@ -988,11 +1150,11 @@ async function startServer() {
       return res.status(400).json({ error: '昵称不能为空且不超过30个字符' });
     }
     const user = (await pool.query(
-      'UPDATE users SET nickname = $1 WHERE id = $2 RETURNING id, email, nickname, avatar_url',
+      'UPDATE users SET nickname = $1 WHERE id = $2 RETURNING id, email, nickname, avatar_url, password_hash',
       [nickname, req.session.userId]
     )).rows[0];
     if (!user) return res.status(404).json({ error: '用户不存在' });
-    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
+    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url, has_password: Boolean(user.password_hash) } });
   }));
 
   app.post("/api/auth/avatar", requireAuth, avatarUpload.single('avatar'), asyncHandler(async (req: any, res) => {
@@ -1010,15 +1172,79 @@ async function startServer() {
     }
 
     const user = (await pool.query(
-      'UPDATE users SET avatar_url = $1 WHERE id = $2 RETURNING id, email, nickname, avatar_url',
+      'UPDATE users SET avatar_url = $1 WHERE id = $2 RETURNING id, email, nickname, avatar_url, password_hash',
       [avatarUrl, req.session.userId]
     )).rows[0];
     if (!user) return res.status(404).json({ error: '用户不存在' });
-    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url } });
+    return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url, has_password: Boolean(user.password_hash) } });
   }));
 
   // Serve avatar files
   app.use('/api/avatars', express.static(avatarsDir, { maxAge: '7d' }));
+
+  // --- Preferences routes ---
+  app.get("/api/preferences", requireAuth, asyncHandler(async (req, res) => {
+    const row = (await pool.query(
+      'SELECT source_layout, theme, view_mode FROM user_preferences WHERE user_id = $1',
+      [req.session.userId]
+    )).rows[0];
+    return res.json(row || { source_layout: null, theme: null, view_mode: null });
+  }));
+
+  app.put("/api/preferences", requireAuth, asyncHandler(async (req, res) => {
+    const { source_layout, theme, view_mode } = req.body;
+    await pool.query(
+      `INSERT INTO user_preferences (user_id, source_layout, theme, view_mode, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         source_layout = COALESCE($2, user_preferences.source_layout),
+         theme = COALESCE($3, user_preferences.theme),
+         view_mode = COALESCE($4, user_preferences.view_mode),
+         updated_at = NOW()`,
+      [req.session.userId, source_layout ? JSON.stringify(source_layout) : null, theme ?? null, view_mode ?? null]
+    );
+    return res.json({ success: true });
+  }));
+
+  // --- Notes routes ---
+  app.get("/api/notes", requireAuth, asyncHandler(async (req, res) => {
+    const rows = (await pool.query(
+      'SELECT id, title, content, tags, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC',
+      [req.session.userId]
+    )).rows;
+    return res.json(rows);
+  }));
+
+  app.post("/api/notes", requireAuth, asyncHandler(async (req, res) => {
+    const { title, content, tags } = req.body;
+    const row = (await pool.query(
+      'INSERT INTO notes (user_id, title, content, tags) VALUES ($1, $2, $3, $4) RETURNING id, title, content, tags, created_at, updated_at',
+      [req.session.userId, title || '', content || '', tags ? JSON.stringify(tags) : '[]']
+    )).rows[0];
+    return res.json(row);
+  }));
+
+  app.put("/api/notes/:id", requireAuth, asyncHandler(async (req, res) => {
+    const { title, content, tags } = req.body;
+    const row = (await pool.query(
+      `UPDATE notes SET
+        title = COALESCE($1, title),
+        content = COALESCE($2, content),
+        tags = COALESCE($3, tags),
+        updated_at = NOW()
+      WHERE id = $4 AND user_id = $5
+      RETURNING id, title, content, tags, created_at, updated_at`,
+      [title ?? null, content ?? null, tags ? JSON.stringify(tags) : null, req.params.id, req.session.userId]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: '笔记不存在' });
+    return res.json(row);
+  }));
+
+  app.delete("/api/notes/:id", requireAuth, asyncHandler(async (req, res) => {
+    const result = await pool.query('DELETE FROM notes WHERE id = $1 AND user_id = $2', [req.params.id, req.session.userId]);
+    if (result.rowCount === 0) return res.status(404).json({ error: '笔记不存在' });
+    return res.json({ success: true });
+  }));
 
   // API Routes
   

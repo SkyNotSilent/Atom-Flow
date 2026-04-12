@@ -3,10 +3,12 @@ import { useAppContext } from '../context/AppContext';
 import { AtomCard } from '../types';
 import { CARD_COLORS } from '../constants';
 import { cn } from '../components/Nav';
-import { Check, Plus, X, Copy, Download, Sparkles } from 'lucide-react';
+import { Check, Plus, X, Copy, Download, Sparkles, FileText, Wand2 } from 'lucide-react';
+import { NotesPanel } from '../components/NotesPanel';
 
 export const WritePage: React.FC = () => {
   const { savedCards, showToast, theme } = useAppContext();
+  const [writeMode, setWriteMode] = useState<'magic' | 'notes'>('magic');
   const [topic, setTopic] = useState('');
   const [canvasCards, setCanvasCards] = useState<AtomCard[]>([]);
   const [dragCard, setDragCard] = useState<AtomCard | null>(null);
@@ -164,11 +166,65 @@ export const WritePage: React.FC = () => {
     return 'pending';
   };
 
+  if (writeMode === 'notes') {
+    return (
+      <div id="page-write" className="flex flex-col h-[calc(100vh-56px)] overflow-hidden">
+        {/* Mode toggle */}
+        <div className="shrink-0 px-4 md:px-8 pt-4 pb-2 flex items-center gap-3">
+          <button
+            onClick={() => setWriteMode('magic')}
+            className={cn(
+              "flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13px] font-medium transition-colors",
+              "text-text2 hover:bg-surface2"
+            )}
+          >
+            <Wand2 size={14} />
+            魔法写作
+          </button>
+          <button
+            onClick={() => setWriteMode('notes')}
+            className={cn(
+              "flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13px] font-medium transition-colors",
+              "bg-accent-light text-accent"
+            )}
+          >
+            <FileText size={14} />
+            我的笔记
+          </button>
+        </div>
+        <div className="flex-1 min-h-0">
+          <NotesPanel />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div id="page-write" className="flex flex-col h-[calc(100vh-56px)] overflow-hidden p-4 md:p-[22px_32px_0]">
-      {/* Header */}
-      <div className="shrink-0 mb-2.5">
-        <h1 className="font-serif text-[22px] font-bold text-text-main">魔法写作</h1>
+      {/* Mode toggle + Header */}
+      <div className="shrink-0 mb-2.5 flex items-center gap-4">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setWriteMode('magic')}
+            className={cn(
+              "flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13px] font-medium transition-colors",
+              "bg-accent-light text-accent"
+            )}
+          >
+            <Wand2 size={14} />
+            魔法写作
+          </button>
+          <button
+            onClick={() => setWriteMode('notes')}
+            className={cn(
+              "flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13px] font-medium transition-colors",
+              "text-text2 hover:bg-surface2"
+            )}
+          >
+            <FileText size={14} />
+            我的笔记
+          </button>
+        </div>
       </div>
 
       {/* Workflow Bar */}
