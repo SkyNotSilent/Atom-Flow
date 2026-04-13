@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, Camera, Loader2, Mail, Lock, Eye, EyeOff } from 'lucide-react';
+import { X, Camera, Loader2, Mail } from 'lucide-react';
 import { cn } from './Nav';
 import { useAppContext } from '../context/AppContext';
 
@@ -15,11 +15,6 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const [error, setError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [newPassword, setNewPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [savingPassword, setSavingPassword] = useState(false);
-  const [passwordError, setPasswordError] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
 
   useEffect(() => {
     if (isOpen && user) {
@@ -27,11 +22,6 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
       setError('');
       setSaving(false);
       setUploadingAvatar(false);
-      setNewPassword('');
-      setConfirmPassword('');
-      setPasswordError('');
-      setSavingPassword(false);
-      setShowPassword(false);
     }
   }, [isOpen, user]);
 
@@ -158,74 +148,6 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
           </div>
 
           {error && <p className="text-[12px] text-red-500 mb-3">{error}</p>}
-
-          {/* Password section */}
-          <div className="border-t border-border pt-3 mb-3 mt-1">
-            <label className="block text-[12px] text-text3 mb-1.5">
-              {user.has_password ? '修改密码' : '设置密码'}
-            </label>
-            <div className="relative mb-2">
-              <Lock size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-text3" />
-              <input
-                type={showPassword ? 'text' : 'password'}
-                value={newPassword}
-                onChange={e => { setNewPassword(e.target.value); setPasswordError(''); }}
-                placeholder="新密码（至少 8 个字符）"
-                className="w-full pl-9 pr-10 py-2 rounded-xl border border-border bg-bg text-[13px] text-text-main outline-none focus:border-accent transition-colors"
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-text3 hover:text-text-main"
-              >
-                {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
-              </button>
-            </div>
-            <div className="relative mb-2">
-              <Lock size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-text3" />
-              <input
-                type={showPassword ? 'text' : 'password'}
-                value={confirmPassword}
-                onChange={e => { setConfirmPassword(e.target.value); setPasswordError(''); }}
-                placeholder="确认新密码"
-                className="w-full pl-9 pr-3 py-2 rounded-xl border border-border bg-bg text-[13px] text-text-main outline-none focus:border-accent transition-colors"
-              />
-            </div>
-            {passwordError && <p className="text-[12px] text-red-500 mb-2">{passwordError}</p>}
-            <button
-              onClick={async () => {
-                if (!newPassword || newPassword.length < 8) { setPasswordError('密码至少 8 个字符'); return; }
-                if (newPassword !== confirmPassword) { setPasswordError('两次密码不一致'); return; }
-                setSavingPassword(true);
-                setPasswordError('');
-                try {
-                  const res = await fetch('/api/auth/set-password', {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: newPassword })
-                  });
-                  if (!res.ok) {
-                    const data = await res.json().catch(() => ({}));
-                    setPasswordError(data.error || '设置失败');
-                    return;
-                  }
-                  showToast('密码已设置');
-                  setNewPassword('');
-                  setConfirmPassword('');
-                } catch { setPasswordError('网络错误'); } finally { setSavingPassword(false); }
-              }}
-              disabled={savingPassword || !newPassword}
-              className={cn(
-                "w-full py-2 rounded-xl text-[13px] font-medium transition-all flex items-center justify-center gap-2",
-                savingPassword || !newPassword
-                  ? "bg-surface2 text-text3 cursor-not-allowed"
-                  : "bg-surface2 text-text-main hover:bg-accent hover:text-white"
-              )}
-            >
-              {savingPassword && <Loader2 size={14} className="animate-spin" />}
-              {savingPassword ? '保存中...' : user.has_password ? '修改密码' : '设置密码'}
-            </button>
-          </div>
 
           {/* Save button */}
           <button
