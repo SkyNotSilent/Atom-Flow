@@ -1580,53 +1580,109 @@ async function startServer() {
     res.json({ success: true });
   }));
 
-  // Translate article content
+  // Translate article content (Baidu Translate API)
+  // Supports both single string (content) and array of strings (segments) for paragraph-level translation
   app.post("/api/translate", requireAuth, async (req, res) => {
-    const { content, targetLang = 'zh-CN' } = req.body;
-    
-    if (!content) {
-      return res.status(400).json({ error: "Content is required" });
+    const { content, segments, targetLang = 'zh' } = req.body;
+
+    const appid = process.env.BAIDU_TRANSLATE_APPID;
+    const key = process.env.BAIDU_TRANSLATE_KEY;
+
+    if (!appid || !key) {
+      return res.status(500).json({ error: "Translation service not configured" });
     }
 
+    const toLang = targetLang === 'zh-CN' ? 'zh' : targetLang;
+    const crypto = await import('crypto');
+
+    // Strip HTML and Markdown, returning plain text only
+    const HTML_TAGS_RE = '(?:p|div|span|li|ul|ol|br|hr|h[1-6]|em|strong|code|pre|blockquote|details|summary|figure|video|iframe|script|style|a|img|table|t[rdh]|thead|tbody|tfoot|section|article|header|footer|nav|aside|main)';
+    const stripMarkdown = (md: string): string => {
+      return md
+        .replace(/<!--[\s\S]*?-->/g, '')           // HTML comments
+        .replace(/<(script|style|iframe|figure|video|details|summary)[^>]*>[\s\S]*?<\/\1>/gi, '')  // block elements with content
+        .replace(/<[^>]*>/g, ' ')                  // remaining HTML tags (including CJK tag names like <详情>)
+        .replace(/&[a-zA-Z#\d]+;/g, ' ')          // HTML entities (&nbsp; &hellip; &amp; &rsquo; etc.)
+        // Bare tag remnants: "。p" "！p" ".p" at end of line, or "p" alone on a line
+        .replace(new RegExp(`(?<=[。！？.!?\\s])\\/?${HTML_TAGS_RE}\\s*$`, 'gmi'), '')
+        .replace(new RegExp(`^\\/?${HTML_TAGS_RE}\\s*$`, 'gmi'), '')
+        .replace(/!\[.*?\]\(.*?\)/g, '')           // MD images
+        .replace(/\[([^\]]*)\]\(.*?\)/g, '$1')    // MD links → label only
+        .replace(/```[\s\S]*?```/g, '')            // fenced code blocks
+        .replace(/`[^`]*`/g, '')                   // inline code
+        .replace(/^#{1,6}\s+/gm, '')               // headings
+        .replace(/(\*{1,3}|_{1,3})(.*?)\1/g, '$2') // bold / italic
+        .replace(/~~(.*?)~~/g, '$1')               // strikethrough
+        .replace(/^\s*[-*+>]\s+/gm, '')            // list bullets / blockquotes
+        .replace(/^\s*\d+\.\s+/gm, '')             // ordered list numbers
+        .replace(/\|/g, ' ')                       // table pipes
+        .replace(/\[[\d]+\]/g, '')                 // footnote refs
+        .replace(/[ \t]{2,}/g, ' ')               // collapse spaces
+        .replace(/\n[ \t]*\n/g, '\n\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    };
+
+    // Helper: call Baidu API for a single text
+    const baiduTranslate = async (text: string): Promise<string> => {
+      const salt = Date.now().toString() + Math.random();
+      const sign = crypto.createHash('md5').update(appid + text + salt + key).digest('hex');
+      const params = new URLSearchParams({ q: text, from: 'auto', to: toLang, appid, salt, sign });
+      const response = await fetch(`https://fanyi-api.baidu.com/api/trans/vip/translate?${params}`);
+      const data = await response.json() as any;
+      if (data.error_code) throw new Error(`百度翻译错误 ${data.error_code}: ${data.error_msg}`);
+      return (data.trans_result as Array<{ dst: string }>).map(r => r.dst).join('\n');
+    };
+
+    // Clean artifacts that Baidu introduces in translated output
+    const cleanTranslation = (t: string): string => {
+      return t
+        // Remove stray ；between Chinese words (from apostrophes like we're → 我们；重新)
+        .replace(/(?<=[\u4e00-\u9fa5\w])；(?=[\u4e00-\u9fa5\w])/g, '')
+        // Remove leftover HTML/Markdown that Baidu left untouched
+        .replace(/<[^>]{0,60}>/g, '')
+        .replace(/&[a-zA-Z#\d]+;/g, '')
+        // Remove bare URLs in parentheses: （https://...） or (https://...)
+        .replace(/[（(]\s*https?:\/\/[^\s）)]+\s*[）)]/g, '')
+        // Remove standalone URLs
+        .replace(/https?:\/\/\S+/g, '')
+        // Remove leftover markdown link syntax残留
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+        // Remove lines that are purely punctuation/symbols with no CJK or Latin content
+        .replace(/^[^\u4e00-\u9fa5a-zA-Z0-9]+$/gm, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    };
+
     try {
-      const { GoogleGenerativeAI } = await import('@google/genai');
-      const apiKey = process.env.GEMINI_API_KEY;
-      
-      if (!apiKey) {
-        console.error('Translation failed: GEMINI_API_KEY not configured');
-        return res.status(500).json({ 
-          error: "Translation service not configured",
-          details: "GEMINI_API_KEY environment variable is missing"
-        });
+      // Segment mode: translate in parallel batches of 5
+      if (Array.isArray(segments) && segments.length > 0) {
+        const results: string[] = new Array(segments.length).fill('');
+        const BATCH = 5;
+        for (let i = 0; i < segments.length; i += BATCH) {
+          const batch = segments.slice(i, i + BATCH) as string[];
+          const batchResults = await Promise.all(batch.map(async (seg) => {
+            if (!seg.trim()) return '';
+            const plain = stripMarkdown(seg);
+            if (!plain) return '';
+            const encoded = encodeURIComponent(plain);
+            const text = encoded.length > 5000 ? plain.slice(0, 1000) : plain;
+            const translated = await baiduTranslate(text);
+            return cleanTranslation(translated);
+          }));
+          batchResults.forEach((r, j) => { results[i + j] = r; });
+        }
+        return res.json({ success: true, segments: results });
       }
 
-      const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
-
-      const prompt = `请将以下内容翻译成${targetLang === 'zh-CN' ? '简体中文' : targetLang}。保持原文的格式和结构，只翻译文字内容。如果是Markdown格式，保留所有Markdown标记。
-
-内容：
-${content}`;
-
-      const result = await model.generateContent(prompt);
-      const translatedText = result.response.text();
-
-      res.json({ 
-        success: true, 
-        translatedContent: translatedText,
-        originalLength: content.length,
-        translatedLength: translatedText.length
-      });
+      // Single content mode
+      if (!content) return res.status(400).json({ error: "Content is required" });
+      const translatedText = cleanTranslation(await baiduTranslate(content));
+      res.json({ success: true, translatedContent: translatedText });
     } catch (error: any) {
       console.error('Translation error:', error);
-      const errorMessage = error?.message || 'Unknown error';
-      const errorDetails = error?.response?.data || error?.toString() || '';
-      
-      res.status(500).json({ 
-        error: "Translation failed",
-        details: errorMessage,
-        debug: errorDetails
-      });
+      res.status(500).json({ error: "Translation failed", details: error?.message });
     }
   });
 

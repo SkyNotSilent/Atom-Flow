@@ -7,14 +7,33 @@ import rehypeRaw from 'rehype-raw';
 import { cn } from './Nav';
 import { getDisplaySource } from '../utils/articleDisplay';
 
+const LANG_OPTIONS = [
+  { value: 'zh', label: '中文' },
+  { value: 'en', label: 'English' },
+  { value: 'ja', label: '日本語' },
+  { value: 'ko', label: '한국어' },
+  { value: 'fr', label: 'Français' },
+  { value: 'de', label: 'Deutsch' },
+];
+
+// Split text content into translatable segments (paragraphs / headings)
+function splitIntoSegments(text: string): string[] {
+  return text.split(/\n\n+/).map(s => s.trim()).filter(Boolean);
+}
+
 export const ReaderPane: React.FC = () => {
   const { readingArticle, setReadingArticle, saveArticle, showToast, isSavingArticle, getSavingStageText, articles } = useAppContext();
   const contentRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
   const [isTranslating, setIsTranslating] = useState(false);
-  const [translatedContent, setTranslatedContent] = useState<string | null>(null);
-  const [showOriginal, setShowOriginal] = useState(false);
+  const [translateActive, setTranslateActive] = useState(false);
+  const [translatedTitle, setTranslatedTitle] = useState<string | null>(null);
+  const [translatedSegments, setTranslatedSegments] = useState<string[] | null>(null);
+  const [originalSegments, setOriginalSegments] = useState<string[] | null>(null);
+  const [targetLang, setTargetLang] = useState('zh');
+  const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -47,6 +66,17 @@ export const ReaderPane: React.FC = () => {
     }
   }, [currentArticle]);
 
+  // Close more menu when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (moreMenuRef.current && !moreMenuRef.current.contains(e.target as Node)) {
+        setShowMoreMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
   // Audio player effects
   useEffect(() => {
     const audio = audioRef.current;
@@ -67,12 +97,16 @@ export const ReaderPane: React.FC = () => {
     };
   }, [isPodcast, currentArticle?.audioUrl]);
 
-  // Reset scroll position and audio state when article changes
+  // Reset scroll position, audio state, and translation state when article changes
   useEffect(() => {
     scrollRef.current?.scrollTo(0, 0);
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
+    setTranslateActive(false);
+    setTranslatedTitle(null);
+    setTranslatedSegments(null);
+    setOriginalSegments(null);
   }, [currentArticle?.id]);
 
   const togglePlay = () => {
@@ -116,48 +150,71 @@ export const ReaderPane: React.FC = () => {
 
   const handleClose = () => {
     setReadingArticle(null);
-    setTranslatedContent(null);
-    setShowOriginal(false);
+    setTranslateActive(false);
+    setTranslatedTitle(null);
+    setTranslatedSegments(null);
+    setOriginalSegments(null);
   };
 
   const handleTranslate = async () => {
     if (!currentArticle) return;
-    
-    if (translatedContent) {
-      setShowOriginal(!showOriginal);
+
+    // Toggle off: clear translation
+    if (translateActive) {
+      setTranslateActive(false);
+      return;
+    }
+
+    // Toggle on: if already translated, just activate
+    if (translatedSegments) {
+      setTranslateActive(true);
       return;
     }
 
     setIsTranslating(true);
+    setTranslateActive(true);
     try {
-      const contentToTranslate = currentArticle.markdownContent || currentArticle.content;
+      const rawContent = currentArticle.markdownContent || currentArticle.content || '';
+      const segs = splitIntoSegments(rawContent);
+      const titleText = currentArticle.title || '';
+
+      // Translate title + segments together
+      const allSegments = [titleText, ...segs];
       const response = await fetch('/api/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: contentToTranslate, targetLang: 'zh-CN' })
+        body: JSON.stringify({ segments: allSegments, targetLang })
       });
-
       const data = await response.json();
 
       if (!response.ok) {
-        console.error('Translation API error:', data);
-        if (data.details?.includes('GEMINI_API_KEY')) {
-          showToast('翻译服务未配置，请联系管理员');
-        } else {
-          showToast(`翻译失败: ${data.details || data.error || '未知错误'}`);
-        }
+        showToast(`翻译失败: ${data.details || data.error || '未知错误'}`);
+        setTranslateActive(false);
         return;
       }
 
-      setTranslatedContent(data.translatedContent);
-      setShowOriginal(false);
+      const [transTitle, ...transSegs] = data.segments as string[];
+      setTranslatedTitle(transTitle);
+      setOriginalSegments(segs);
+      setTranslatedSegments(transSegs);
       showToast('翻译完成');
     } catch (error) {
       console.error('Translation error:', error);
       showToast('翻译失败，请稍后重试');
+      setTranslateActive(false);
     } finally {
       setIsTranslating(false);
     }
+  };
+
+  const handleLangChange = (lang: string) => {
+    setTargetLang(lang);
+    // Clear existing translation so next toggle re-translates in new lang
+    setTranslatedTitle(null);
+    setTranslatedSegments(null);
+    setOriginalSegments(null);
+    setTranslateActive(false);
+    setShowMoreMenu(false);
   };
 
   const handleBookmark = async () => {
@@ -219,21 +276,22 @@ export const ReaderPane: React.FC = () => {
               原文 <ExternalLink size={12} />
             </a>
           )}
-          <button 
+          <button
             onClick={handleTranslate}
             disabled={isTranslating}
+            title="翻译"
             className={cn(
-              "px-2.5 h-8 rounded-full border flex items-center gap-1 text-[12px] transition-colors",
-              translatedContent 
-                ? "border-accent bg-accent-light text-accent hover:bg-accent hover:text-white" 
+              "w-8 h-8 flex items-center justify-center rounded-full border transition-colors",
+              translateActive
+                ? "border-accent bg-accent text-white"
                 : "border-border text-text2 hover:bg-surface2",
               isTranslating && "cursor-wait opacity-70"
             )}
           >
-            <Languages size={14} className={cn(isTranslating && "animate-pulse")} />
-            <span className="hidden sm:inline">
-              {isTranslating ? '翻译中...' : translatedContent ? (showOriginal ? '查看译文' : '查看原文') : '翻译'}
-            </span>
+            {isTranslating
+              ? <Loader2 size={15} className="animate-spin" />
+              : <Languages size={15} />
+            }
           </button>
           <button onClick={handleShare} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
             <Share size={16} />
@@ -241,9 +299,33 @@ export const ReaderPane: React.FC = () => {
           <button onClick={handleBookmark} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
             <Bookmark size={16} />
           </button>
-          <button className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
-            <MoreHorizontal size={16} />
-          </button>
+          {/* More menu */}
+          <div ref={moreMenuRef} className="relative">
+            <button
+              onClick={() => setShowMoreMenu(v => !v)}
+              className={cn("w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors", showMoreMenu && "bg-surface2")}
+            >
+              <MoreHorizontal size={16} />
+            </button>
+            {showMoreMenu && (
+              <div className="absolute right-0 top-full mt-1.5 w-44 bg-surface border border-border rounded-xl shadow-[0_8px_30px_rgba(0,0,0,0.15)] z-50 overflow-hidden py-1">
+                <div className="px-3 py-1.5 text-[11px] text-text3 font-medium uppercase tracking-wide">翻译语言</div>
+                {LANG_OPTIONS.map(opt => (
+                  <button
+                    key={opt.value}
+                    onClick={() => handleLangChange(opt.value)}
+                    className={cn(
+                      "w-full text-left px-3 py-2 text-[13px] flex items-center justify-between hover:bg-surface2 transition-colors",
+                      targetLang === opt.value ? "text-accent font-medium" : "text-text-main"
+                    )}
+                  >
+                    {opt.label}
+                    {targetLang === opt.value && <Check size={13} />}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -251,9 +333,15 @@ export const ReaderPane: React.FC = () => {
       <div ref={scrollRef} className="flex-1 overflow-y-auto bg-surface">
         <div className="max-w-3xl mx-auto py-10 px-6 sm:px-12 min-h-full">
           <div className="mb-8">
-            <h1 className="font-serif text-2xl sm:text-[32px] font-bold text-text-main leading-[1.4] mb-4">
+            <h1 className="font-serif text-2xl sm:text-[32px] font-bold text-text-main leading-[1.4] mb-1">
               {currentArticle.title}
             </h1>
+            {translateActive && translatedTitle && (
+              <p className="text-xl sm:text-2xl font-serif text-text2 leading-[1.4] mb-4 border-l-2 border-accent/40 pl-3">
+                {translatedTitle}
+              </p>
+            )}
+            {!(translateActive && translatedTitle) && <div className="mb-4" />}
             <div className="flex items-center gap-2 mb-8 text-[13px] text-text3">
               <span className="font-medium text-accent">{displaySource}</span>
               <span>·</span>
@@ -334,18 +422,37 @@ export const ReaderPane: React.FC = () => {
               ref={contentRef}
               className="text-[15px] sm:text-[16px] leading-[1.8] sm:leading-[2] text-text-main prose prose-p:mb-6 prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-img:rounded-xl prose-img:my-8 max-w-none pb-20 [&_section[data-footnotes]]:hidden [&_.footnotes]:hidden"
             >
-              {translatedContent && !showOriginal ? (
+              {translateActive && originalSegments && translatedSegments ? (
+                // Paragraph-interleaved translation view
                 <div>
-                  <div className="mb-6 p-3 bg-accent-light/30 rounded-xl border border-accent/20 text-[13px] text-accent flex items-center gap-2">
-                    <Languages size={16} />
-                    <span>以下为 AI 翻译内容</span>
-                  </div>
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm]}
-                    rehypePlugins={[rehypeRaw]}
-                  >
-                    {translatedContent}
-                  </ReactMarkdown>
+                  {originalSegments.map((seg, i) => (
+                    <div key={i} className="mb-6">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}
+                        components={{
+                          a: ({node, href, children, ...props}) => (
+                            <a {...props} href={href} className="text-accent hover:underline break-all" target="_blank" rel="noreferrer">{children}</a>
+                          ),
+                          img: ({node, src, onError, ...props}) => {
+                            let normalizedSrc = src || '';
+                            if (normalizedSrc.startsWith('//')) normalizedSrc = `https:${normalizedSrc}`;
+                            else if (normalizedSrc.startsWith('/')) {
+                              const articleHost = currentArticle?.url ? new URL(currentArticle.url).origin : '';
+                              normalizedSrc = articleHost ? `${articleHost}${normalizedSrc}` : normalizedSrc;
+                            }
+                            const proxySrc = normalizedSrc.startsWith('http')
+                              ? `/api/image-proxy?url=${encodeURIComponent(normalizedSrc)}&referer=${encodeURIComponent(currentArticle?.url || '')}`
+                              : normalizedSrc;
+                            return <img {...props} src={proxySrc} referrerPolicy="no-referrer" className="w-full rounded-xl my-4 object-cover bg-surface2" loading="lazy" onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />;
+                          }
+                        }}
+                      >{seg}</ReactMarkdown>
+                      {translatedSegments[i] && (
+                        <p className="mt-1 text-text2 text-[14px] sm:text-[15px] leading-[1.8]">
+                          {translatedSegments[i]}
+                        </p>
+                      )}
+                    </div>
+                  ))}
                 </div>
               ) : currentArticle.markdownContent ? (
                 <ReactMarkdown

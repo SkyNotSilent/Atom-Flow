@@ -761,7 +761,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
       } else if (entry?.type === 'collection') {
         setDragPreview({ x: event.clientX, y: event.clientY, text: entry.name });
       }
-    }, 140);
+    }, 500);
   };
 
   useEffect(() => {
