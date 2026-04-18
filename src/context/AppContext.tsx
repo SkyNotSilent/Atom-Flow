@@ -1,9 +1,10 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
-import { Article, AtomCard, User, Note } from '../types';
+import { Article, AtomCard, User, Note, SavedArticle } from '../types';
 
 interface AppState {
   articles: Article[];
   savedCards: AtomCard[];
+  savedArticles: SavedArticle[];
   saveArticle: (articleId: number) => Promise<void>;
   addCards: (cards: AtomCard[]) => void;
   addCard: (card: AtomCard) => Promise<void>;
@@ -49,6 +50,7 @@ const AppContext = createContext<AppState | undefined>(undefined);
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [articles, setArticles] = useState<Article[]>([]);
   const [savedCards, setSavedCards] = useState<AtomCard[]>([]);
+  const [savedArticles, setSavedArticles] = useState<SavedArticle[]>([]);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [readingArticle, setReadingArticleState] = useState<Article | null>(null);
@@ -138,14 +140,19 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
         // Only fetch cards, preferences, and notes if logged in
         if (loggedIn) {
+          // loadPreferences must complete before loadUserSubscriptions so that
+          // server-synced source_layout is written to localStorage first, then
+          // user subscriptions are merged on top (not overwritten).
           const [cardsRes] = await Promise.all([
             fetch('/api/cards'),
-            loadPreferences(),
-            loadNotes()
+            loadPreferences().then(() => loadUserSubscriptions()),
+            loadNotes(),
+            loadSavedArticles()
           ]);
           if (cardsRes.ok) {
             setSavedCards(await cardsRes.json());
           }
+          await reloadArticles(); // reload with user articles merged
         }
       } catch (error) {
         console.error("Failed to fetch initial data:", error);
@@ -207,6 +214,53 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     try {
       const res = await fetch('/api/notes');
       if (res.ok) setNotes(await res.json());
+    } catch {}
+  };
+
+  const loadSavedArticles = async () => {
+    try {
+      const res = await fetch('/api/saved-articles');
+      if (res.ok) setSavedArticles(await res.json());
+    } catch {}
+  };
+
+  // Restore user's custom subscriptions into localStorage (cross-device support)
+  const loadUserSubscriptions = async () => {
+    try {
+      const res = await fetch('/api/subscriptions');
+      if (!res.ok) return;
+      const subs: Array<{ name: string; rssUrl: string; color: string; icon?: string }> = await res.json();
+      if (subs.length === 0) return;
+
+      const raw = window.localStorage.getItem('atomflow:source-layout:v1');
+      const stored = raw ? JSON.parse(raw) : { version: 2, entries: [] };
+      const entries: any[] = stored.version ? stored.entries : stored;
+
+      const existingNames = new Set<string>();
+      entries.forEach((e: any) => {
+        if (e.type === 'source') existingNames.add(e.name);
+        if (e.type === 'collection') e.children?.forEach((c: any) => existingNames.add(c.name));
+      });
+
+      let changed = false;
+      subs.forEach(sub => {
+        if (!existingNames.has(sub.name)) {
+          entries.push({
+            id: `source:${sub.name}`,
+            type: 'source',
+            name: sub.name,
+            color: sub.color,
+            rssUrl: sub.rssUrl,
+            icon: sub.icon
+          });
+          changed = true;
+        }
+      });
+
+      if (changed) {
+        window.localStorage.setItem('atomflow:source-layout:v1', JSON.stringify({ version: 2, entries }));
+        window.dispatchEvent(new Event('atomflow:preferences-loaded'));
+      }
     } catch {}
   };
 
@@ -282,12 +336,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (res.ok) {
         setSavingState({ articleId, stage: saveStages[3] });
         // Refresh data to get the new cards and updated article state
-        const [articlesRes, cardsRes] = await Promise.all([
+        const [articlesRes, cardsRes, savedArticlesRes] = await Promise.all([
           fetch('/api/articles'),
-          fetch('/api/cards')
+          fetch('/api/cards'),
+          fetch('/api/saved-articles')
         ]);
-        setArticles(await articlesRes.json());
-        setSavedCards(await cardsRes.json());
+        if (articlesRes.ok) setArticles(await articlesRes.json());
+        if (cardsRes.ok) setSavedCards(await cardsRes.json());
+        if (savedArticlesRes.ok) setSavedArticles(await savedArticlesRes.json());
       }
     } catch (error) {
       console.error("Failed to save article:", error);
@@ -360,18 +416,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const handleLoginSuccess = async (userData: User) => {
     setUser(userData);
     setShowLoginModal(false);
-    // Fetch cards, preferences, and notes now that user is logged in
     try {
       const [cardsRes] = await Promise.all([
         fetch('/api/cards'),
-        loadPreferences(),
-        loadNotes()
+        loadPreferences().then(() => loadUserSubscriptions()),
+        loadNotes(),
+        loadSavedArticles()
       ]);
       if (cardsRes.ok) {
         setSavedCards(await cardsRes.json());
       }
+      await reloadArticles(); // reload to include user's private articles
     } catch {}
-    // Execute pending action
     if (pendingAction) {
       pendingAction();
       setPendingAction(null);
@@ -384,7 +440,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } catch {}
     setUser(null);
     setSavedCards([]);
+    setSavedArticles([]);
     setNotes([]);
+    await reloadArticles(); // reload without user articles
   };
 
   const updateProfile = async (nickname: string) => {
@@ -425,7 +483,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   return (
     <AppContext.Provider value={{
-      articles, savedCards, saveArticle, addCards, addCard, updateCard, deleteCard,
+      articles, savedCards, savedArticles, saveArticle, addCards, addCard, updateCard, deleteCard,
       showToast, toastMsg, theme, toggleTheme,
       viewMode, setViewMode,
       readingArticle, setReadingArticle,

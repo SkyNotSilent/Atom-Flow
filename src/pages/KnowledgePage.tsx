@@ -3,10 +3,10 @@ import { useAppContext } from '../context/AppContext';
 import { AtomCard } from '../types';
 import { CARD_COLORS } from '../constants';
 import { Search, Plus, ExternalLink } from 'lucide-react';
-import { findLinkedArticle, getCardSourceLabel, getKnowledgeLinkedArticles } from '../utils/articleDisplay';
+import { findLinkedArticle, getCardSourceLabel } from '../utils/articleDisplay';
 
 export const KnowledgePage: React.FC = () => {
-  const { savedCards, theme, showToast, articles, setReadingArticle, knowledgeTypeFilter, knowledgeSourceFilter, setActiveSource } = useAppContext();
+  const { savedCards, savedArticles, theme, showToast, articles, setReadingArticle, knowledgeTypeFilter, knowledgeSourceFilter, setActiveSource } = useAppContext();
 
   const handleSourceClick = (e: React.MouseEvent, articleId?: number) => {
     e.stopPropagation();
@@ -21,28 +21,21 @@ export const KnowledgePage: React.FC = () => {
   };
   const [search, setSearch] = useState('');
   const [editingCard, setEditingCard] = useState<AtomCard | Partial<AtomCard> | null>(null);
-  const sourceArticles = useMemo(() => {
-    return getKnowledgeLinkedArticles(savedCards, articles)
-      .map(item => articles.find(article => article.id === item.id))
-      .filter(Boolean) as typeof articles;
-  }, [savedCards, articles]);
+
+  // 来源 view now uses persisted savedArticles (survives server restart)
   const filteredSourceArticles = useMemo(() => {
-    const sourceHasSelectedArticle = knowledgeSourceFilter.startsWith('article:')
-      ? sourceArticles.some(article => knowledgeSourceFilter === `article:${article.id}`)
-      : false;
-    return sourceArticles.filter(article => {
-      const matchSource = knowledgeSourceFilter === '全部'
-        || !sourceHasSelectedArticle
-        || knowledgeSourceFilter === `article:${article.id}`;
+    return savedArticles.filter(sa => {
       const keyword = search.trim().toLowerCase();
       const matchSearch = keyword === ''
-        || article.title.toLowerCase().includes(keyword)
-        || article.excerpt.toLowerCase().includes(keyword)
-        || article.topic.toLowerCase().includes(keyword)
-        || article.source.toLowerCase().includes(keyword);
-      return matchSource && matchSearch;
+        || sa.title.toLowerCase().includes(keyword)
+        || sa.excerpt.toLowerCase().includes(keyword)
+        || sa.topic.toLowerCase().includes(keyword)
+        || sa.source.toLowerCase().includes(keyword);
+      const matchSource = knowledgeSourceFilter === '全部'
+        || knowledgeSourceFilter === `article:${sa.id}`;
+      return matchSearch && matchSource;
     });
-  }, [sourceArticles, knowledgeSourceFilter, search]);
+  }, [savedArticles, knowledgeSourceFilter, search]);
 
   const filteredCards = savedCards.filter(card => {
     const sourceLabel = getCardSourceLabel(card, articles);
@@ -88,45 +81,58 @@ export const KnowledgePage: React.FC = () => {
           </div>
         ) : (
           <div className="flex flex-col gap-2.5">
-            {filteredSourceArticles.map(article => (
+            {filteredSourceArticles.map(sa => {
+              // Try to find the live article in memory for reader opening
+              const liveArticle = articles.find(a => (a.url && sa.url && a.url === sa.url) || a.title === sa.title);
+              return (
               <div
-                key={article.id}
+                key={sa.id}
                 onClick={() => {
-                  setActiveSource(article.source || null);
-                  setReadingArticle(article);
+                  if (liveArticle) {
+                    setActiveSource(liveArticle.source || null);
+                    setReadingArticle(liveArticle);
+                  } else {
+                    showToast('原文暂不可预览（服务器缓存已刷新）');
+                  }
                 }}
                 className="bg-surface rounded-xl border border-border hover:border-accent hover:shadow-[0_1px_4px_rgba(0,0,0,0.07),0_4px_16px_rgba(0,0,0,0.05)] p-[18px_20px] transition-all duration-150 cursor-pointer"
               >
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
                     <span className="bg-accent-light text-accent text-[11.5px] font-semibold px-2 py-0.5 rounded">
-                      {article.source}
+                      {sa.source}
                     </span>
                     <span className="bg-surface2 text-text2 text-[11px] px-[7px] py-0.5 rounded">
-                      {article.topic}
+                      {sa.topic}
                     </span>
-                    <span className="text-[12px] text-text3 ml-1">{article.time}</span>
+                    {sa.savedAt && (
+                      <span className="text-[12px] text-text3 ml-1">{new Date(sa.savedAt).toLocaleDateString('zh-CN')}</span>
+                    )}
                   </div>
                 </div>
                 <h2 className="font-serif text-[15.5px] font-semibold text-text-main mb-1.5 leading-snug">
-                  {article.title}
+                  {sa.title}
                 </h2>
                 <p className="text-[13px] text-text2 leading-[1.7] line-clamp-2">
-                  {article.excerpt}
+                  {sa.excerpt}
                 </p>
                 <div className="mt-3 flex gap-2" onClick={e => e.stopPropagation()}>
                   <button
                     onClick={() => {
-                      setActiveSource(article.source || null);
-                      setReadingArticle(article);
+                      if (liveArticle) {
+                        setActiveSource(liveArticle.source || null);
+                        setReadingArticle(liveArticle);
+                      } else {
+                        showToast('原文暂不可预览');
+                      }
                     }}
                     className="px-3 py-1.5 rounded-lg text-[13px] font-medium border border-border text-text2 hover:bg-surface2 transition-colors"
                   >
                     阅读全文
                   </button>
-                  {article.url && (
+                  {sa.url && (
                     <a
-                      href={article.url}
+                      href={sa.url}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="px-3 py-1.5 rounded-lg text-[13px] font-medium bg-accent-light text-accent hover:bg-accent hover:text-white transition-colors flex items-center gap-1"
@@ -137,7 +143,8 @@ export const KnowledgePage: React.FC = () => {
                   )}
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         )
       ) : filteredCards.length === 0 ? (

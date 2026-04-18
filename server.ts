@@ -214,6 +214,45 @@ async function saveArticlesCache(articles: Article[]) {
   await fs.writeFile(CACHE_FILE, JSON.stringify(articles), "utf-8");
 }
 
+// Built-in source names — these are globally shared and never stored per-user
+const BUILTIN_SOURCE_NAMES = new Set([
+  '少数派', '人人都是产品经理', '36氪', '虎嗅', '数字生命卡兹克',
+  '新智元', '即刻话题', 'GitHub Blog', 'Sam Altman',
+  '张小珺商业访谈录', 'Lex Fridman', 'Y Combinator', 'Andrej Karpathy'
+]);
+
+async function loadUserArticlesAsArticles(userId: number, pool: pg.Pool): Promise<Article[]> {
+  const rows = (await pool.query(
+    `SELECT id, source, source_icon, topic, title, excerpt, content, url,
+            audio_url, audio_duration, published_at, time_str, saved,
+            full_fetched, markdown_content
+     FROM user_articles
+     WHERE user_id = $1
+     ORDER BY published_at DESC NULLS LAST
+     LIMIT 500`,
+    [userId]
+  )).rows;
+
+  return rows.map(row => ({
+    id: Number(row.id),
+    saved: row.saved as boolean,
+    source: row.source as string,
+    sourceIcon: row.source_icon ?? undefined,
+    topic: row.topic as string,
+    time: row.time_str as string,
+    publishedAt: row.published_at ? Number(row.published_at) : undefined,
+    title: row.title as string,
+    excerpt: row.excerpt as string,
+    content: row.content as string,
+    markdownContent: row.markdown_content ?? undefined,
+    url: row.url ?? undefined,
+    audioUrl: row.audio_url ?? undefined,
+    audioDuration: row.audio_duration ?? undefined,
+    fullFetched: row.full_fetched as boolean,
+    cards: []
+  }));
+}
+
 const SOURCE_PRIORITY: Record<string, number> = {
   '36氪': 5,
   'Lex Fridman': 4.8,
@@ -500,6 +539,108 @@ const buildCardsFromArticleContent = (article: Article): Omit<AtomCard, "id" | "
         { type: "观点", content: `关于「${article.title}」的核心观点：${normalizedExcerpt.slice(0, 40)}...`, tags: [article.topic, "自动提取"] },
         { type: "故事", content: `${normalizedExcerpt.slice(0, 50)}...`, tags: ["叙事"] }
       ];
+};
+
+// --- AI-powered card extraction (with fallback to regex) ---
+const AI_SYSTEM_PROMPT = `你是一个知识提炼助手。请从文章中提取最多3张知识卡片。
+类型：观点、数据、金句、故事
+- 观点：文章核心主张，用自己的话提炼，最多100字
+- 数据：含具体数字/百分比/研究结论，原文摘录，最多100字
+- 金句：表达精炼值得收藏的原话，直接引用，最多100字
+- 故事：具体案例或叙事片段，最多100字
+规则：
+1. 优先提取有信息量的类型，没有就不硬凑
+2. tags 给2-5个语义标签
+3. 严格只输出JSON数组，不要输出任何其他内容
+格式：[{"type":"观点","content":"...","tags":["标签1","标签2"]}]`;
+
+const VALID_CARD_TYPES = new Set(["观点", "数据", "金句", "故事"]);
+
+const extractCardsWithAI = async (
+  article: Article
+): Promise<Omit<AtomCard, "id" | "articleTitle" | "articleId">[]> => {
+  const apiKey = process.env.AI_API_KEY;
+  const baseUrl = process.env.AI_BASE_URL;
+  const model = process.env.AI_MODEL;
+  if (!apiKey || !baseUrl || !model) return [];
+
+  try {
+    const plainContent = normalizePlainText(
+      article.markdownContent || article.content || article.excerpt
+    ).slice(0, 3000);
+
+    if (plainContent.length < 30) return [];
+
+    const userPrompt = `标题：${article.title}\n来源：${article.source}\n话题：${article.topic}\n\n正文：${plainContent}`;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'user', content: `${AI_SYSTEM_PROMPT}\n\n===文章===\n${userPrompt}` }
+        ],
+        max_tokens: 1000,
+        temperature: 0.3
+      }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      console.error(`[AI] API returned ${response.status}: ${await response.text()}`);
+      return [];
+    }
+
+    const data = await response.json() as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const raw = data.choices?.[0]?.message?.content;
+    if (!raw) return [];
+
+    // Strip markdown code fences if present
+    const cleaned = raw.replace(/```json\s*/g, '').replace(/```/g, '').trim();
+    const parsed: unknown = JSON.parse(cleaned);
+
+    if (!Array.isArray(parsed)) return [];
+
+    // Validate and sanitize each card
+    const validCards: Omit<AtomCard, "id" | "articleTitle" | "articleId">[] = [];
+    for (const item of parsed.slice(0, 3)) {
+      const card = item as Record<string, unknown>;
+      if (
+        typeof card.type === 'string' &&
+        VALID_CARD_TYPES.has(card.type) &&
+        typeof card.content === 'string' &&
+        card.content.trim().length > 0 &&
+        Array.isArray(card.tags) &&
+        card.tags.every((t: unknown) => typeof t === 'string')
+      ) {
+        validCards.push({
+          type: card.type as AtomCard['type'],
+          content: card.content.trim().slice(0, 100),
+          tags: (card.tags as string[]).slice(0, 5)
+        });
+      }
+    }
+
+    if (validCards.length > 0) {
+      console.log(`[AI] Extracted ${validCards.length} cards from "${article.title.slice(0, 30)}"`);
+    }
+    return validCards;
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[AI] Card extraction failed: ${errMsg}`);
+    return [];
+  }
 };
 
 const isBlockedPageContent = (content: string) => {
@@ -803,6 +944,99 @@ async function startServer() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id, updated_at DESC)`);
 
+  // User custom subscriptions
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_subscriptions (
+      id          SERIAL PRIMARY KEY,
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name        TEXT NOT NULL,
+      rss_url     TEXT NOT NULL,
+      color       TEXT NOT NULL DEFAULT '#718096',
+      icon        TEXT,
+      topic       TEXT NOT NULL DEFAULT '自定义订阅',
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, name)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user ON user_subscriptions(user_id)`);
+
+  // Articles from user custom subscriptions (permanently stored, per-user)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_articles (
+      id              BIGSERIAL PRIMARY KEY,
+      user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      subscription_id INTEGER NOT NULL REFERENCES user_subscriptions(id) ON DELETE CASCADE,
+      source          TEXT NOT NULL,
+      source_icon     TEXT,
+      topic           TEXT NOT NULL DEFAULT '自定义订阅',
+      title           TEXT NOT NULL,
+      excerpt         TEXT NOT NULL DEFAULT '',
+      content         TEXT NOT NULL DEFAULT '',
+      url             TEXT,
+      audio_url       TEXT,
+      audio_duration  TEXT,
+      published_at    BIGINT,
+      time_str        TEXT NOT NULL DEFAULT '',
+      saved           BOOLEAN NOT NULL DEFAULT FALSE,
+      full_fetched    BOOLEAN NOT NULL DEFAULT FALSE,
+      markdown_content TEXT,
+      fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_articles_unique_url ON user_articles(user_id, url) WHERE url IS NOT NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_articles_user_source ON user_articles(user_id, source)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_articles_published ON user_articles(user_id, published_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_articles_subscription ON user_articles(subscription_id)`);
+
+  // --- saved_articles: persisted original articles when user saves to knowledge base ---
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS saved_articles (
+      id            BIGSERIAL PRIMARY KEY,
+      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title         TEXT NOT NULL DEFAULT '',
+      url           TEXT,
+      source        TEXT NOT NULL DEFAULT '',
+      source_icon   TEXT,
+      topic         TEXT NOT NULL DEFAULT '',
+      excerpt       TEXT NOT NULL DEFAULT '',
+      content       TEXT NOT NULL DEFAULT '',
+      published_at  BIGINT,
+      saved_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_articles_user ON saved_articles(user_id, saved_at DESC)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_articles_unique ON saved_articles(user_id, url) WHERE url IS NOT NULL`);
+
+  // --- saved_cards: add origin and saved_article_id columns ---
+  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'manual'`);
+  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS saved_article_id BIGINT REFERENCES saved_articles(id) ON DELETE SET NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_saved_article ON saved_cards(saved_article_id)`);
+
+  // --- card_relations: knowledge graph (reserved for future use) ---
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS card_relations (
+      id              SERIAL PRIMARY KEY,
+      card_a          TEXT NOT NULL REFERENCES saved_cards(id) ON DELETE CASCADE,
+      card_b          TEXT NOT NULL REFERENCES saved_cards(id) ON DELETE CASCADE,
+      relation_type   TEXT NOT NULL CHECK (relation_type IN ('supports','conflicts','extends')),
+      confidence      REAL DEFAULT 0.5,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (card_a, card_b, relation_type)
+    )
+  `);
+
+  // --- pgvector: optional semantic search extension ---
+  let pgvectorAvailable = false;
+  try {
+    await pool.query('CREATE EXTENSION IF NOT EXISTS vector');
+    pgvectorAvailable = true;
+    await pool.query('ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS embedding vector(1536)');
+    console.log('[DB] pgvector extension enabled');
+  } catch {
+    console.log('[DB] pgvector not available, semantic search disabled');
+  }
+
   // Backfill: set default nickname for existing users who don't have one
   await pool.query("UPDATE users SET nickname = split_part(email, '@', 1) WHERE nickname IS NULL");
 
@@ -840,6 +1074,9 @@ async function startServer() {
   app.use(express.json());
 
   // --- Session middleware (PostgreSQL) ---
+  if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
+    throw new Error('SESSION_SECRET environment variable must be set in production');
+  }
   app.set('trust proxy', 1);
   const PgSession = connectPgSimple(session);
   app.use(session({
@@ -1285,74 +1522,173 @@ async function startServer() {
 
   // API Routes
   
-  // Get all articles
-  app.get("/api/articles", async (req, res) => {
-    // Optional: Refresh feeds periodically or on request
-    // if (articles.length === 0) articles = await fetchRSSFeeds();
-    res.json(articles);
-  });
+  // Get all articles (global + user's private articles when logged in)
+  app.get("/api/articles", asyncHandler(async (req, res) => {
+    if (!req.session.userId) {
+      return res.json(articles);
+    }
+    const userArticles = await loadUserArticlesAsArticles(req.session.userId, pool);
+    if (userArticles.length === 0) {
+      return res.json(articles);
+    }
+    // Deduplicate: skip user articles whose URL already exists in global store
+    const globalUrls = new Set(articles.filter(a => a.url).map(a => a.url as string));
+    const uniqueUserArticles = userArticles.filter(a => !a.url || !globalUrls.has(a.url));
+    return res.json(rankArticles([...articles, ...uniqueUserArticles]));
+  }));
 
-  app.post("/api/sources/fetch", async (req, res) => {
+  app.post("/api/sources/fetch", asyncHandler(async (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
     if (!source || !input) {
       return res.status(400).json({ error: "source and input are required" });
     }
+    const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
+    const userId = req.session.userId;
     try {
       const parsed = await parseWithRetry([input], 15000, 2);
-      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000);
-      const combined = [...fetched, ...articles];
-      const dedup = new Map<string, Article>();
-      for (const article of combined) {
-        const key = article.url ? `url:${article.url}` : `st:${article.source}:${article.title}`;
-        if (!dedup.has(key)) dedup.set(key, article);
+      const feedIcon = extractFeedIcon(parsed);
+      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon);
+
+      // Anonymous user OR fetching a built-in source → global in-memory store
+      if (!userId || isBuiltin) {
+        const combined = [...fetched, ...articles];
+        const dedup = new Map<string, Article>();
+        for (const article of combined) {
+          const key = article.url ? `url:${article.url}` : `st:${article.source}:${article.title}`;
+          if (!dedup.has(key)) dedup.set(key, article);
+        }
+        articles = rankArticles(Array.from(dedup.values()));
+        await saveArticlesCache(articles);
+        return res.json({ success: true, added: fetched.length });
       }
-      articles = rankArticles(Array.from(dedup.values()));
-      await saveArticlesCache(articles);
-      return res.json({ success: true, added: fetched.length });
+
+      // Logged-in user + custom source → persist to DB
+      const subResult = await pool.query(
+        `INSERT INTO user_subscriptions (user_id, name, rss_url, color, icon, topic)
+         VALUES ($1, $2, $3, $4, $5, '自定义订阅')
+         ON CONFLICT (user_id, name) DO UPDATE SET
+           rss_url    = EXCLUDED.rss_url,
+           icon       = COALESCE(EXCLUDED.icon, user_subscriptions.icon),
+           updated_at = NOW()
+         RETURNING id`,
+        [userId, source, input, req.body?.color ?? '#718096', feedIcon ?? null]
+      );
+      const subscriptionId = subResult.rows[0].id as number;
+
+      let added = 0;
+      for (const article of fetched) {
+        if (!article.url) continue;
+        await pool.query(
+          `INSERT INTO user_articles
+             (user_id, subscription_id, source, source_icon, topic, title, excerpt,
+              content, url, audio_url, audio_duration, published_at, time_str)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+           ON CONFLICT DO NOTHING`,
+          [
+            userId, subscriptionId, article.source, article.sourceIcon ?? null,
+            article.topic, article.title, article.excerpt, article.content,
+            article.url, article.audioUrl ?? null, article.audioDuration ?? null,
+            article.publishedAt ?? null, article.time
+          ]
+        );
+        added++;
+      }
+      return res.json({ success: true, added });
     } catch (error) {
       return res.status(502).json({ error: "failed to fetch source" });
     }
-  });
+  }));
 
-  app.post("/api/sources/retry", async (req, res) => {
+  app.post("/api/sources/retry", asyncHandler(async (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
     if (!source || !input) {
       return res.status(400).json({ error: "source and input are required" });
     }
+    const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
+    const userId = req.session.userId;
     try {
-      // 使用60秒超时重试
       const parsed = await parseWithRetry([input], 60000, 1);
-      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, extractFeedIcon(parsed));
-      const combined = [...fetched, ...articles];
-      const dedup = new Map<string, Article>();
-      for (const article of combined) {
-        const key = article.url ? `url:${article.url}` : `st:${article.source}:${article.title}`;
-        if (!dedup.has(key)) dedup.set(key, article);
+      const feedIcon = extractFeedIcon(parsed);
+      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon);
+
+      if (!userId || isBuiltin) {
+        const combined = [...fetched, ...articles];
+        const dedup = new Map<string, Article>();
+        for (const article of combined) {
+          const key = article.url ? `url:${article.url}` : `st:${article.source}:${article.title}`;
+          if (!dedup.has(key)) dedup.set(key, article);
+        }
+        articles = rankArticles(Array.from(dedup.values()));
+        await saveArticlesCache(articles);
+        return res.json({ success: true, added: fetched.length });
       }
-      articles = rankArticles(Array.from(dedup.values()));
-      await saveArticlesCache(articles);
-      return res.json({ success: true, added: fetched.length });
+
+      // Logged-in user + custom source → persist to DB
+      const subResult = await pool.query(
+        `INSERT INTO user_subscriptions (user_id, name, rss_url, color, icon, topic)
+         VALUES ($1, $2, $3, $4, $5, '自定义订阅')
+         ON CONFLICT (user_id, name) DO UPDATE SET
+           rss_url    = EXCLUDED.rss_url,
+           icon       = COALESCE(EXCLUDED.icon, user_subscriptions.icon),
+           updated_at = NOW()
+         RETURNING id`,
+        [userId, source, input, req.body?.color ?? '#718096', feedIcon ?? null]
+      );
+      const subscriptionId = subResult.rows[0].id as number;
+
+      let added = 0;
+      for (const article of fetched) {
+        if (!article.url) continue;
+        await pool.query(
+          `INSERT INTO user_articles
+             (user_id, subscription_id, source, source_icon, topic, title, excerpt,
+              content, url, audio_url, audio_duration, published_at, time_str)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+           ON CONFLICT DO NOTHING`,
+          [
+            userId, subscriptionId, article.source, article.sourceIcon ?? null,
+            article.topic, article.title, article.excerpt, article.content,
+            article.url, article.audioUrl ?? null, article.audioDuration ?? null,
+            article.publishedAt ?? null, article.time
+          ]
+        );
+        added++;
+      }
+      return res.json({ success: true, added });
     } catch (error: any) {
       console.error(`Failed to retry source ${source}:`, error);
-      return res.status(502).json({ 
-        error: "获取失败", 
-        details: error?.message || '未知错误'
-      });
+      return res.status(502).json({ error: "获取失败", details: error?.message || '未知错误' });
     }
-  });
+  }));
 
-  app.delete("/api/sources/:source", async (req, res) => {
+  app.delete("/api/sources/:source", asyncHandler(async (req, res) => {
     const source = decodeURIComponent(req.params.source || '').trim();
     if (!source) return res.status(400).json({ error: "source is required" });
-    const before = articles.length;
-    articles = articles.filter(article => article.source !== source);
-    await saveArticlesCache(articles);
-    return res.json({ success: true, removed: before - articles.length });
-  });
+    const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
+    const userId = req.session.userId;
 
-  app.patch("/api/sources/rename", async (req, res) => {
+    let removed = 0;
+    // For built-in sources (or anonymous), remove from global in-memory store
+    if (isBuiltin || !userId) {
+      const before = articles.length;
+      articles = articles.filter(article => article.source !== source);
+      await saveArticlesCache(articles);
+      removed = before - articles.length;
+    }
+    // For logged-in users with custom sources, delete from DB (user_articles cascade)
+    if (userId && !isBuiltin) {
+      const result = await pool.query(
+        'DELETE FROM user_subscriptions WHERE user_id = $1 AND name = $2',
+        [userId, source]
+      );
+      removed += result.rowCount ?? 0;
+    }
+    return res.json({ success: true, removed });
+  }));
+
+  app.patch("/api/sources/rename", asyncHandler(async (req, res) => {
     const from = typeof req.body?.from === 'string' ? req.body.from.trim() : '';
     const to = typeof req.body?.to === 'string' ? req.body.to.trim() : '';
     if (!from || !to) return res.status(400).json({ error: "from and to are required" });
@@ -1364,8 +1700,20 @@ async function startServer() {
       return { ...article, source: to };
     });
     await saveArticlesCache(articles);
+    // For logged-in users with custom sources, also rename in DB
+    const userId = req.session.userId;
+    if (userId && !BUILTIN_SOURCE_NAMES.has(from)) {
+      await pool.query(
+        `UPDATE user_subscriptions SET name = $1, updated_at = NOW() WHERE user_id = $2 AND name = $3`,
+        [to, userId, from]
+      );
+      await pool.query(
+        `UPDATE user_articles SET source = $1 WHERE user_id = $2 AND source = $3`,
+        [to, userId, from]
+      );
+    }
     return res.json({ success: true, renamed });
-  });
+  }));
 
   app.post("/api/articles/refresh-cache", (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
@@ -1393,7 +1741,31 @@ async function startServer() {
   // Save an article (mark as saved and extract cards)
   app.post("/api/articles/:id/save", requireAuth, asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
-    const article = articles.find(a => a.id === articleId);
+    let article = articles.find(a => a.id === articleId);
+    let isUserArticle = false;
+
+    // If not in global store, check user_articles DB
+    if (!article && req.session.userId) {
+      const row = (await pool.query(
+        `SELECT id, source, source_icon, topic, title, excerpt, content, url,
+                audio_url, audio_duration, published_at, time_str, saved,
+                full_fetched, markdown_content
+         FROM user_articles WHERE id = $1 AND user_id = $2`,
+        [articleId, req.session.userId]
+      )).rows[0];
+      if (row) {
+        isUserArticle = true;
+        article = {
+          id: Number(row.id), saved: row.saved, source: row.source,
+          sourceIcon: row.source_icon ?? undefined, topic: row.topic,
+          time: row.time_str, publishedAt: row.published_at ? Number(row.published_at) : undefined,
+          title: row.title, excerpt: row.excerpt, content: row.content,
+          markdownContent: row.markdown_content ?? undefined, url: row.url ?? undefined,
+          audioUrl: row.audio_url ?? undefined, audioDuration: row.audio_duration ?? undefined,
+          fullFetched: row.full_fetched, cards: []
+        } as Article;
+      }
+    }
 
     if (!article) {
       return res.status(404).json({ error: "Article not found" });
@@ -1404,9 +1776,17 @@ async function startServer() {
     if (!existingCard) {
       article.saved = true;
 
+      // AI extraction BEFORE transaction (may take up to 15s, don't hold DB conn)
       let cardsToSave = article.cards;
+      let origin: 'ai' | 'manual' = 'manual';
       if (!cardsToSave || cardsToSave.length === 0) {
-        cardsToSave = buildCardsFromArticleContent(article);
+        const aiCards = await extractCardsWithAI(article);
+        if (aiCards.length > 0) {
+          cardsToSave = aiCards;
+          origin = 'ai';
+        } else {
+          cardsToSave = buildCardsFromArticleContent(article);
+        }
         article.cards = cardsToSave;
       }
 
@@ -1420,10 +1800,55 @@ async function startServer() {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
+
+        // Persist original article to saved_articles
+        let savedArticleId: number | null = null;
+        if (article.url) {
+          // URL exists: upsert using unique index
+          const savedArticleResult = await client.query(
+            `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, published_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (user_id, url) WHERE url IS NOT NULL
+             DO UPDATE SET title = EXCLUDED.title, content = EXCLUDED.content, excerpt = EXCLUDED.excerpt, source_icon = EXCLUDED.source_icon
+             RETURNING id`,
+            [
+              req.session.userId, article.title, article.url,
+              article.source, article.sourceIcon || null, article.topic,
+              article.excerpt, article.markdownContent || article.content || article.excerpt,
+              article.publishedAt || null
+            ]
+          );
+          savedArticleId = savedArticleResult.rows[0]?.id ?? null;
+        } else {
+          // No URL: check by title to avoid duplicates, then insert if not found
+          const existing = await client.query(
+            `SELECT id FROM saved_articles WHERE user_id = $1 AND url IS NULL AND title = $2 LIMIT 1`,
+            [req.session.userId, article.title]
+          );
+          if (existing.rows[0]) {
+            savedArticleId = existing.rows[0].id;
+          } else {
+            const insertResult = await client.query(
+              `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, published_at)
+               VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8)
+               RETURNING id`,
+              [
+                req.session.userId, article.title,
+                article.source, article.sourceIcon || null, article.topic,
+                article.excerpt, article.markdownContent || article.content || article.excerpt,
+                article.publishedAt || null
+              ]
+            );
+            savedArticleId = insertResult.rows[0]?.id ?? null;
+          }
+        }
+
         for (const card of newCards) {
           await client.query(
-            'INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-            [card.id, req.session.userId, card.type, card.content, JSON.stringify(card.tags), card.articleTitle, card.articleId || null]
+            `INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id, origin, saved_article_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [card.id, req.session.userId, card.type, card.content, JSON.stringify(card.tags),
+             card.articleTitle, card.articleId || null, origin, savedArticleId || null]
           );
         }
         await client.query('COMMIT');
@@ -1435,14 +1860,44 @@ async function startServer() {
       }
     }
 
+    // Also update saved flag in user_articles if this is a user article
+    if (isUserArticle) {
+      await pool.query(
+        'UPDATE user_articles SET saved = TRUE WHERE id = $1 AND user_id = $2',
+        [articleId, req.session.userId]
+      );
+    }
+
     res.json({ success: true, article });
   }));
 
   // Fetch full content for an article
-  app.get("/api/articles/:id/full", async (req, res) => {
+  app.get("/api/articles/:id/full", asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
-    const article = articles.find(a => a.id === articleId);
-    
+    let article: Article | undefined = articles.find(a => a.id === articleId);
+
+    // If not in global store, check user_articles DB
+    if (!article && req.session.userId) {
+      const row = (await pool.query(
+        `SELECT id, source, source_icon, topic, title, excerpt, content, url,
+                audio_url, audio_duration, published_at, time_str, saved,
+                full_fetched, markdown_content
+         FROM user_articles WHERE id = $1 AND user_id = $2`,
+        [articleId, req.session.userId]
+      )).rows[0];
+      if (row) {
+        article = {
+          id: Number(row.id), saved: row.saved, source: row.source,
+          sourceIcon: row.source_icon ?? undefined, topic: row.topic,
+          time: row.time_str, publishedAt: row.published_at ? Number(row.published_at) : undefined,
+          title: row.title, excerpt: row.excerpt, content: row.content,
+          markdownContent: row.markdown_content ?? undefined, url: row.url ?? undefined,
+          audioUrl: row.audio_url ?? undefined, audioDuration: row.audio_duration ?? undefined,
+          fullFetched: row.full_fetched, cards: []
+        } as Article;
+      }
+    }
+
     if (!article) {
       return res.status(404).json({ error: "Article not found" });
     }
@@ -1466,10 +1921,10 @@ async function startServer() {
       article.fullFetched = true;
       return res.json({ success: true, article });
     }
-  });
+  }));
 
   // Image proxy to bypass CSP and hotlink protection
-  app.get("/api/image-proxy", async (req, res) => {
+  app.get("/api/image-proxy", asyncHandler(async (req, res) => {
     const imageUrl = req.query.url as string;
     const referer = (req.query.referer as string) || '';
     if (!imageUrl) {
@@ -1527,12 +1982,24 @@ async function startServer() {
       console.error('Image proxy error:', error);
       res.status(500).send("Failed to load image");
     }
-  });
+  }));
+
+  // Get user's custom subscriptions (for cross-device restore)
+  app.get("/api/subscriptions", requireAuth, asyncHandler(async (req, res) => {
+    const rows = (await pool.query(
+      `SELECT id, name, rss_url AS "rssUrl", color, icon, topic, created_at AS "createdAt"
+       FROM user_subscriptions WHERE user_id = $1 ORDER BY created_at ASC`,
+      [req.session.userId]
+    )).rows;
+    return res.json(rows);
+  }));
 
   // Get all saved cards
   app.get("/api/cards", requireAuth, asyncHandler(async (req, res) => {
     const rows = (await pool.query(
-      'SELECT id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId" FROM saved_cards WHERE user_id = $1 ORDER BY created_at DESC',
+      `SELECT id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId",
+              origin, saved_article_id AS "savedArticleId"
+       FROM saved_cards WHERE user_id = $1 ORDER BY created_at DESC`,
       [req.session.userId]
     )).rows;
     res.json(rows);
@@ -1580,9 +2047,34 @@ async function startServer() {
     res.json({ success: true });
   }));
 
+  // --- Saved Articles (persisted originals) ---
+
+  // List all saved articles (without full content to reduce payload)
+  app.get("/api/saved-articles", requireAuth, asyncHandler(async (req, res) => {
+    const rows = (await pool.query(
+      `SELECT id, title, url, source, source_icon AS "sourceIcon", topic, excerpt,
+              published_at AS "publishedAt", saved_at AS "savedAt"
+       FROM saved_articles WHERE user_id = $1 ORDER BY saved_at DESC`,
+      [req.session.userId]
+    )).rows;
+    res.json(rows);
+  }));
+
+  // Get a single saved article (with full content)
+  app.get("/api/saved-articles/:id", requireAuth, asyncHandler(async (req, res) => {
+    const row = (await pool.query(
+      `SELECT id, title, url, source, source_icon AS "sourceIcon", topic, excerpt, content,
+              published_at AS "publishedAt", saved_at AS "savedAt"
+       FROM saved_articles WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.session.userId]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: "Saved article not found" });
+    res.json(row);
+  }));
+
   // Translate article content (Baidu Translate API)
   // Supports both single string (content) and array of strings (segments) for paragraph-level translation
-  app.post("/api/translate", requireAuth, async (req, res) => {
+  app.post("/api/translate", requireAuth, asyncHandler(async (req, res) => {
     const { content, segments, targetLang = 'zh' } = req.body;
 
     const appid = process.env.BAIDU_TRANSLATE_APPID;
@@ -1684,7 +2176,7 @@ async function startServer() {
       console.error('Translation error:', error);
       res.status(500).json({ error: "Translation failed", details: error?.message });
     }
-  });
+  }));
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {

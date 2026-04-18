@@ -22,6 +22,21 @@ export interface AtomCard {
   tags: string[];
   articleTitle: string;
   articleId?: number;
+  origin?: 'manual' | 'ai';
+  savedArticleId?: number;
+}
+
+export interface SavedArticle {
+  id: number;
+  title: string;
+  url?: string;
+  source: string;
+  sourceIcon?: string;
+  topic: string;
+  excerpt: string;
+  content?: string;
+  publishedAt?: number;
+  savedAt: string;
 }
 
 export interface Article {

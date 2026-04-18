@@ -21,7 +21,7 @@ function splitIntoSegments(text: string): string[] {
   return text.split(/\n\n+/).map(s => s.trim()).filter(Boolean);
 }
 
-export const ReaderPane: React.FC = () => {
+export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
   const { readingArticle, setReadingArticle, saveArticle, showToast, isSavingArticle, getSavingStageText, articles } = useAppContext();
   const contentRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);

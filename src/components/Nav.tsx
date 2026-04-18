@@ -3,7 +3,6 @@ import { useAppContext } from '../context/AppContext';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut } from 'lucide-react';
-import { getKnowledgeLinkedArticles } from '../utils/articleDisplay';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -193,20 +192,22 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
     }
   }
   
-  // 检查是否有缺失的BASE_SOURCES，如果有，说明用户数据不完整，直接返回默认结构
+  // 检查是否有缺失的BASE_SOURCES，只补充缺失的，不丢弃用户自定义源
   const usedNames = new Set<string>();
   parsed.forEach(entry => {
     if (entry.type === 'source') usedNames.add(entry.name);
     if (entry.type === 'collection') entry.children.forEach(child => usedNames.add(child.name));
   });
-  
+
   const missingBaseSources = BASE_SOURCES.filter(source => !usedNames.has(source.name));
-  
-  // 如果有缺失的基础源，说明是旧版本数据或不完整数据，返回默认合集结构
+
+  // 只补充缺失的基础源，保留用户自定义源
   if (missingBaseSources.length > 0) {
-    return createDefaultEntries();
+    for (const src of missingBaseSources) {
+      parsed.push({ id: `source:${src.name}`, type: 'source', name: src.name, color: src.color });
+    }
   }
-  
+
   return parsed.length > 0 ? parsed : createDefaultEntries();
 };
 
@@ -238,7 +239,7 @@ const loadEntriesFromStorage = (): NavEntry[] => {
 
 export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const {
-    articles, savedCards, theme, toggleTheme, setActiveSource, showToast, reloadArticles, activeSource,
+    articles, savedCards, savedArticles, theme, toggleTheme, setActiveSource, showToast, reloadArticles, activeSource,
     knowledgeTypeFilter, setKnowledgeTypeFilter, setKnowledgeSourceFilter,
     user, loginAndDo, logout, setShowProfileModal, syncPreferences
   } = useAppContext();
@@ -862,8 +863,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     }
     return counter;
   }, [savedCards]);
-  const knowledgeLinkedArticles = useMemo(() => getKnowledgeLinkedArticles(savedCards, articles), [savedCards, articles]);
-  const uniqueKnowledgeArticlesCount = useMemo(() => new Set(savedCards.map(card => card.articleTitle)).size, [savedCards]);
+  const savedArticlesCount = useMemo(() => savedArticles.length, [savedArticles]);
   const uniqueKnowledgeTagsCount = useMemo(() => new Set(savedCards.flatMap(card => card.tags)).size, [savedCards]);
 
   const contextCollectionId = contextMenu?.target.kind === 'collection' ? contextMenu.target.collectionId : undefined;
@@ -1037,7 +1037,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
                 <div className="text-[11px] text-text3">原子卡片总数</div>
               </div>
               <div className="rounded-lg border border-border bg-surface2 px-3 py-2">
-                <div className="text-[16px] font-semibold text-text-main">{uniqueKnowledgeArticlesCount}</div>
+                <div className="text-[16px] font-semibold text-text-main">{savedArticlesCount}</div>
                 <div className="text-[11px] text-text3">来源文章数</div>
               </div>
               <div className="rounded-lg border border-border bg-surface2 px-3 py-2">
@@ -1049,7 +1049,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
             <div className="px-2 flex flex-col gap-0.5">
               {knowledgeTypeOptions.map(type => {
                 const count = type === '来源'
-                  ? knowledgeLinkedArticles.length
+                  ? savedArticlesCount
                   : (knowledgeTypeCounts.get(type) || 0);
                 return (
                   <button

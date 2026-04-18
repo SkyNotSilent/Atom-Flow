@@ -96,9 +96,10 @@ export const DiscoverPage: React.FC = () => {
       const response = await fetch('/api/sources/fetch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          source: source.name, 
-          input: source.url 
+        body: JSON.stringify({
+          source: source.name,
+          input: source.url,
+          color: source.color
         })
       });
 
@@ -169,9 +170,10 @@ export const DiscoverPage: React.FC = () => {
       const response = await fetch('/api/sources/fetch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          source: sourceName, 
-          input: input 
+        body: JSON.stringify({
+          source: sourceName,
+          input: input,
+          color: '#718096'
         })
       });
 
