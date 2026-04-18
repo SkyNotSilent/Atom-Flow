@@ -64,13 +64,30 @@ npm run dev
 
 ## 环境变量配置
 
-创建 `.env` 文件（可选）：
+创建 `.env` 文件或在部署平台配置以下环境变量：
 
+### 必需
+```env
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
+SESSION_SECRET=your-random-secret-string
+AI_API_KEY=your-openai-compatible-api-key
+AI_BASE_URL=https://api-us.aiznt.com
+AI_MODEL=qwen3.6-plus
+```
+
+### 可选
 ```env
 PORT=3001
 NODE_ENV=production
 RSSHUB_BASE=https://rsshub.app
+RESEND_API_KEY=your-resend-key
+SMTP_USER=your-gmail@gmail.com
+SMTP_PASS=your-app-password
+BAIDU_TRANSLATE_APPID=your-appid
+BAIDU_TRANSLATE_KEY=your-key
 ```
+
+> **注意**：Railway 会自动注入 `DATABASE_URL`（添加 PostgreSQL 插件后）。其他变量需要在 Railway Variables 面板手动添加。
 
 ## 验证部署
 
