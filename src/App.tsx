@@ -172,10 +172,10 @@ function AppContent() {
       <div
         className={`
           flex flex-col overflow-hidden
-          ${isMobile ? 'flex-1' : 'shrink-0 border-r border-border'}
+          ${isMobile ? 'flex-1' : activeTab === 'write' ? 'flex-1 border-r border-border' : 'shrink-0 border-r border-border'}
           ${isMobile && readingArticle ? 'hidden' : ''}
         `}
-        style={{ width: isMobile ? '100%' : centerWidth }}
+        style={{ width: isMobile ? '100%' : activeTab === 'write' ? undefined : centerWidth }}
       >
         {/* 移动端顶部栏 */}
         {isMobile && (
@@ -201,9 +201,9 @@ function AppContent() {
       </div>
 
       {/* 右侧阅读区 */}
-      <div 
+      <div
         className={`
-          ${isMobile ? 'fixed inset-0 z-30 bg-surface' : 'flex-1 min-w-[320px]'}
+          ${isMobile ? 'fixed inset-0 z-30 bg-surface' : activeTab === 'write' ? 'min-w-[400px] w-[400px] shrink-0' : 'flex-1 min-w-[320px]'}
           overflow-hidden bg-surface
           ${isMobile && !readingArticle ? 'hidden' : ''}
         `}
