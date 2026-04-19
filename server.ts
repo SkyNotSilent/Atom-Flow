@@ -877,14 +877,27 @@ async function startServer() {
   // --- Database init (PostgreSQL) ---
   // Note: rejectUnauthorized: false is required for Railway's self-signed PG certs.
   // If migrating to another platform (Supabase, Neon, etc.), review this setting.
-  const pool = new pg.Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production'
-      ? { rejectUnauthorized: false }
-      : false,
-    max: 10,
-  });
+  let pool: pg.Pool | null = null;
+  let dbAvailable = false;
+  try {
+    const _pool = new pg.Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.NODE_ENV === 'production'
+        ? { rejectUnauthorized: false }
+        : false,
+      max: 10,
+    });
+    // Test connection
+    await _pool.query('SELECT 1');
+    pool = _pool;
+    dbAvailable = true;
+    console.log('Database connected successfully');
+  } catch (err) {
+    console.warn('Database unavailable — server will start without auth/persistence features');
+    console.warn('Error:', (err as Error).message);
+  }
 
+  if (pool) {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id           SERIAL PRIMARY KEY,
@@ -1039,6 +1052,7 @@ async function startServer() {
 
   // Backfill: set default nickname for existing users who don't have one
   await pool.query("UPDATE users SET nickname = split_part(email, '@', 1) WHERE nickname IS NULL");
+  } // end if (pool)
 
   const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
@@ -1078,19 +1092,28 @@ async function startServer() {
     throw new Error('SESSION_SECRET environment variable must be set in production');
   }
   app.set('trust proxy', 1);
-  const PgSession = connectPgSimple(session);
-  app.use(session({
-    store: new PgSession({ pool, createTableIfMissing: true }),
-    secret: process.env.SESSION_SECRET || 'atomflow-dev-secret-change-in-prod',
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000
-    }
-  }));
+  if (pool) {
+    const PgSession = connectPgSimple(session);
+    app.use(session({
+      store: new PgSession({ pool, createTableIfMissing: true }),
+      secret: process.env.SESSION_SECRET || 'atomflow-dev-secret-change-in-prod',
+      resave: false,
+      saveUninitialized: false,
+      cookie: {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 7 * 24 * 60 * 60 * 1000
+      }
+    }));
+  } else {
+    app.use(session({
+      secret: process.env.SESSION_SECRET || 'atomflow-dev-secret-change-in-prod',
+      resave: false,
+      saveUninitialized: false,
+      cookie: { httpOnly: true, secure: false, sameSite: 'lax', maxAge: 7 * 24 * 60 * 60 * 1000 }
+    }));
+  }
 
   // In-memory database for prototype
   let articles: Article[] = [];
@@ -2175,6 +2198,151 @@ async function startServer() {
     } catch (error: any) {
       console.error('Translation error:', error);
       res.status(500).json({ error: "Translation failed", details: error?.message });
+    }
+  }));
+
+  // --- Writing: AI recall (semantic matching) ---
+  app.post("/api/write/recall", requireAuth, asyncHandler(async (req, res) => {
+    const { topic } = req.body;
+    if (!topic || typeof topic !== 'string') return res.status(400).json({ error: "topic is required" });
+
+    // Get user's saved cards
+    const cardRows = (await pool.query(
+      `SELECT id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId"
+       FROM saved_cards WHERE user_id = $1`,
+      [req.session.userId]
+    )).rows.map(r => ({ ...r, tags: typeof r.tags === 'string' ? JSON.parse(r.tags) : r.tags }));
+
+    if (cardRows.length === 0) return res.json({ cards: [] });
+
+    const apiKey = process.env.AI_API_KEY;
+    const baseUrl = process.env.AI_BASE_URL;
+    const model = process.env.AI_MODEL;
+
+    // If AI not configured, fallback to keyword matching
+    if (!apiKey || !baseUrl || !model) {
+      const keywords = topic.split(/[\s,、]+/).filter(Boolean);
+      const matched = cardRows.filter(c => {
+        const text = `${c.content} ${c.tags.join(' ')} ${c.articleTitle || ''}`.toLowerCase();
+        return keywords.some((k: string) => text.includes(k.toLowerCase()));
+      });
+      return res.json({ cards: matched.length >= 2 ? matched : cardRows.slice(0, 10) });
+    }
+
+    // Build card summaries for AI to score
+    const cardSummaries = cardRows.slice(0, 50).map((c, i) => `[${i}] (${c.type}) ${c.content.slice(0, 60)}`).join('\n');
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 12000);
+
+      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: `你是写作素材召回助手。用户想写的主题是「${topic}」。\n\n以下是用户知识库中的卡片：\n${cardSummaries}\n\n请选出与主题最相关的卡片序号（最多10个），按相关度从高到低排列。\n严格只输出JSON数组，格式：[0, 3, 7, ...]` }],
+          max_tokens: 200,
+          temperature: 0.2
+        }),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        // Fallback to keyword
+        const keywords = topic.split(/[\s,、]+/).filter(Boolean);
+        const matched = cardRows.filter(c => {
+          const text = `${c.content} ${c.tags.join(' ')}`.toLowerCase();
+          return keywords.some((k: string) => text.includes(k.toLowerCase()));
+        });
+        return res.json({ cards: matched.length >= 2 ? matched : cardRows.slice(0, 10) });
+      }
+
+      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      const raw = data.choices?.[0]?.message?.content || '';
+      const cleaned = raw.replace(/```json\s*/g, '').replace(/```/g, '').trim();
+      const indices: number[] = JSON.parse(cleaned);
+
+      if (!Array.isArray(indices)) {
+        return res.json({ cards: cardRows.slice(0, 10) });
+      }
+
+      const recalled = indices
+        .filter(i => typeof i === 'number' && i >= 0 && i < cardRows.length)
+        .map(i => cardRows[i]);
+
+      return res.json({ cards: recalled.length > 0 ? recalled : cardRows.slice(0, 10) });
+    } catch (err) {
+      console.error('[AI] Recall failed:', err instanceof Error ? err.message : err);
+      return res.json({ cards: cardRows.slice(0, 10) });
+    }
+  }));
+
+  // --- Writing: AI generate article ---
+  app.post("/api/write/generate", requireAuth, asyncHandler(async (req, res) => {
+    const { topic, cards } = req.body;
+    if (!topic || !Array.isArray(cards) || cards.length === 0) {
+      return res.status(400).json({ error: "topic and cards are required" });
+    }
+
+    const apiKey = process.env.AI_API_KEY;
+    const baseUrl = process.env.AI_BASE_URL;
+    const model = process.env.AI_MODEL;
+    if (!apiKey || !baseUrl || !model) {
+      return res.status(500).json({ error: "AI service not configured" });
+    }
+
+    const cardText = cards.map((c: any, i: number) => `${i + 1}. [${c.type}] ${c.content}`).join('\n');
+
+    const prompt = `你是一个优秀的内容创作者。请根据以下主题和素材卡片，写一篇结构清晰、有观点、有论据的文章。
+
+主题：${topic}
+
+素材卡片：
+${cardText}
+
+要求：
+1. 文章800-1500字，分段清晰
+2. 自然融入卡片中的观点、数据、金句、故事作为论据
+3. 有引人入胜的开头和有力的结尾
+4. 语言风格自然流畅，不要AI腔（不要"让我们""在当今社会"这类套话）
+5. 输出纯Markdown格式（用##做小标题，不要用HTML）`;
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+
+      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 3000,
+          temperature: 0.7
+        }),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error(`[AI] Generate returned ${response.status}: ${errText}`);
+        return res.status(500).json({ error: "AI generation failed" });
+      }
+
+      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      const content = data.choices?.[0]?.message?.content || '';
+
+      if (!content) {
+        return res.status(500).json({ error: "AI returned empty content" });
+      }
+
+      res.json({ success: true, content });
+    } catch (err) {
+      console.error('[AI] Generate failed:', err instanceof Error ? err.message : err);
+      res.status(500).json({ error: "AI generation failed" });
     }
   }));
 

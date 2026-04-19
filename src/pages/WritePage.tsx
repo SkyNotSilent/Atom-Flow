@@ -20,13 +20,13 @@ export const WritePage: React.FC = () => {
   
   // Generation State
   const [isGenerating, setIsGenerating] = useState(false);
-  const [generatedHtml, setGeneratedHtml] = useState<string | null>(null);
+  const [generatedContent, setGeneratedContent] = useState<string | null>(null);
   const [step, setStep] = useState(1);
 
   const canvasRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (generatedHtml) {
+    if (generatedContent) {
       setStep(4);
     } else if (canvasCards.length > 0) {
       setStep(3);
@@ -35,34 +35,43 @@ export const WritePage: React.FC = () => {
     } else {
       setStep(1);
     }
-  }, [hasRecalled, canvasCards, generatedHtml]);
+  }, [hasRecalled, canvasCards, generatedContent]);
 
   const handleRecall = async () => {
     if (!topic.trim()) return;
-    
+
     setIsRecalling(true);
     setHasRecalled(false);
     setRecalledCards([]);
 
-    // Simulate AI/Network delay
-    await new Promise(r => setTimeout(r, 1500));
-
-    const keywords = topic.split(/[\s,、]+/).filter(Boolean);
-    let matched = savedCards;
-
-    if (keywords.length > 0) {
-      matched = savedCards.filter(c => {
+    try {
+      const res = await fetch('/api/write/recall', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topic: topic.trim() })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setRecalledCards(data.cards || []);
+      } else {
+        // Fallback to local keyword matching
+        const keywords = topic.split(/[\s,、]+/).filter(Boolean);
+        const matched = savedCards.filter(c => {
+          const text = `${c.content} ${c.tags.join(' ')} ${c.articleTitle}`.toLowerCase();
+          return keywords.some(k => text.includes(k.toLowerCase()));
+        });
+        setRecalledCards(matched.length >= 2 ? matched : savedCards);
+      }
+    } catch {
+      // Offline fallback
+      const keywords = topic.split(/[\s,、]+/).filter(Boolean);
+      const matched = savedCards.filter(c => {
         const text = `${c.content} ${c.tags.join(' ')} ${c.articleTitle}`.toLowerCase();
         return keywords.some(k => text.includes(k.toLowerCase()));
       });
+      setRecalledCards(matched.length >= 2 ? matched : savedCards);
     }
 
-    // Fallback to all cards if less than 2 matched (as per original PRD logic)
-    if (keywords.length > 0 && matched.length < 2) {
-      matched = savedCards;
-    }
-
-    setRecalledCards(matched);
     setHasRecalled(true);
     setIsRecalling(false);
   };
@@ -117,40 +126,43 @@ export const WritePage: React.FC = () => {
 
   const handleGenerate = async () => {
     setIsGenerating(true);
-    setGeneratedHtml(null);
-    
-    await new Promise(r => setTimeout(r, 2800));
-    
-    const html = `
-      <p>在探讨“${topic}”这个话题时，我们首先需要理解其背后的深层逻辑。</p>
-      ${canvasCards.some(c => c.type === '观点') ? `<h3>问题的根源</h3><p>${canvasCards.filter(c => c.type === '观点').map(c => c.content).join(' ')}</p>` : ''}
-      ${canvasCards.some(c => c.type === '数据') ? `<h3>数据说明了什么</h3><p>${canvasCards.filter(c => c.type === '数据').map(c => c.content).join(' ')}</p>` : ''}
-      ${canvasCards.some(c => c.type === '故事') ? `<h3>可以参考的路径</h3><p>${canvasCards.filter(c => c.type === '故事').map(c => c.content).join(' ')}</p>` : ''}
-      ${canvasCards.some(c => c.type === '金句') ? `<h3>最后想说的</h3><p>正如那句话所说：${canvasCards.filter(c => c.type === '金句').map(c => c.content).join(' ')}</p>` : ''}
-      <p>综上所述，解决“${topic}”的关键在于将理论与实践相结合，持续迭代。</p>
-    `;
-    
-    setGeneratedHtml(html);
+    setGeneratedContent(null);
+
+    try {
+      const res = await fetch('/api/write/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          topic: topic.trim(),
+          cards: canvasCards.map(c => ({ type: c.type, content: c.content }))
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setGeneratedContent(data.content);
+        showToast('✦ 文章已生成，可复制或导出');
+      } else {
+        const err = await res.json().catch(() => ({}));
+        showToast(err.error || '生成失败，请稍后重试');
+      }
+    } catch {
+      showToast('网络错误，无法生成文章');
+    }
+
     setIsGenerating(false);
-    showToast('✦ 文章已生成，可复制或导出');
   };
 
   const handleCopy = () => {
-    if (generatedHtml) {
-      const temp = document.createElement('div');
-      temp.innerHTML = generatedHtml;
-      navigator.clipboard.writeText(temp.innerText);
+    if (generatedContent) {
+      navigator.clipboard.writeText(generatedContent);
       showToast('✓ 已复制全文到剪贴板');
     }
   };
 
   const handleExport = () => {
-    if (generatedHtml) {
-      let md = generatedHtml
-        .replace(/<h3>(.*?)<\/h3>/g, '\n### $1\n\n')
-        .replace(/<p>(.*?)<\/p>/g, '$1\n\n');
-      
-      const blob = new Blob([md], { type: 'text/markdown' });
+    if (generatedContent) {
+      const blob = new Blob([generatedContent], { type: 'text/markdown' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -161,7 +173,7 @@ export const WritePage: React.FC = () => {
   };
 
   const getStepStatus = (id: number) => {
-    if (step > id || (id === 4 && generatedHtml)) return 'done';
+    if (step > id || (id === 4 && generatedContent)) return 'done';
     if (step === id) return 'active';
     return 'pending';
   };
@@ -406,7 +418,7 @@ export const WritePage: React.FC = () => {
               <div className="text-[14px] font-bold text-text-main">Step 3 · 写作画布</div>
               {canvasCards.length > 0 && (
                 <button 
-                  onClick={() => { setCanvasCards([]); setGeneratedHtml(null); }}
+                  onClick={() => { setCanvasCards([]); setGeneratedContent(null); }}
                   className="text-[12px] text-text3 hover:text-red-500 transition-colors"
                 >
                   清空
@@ -473,15 +485,15 @@ export const WritePage: React.FC = () => {
             <div className="shrink-0 p-[12px_16px] border-b border-border bg-bg flex items-center justify-between">
               <div className="text-[13px] font-bold text-text-main">Step 4 · 生成结果</div>
               <div className="flex items-center gap-2">
-                <button 
-                  disabled={!generatedHtml}
+                <button
+                  disabled={!generatedContent}
                   onClick={handleCopy}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-text2 hover:bg-border disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
                   <Copy size={14} /> <span className="hidden md:inline">复制全文</span>
                 </button>
-                <button 
-                  disabled={!generatedHtml}
+                <button
+                  disabled={!generatedContent}
                   onClick={handleExport}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-text2 hover:bg-border disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
@@ -500,11 +512,10 @@ export const WritePage: React.FC = () => {
                   </div>
                   <div className="text-[13px] font-medium text-accent">AI 正在组装你的文章...</div>
                 </div>
-              ) : generatedHtml ? (
-                <div 
-                  className="font-serif text-[14px] leading-[1.9] text-text-main prose prose-p:mb-[13px] prose-h3:text-[16px] prose-h3:font-bold prose-h3:mt-6 prose-h3:mb-3"
-                  dangerouslySetInnerHTML={{ __html: generatedHtml }}
-                />
+              ) : generatedContent ? (
+                <div className="font-serif text-[14px] leading-[1.9] text-text-main whitespace-pre-wrap">
+                  {generatedContent}
+                </div>
               ) : (
                 <div className="h-full flex items-center justify-center text-text3 text-[13px]">
                   等待生成...
