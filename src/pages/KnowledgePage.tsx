@@ -1,12 +1,53 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { AtomCard } from '../types';
+import { Article, AtomCard, SavedArticle } from '../types';
 import { CARD_COLORS } from '../constants';
 import { Search, Plus, ExternalLink } from 'lucide-react';
 import { findLinkedArticle, getCardSourceLabel } from '../utils/articleDisplay';
 
 export const KnowledgePage: React.FC = () => {
   const { savedCards, savedArticles, showToast, articles, setReadingArticle, knowledgeTypeFilter, knowledgeSourceFilter, setActiveSource } = useAppContext();
+
+  /** 从数据库加载已保存文章的全文并打开阅读面板 */
+  const openSavedArticle = useCallback(async (sa: SavedArticle) => {
+    // 优先从内存中找到 live article（RSS缓存还在时）
+    const liveArticle = articles.find(a => (a.url && sa.url && a.url === sa.url) || a.title === sa.title);
+    if (liveArticle) {
+      setActiveSource(liveArticle.source || null);
+      setReadingArticle(liveArticle);
+      return;
+    }
+    // 内存中没有 → 从数据库获取全文
+    try {
+      const res = await fetch(`/api/saved-articles/${sa.id}`);
+      if (!res.ok) {
+        showToast('加载原文失败');
+        return;
+      }
+      const data = await res.json();
+      // 构造为 Article 格式供阅读面板使用
+      const article: Article = {
+        id: -(sa.id), // 负数ID避免与RSS文章冲突
+        saved: true,
+        source: data.source || sa.source,
+        sourceIcon: data.sourceIcon || sa.sourceIcon,
+        topic: data.topic || sa.topic,
+        time: sa.savedAt ? new Date(sa.savedAt).toLocaleDateString('zh-CN') : '',
+        publishedAt: data.publishedAt || sa.publishedAt,
+        title: data.title || sa.title,
+        excerpt: data.excerpt || sa.excerpt,
+        content: data.content || sa.excerpt,
+        markdownContent: data.content || undefined,
+        url: data.url || sa.url,
+        fullFetched: true,
+        cards: [],
+      };
+      setActiveSource(article.source || null);
+      setReadingArticle(article);
+    } catch {
+      showToast('网络错误，无法加载原文');
+    }
+  }, [articles, setActiveSource, setReadingArticle, showToast]);
 
   const handleSourceClick = (e: React.MouseEvent, articleId?: number) => {
     e.stopPropagation();
@@ -82,19 +123,10 @@ export const KnowledgePage: React.FC = () => {
         ) : (
           <div className="flex flex-col gap-2.5">
             {filteredSourceArticles.map(sa => {
-              // Try to find the live article in memory for reader opening
-              const liveArticle = articles.find(a => (a.url && sa.url && a.url === sa.url) || a.title === sa.title);
               return (
               <div
                 key={sa.id}
-                onClick={() => {
-                  if (liveArticle) {
-                    setActiveSource(liveArticle.source || null);
-                    setReadingArticle(liveArticle);
-                  } else {
-                    showToast('原文暂不可预览（服务器缓存已刷新）');
-                  }
-                }}
+                onClick={() => openSavedArticle(sa)}
                 className="bg-surface rounded-xl border border-border hover:border-accent hover:shadow-[0_1px_4px_rgba(0,0,0,0.07),0_4px_16px_rgba(0,0,0,0.05)] p-[18px_20px] transition-all duration-150 cursor-pointer"
               >
                 <div className="flex items-center justify-between mb-2">
@@ -118,14 +150,7 @@ export const KnowledgePage: React.FC = () => {
                 </p>
                 <div className="mt-3 flex gap-2" onClick={e => e.stopPropagation()}>
                   <button
-                    onClick={() => {
-                      if (liveArticle) {
-                        setActiveSource(liveArticle.source || null);
-                        setReadingArticle(liveArticle);
-                      } else {
-                        showToast('原文暂不可预览');
-                      }
-                    }}
+                    onClick={() => openSavedArticle(sa)}
                     className="px-3 py-1.5 rounded-lg text-[13px] font-medium border border-border text-text2 hover:bg-surface2 transition-colors"
                   >
                     阅读全文
