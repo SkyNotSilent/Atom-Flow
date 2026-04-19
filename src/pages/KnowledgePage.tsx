@@ -6,7 +6,7 @@ import { Search, Plus, ExternalLink } from 'lucide-react';
 import { findLinkedArticle, getCardSourceLabel } from '../utils/articleDisplay';
 
 export const KnowledgePage: React.FC = () => {
-  const { savedCards, savedArticles, theme, showToast, articles, setReadingArticle, knowledgeTypeFilter, knowledgeSourceFilter, setActiveSource } = useAppContext();
+  const { savedCards, savedArticles, showToast, articles, setReadingArticle, knowledgeTypeFilter, knowledgeSourceFilter, setActiveSource } = useAppContext();
 
   const handleSourceClick = (e: React.MouseEvent, articleId?: number) => {
     e.stopPropagation();
@@ -153,67 +153,57 @@ export const KnowledgePage: React.FC = () => {
           <div className="text-[15px]">还没有卡片，去今日推送存入第一篇文章吧</div>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+        <div className="flex flex-col gap-3">
           {filteredCards.map((card, idx) => {
             const colors = CARD_COLORS[card.type] || { main: '#2B6CB0', bg: '#EBF8FF', darkBg: 'rgba(43, 108, 176, 0.15)' };
-            const bg = theme === 'dark' ? colors.darkBg : colors.bg;
             const linkedArticle = findLinkedArticle(card as AtomCard, articles);
+            const isQuote = card.type === '金句';
+            const isData = card.type === '数据';
             return (
-              <div 
+              <div
                 key={card.id || idx}
                 onClick={() => setEditingCard(card)}
-                className="rounded-xl p-[15px_16px] flex flex-col cursor-pointer transition-all duration-200 hover:-translate-y-1 hover:scale-[1.01] shadow-[0_4px_12px_rgba(0,0,0,0.08)] hover:shadow-[0_10px_24px_rgba(0,0,0,0.14)] border border-white/30"
-                style={{ 
-                  background: `linear-gradient(145deg, ${bg} 0%, ${theme === 'dark' ? 'rgba(255,255,255,0.02)' : 'rgba(255,255,255,0.65)'} 100%)`,
-                  borderLeft: `3px solid ${colors.main}`
-                }}
+                className="flex bg-surface rounded-xl overflow-hidden cursor-pointer transition-all duration-200 hover:shadow-[0_4px_16px_rgba(0,0,0,0.07)] border border-border"
               >
-                <div className="text-[11px] font-bold" style={{ color: colors.main }}>
-                  {card.type}
-                </div>
-                <div className="text-[13px] text-text-main leading-[1.7] my-2 flex-1">
-                  {card.content}
-                </div>
-                {linkedArticle && (
-                  <div className="rounded-lg border border-border/70 bg-surface/70 px-3 py-2 mb-2">
-                    <div className="text-[11px] text-text3">引用自 · {getCardSourceLabel(card, articles)}</div>
-                    <div className="text-[12px] text-text-main truncate mt-0.5" title={linkedArticle.title}>
-                      {linkedArticle.title}
-                    </div>
-                    <div className="flex items-center gap-3 mt-1.5 text-[11px]">
-                      <button className="text-accent hover:underline" onClick={(e) => handleSourceClick(e, linkedArticle.id)}>
-                        回看今日推送原文
-                      </button>
-                      {linkedArticle.url && (
-                        <a
-                          href={linkedArticle.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-text2 hover:text-accent flex items-center gap-1"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          原文链接
-                          <ExternalLink size={11} />
-                        </a>
-                      )}
+                {/* 内容区 */}
+                <div className="flex-1 flex items-start gap-3 px-4 py-3 min-w-0">
+                  {/* 圆点 + 类型 */}
+                  <div className="shrink-0 flex items-center gap-1.5 mt-0.5">
+                    <span className="w-2 h-2 rounded-full" style={{ background: colors.main }} />
+                    <span className="text-[11px] text-text3 font-medium">{card.type}</span>
+                  </div>
+                  {/* 主内容 */}
+                  <div className="flex-1 min-w-0">
+                    {isData && (() => {
+                      const numMatch = card.content.match(/[\d,.]+\s*[%亿万美元份个年月天]+/);
+                      return numMatch ? (
+                        <span className="text-[18px] font-bold mr-2" style={{ color: colors.main }}>
+                          {numMatch[0]}
+                        </span>
+                      ) : null;
+                    })()}
+                    <div className={`text-text-main leading-[1.7] line-clamp-2 ${isQuote ? 'font-serif text-[15px] font-semibold' : 'text-[13.5px]'}`}>
+                      {card.content}
                     </div>
                   </div>
-                )}
-                <div className="flex flex-wrap items-center gap-2 mt-2">
-                  {card.tags.map(t => (
-                    <span key={t} className="bg-surface/60 text-text2 text-[11px] px-2 py-0.5 rounded-md">
-                      #{t}
-                    </span>
-                  ))}
-                  <div className="ml-auto flex items-center gap-1">
-                    {card.articleId && (
-                      <span className="text-[11px] text-accent hover:underline cursor-pointer flex items-center gap-0.5" onClick={(e) => handleSourceClick(e, card.articleId)}>
-                        🔗 来源
-                      </span>
+                  {/* 右侧标签 + 来源 */}
+                  <div className="shrink-0 flex flex-col items-end gap-1.5 ml-2">
+                    <div className="flex flex-wrap justify-end gap-1">
+                      {card.tags.slice(0, 3).map(t => (
+                        <span
+                          key={t}
+                          className="text-[10px] text-white/90 px-1.5 py-0.5 rounded-full"
+                          style={{ background: colors.main, opacity: 0.7 }}
+                        >
+                          {t}
+                        </span>
+                      ))}
+                    </div>
+                    {(linkedArticle || card.articleTitle) && (
+                      <div className="text-[10px] text-text3 max-w-[120px] truncate">
+                        {linkedArticle?.title || card.articleTitle}
+                      </div>
                     )}
-                    <span className="text-[11px] text-text3 truncate max-w-[120px]" title={card.articleTitle}>
-                      {card.articleTitle}
-                    </span>
                   </div>
                 </div>
               </div>
