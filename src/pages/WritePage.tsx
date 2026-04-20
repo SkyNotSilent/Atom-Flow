@@ -54,22 +54,10 @@ export const WritePage: React.FC = () => {
         const data = await res.json();
         setRecalledCards(data.cards || []);
       } else {
-        // Fallback to local keyword matching
-        const keywords = topic.split(/[\s,、]+/).filter(Boolean);
-        const matched = savedCards.filter(c => {
-          const text = `${c.content} ${c.tags.join(' ')} ${c.articleTitle}`.toLowerCase();
-          return keywords.some(k => text.includes(k.toLowerCase()));
-        });
-        setRecalledCards(matched.length >= 2 ? matched : savedCards);
+        showToast('召回失败，请稍后重试');
       }
     } catch {
-      // Offline fallback
-      const keywords = topic.split(/[\s,、]+/).filter(Boolean);
-      const matched = savedCards.filter(c => {
-        const text = `${c.content} ${c.tags.join(' ')} ${c.articleTitle}`.toLowerCase();
-        return keywords.some(k => text.includes(k.toLowerCase()));
-      });
-      setRecalledCards(matched.length >= 2 ? matched : savedCards);
+      showToast('网络错误');
     }
 
     setHasRecalled(true);

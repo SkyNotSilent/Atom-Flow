@@ -2201,7 +2201,7 @@ async function startServer() {
     }
   }));
 
-  // --- Writing: AI recall (semantic matching) ---
+  // --- Writing: keyword recall ---
   app.post("/api/write/recall", requireAuth, asyncHandler(async (req, res) => {
     const { topic } = req.body;
     if (!topic || typeof topic !== 'string') return res.status(400).json({ error: "topic is required" });
@@ -2215,68 +2215,13 @@ async function startServer() {
 
     if (cardRows.length === 0) return res.json({ cards: [] });
 
-    const apiKey = process.env.AI_API_KEY;
-    const baseUrl = process.env.AI_BASE_URL;
-    const model = process.env.AI_MODEL;
+    const keywords = topic.split(/[\s,、]+/).filter(Boolean);
+    const matched = cardRows.filter(c => {
+      const text = `${c.content} ${(c.tags || []).join(' ')} ${c.articleTitle || ''}`.toLowerCase();
+      return keywords.some((k: string) => text.includes(k.toLowerCase()));
+    });
 
-    // If AI not configured, fallback to keyword matching
-    if (!apiKey || !baseUrl || !model) {
-      const keywords = topic.split(/[\s,、]+/).filter(Boolean);
-      const matched = cardRows.filter(c => {
-        const text = `${c.content} ${c.tags.join(' ')} ${c.articleTitle || ''}`.toLowerCase();
-        return keywords.some((k: string) => text.includes(k.toLowerCase()));
-      });
-      return res.json({ cards: matched.length >= 2 ? matched : cardRows.slice(0, 10) });
-    }
-
-    // Build card summaries for AI to score
-    const cardSummaries = cardRows.slice(0, 50).map((c, i) => `[${i}] (${c.type}) ${c.content.slice(0, 60)}`).join('\n');
-
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 12000);
-
-      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: 'user', content: `你是写作素材召回助手。用户想写的主题是「${topic}」。\n\n以下是用户知识库中的卡片：\n${cardSummaries}\n\n请选出与主题最相关的卡片序号（最多10个），按相关度从高到低排列。\n严格只输出JSON数组，格式：[0, 3, 7, ...]` }],
-          max_tokens: 200,
-          temperature: 0.2
-        }),
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-
-      if (!response.ok) {
-        // Fallback to keyword
-        const keywords = topic.split(/[\s,、]+/).filter(Boolean);
-        const matched = cardRows.filter(c => {
-          const text = `${c.content} ${c.tags.join(' ')}`.toLowerCase();
-          return keywords.some((k: string) => text.includes(k.toLowerCase()));
-        });
-        return res.json({ cards: matched.length >= 2 ? matched : cardRows.slice(0, 10) });
-      }
-
-      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-      const raw = data.choices?.[0]?.message?.content || '';
-      const cleaned = raw.replace(/```json\s*/g, '').replace(/```/g, '').trim();
-      const indices: number[] = JSON.parse(cleaned);
-
-      if (!Array.isArray(indices)) {
-        return res.json({ cards: cardRows.slice(0, 10) });
-      }
-
-      const recalled = indices
-        .filter(i => typeof i === 'number' && i >= 0 && i < cardRows.length)
-        .map(i => cardRows[i]);
-
-      return res.json({ cards: recalled.length > 0 ? recalled : cardRows.slice(0, 10) });
-    } catch (err) {
-      console.error('[AI] Recall failed:', err instanceof Error ? err.message : err);
-      return res.json({ cards: cardRows.slice(0, 10) });
-    }
+    res.json({ cards: matched.length >= 2 ? matched : cardRows.slice(0, 10) });
   }));
 
   // --- Writing: AI generate article ---
@@ -2311,7 +2256,7 @@ ${cardText}
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30000);
+      const timeout = setTimeout(() => controller.abort(), 60000);
 
       const response = await fetch(`${baseUrl}/v1/chat/completions`, {
         method: 'POST',
