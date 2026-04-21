@@ -344,9 +344,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (articlesRes.ok) setArticles(await articlesRes.json());
         if (cardsRes.ok) setSavedCards(await cardsRes.json());
         if (savedArticlesRes.ok) setSavedArticles(await savedArticlesRes.json());
+      } else {
+        const errBody = await res.text().catch(() => '');
+        console.error(`[saveArticle] API failed: ${res.status} ${errBody}`);
+        showToast(`保存失败: ${res.status}`);
       }
     } catch (error) {
       console.error("Failed to save article:", error);
+      showToast('保存失败: 网络错误');
     } finally {
       await new Promise(resolve => setTimeout(resolve, 260));
       setSavingState({ articleId: null, stage: null });
