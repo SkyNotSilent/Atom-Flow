@@ -105,12 +105,16 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
                   src={user.avatar_url}
                   alt=""
                   className="w-16 h-16 rounded-full object-cover"
+                  onError={(e) => {
+                    const el = e.currentTarget;
+                    el.style.display = 'none';
+                    el.nextElementSibling?.classList.remove('hidden');
+                  }}
                 />
-              ) : (
-                <div className="w-16 h-16 rounded-full bg-accent text-white flex items-center justify-center text-[22px] font-semibold">
-                  {avatarLetter}
-                </div>
-              )}
+              ) : null}
+              <div className={`w-16 h-16 rounded-full bg-accent text-white flex items-center justify-center text-[22px] font-semibold${user.avatar_url ? ' hidden' : ''}`}>
+                {avatarLetter}
+              </div>
               <div className="absolute inset-0 rounded-full bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                 {uploadingAvatar ? (
                   <Loader2 size={20} className="text-white animate-spin" />

@@ -1320,12 +1320,16 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
                   src={user.avatar_url}
                   alt=""
                   className="w-6 h-6 rounded-full object-cover shrink-0"
+                  onError={(e) => {
+                    const el = e.currentTarget;
+                    el.style.display = 'none';
+                    el.nextElementSibling?.classList.remove('hidden');
+                  }}
                 />
-              ) : (
-                <div className="w-6 h-6 rounded-full bg-accent text-white flex items-center justify-center text-[11px] font-medium shrink-0">
-                  {(user.nickname || user.email)[0].toUpperCase()}
-                </div>
-              )}
+              ) : null}
+              <div className={`w-6 h-6 rounded-full bg-accent text-white flex items-center justify-center text-[11px] font-medium shrink-0${user.avatar_url ? ' hidden' : ''}`}>
+                {(user.nickname || user.email)[0].toUpperCase()}
+              </div>
               <span className="text-[12px] text-text2 truncate">
                 {user.nickname || user.email.split('@')[0]}
               </span>

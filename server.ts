@@ -15,6 +15,7 @@ import connectPgSimple from "connect-pg-simple";
 import bcrypt from "bcryptjs";
 import { Resend } from "resend";
 import nodemailer from "nodemailer";
+import sharp from "sharp";
 
 dotenv.config();
 
@@ -1064,21 +1065,11 @@ async function startServer() {
       })
     : null;
 
-  // Avatar upload setup
-  const avatarsDir = path.join(process.cwd(), '.cache', 'avatars');
-  await fs.mkdir(avatarsDir, { recursive: true });
-
-  const avatarStorage = multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, avatarsDir),
-    filename: (req: any, _file, cb) => {
-      const ext = path.extname(_file.originalname) || '.jpg';
-      cb(null, `${req.session.userId}-${Date.now()}${ext}`);
-    }
-  });
-
+  // Avatar upload setup (memory storage → compress → base64 data URL stored in DB)
+  const AVATAR_MAX_BYTES = 2 * 1024 * 1024; // 2MB threshold for compression
   const avatarUpload = multer({
-    storage: avatarStorage,
-    limits: { fileSize: 2 * 1024 * 1024 },
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }, // accept up to 10MB, compress if > 2MB
     fileFilter: (_req, file, cb) => {
       const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
       cb(null, allowed.includes(file.mimetype));
@@ -1456,28 +1447,30 @@ async function startServer() {
 
   app.post("/api/auth/avatar", requireAuth, avatarUpload.single('avatar'), asyncHandler(async (req: any, res) => {
     if (!req.file) {
-      return res.status(400).json({ error: '请上传有效的图片文件（JPG/PNG/GIF/WebP，最大2MB）' });
+      return res.status(400).json({ error: '请上传有效的图片文件（JPG/PNG/GIF/WebP，最大10MB）' });
     }
-    const avatarUrl = `/api/avatars/${req.file.filename}`;
 
-    // Delete old avatar file
-    const oldUser = (await pool.query('SELECT avatar_url FROM users WHERE id = $1', [req.session.userId])).rows[0];
-    if (oldUser?.avatar_url) {
-      const oldFilename = oldUser.avatar_url.replace('/api/avatars/', '');
-      const oldPath = path.join(avatarsDir, oldFilename);
-      await fs.unlink(oldPath).catch(() => {});
+    let buffer: Buffer = req.file.buffer;
+    let mimetype: string = req.file.mimetype;
+
+    // Compress if larger than 2MB: resize to 256x256 and convert to JPEG
+    if (buffer.length > AVATAR_MAX_BYTES) {
+      buffer = await sharp(buffer)
+        .resize(256, 256, { fit: 'cover' })
+        .jpeg({ quality: 80 })
+        .toBuffer();
+      mimetype = 'image/jpeg';
     }
+
+    const dataUrl = `data:${mimetype};base64,${buffer.toString('base64')}`;
 
     const user = (await pool.query(
       'UPDATE users SET avatar_url = $1 WHERE id = $2 RETURNING id, email, nickname, avatar_url, password_hash',
-      [avatarUrl, req.session.userId]
+      [dataUrl, req.session.userId]
     )).rows[0];
     if (!user) return res.status(404).json({ error: '用户不存在' });
     return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url, has_password: Boolean(user.password_hash) } });
   }));
-
-  // Serve avatar files
-  app.use('/api/avatars', express.static(avatarsDir, { maxAge: '7d' }));
 
   // --- Preferences routes ---
   app.get("/api/preferences", requireAuth, asyncHandler(async (req, res) => {
