@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
 import { Article, AtomCard, User, Note, SavedArticle } from '../types';
+import { logger } from '../utils/logger';
 
 interface AppState {
   articles: Article[];
@@ -116,7 +117,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           }
         }
       } catch (error) {
-        console.error("Failed to fetch full article:", error);
+        logger.error("Failed to fetch full article", { error, articleId: article.id, articleUrl: article.url });
       }
     }
   };
@@ -155,7 +156,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           await reloadArticles(); // reload with user articles merged
         }
       } catch (error) {
-        console.error("Failed to fetch initial data:", error);
+        logger.error("Failed to fetch initial data", { error });
         setIsAuthLoading(false);
       }
     };
@@ -188,7 +189,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(prefs)
-      }).catch(err => console.error('Failed to sync preferences:', err));
+      }).catch(error => logger.error('Failed to sync preferences', { error, prefs }));
     }, 500);
   }, []);
 
@@ -277,7 +278,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return note;
       }
     } catch (error) {
-      console.error('Failed to create note:', error);
+      logger.error('Failed to create note', { error });
     }
     return null;
   };
@@ -294,7 +295,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setNotes(prev => prev.map(n => n.id === id ? updated : n));
       }
     } catch (error) {
-      console.error('Failed to update note:', error);
+      logger.error('Failed to update note', { error, noteId: id });
     }
   };
 
@@ -305,7 +306,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setNotes(prev => prev.filter(n => n.id !== id));
       }
     } catch (error) {
-      console.error('Failed to delete note:', error);
+      logger.error('Failed to delete note', { error, noteId: id });
     }
   };
 
@@ -346,11 +347,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (savedArticlesRes.ok) setSavedArticles(await savedArticlesRes.json());
       } else {
         const errBody = await res.text().catch(() => '');
-        console.error(`[saveArticle] API failed: ${res.status} ${errBody}`);
+        logger.error('Save article API failed', { articleId, status: res.status, responseBody: errBody });
         showToast(`保存失败: ${res.status}`);
       }
     } catch (error) {
-      console.error("Failed to save article:", error);
+      logger.error("Failed to save article", { error, articleId });
       showToast('保存失败: 网络错误');
     } finally {
       await new Promise(resolve => setTimeout(resolve, 260));
@@ -378,7 +379,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setSavedCards(prev => [newCard, ...prev]);
       }
     } catch (error) {
-      console.error("Failed to add card:", error);
+      logger.error("Failed to add card", { error, cardType: card.type });
     }
   };
 
@@ -394,7 +395,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setSavedCards(prev => prev.map(c => c.id === id ? updatedCard : c));
       }
     } catch (error) {
-      console.error("Failed to update card:", error);
+      logger.error("Failed to update card", { error, cardId: id });
     }
   };
 
@@ -405,7 +406,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setSavedCards(prev => prev.filter(c => c.id !== id));
       }
     } catch (error) {
-      console.error("Failed to delete card:", error);
+      logger.error("Failed to delete card", { error, cardId: id });
     }
   };
 

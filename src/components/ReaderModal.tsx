@@ -6,6 +6,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { cn } from './Nav';
 import { getDisplaySource } from '../utils/articleDisplay';
+import { logger } from '../utils/logger';
 
 const LANG_OPTIONS = [
   { value: 'zh', label: '中文' },
@@ -116,7 +117,7 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
     if (isPlaying) {
       audio.pause();
     } else {
-      audio.play().catch(console.error);
+      audio.play().catch(error => logger.error('Failed to play article audio', { error, articleId: currentArticle?.id }));
     }
     setIsPlaying(!isPlaying);
   };
@@ -199,7 +200,7 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
       setTranslatedSegments(transSegs);
       showToast('翻译完成');
     } catch (error) {
-      console.error('Translation error:', error);
+      logger.error('Translation error', { error, articleId: currentArticle.id, targetLang });
       showToast('翻译失败，请稍后重试');
       setTranslateActive(false);
     } finally {

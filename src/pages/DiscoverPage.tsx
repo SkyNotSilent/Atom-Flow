@@ -2,6 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { Check, Plus } from 'lucide-react';
 import { cn } from '../components/Nav';
+import { logger } from '../utils/logger';
 
 interface SourceRecommendation {
   name: string;
@@ -137,7 +138,7 @@ export const DiscoverPage: React.FC = () => {
       // 触发页面刷新以更新导航栏
       window.location.reload();
     } catch (error) {
-      console.error('Failed to add source:', error);
+      logger.error('Failed to add source', { error, source: source.name, input: source.url });
       showToast('添加失败，请稍后重试');
     } finally {
       setLoadingSources(prev => {
@@ -210,7 +211,7 @@ export const DiscoverPage: React.FC = () => {
       // 触发页面刷新以更新导航栏
       window.location.reload();
     } catch (error) {
-      console.error('Failed to add custom source:', error);
+      logger.error('Failed to add custom source', { error, source: sourceName, input });
       showToast('添加失败，请检查链接是否正确');
     } finally {
       setIsAddingCustom(false);

@@ -16,8 +16,92 @@ import bcrypt from "bcryptjs";
 import { Resend } from "resend";
 import nodemailer from "nodemailer";
 import sharp from "sharp";
+import type { IncomingMessage } from "http";
+import pino from "pino";
+import pinoHttp from "pino-http";
 
 dotenv.config();
+
+const isProduction = process.env.NODE_ENV === "production";
+const logger = pino({
+  level: process.env.LOG_LEVEL || (isProduction ? "info" : "debug"),
+  base: {
+    service: "atomflow",
+    env: process.env.NODE_ENV || "development",
+  },
+  redact: {
+    paths: [
+      "req.headers.authorization",
+      "req.headers.cookie",
+      "res.headers.set-cookie",
+      "password",
+      "passwordHash",
+      "password_hash",
+      "token",
+      "secret",
+    ],
+    censor: "[redacted]",
+  },
+  serializers: {
+    err: pino.stdSerializers.err,
+  },
+});
+
+const formatOtpForLog = (code: string) => {
+  return isProduction ? `${code.slice(0, 2)}****` : code;
+};
+
+const logOtpEvent = (event: "login" | "registration", email: string, code: string) => {
+  const payload = { authEvent: event, email, otp: formatOtpForLog(code) };
+  if (isProduction) {
+    logger.info(payload, "Verification code generated");
+  } else {
+    logger.debug(payload, "Verification code generated");
+  }
+};
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+};
+
+const sanitizeClientLogValue = (value: unknown, depth = 0): unknown => {
+  if (depth > 4) return "[truncated]";
+  if (value instanceof Error) return { name: value.name, message: value.message, stack: value.stack };
+  if (Array.isArray(value)) return value.slice(0, 20).map(item => sanitizeClientLogValue(item, depth + 1));
+  if (!isPlainRecord(value)) {
+    if (typeof value === "string") return value.slice(0, 2000);
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).slice(0, 50).map(([key, item]) => {
+      const sensitiveKey = /password|token|secret|authorization|cookie|code/i.test(key);
+      return [key, sensitiveKey ? "[redacted]" : sanitizeClientLogValue(item, depth + 1)];
+    })
+  );
+};
+
+const shouldSkipRequestLog = (req: IncomingMessage) => {
+  const pathname = (req.url || "").split("?")[0];
+  return (
+    pathname.startsWith("/@vite") ||
+    pathname.startsWith("/@react-refresh") ||
+    pathname.startsWith("/src/") ||
+    pathname.startsWith("/node_modules/") ||
+    pathname.startsWith("/assets/") ||
+    pathname === "/favicon.ico" ||
+    /\.(?:js|mjs|css|map|ico|png|jpe?g|gif|svg|webp|woff2?|ttf)$/i.test(pathname)
+  );
+};
+
+process.on("unhandledRejection", (reason) => {
+  logger.fatal({ err: reason }, "Unhandled promise rejection");
+});
+
+process.on("uncaughtException", (error) => {
+  logger.fatal({ err: error }, "Uncaught exception");
+  process.exit(1);
+});
 
 // Parse BIGINT as number instead of string
 pg.types.setTypeParser(20, v => v === null ? null : Number(v));
@@ -597,7 +681,12 @@ const extractCardsWithAI = async (
     clearTimeout(timeout);
 
     if (!response.ok) {
-      console.error(`[AI] API returned ${response.status}: ${await response.text()}`);
+      const responseBody = await response.text();
+      logger.error({
+        module: "ai",
+        status: response.status,
+        responseBody: responseBody.slice(0, 1000),
+      }, "AI API request failed");
       return [];
     }
 
@@ -634,12 +723,15 @@ const extractCardsWithAI = async (
     }
 
     if (validCards.length > 0) {
-      console.log(`[AI] Extracted ${validCards.length} cards from "${article.title.slice(0, 30)}"`);
+      logger.info({
+        module: "ai",
+        cardCount: validCards.length,
+        articleTitle: article.title.slice(0, 80),
+      }, "AI cards extracted");
     }
     return validCards;
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    console.error(`[AI] Card extraction failed: ${errMsg}`);
+    logger.error({ err, module: "ai", articleTitle: article.title.slice(0, 80) }, "AI card extraction failed");
     return [];
   }
 };
@@ -794,60 +886,44 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     const karpathyArticles = results[12].status === 'fulfilled'
       ? normalizeFeedItems(results[12].value.items, 'Andrej Karpathy', 'YouTube', 12000, extractFeedIcon(results[12].value))
       : [];
-    console.log('RSS counts:', {
-      sspai: sspaiArticles.length,
-      woshipm: woshipmArticles.length,
-      kr36: krArticles.length,
-      huxiu: huxiuArticles.length,
-      zslren: zslrenArticles.length,
-      xzy: xzyArticles.length,
-      jike: jikeArticles.length,
-      github: githubArticles.length,
-      sama: samaArticles.length,
-      xyzfm: xyzfmArticles.length,
-      lex: lexArticles.length,
-      yc: ycArticles.length,
-      karpathy: karpathyArticles.length
+    logger.info({
+      module: "rss",
+      counts: {
+        sspai: sspaiArticles.length,
+        woshipm: woshipmArticles.length,
+        kr36: krArticles.length,
+        huxiu: huxiuArticles.length,
+        zslren: zslrenArticles.length,
+        xzy: xzyArticles.length,
+        jike: jikeArticles.length,
+        github: githubArticles.length,
+        sama: samaArticles.length,
+        xyzfm: xyzfmArticles.length,
+        lex: lexArticles.length,
+        yc: ycArticles.length,
+        karpathy: karpathyArticles.length
+      }
+    }, "RSS feed counts");
+    const feedNames = [
+      'sspai',
+      'woshipm',
+      '36kr',
+      'huxiu',
+      'zslren',
+      'xzy',
+      'jike topic',
+      'GitHub Blog',
+      'Sam Altman Twitter',
+      '张小珺商业访谈录',
+      'Lex Fridman',
+      'Y Combinator',
+      'Andrej Karpathy',
+    ];
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        logger.error({ err: result.reason, module: "rss", feed: feedNames[index] }, "Failed to fetch RSS feed");
+      }
     });
-    if (results[0].status === 'rejected') {
-      console.error('Failed to fetch RSS from sspai:', results[0].reason);
-    }
-    if (results[1].status === 'rejected') {
-      console.error('Failed to fetch RSS from woshipm:', results[1].reason);
-    }
-    if (results[2].status === 'rejected') {
-      console.error('Failed to fetch RSS from 36kr:', results[2].reason);
-    }
-    if (results[3].status === 'rejected') {
-      console.error('Failed to fetch RSS from huxiu:', results[3].reason);
-    }
-    if (results[4].status === 'rejected') {
-      console.error('Failed to fetch RSS from zslren:', results[4].reason);
-    }
-    if (results[5].status === 'rejected') {
-      console.error('Failed to fetch RSS from xzy:', results[5].reason);
-    }
-    if (results[6].status === 'rejected') {
-      console.error('Failed to fetch RSS from jike topic:', results[6].reason);
-    }
-    if (results[7].status === 'rejected') {
-      console.error('Failed to fetch RSS from GitHub Blog:', results[7].reason);
-    }
-    if (results[8].status === 'rejected') {
-      console.error('Failed to fetch RSS from Sam Altman Twitter:', results[8].reason);
-    }
-    if (results[9].status === 'rejected') {
-      console.error('Failed to fetch RSS from 张小珺商业访谈录:', results[9].reason);
-    }
-    if (results[10].status === 'rejected') {
-      console.error('Failed to fetch RSS from Lex Fridman:', results[10].reason);
-    }
-    if (results[11].status === 'rejected') {
-      console.error('Failed to fetch RSS from Y Combinator:', results[11].reason);
-    }
-    if (results[12].status === 'rejected') {
-      console.error('Failed to fetch RSS from Andrej Karpathy:', results[12].reason);
-    }
     const merged = [
       ...sspaiArticles,
       ...woshipmArticles,
@@ -866,7 +942,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     const ordered = rankArticles(merged);
     return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
   } catch (error) {
-    console.error('Failed to fetch RSS, falling back to mock data:', error);
+    logger.error({ err: error, module: "rss" }, "Failed to fetch RSS, falling back to mock data");
     return [...MOCK_ARTICLES];
   }
 }
@@ -892,10 +968,9 @@ async function startServer() {
     await _pool.query('SELECT 1');
     pool = _pool;
     dbAvailable = true;
-    console.log('Database connected successfully');
+    logger.info({ module: "db" }, "Database connected successfully");
   } catch (err) {
-    console.warn('Database unavailable — server will start without auth/persistence features');
-    console.warn('Error:', (err as Error).message);
+    logger.warn({ err, module: "db" }, "Database unavailable; server will start without auth/persistence features");
   }
 
   if (pool) {
@@ -1046,9 +1121,9 @@ async function startServer() {
     await pool.query('CREATE EXTENSION IF NOT EXISTS vector');
     pgvectorAvailable = true;
     await pool.query('ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS embedding vector(1536)');
-    console.log('[DB] pgvector extension enabled');
+    logger.info({ module: "db" }, "pgvector extension enabled");
   } catch {
-    console.log('[DB] pgvector not available, semantic search disabled');
+    logger.info({ module: "db" }, "pgvector not available, semantic search disabled");
   }
 
   // Backfill: set default nickname for existing users who don't have one
@@ -1077,6 +1152,38 @@ async function startServer() {
   });
 
   app.use(express.json());
+  app.use(pinoHttp({
+    logger,
+    autoLogging: {
+      ignore: shouldSkipRequestLog,
+    },
+    customLogLevel: (_req, res, err) => {
+      if (err || res.statusCode >= 500) return "error";
+      if (res.statusCode >= 400) return "warn";
+      return "info";
+    },
+    customSuccessMessage: (req, res, responseTime) => `${req.method} ${req.url} ${res.statusCode} ${Math.round(responseTime)}ms`,
+    customErrorMessage: (req, res, err) => `${req.method} ${req.url} ${res.statusCode} ${err.message}`,
+  }));
+
+  app.post("/api/log", (req, res) => {
+    const { level, message, context } = req.body || {};
+    if (level !== "error" && level !== "warn") {
+      return res.status(400).json({ error: "unsupported log level" });
+    }
+
+    const logPayload = {
+      module: "client",
+      client: sanitizeClientLogValue(isPlainRecord(context) ? context : {}),
+    };
+    const logMessage = `[CLIENT] ${typeof message === "string" ? message.slice(0, 500) : "Client log"}`;
+    if (level === "error") {
+      logger.error(logPayload, logMessage);
+    } else {
+      logger.warn(logPayload, logMessage);
+    }
+    return res.json({ success: true });
+  });
 
   // --- Session middleware (PostgreSQL) ---
   if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
@@ -1114,34 +1221,34 @@ async function startServer() {
   }
 
   // Load RSS feeds on startup
-  console.log('Fetching RSS feeds...');
+  logger.info({ module: "rss" }, "Fetching RSS feeds");
   const refreshFeeds = async () => {
     try {
       const fresh = await fetchRSSFeeds();
-      console.log(`Fetched ${fresh.length} fresh articles`);
+      logger.info({ module: "rss", freshCount: fresh.length }, "Fetched fresh articles");
 
       // 只有当新数据不为空时才合并
       if (fresh.length > 0) {
         const withFallback = mergeWithSourceFallback(articles, fresh);
         articles = mergeArticles(articles, rankArticles(withFallback));
         await saveArticlesCache(articles);
-        console.log(`Loaded ${articles.length} articles.`);
+        logger.info({ module: "rss", articleCount: articles.length }, "Loaded articles");
       } else {
-        console.log('No fresh articles fetched, keeping existing data');
+        logger.info({ module: "rss" }, "No fresh articles fetched, keeping existing data");
       }
     } catch (error) {
-      console.error('Failed to refresh feeds, keeping existing data:', error);
+      logger.error({ err: error, module: "rss" }, "Failed to refresh feeds, keeping existing data");
     }
   };
   // 如果有缓存数据，不阻塞启动，后台异步刷新
   if (articles.length > 0) {
-    console.log(`Using ${articles.length} cached articles, refreshing in background...`);
+    logger.info({ module: "rss", articleCount: articles.length }, "Using cached articles, refreshing in background");
     refreshFeeds();
   } else {
     await refreshFeeds();
   }
   setInterval(() => {
-    refreshFeeds().catch(error => console.error('Failed to refresh feeds:', error));
+    refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds"));
   }, 10 * 60 * 1000);
 
   // --- Auth Routes ---
@@ -1167,7 +1274,7 @@ async function startServer() {
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
     await pool.query('INSERT INTO verification_codes (email, code, expires_at) VALUES ($1, $2, $3)', [email, code, expiresAt]);
 
-    console.log(`[AUTH] 验证码 → ${email}: ${code}`);
+    logOtpEvent("login", email, code);
 
     const htmlContent = `
       <div style="font-family: sans-serif; max-width: 400px; margin: 0 auto; padding: 20px;">
@@ -1196,7 +1303,7 @@ async function startServer() {
       }
       return res.json({ success: true });
     } catch (error) {
-      console.error('Failed to send verification code:', error);
+      logger.error({ err: error, module: "auth", email }, "Failed to send verification code");
       return res.status(500).json({ error: '发送验证码失败，请稍后再试' });
     }
   }));
@@ -1284,7 +1391,7 @@ async function startServer() {
       [email, code, expiresAt, passwordHash]
     );
 
-    console.log(`[AUTH] 注册验证码 → ${email}: ${code}`);
+    logOtpEvent("registration", email, code);
 
     const htmlContent = `
       <div style="font-family: sans-serif; max-width: 400px; margin: 0 auto; padding: 20px;">
@@ -1313,7 +1420,7 @@ async function startServer() {
       }
       return res.json({ success: true });
     } catch (error) {
-      console.error('Failed to send registration code:', error);
+      logger.error({ err: error, module: "auth", email }, "Failed to send registration code");
       return res.status(500).json({ error: '发送验证码失败，请稍后再试' });
     }
   }));
@@ -1674,7 +1781,7 @@ async function startServer() {
       }
       return res.json({ success: true, added });
     } catch (error: any) {
-      console.error(`Failed to retry source ${source}:`, error);
+      logger.error({ err: error, module: "rss", source }, "Failed to retry source");
       return res.status(502).json({ error: "获取失败", details: error?.message || '未知错误' });
     }
   }));
@@ -1931,7 +2038,7 @@ async function startServer() {
       
       return res.json({ success: true, article });
     } catch (error) {
-      console.error('Failed to process article content:', error);
+      logger.error({ err: error, module: "articles", articleId }, "Failed to process article content");
       article.markdownContent = article.content || article.excerpt || '暂无内容';
       article.readabilityUsed = false;
       article.fullFetched = true;
@@ -1995,7 +2102,7 @@ async function startServer() {
       const arrayBuffer = await response.arrayBuffer();
       res.send(Buffer.from(arrayBuffer));
     } catch (error) {
-      console.error('Image proxy error:', error);
+      logger.error({ err: error, module: "image-proxy", imageUrl }, "Image proxy error");
       res.status(500).send("Failed to load image");
     }
   }));
@@ -2189,7 +2296,7 @@ async function startServer() {
       const translatedText = cleanTranslation(await baiduTranslate(content));
       res.json({ success: true, translatedContent: translatedText });
     } catch (error: any) {
-      console.error('Translation error:', error);
+      logger.error({ err: error, module: "translate" }, "Translation error");
       res.status(500).json({ error: "Translation failed", details: error?.message });
     }
   }));
@@ -2266,7 +2373,11 @@ ${cardText}
 
       if (!response.ok) {
         const errText = await response.text();
-        console.error(`[AI] Generate returned ${response.status}: ${errText}`);
+        logger.error({
+          module: "ai",
+          status: response.status,
+          responseBody: errText.slice(0, 1000),
+        }, "AI generation request failed");
         return res.status(500).json({ error: "AI generation failed" });
       }
 
@@ -2279,7 +2390,7 @@ ${cardText}
 
       res.json({ success: true, content });
     } catch (err) {
-      console.error('[AI] Generate failed:', err instanceof Error ? err.message : err);
+      logger.error({ err, module: "ai" }, "AI generation failed");
       res.status(500).json({ error: "AI generation failed" });
     }
   }));
@@ -2295,8 +2406,23 @@ ${cardText}
     app.use(express.static("dist"));
   }
 
+  app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    logger.error({
+      err,
+      module: "express",
+      method: req.method,
+      path: req.path,
+      requestId: req.id,
+    }, "Unhandled Express error");
+    res.status(500).json({ error: "Internal server error" });
+  });
+
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    logger.info({ module: "server", port: PORT }, `Server running on http://localhost:${PORT}`);
   });
 }
 

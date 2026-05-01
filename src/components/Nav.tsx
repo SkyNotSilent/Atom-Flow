@@ -3,6 +3,7 @@ import { useAppContext } from '../context/AppContext';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut } from 'lucide-react';
+import { logger } from '../utils/logger';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -221,7 +222,7 @@ const loadEntriesFromStorage = (): NavEntry[] => {
     
     // 检查版本号，如果是旧版本数据，强制使用新的合集结构
     if (parsed.version !== SOURCE_LAYOUT_VERSION) {
-      console.log('检测到旧版本数据，重置为合集结构');
+      logger.info('Detected legacy source layout, resetting to collection structure', { version: parsed.version });
       const defaultEntries = createDefaultEntries();
       // 保存新版本数据
       window.localStorage.setItem(SOURCE_LAYOUT_STORAGE_KEY, JSON.stringify({
