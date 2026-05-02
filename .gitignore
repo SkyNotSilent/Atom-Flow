@@ -7,5 +7,6 @@ coverage/
 .env*
 !.env.example
 .cache/
+.claude/settings.local.json
 tmp_*.json
 articles.json

@@ -3,6 +3,7 @@ import { useAppContext } from '../context/AppContext';
 import { Article } from '../types';
 import { cn } from '../components/Nav';
 import { Check, LayoutGrid, List, Sparkles } from 'lucide-react';
+import { InspirationButton } from '../components/InspirationButton';
 import { getDisplaySource, sourceMatches } from '../utils/articleDisplay';
 
 export const FeedPage: React.FC = () => {
@@ -234,12 +235,11 @@ export const FeedPage: React.FC = () => {
                 </p>
 
                 <div className="mt-3 flex gap-2" onClick={e => e.stopPropagation()}>
-                  <button 
-                    onClick={() => setReadingArticle(article)}
-                    className="px-3 py-1.5 rounded-lg text-[12px] sm:text-[13px] font-medium border border-border text-text2 hover:bg-surface2 transition-colors"
-                  >
-                    阅读全文
-                  </button>
+                  <InspirationButton
+                    articleTitle={article.title}
+                    articleId={article.id}
+                    compact
+                  />
                   {!article.saved ? (
                     <button 
                       onClick={() => void handleSave(article)}

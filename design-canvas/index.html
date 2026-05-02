@@ -1,0 +1,1955 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AtomFlow · 写作页 & 图标 设计画布</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Serif+SC:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#FAFAF8;          /* warm paper */
+    --surface:#FFFFFF;
+    --surface2:#F3F1EA;
+    --ink:#1A1916;
+    --ink2:#4A4841;
+    --ink3:#8A8679;
+    --border:#E6E2D6;
+    --accent:#2B6CB0;       /* atom blue */
+    --accent2:#B8864D;      /* copper */
+    --accent-soft:#E8EEF7;
+    --accent2-soft:#F4EADA;
+    --danger:#B0453A;
+    --radius:12px;
+    --shadow:0 1px 2px rgba(20,18,12,.04), 0 8px 28px rgba(20,18,12,.06);
+  }
+  html.dark{
+    --bg:#0E1116;
+    --surface:#161A21;
+    --surface2:#1E232C;
+    --ink:#ECEAE2;
+    --ink2:#B8B4A6;
+    --ink3:#6D6A5F;
+    --border:#262B35;
+    --accent:#6FA9FF;
+    --accent2:#E0B87A;
+    --accent-soft:rgba(111,169,255,.12);
+    --accent2-soft:rgba(224,184,122,.12);
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 28px rgba(0,0,0,.4);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font-family:Inter,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+  body{min-height:100vh}
+  .serif{font-family:"Fraunces","Noto Serif SC",Georgia,serif;font-optical-sizing:auto}
+  .mono{font-family:"JetBrains Mono",ui-monospace,monospace}
+  a{color:inherit}
+  button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
+
+  /* ============ Top control bar ============ */
+  .topbar{
+    position:sticky;top:0;z-index:50;
+    display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+    padding:12px 24px;
+    background:color-mix(in oklab, var(--bg) 85%, transparent);
+    backdrop-filter:saturate(1.1) blur(12px);
+    border-bottom:1px solid var(--border);
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-weight:600;letter-spacing:.2px}
+  .brand-mark{width:28px;height:28px;display:grid;place-items:center}
+  .pill-group{display:flex;gap:4px;background:var(--surface2);padding:3px;border-radius:999px}
+  .pill{padding:6px 12px;border-radius:999px;font-size:12.5px;color:var(--ink2);font-weight:500}
+  .pill.active{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .ctl{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink2)}
+  .ctl label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink3)}
+  .seg{display:flex;background:var(--surface2);border-radius:8px;padding:2px}
+  .seg button{padding:5px 10px;border-radius:6px;font-size:12px;color:var(--ink2)}
+  .seg button.on{background:var(--surface);color:var(--ink);box-shadow:0 1px 1px rgba(0,0,0,.05)}
+  .spacer{flex:1}
+
+  /* ============ Layout ============ */
+  main{padding:28px 24px 120px;max-width:1480px;margin:0 auto}
+  h1.title{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink3);margin:0 0 8px;font-weight:600}
+  h2.section{font-family:"Fraunces","Noto Serif SC",serif;font-weight:500;font-size:30px;margin:0 0 4px;letter-spacing:-.01em}
+  p.lede{color:var(--ink2);font-size:14px;margin:0 0 28px;max-width:760px;line-height:1.6}
+
+  .nav-chips{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 34px}
+  .chip{padding:7px 14px;border:1px solid var(--border);border-radius:999px;font-size:12.5px;color:var(--ink2);cursor:pointer;transition:.15s}
+  .chip:hover{border-color:var(--ink3);color:var(--ink)}
+  .chip.current{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+
+  .variation{
+    margin:0 0 64px;
+    scroll-margin-top:90px;
+  }
+  .variation > header{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin:0 0 14px}
+  .variation > header .num{font-family:"Fraunces",serif;font-size:56px;line-height:1;color:var(--accent);opacity:.22;font-weight:500}
+  .variation h3{margin:0;font-size:20px;font-family:"Fraunces",serif;font-weight:500;letter-spacing:-.01em}
+  .variation .sub{color:var(--ink3);font-size:12.5px;margin-top:2px;letter-spacing:.02em}
+  .variation .tags{display:flex;gap:6px;flex-wrap:wrap}
+  .tag{padding:3px 9px;border-radius:4px;font-size:11px;background:var(--surface2);color:var(--ink2);letter-spacing:.02em}
+
+  .stage{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:18px;
+    box-shadow:var(--shadow);
+    overflow:hidden;
+  }
+
+  .tiny-nav{display:flex;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--border);font-size:12.5px;color:var(--ink2);background:var(--bg)}
+  .tiny-nav .dot{width:10px;height:10px;border-radius:50%;background:#e6c7c1}
+  .tiny-nav .dot.g{background:#d6d2c3}
+  .tiny-nav .dot.b{background:#c6d4e3}
+  .tiny-nav .sep{width:1px;height:14px;background:var(--border)}
+  .tiny-nav .crumb{color:var(--ink3)}
+  .tiny-nav .crumb b{color:var(--ink);font-weight:500}
+
+  /* ===== V1 Paper — 稿纸派 ===== */
+  .v-paper{display:grid;grid-template-columns:220px 1fr 260px;min-height:640px}
+  .v-paper aside{padding:20px 16px;border-right:1px solid var(--border);background:var(--bg)}
+  .v-paper aside.right{border-right:none;border-left:1px solid var(--border)}
+  .v-paper .panel-title{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink3);margin:0 0 12px;font-weight:600}
+  .paper-card{padding:10px 12px;border-left:3px solid var(--accent);background:var(--surface);border-radius:6px;margin-bottom:8px;cursor:grab;transition:.15s}
+  .paper-card:hover{transform:translateX(2px);box-shadow:var(--shadow)}
+  .paper-card .t{font-size:10.5px;color:var(--accent);font-weight:700;letter-spacing:.06em;margin-bottom:3px}
+  .paper-card .c{font-size:12px;color:var(--ink);line-height:1.55}
+  .paper-card.copper{border-left-color:var(--accent2)}
+  .paper-card.copper .t{color:var(--accent2)}
+  .paper-card.ink{border-left-color:var(--ink2)}
+  .paper-card.ink .t{color:var(--ink2)}
+  .paper-sheet{padding:42px 56px;background:
+      repeating-linear-gradient(to bottom, transparent 0 31px, var(--border) 31px 32px);
+      min-height:100%;
+  }
+  .paper-sheet .meta{display:flex;gap:14px;align-items:center;color:var(--ink3);font-size:11.5px;margin-bottom:6px;letter-spacing:.02em}
+  .paper-sheet .meta .live{display:inline-flex;align-items:center;gap:5px}
+  .paper-sheet .meta .live::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px color-mix(in oklab,var(--accent) 25%, transparent)}
+  .paper-sheet h1{font-family:"Fraunces","Noto Serif SC",serif;font-weight:500;font-size:32px;margin:0 0 4px;line-height:1.2;letter-spacing:-.01em}
+  .paper-sheet .byline{color:var(--ink3);font-size:12.5px;margin-bottom:22px}
+  .paper-sheet p{font-family:"Noto Serif SC","Fraunces",serif;font-size:15.5px;line-height:32px;margin:0 0 8px;color:var(--ink)}
+  .paper-sheet p.q{padding-left:16px;border-left:2px solid var(--accent2);color:var(--ink2);font-style:italic}
+  .src-mark{background:linear-gradient(to top, color-mix(in oklab, var(--accent) 22%, transparent) 40%, transparent 40%);cursor:help;padding:0 1px}
+  .src-mark.c2{background:linear-gradient(to top, color-mix(in oklab, var(--accent2) 28%, transparent) 40%, transparent 40%)}
+  .composer{padding:14px 20px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center;background:var(--bg)}
+  .composer input{flex:1;border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-size:13px;background:var(--surface);color:var(--ink);outline:none}
+  .composer input:focus{border-color:var(--accent)}
+  .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:10px;font-size:13px;font-weight:500;cursor:pointer;transition:.15s}
+  .btn.primary{background:var(--ink);color:var(--bg)}
+  .btn.primary:hover{background:var(--accent)}
+  .btn.ghost{background:var(--surface2);color:var(--ink)}
+  .btn.ghost:hover{background:var(--border)}
+  .btn.atom{background:linear-gradient(135deg,var(--accent),#1E4E8C);color:#fff;padding:10px 18px}
+
+  /* ===== V2 Workbench — 工作台派 ===== */
+  .v-bench{display:grid;grid-template-columns:260px 1fr 280px;min-height:640px;background:var(--surface)}
+  .v-bench .col{border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0}
+  .v-bench .col:last-child{border-right:none;border-left:1px solid var(--border)}
+  .v-bench .col-head{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--ink3);letter-spacing:.1em;text-transform:uppercase;font-weight:600;background:var(--bg)}
+  .v-bench .col-body{padding:14px;overflow:auto;flex:1}
+  .v-bench .editor-body{padding:32px 48px;background:var(--bg)}
+  .v-bench .editor-body h1{font-size:26px;font-family:"Fraunces",serif;font-weight:500;margin:0 0 4px;letter-spacing:-.01em}
+  .v-bench .editor-body .meta{font-size:12px;color:var(--ink3);margin-bottom:18px}
+  .v-bench .editor-body p{font-size:14.5px;line-height:28px;margin:0 0 12px;color:var(--ink)}
+  .v-bench .topic-input{width:100%;border:1px solid var(--border);background:var(--surface);padding:10px 12px;border-radius:8px;font-size:13px;outline:none}
+  .v-bench .tagrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .v-bench .tagrow button{padding:4px 10px;background:var(--surface2);color:var(--ink2);border-radius:6px;font-size:11.5px}
+  .v-bench .card-mini{padding:10px;border-radius:8px;background:var(--surface2);margin-bottom:8px;cursor:grab}
+  .v-bench .card-mini .t{font-size:10.5px;font-weight:700;letter-spacing:.06em;color:var(--accent);margin-bottom:2px}
+  .v-bench .card-mini .c{font-size:12px;color:var(--ink);line-height:1.5}
+  .v-bench .card-mini.c2 .t{color:var(--accent2)}
+  .v-bench .outline-item{display:flex;gap:8px;padding:7px 8px;border-radius:6px;font-size:12.5px;cursor:pointer;color:var(--ink2)}
+  .v-bench .outline-item:hover{background:var(--surface2)}
+  .v-bench .outline-item .idx{width:18px;height:18px;border-radius:4px;background:var(--accent-soft);color:var(--accent);font-size:11px;display:grid;place-items:center;font-weight:600}
+  .v-bench .status{display:flex;align-items:center;gap:8px;padding:8px 16px;border-top:1px solid var(--border);font-size:11.5px;color:var(--ink3);background:var(--bg)}
+  .v-bench .status .ok{color:var(--accent)}
+
+  /* ===== V3 Atom — 原子画布派 ===== */
+  .v-atom{position:relative;min-height:680px;background:
+      radial-gradient(circle at 30% 40%, color-mix(in oklab, var(--accent) 6%, transparent), transparent 50%),
+      radial-gradient(circle at 75% 70%, color-mix(in oklab, var(--accent2) 5%, transparent), transparent 50%),
+      var(--bg);
+      overflow:hidden;
+  }
+  .v-atom .grid{position:absolute;inset:0;background-image:
+      linear-gradient(to right, color-mix(in oklab, var(--ink) 4%, transparent) 1px, transparent 1px),
+      linear-gradient(to bottom, color-mix(in oklab, var(--ink) 4%, transparent) 1px, transparent 1px);
+      background-size:32px 32px;pointer-events:none;mask-image:radial-gradient(ellipse at center, black 30%, transparent 75%);
+  }
+  .v-atom .orbit{position:absolute;border:1px dashed color-mix(in oklab, var(--accent) 30%, transparent);border-radius:50%;pointer-events:none}
+  .v-atom .nucleus{
+    position:absolute;left:50%;top:52%;transform:translate(-50%,-50%);
+    width:280px;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px 20px;
+    box-shadow:var(--shadow), 0 0 0 8px color-mix(in oklab, var(--accent) 12%, transparent);
+  }
+  .v-atom .nucleus .label{font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:8px}
+  .v-atom .nucleus h4{margin:0 0 8px;font-size:18px;font-family:"Fraunces",serif;font-weight:500}
+  .v-atom .nucleus .gen{width:100%;margin-top:10px;background:linear-gradient(135deg,var(--accent),#193F70);color:#fff;padding:10px;border-radius:10px;font-size:13px;font-weight:500;display:flex;align-items:center;justify-content:center;gap:6px}
+  .v-atom .particle{position:absolute;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:11.5px;max-width:180px;box-shadow:0 2px 8px rgba(0,0,0,.05);cursor:grab;transition:.2s}
+  .v-atom .particle:hover{transform:scale(1.04);border-color:var(--accent)}
+  .v-atom .particle .t{font-size:9.5px;font-weight:700;letter-spacing:.08em;color:var(--accent);margin-bottom:2px}
+  .v-atom .particle.c2 .t{color:var(--accent2)}
+  .v-atom .particle .c{color:var(--ink);line-height:1.45}
+  .v-atom svg.links{position:absolute;inset:0;pointer-events:none;width:100%;height:100%}
+  .v-atom .compose{position:absolute;left:24px;right:24px;bottom:20px;display:flex;gap:10px;align-items:center;background:color-mix(in oklab, var(--surface) 90%, transparent);backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:14px;padding:10px 14px}
+  .v-atom .compose input{flex:1;border:none;background:transparent;outline:none;color:var(--ink);font-size:13px}
+  .v-atom .compose .hint{font-size:11px;color:var(--ink3)}
+
+  /* ===== V4 Noir — 暗色科幻派 ===== */
+  .v-noir{background:#07090D;color:#DDE3EC;min-height:680px;display:grid;grid-template-columns:64px 280px 1fr;position:relative;overflow:hidden}
+  .v-noir::before{content:"";position:absolute;inset:0;background:
+    radial-gradient(circle at 20% 20%, rgba(94,155,255,.08), transparent 40%),
+    radial-gradient(circle at 80% 80%, rgba(94,155,255,.06), transparent 50%);
+    pointer-events:none;
+  }
+  .v-noir .rail{border-right:1px solid #141922;display:flex;flex-direction:column;align-items:center;gap:12px;padding:16px 0;position:relative}
+  .v-noir .rail .r-item{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;color:#6B7486;background:transparent;border:1px solid transparent}
+  .v-noir .rail .r-item.on{color:#8CB5FF;background:rgba(140,181,255,.08);border-color:rgba(140,181,255,.2)}
+  .v-noir .panel{border-right:1px solid #141922;padding:18px 16px;position:relative}
+  .v-noir .panel h5{font-size:10.5px;letter-spacing:.16em;color:#6B7486;text-transform:uppercase;margin:0 0 12px;font-weight:600}
+  .v-noir .noir-card{padding:10px 12px;border:1px solid #141922;border-radius:10px;background:rgba(140,181,255,.03);margin-bottom:8px}
+  .v-noir .noir-card .t{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#8CB5FF;margin-bottom:3px;font-weight:600}
+  .v-noir .noir-card .c{font-size:12px;line-height:1.55;color:#C4CCD9}
+  .v-noir .noir-card.c2 .t{color:#E0B87A}
+  .v-noir .stage2{padding:40px 56px;position:relative}
+  .v-noir .stage2 .tag{display:inline-block;padding:3px 8px;border:1px solid rgba(140,181,255,.25);border-radius:4px;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:#8CB5FF;margin-bottom:14px;font-family:"JetBrains Mono",monospace}
+  .v-noir .stage2 h1{font-family:"Fraunces",serif;font-weight:500;font-size:34px;margin:0 0 6px;letter-spacing:-.01em;color:#ECEFF3}
+  .v-noir .stage2 .meta{color:#6B7486;font-size:12px;margin-bottom:22px;font-family:"JetBrains Mono",monospace}
+  .v-noir .stage2 p{font-size:15px;line-height:30px;color:#C4CCD9;margin:0 0 12px;max-width:720px}
+  .v-noir .glow{background:linear-gradient(90deg, rgba(140,181,255,.22), transparent 80%);padding:0 2px;border-radius:2px}
+  .v-noir .cmdbar{position:absolute;left:50%;bottom:28px;transform:translateX(-50%);display:flex;align-items:center;gap:10px;background:rgba(10,13,19,.7);backdrop-filter:blur(14px);border:1px solid rgba(140,181,255,.2);border-radius:12px;padding:10px 14px;min-width:520px;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+  .v-noir .cmdbar .slash{color:#8CB5FF;font-family:"JetBrains Mono",monospace;font-size:13px}
+  .v-noir .cmdbar input{flex:1;background:transparent;border:none;outline:none;color:#DDE3EC;font-size:13px;font-family:"JetBrains Mono",monospace}
+  .v-noir .cmdbar kbd{font-family:"JetBrains Mono",monospace;font-size:10px;padding:2px 6px;border:1px solid #1F2735;border-radius:4px;color:#6B7486}
+
+  /* ===== V5 Humanist — 人文衬线派 ===== */
+  .v-hum{background:#F5EFE3;color:#2C2622;min-height:660px;display:grid;grid-template-columns:1fr 320px}
+  html.dark .v-hum{background:#1a1612;color:#e9e3d4}
+  .v-hum .reader{padding:48px 64px}
+  .v-hum .reader .kicker{font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;color:#8a7b5a;margin-bottom:10px;font-weight:600}
+  .v-hum .reader h1{font-family:"Fraunces","Noto Serif SC",serif;font-weight:400;font-size:40px;line-height:1.15;margin:0 0 8px;letter-spacing:-.015em;font-style:italic}
+  .v-hum .reader h1 em{color:#b8864d;font-style:italic}
+  .v-hum .reader .by{color:#8a7b5a;font-size:13px;margin-bottom:28px;border-bottom:1px solid #e0d6c1;padding-bottom:18px}
+  html.dark .v-hum .reader .by{border-color:#3a322a;color:#a59881}
+  .v-hum .reader p{font-family:"Noto Serif SC","Fraunces",serif;font-size:16px;line-height:32px;margin:0 0 14px;color:inherit}
+  .v-hum .reader p:first-letter.drop{font-family:"Fraunces",serif;font-size:52px;float:left;line-height:1;padding:4px 8px 0 0;color:#b8864d}
+  .v-hum .reader .pullquote{font-family:"Fraunces",serif;font-style:italic;font-size:22px;line-height:1.5;color:#8a7b5a;border-left:2px solid #b8864d;padding:4px 0 4px 18px;margin:22px 0}
+  .v-hum .reader .under{text-decoration:underline;text-decoration-color:#d5be8c;text-decoration-thickness:2px;text-underline-offset:4px;cursor:help}
+  .v-hum .rail{background:#EDE4D1;border-left:1px solid #dccfb2;padding:32px 26px}
+  html.dark .v-hum .rail{background:#221c16;border-color:#3a322a}
+  .v-hum .rail h5{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#8a7b5a;margin:0 0 14px;font-weight:600}
+  .v-hum .hcard{padding:12px 14px;background:#F5EFE3;border-left:3px solid #b8864d;border-radius:2px;margin-bottom:10px}
+  html.dark .v-hum .hcard{background:#1a1612}
+  .v-hum .hcard .t{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#b8864d;font-weight:700;margin-bottom:3px}
+  .v-hum .hcard .c{font-family:"Noto Serif SC",serif;font-size:13px;line-height:1.6}
+  .v-hum .hcard.c2{border-left-color:#556b8a}
+  .v-hum .hcard.c2 .t{color:#556b8a}
+  .v-hum .pen{margin-top:18px;display:flex;align-items:center;gap:10px;padding:12px;background:#F5EFE3;border:1px solid #dccfb2;border-radius:4px;font-size:12.5px;color:#8a7b5a}
+  html.dark .v-hum .pen{background:#1a1612;border-color:#3a322a}
+
+  /* ============ Icon lab ============ */
+  .icon-lab{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-top:20px}
+  .icon-cell{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px 16px;text-align:center}
+  .icon-cell .box{width:88px;height:88px;margin:0 auto 12px;display:grid;place-items:center;background:var(--bg);border-radius:16px}
+  .icon-cell h6{margin:0;font-size:13px;font-weight:600}
+  .icon-cell p{margin:4px 0 0;font-size:11.5px;color:var(--ink3);line-height:1.5;min-height:34px}
+  .icon-cell .mini{margin-top:10px;display:flex;justify-content:center;gap:10px;color:var(--ink3)}
+  .icon-row{display:flex;gap:30px;align-items:center;margin-top:28px;flex-wrap:wrap;padding:20px 24px;background:var(--surface);border:1px solid var(--border);border-radius:14px}
+  .icon-row .size{display:flex;flex-direction:column;align-items:center;gap:6px;font-size:11px;color:var(--ink3)}
+
+  /* ============ Pick bar ============ */
+  .pickbar{
+    position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
+    display:flex;gap:8px;align-items:center;
+    background:var(--surface);border:1px solid var(--border);
+    padding:8px 10px;border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.12);
+    z-index:60;font-size:12px;
+  }
+  .pickbar button{padding:7px 12px;border-radius:10px;background:var(--surface2);color:var(--ink2);font-weight:500;font-size:12px}
+  .pickbar button.picked{background:var(--ink);color:var(--bg)}
+  .pickbar .lbl{padding:0 8px;color:var(--ink3)}
+
+  /* ============ FINAL FORM · Knowledge Galaxy ============ */
+  .g-body{display:grid;grid-template-columns:200px 1fr 380px;height:760px;background:var(--bg)}
+
+  /* Rail — 变宽，成为"文章库"侧栏 */
+  .g-rail{display:flex;flex-direction:column;gap:2px;padding:12px 8px;border-right:1px solid var(--border);background:var(--surface);overflow-y:auto}
+  .g-rail-sec{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink3);padding:10px 10px 6px;font-weight:600}
+  .g-rail-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;color:var(--ink2);cursor:pointer;transition:.15s;font-size:12.5px;position:relative}
+  .g-rail-item:hover{background:var(--surface2);color:var(--ink)}
+  .g-rail-item.on{background:color-mix(in oklab, var(--accent) 12%, transparent);color:var(--accent)}
+  .g-rail-item svg{flex-shrink:0}
+  .g-rail-item .txt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .g-rail-item .ndot{width:6px;height:6px;border-radius:50%;background:#E04848;box-shadow:0 0 6px rgba(224,72,72,.6);animation:notifPulse 1.6s ease-in-out infinite}
+  @keyframes notifPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.3);opacity:.7}}
+  .g-rail-zoom{display:flex;gap:4px;padding:8px 10px;margin-top:8px;border-top:1px solid var(--border)}
+  .g-zbtn{flex:1;height:28px;border-radius:6px;color:var(--ink3);display:grid;place-items:center;transition:.15s}
+  .g-zbtn:hover{background:var(--surface2);color:var(--ink)}
+  .g-articles-list{display:flex;flex-direction:column;gap:1px;padding:0 4px}
+  .g-art-item{padding:7px 10px;border-radius:6px;font-size:12px;color:var(--ink2);cursor:pointer;transition:.12s;display:flex;align-items:center;gap:6px;line-height:1.4}
+  .g-art-item:hover{background:var(--surface2);color:var(--ink)}
+  .g-art-item.generated{color:var(--accent);font-weight:500}
+  .g-art-item .dot{width:4px;height:4px;border-radius:50%;background:currentColor;opacity:.5;flex-shrink:0}
+
+  /* Galaxy canvas — 深色太空底 */
+  .g-galaxy{position:relative;overflow:hidden;cursor:grab;
+    background:
+      radial-gradient(ellipse at 30% 40%, rgba(79,142,247,.08), transparent 55%),
+      radial-gradient(ellipse at 70% 70%, rgba(42,89,176,.08), transparent 60%),
+      linear-gradient(180deg, #0B1430 0%, #0A1428 40%, #080F22 100%);
+  }
+  .g-galaxy.dark-canvas{}
+  .g-backdrop{display:none}
+  .g-stars{position:absolute;inset:0;pointer-events:none;
+    background-image:
+      radial-gradient(1.2px 1.2px at 12% 18%, rgba(255,255,255,.9) 50%, transparent 51%),
+      radial-gradient(1px 1px at 22% 8%, rgba(200,220,255,.6) 50%, transparent 51%),
+      radial-gradient(1.5px 1.5px at 34% 14%, rgba(255,255,255,.8) 50%, transparent 51%),
+      radial-gradient(1px 1px at 48% 6%, rgba(180,200,255,.5) 50%, transparent 51%),
+      radial-gradient(1.2px 1.2px at 64% 22%, rgba(255,255,255,.7) 50%, transparent 51%),
+      radial-gradient(1px 1px at 78% 11%, rgba(200,220,255,.5) 50%, transparent 51%),
+      radial-gradient(1.5px 1.5px at 88% 19%, rgba(255,255,255,.8) 50%, transparent 51%),
+      radial-gradient(1px 1px at 6% 45%, rgba(180,200,255,.5) 50%, transparent 51%),
+      radial-gradient(1.2px 1.2px at 16% 62%, rgba(255,255,255,.6) 50%, transparent 51%),
+      radial-gradient(1px 1px at 28% 78%, rgba(200,220,255,.5) 50%, transparent 51%),
+      radial-gradient(1.5px 1.5px at 42% 88%, rgba(255,255,255,.7) 50%, transparent 51%),
+      radial-gradient(1px 1px at 58% 72%, rgba(180,200,255,.5) 50%, transparent 51%),
+      radial-gradient(1.2px 1.2px at 72% 85%, rgba(255,255,255,.6) 50%, transparent 51%),
+      radial-gradient(1px 1px at 86% 66%, rgba(200,220,255,.5) 50%, transparent 51%),
+      radial-gradient(1.5px 1.5px at 94% 78%, rgba(255,255,255,.7) 50%, transparent 51%);
+    animation:starTwinkle 8s ease-in-out infinite;
+  }
+  @keyframes starTwinkle{0%,100%{opacity:.6}50%{opacity:1}}
+
+  .g-svg{display:none}
+
+  /* Canvas 画布容器 */
+  .g-canvas{position:absolute;inset:0;width:100%;height:100%;cursor:grab;touch-action:none}
+  .g-canvas.dragging{cursor:grabbing}
+
+  /* Hover tooltip (canvas 外层 DOM 层) */
+  .g-tip{position:absolute;pointer-events:none;padding:4px 10px;background:rgba(10,22,50,.85);color:#E8F2FF;font-size:11.5px;border:1px solid rgba(120,180,255,.3);border-radius:6px;backdrop-filter:blur(6px);white-space:nowrap;opacity:0;transform:translate(-50%,-140%);transition:opacity .12s;z-index:15;max-width:240px;overflow:hidden;text-overflow:ellipsis}
+  .g-tip.on{opacity:1}
+  .g-tip.atom{border-color:rgba(127,184,255,.5)}
+  .g-tip.atom-c2{border-color:rgba(232,184,122,.5)}
+
+  /* Minimap 小地图 */
+  .g-minimap{position:absolute;right:16px;top:16px;width:160px;height:100px;background:rgba(10,22,50,.55);border:1px solid rgba(120,180,255,.25);border-radius:8px;backdrop-filter:blur(10px);overflow:hidden;cursor:pointer;z-index:12}
+  .g-minimap canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  .g-minimap .mm-label{position:absolute;left:8px;top:6px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:rgba(200,220,255,.6);pointer-events:none}
+
+  /* Zoom 指示器 */
+  .g-zoom-info{position:absolute;left:16px;top:16px;font-size:11px;color:rgba(200,220,255,.65);background:rgba(10,22,50,.55);backdrop-filter:blur(10px);padding:4px 10px;border:1px solid rgba(120,180,255,.2);border-radius:8px;z-index:12;font-family:JetBrains Mono,monospace}
+
+  /* Forge = 聚合生成动画 */
+  .g-forge{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:none;z-index:10;pointer-events:none}
+  .g-forge.on{display:block}
+  .forge-ring{position:absolute;left:50%;top:50%;width:180px;height:180px;margin:-90px 0 0 -90px;border:2px solid rgba(120,200,255,.8);border-radius:50%;border-top-color:transparent;border-right-color:transparent;animation:forgeSpin 1.4s linear infinite}
+  .forge-ring.r2{width:260px;height:260px;margin:-130px 0 0 -130px;border-color:rgba(168,208,255,.5);border-top-color:transparent;border-left-color:transparent;animation-duration:2.2s;animation-direction:reverse}
+  @keyframes forgeSpin{to{transform:rotate(360deg)}}
+  .forge-core{position:relative;width:260px;padding:20px 22px;background:rgba(10,22,50,.88);backdrop-filter:blur(14px);border:1.5px solid rgba(120,200,255,.7);border-radius:14px;text-align:center;box-shadow:0 0 50px rgba(79,142,247,.5), 0 0 100px rgba(79,142,247,.25)}
+  .forge-label{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:#A8D0FF;font-weight:700;margin-bottom:8px}
+  .forge-title{font-family:"Fraunces","Noto Serif SC",serif;font-weight:500;font-size:16px;color:#fff;line-height:1.3;margin-bottom:10px}
+  .forge-meta{display:flex;align-items:center;justify-content:center;gap:8px;font-size:11.5px;color:rgba(200,224,255,.75)}
+  .forge-dots{display:inline-flex;gap:3px}
+  .forge-dots i{width:5px;height:5px;border-radius:50%;background:#A8D0FF;animation:dotBlink 1s ease-in-out infinite}
+  .forge-dots i:nth-child(2){animation-delay:.15s}
+  .forge-dots i:nth-child(3){animation-delay:.3s}
+  @keyframes dotBlink{0%,100%{opacity:.25}50%{opacity:1}}
+
+  /* Legend & hint — 深底适配 */
+  .g-legend{position:absolute;left:16px;bottom:16px;display:flex;flex-direction:column;gap:5px;font-size:11px;color:rgba(200,220,255,.65);background:rgba(10,22,50,.55);backdrop-filter:blur(10px);padding:8px 12px;border:1px solid rgba(120,180,255,.2);border-radius:8px}
+  .lg-item{display:flex;align-items:center;gap:8px}
+  .lg-dot{width:10px;height:10px;border-radius:50%}
+  .lg-dot.sun{background:radial-gradient(circle at 35% 35%, #A8D0FF, #4F8EF7 60%, #2556B8);box-shadow:0 0 6px rgba(79,142,247,.7)}
+  .lg-star{width:12px;height:12px;color:#7FB8FF;filter:drop-shadow(0 0 3px rgba(127,184,255,.7))}
+  .lg-star.c2{color:#E8B87A;filter:drop-shadow(0 0 3px rgba(232,184,122,.7))}
+  .lg-line{width:14px;height:1px;background:rgba(160,200,255,.5)}
+  .g-hint{position:absolute;right:16px;bottom:16px;font-size:11.5px;color:rgba(200,220,255,.65);background:rgba(10,22,50,.55);backdrop-filter:blur(10px);padding:6px 12px;border:1px solid rgba(120,180,255,.2);border-radius:8px}
+
+  /* ========== Minimal Chat ========== */
+  .g-chat{display:flex;flex-direction:column;background:var(--surface);border-left:1px solid var(--border);min-width:0}
+  .gc-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border)}
+  .gc-title{font-size:13px;font-weight:600;color:var(--ink);letter-spacing:.01em}
+  .gc-new{width:26px;height:26px;border-radius:6px;color:var(--ink3);font-size:16px;line-height:1;display:grid;place-items:center}
+  .gc-new:hover{background:var(--surface2);color:var(--ink)}
+
+  .gc-body{flex:1;overflow-y:auto;padding:18px 18px 4px;display:flex;flex-direction:column;gap:18px;scroll-behavior:smooth}
+  .gc-body::-webkit-scrollbar{width:6px}
+  .gc-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+  .gc-greet{color:var(--ink3);font-size:13px;line-height:1.7;padding:6px 2px;font-family:"Noto Serif SC",serif;font-style:italic}
+
+  .gc-msg{display:flex;flex-direction:column;gap:4px;animation:msgIn .3s ease-out}
+  @keyframes msgIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+  .gc-msg.user{align-items:flex-end}
+  .gc-msg.user .bubble{background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:14px 14px 4px 14px;font-size:13.5px;line-height:1.6;max-width:85%}
+  .gc-msg.ai .bubble{color:var(--ink);font-size:13.5px;line-height:1.75;padding:2px 2px;max-width:100%;font-family:"Noto Serif SC","Fraunces",serif}
+  .gc-msg.ai .bubble p{margin:0 0 8px}
+  .gc-msg.ai .bubble p:last-child{margin-bottom:0}
+  .gc-msg.ai .status{font-size:11.5px;color:var(--accent);display:flex;align-items:center;gap:6px;margin-bottom:4px}
+  .gc-msg.ai .status .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:dotBlink 1s infinite}
+  .gc-msg.ai .recall-line{font-size:12px;color:var(--ink3);padding:6px 10px;background:var(--surface2);border-radius:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0}
+  .gc-msg.ai .recall-line b{color:var(--accent);font-weight:600}
+  .gc-msg.ai .saved-card{margin-top:10px;padding:10px 12px;border:1px solid color-mix(in oklab, var(--accent) 35%, transparent);background:color-mix(in oklab, var(--accent) 6%, transparent);border-radius:10px;font-family:ui-sans-serif,system-ui,sans-serif;font-size:12.5px;color:var(--ink2);display:flex;align-items:center;gap:10px}
+  .gc-msg.ai .saved-card .sv-dot{width:8px;height:8px;border-radius:50%;background:#E04848;box-shadow:0 0 6px rgba(224,72,72,.6);animation:notifPulse 1.6s ease-in-out infinite;flex-shrink:0}
+  .gc-msg.ai .saved-card b{color:var(--accent);font-weight:600}
+  .gc-msg.ai .saved-card a{color:var(--accent);text-decoration:underline;cursor:pointer;margin-left:auto;font-weight:500}
+
+  .gc-input{padding:12px 14px 8px;border-top:1px solid var(--border);background:var(--surface)}
+  .gc-input{display:flex;align-items:flex-end;gap:8px}
+  .gc-input textarea{flex:1;border:1px solid var(--border);background:var(--bg);outline:none;resize:none;font-family:inherit;font-size:13.5px;color:var(--ink);min-height:36px;max-height:120px;line-height:1.5;padding:8px 12px;border-radius:10px;transition:border-color .15s}
+  .gc-input textarea:focus{border-color:var(--accent)}
+  .gc-send{width:36px;height:36px;border-radius:10px;background:var(--ink);color:var(--bg);display:grid;place-items:center;font-size:16px;font-weight:600;flex-shrink:0;transition:.15s}
+  .gc-send:hover{background:var(--accent)}
+  .gc-send:disabled{opacity:.4;cursor:not-allowed}
+  .gc-demo-row{display:flex;align-items:center;gap:6px;padding:0 14px 12px;flex-wrap:wrap;font-size:11px;color:var(--ink3);background:var(--surface)}
+  .gc-demo{padding:3px 10px;background:var(--surface2);color:var(--ink2);border-radius:999px;font-size:11.5px;transition:.15s}
+  .gc-demo:hover{background:var(--accent);color:#fff}
+
+  @media (max-width:1100px){
+    .g-body{grid-template-columns:1fr;height:auto}
+    .g-rail{flex-direction:row;overflow-x:auto;overflow-y:hidden;border-right:none;border-bottom:1px solid var(--border);padding:10px}
+    .g-rail-sec{display:none}
+    .g-rail-item{white-space:nowrap}
+    .g-articles-list{flex-direction:row;padding:0}
+    .g-rail-zoom{border-top:none;border-left:1px solid var(--border);margin:0 0 0 8px;padding:0 0 0 8px}
+    .g-galaxy{height:480px}
+    .g-chat{height:520px;border-left:none;border-top:1px solid var(--border)}
+  }
+
+  @media (max-width:1100px){
+    .v-paper,.v-bench{grid-template-columns:1fr;min-height:auto}
+    .v-paper aside,.v-bench .col{border:none;border-bottom:1px solid var(--border)}
+    .v-noir{grid-template-columns:1fr}
+    .v-hum{grid-template-columns:1fr}
+    .icon-lab{grid-template-columns:repeat(2,1fr)}
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/d3-dispatch@3/dist/d3-dispatch.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-quadtree@3/dist/d3-quadtree.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-timer@3/dist/d3-timer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-force@3/dist/d3-force.min.js"></script>
+</head>
+<body>
+
+<!-- ============ TOP BAR ============ -->
+<div class="topbar">
+  <div class="brand">
+    <span class="brand-mark" id="brand-mark"></span>
+    <span>AtomFlow · Design Canvas</span>
+  </div>
+
+  <div class="ctl">
+    <label>主题</label>
+    <div class="seg" id="theme-seg">
+      <button class="on" data-theme="light">亮</button>
+      <button data-theme="dark">暗</button>
+    </div>
+  </div>
+
+  <div class="ctl">
+    <label>字体</label>
+    <div class="seg" id="font-seg">
+      <button class="on" data-font="mix">无衬线 + 衬线</button>
+      <button data-font="serif">全衬线</button>
+      <button data-font="sans">全无衬线</button>
+    </div>
+  </div>
+
+  <div class="ctl">
+    <label>密度</label>
+    <div class="seg" id="dens-seg">
+      <button data-dens="compact">紧凑</button>
+      <button class="on" data-dens="cozy">舒适</button>
+    </div>
+  </div>
+
+  <div class="ctl">
+    <label>色调</label>
+    <div class="seg" id="tone-seg">
+      <button class="on" data-tone="warm">暖米</button>
+      <button data-tone="cool">冷灰</button>
+      <button data-tone="pure">纯白</button>
+    </div>
+  </div>
+
+  <div class="spacer"></div>
+  <span style="font-size:11.5px;color:var(--ink3)">底部选中即可保存偏好</span>
+</div>
+
+<main>
+  <h1 class="title">Writing Page · Exploration</h1>
+  <h2 class="section">5 个方向，选你看起来最像"AtomFlow"的那一个</h2>
+  <p class="lede">
+    每个方向是完整的视觉 + 交互骨架：顶部元信息、正文（富文本占位 + 卡片溯源下划线）、侧栏（召回卡片 / 画布）、底部生成区。
+    翻看时请关注：读起来舒服吗？写起来想打字吗？看到卡片时，你会不会自然地把它"拖进正文"？
+  </p>
+
+  <div class="nav-chips">
+    <a class="chip current" href="#final" style="background:var(--accent);color:#fff;border-color:var(--accent)">★ 最终形态 Final</a>
+    <a class="chip" href="#v1">① 稿纸派</a>
+    <a class="chip" href="#v2">② 工作台派</a>
+    <a class="chip" href="#v3">③ 原子画布派</a>
+    <a class="chip" href="#v4">④ 暗色科幻派</a>
+    <a class="chip" href="#v5">⑤ 人文衬线派</a>
+    <a class="chip" href="#icons">⑥ 图标实验室</a>
+  </div>
+
+  <!-- ===================== FINAL FORM ===================== -->
+  <section class="variation" id="final" style="margin-bottom:80px">
+    <header>
+      <div>
+        <h3>★ 最终形态 <span style="color:var(--ink3);font-weight:400;font-size:14px">· Knowledge Galaxy (知识星图 + 极简 Chat)</span></h3>
+        <div class="sub">中心 = 你全部知识的可视化宇宙 · 右侧 = 极简对话 · 对话驱动画布激活 → 原子流向中心 → 聚合成新文章</div>
+      </div>
+      <div class="num" style="color:var(--accent);opacity:.4">★</div>
+    </header>
+    <div class="tags" style="margin-bottom:12px">
+      <span class="tag">知识星图</span><span class="tag">文章=太阳</span><span class="tag">原子=行星</span><span class="tag">标签=连线</span><span class="tag">对话驱动</span><span class="tag">聚合动画</span>
+    </div>
+
+    <div class="stage" id="final-stage">
+      <div class="tiny-nav">
+        <span class="dot"></span><span class="dot g"></span><span class="dot b"></span>
+        <span class="sep"></span>
+        <span class="crumb">AtomFlow · <b>写作 · 知识星图</b></span>
+        <span style="flex:1"></span>
+        <span style="color:var(--ink3)" id="galaxy-status">12 篇文章 · 58 个原子 · 23 条标签关联</span>
+      </div>
+
+      <div class="g-body" id="g-body">
+        <!-- 左侧：知识库 + 文章库 -->
+        <div class="g-rail">
+          <div class="g-rail-sec">视图</div>
+          <div class="g-rail-item on" data-view="galaxy">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="2"/><circle cx="4" cy="6" r="1.5"/><circle cx="20" cy="7" r="1.5"/><circle cx="5" cy="18" r="1.5"/><circle cx="19" cy="17" r="1.5"/><path d="M6 7 L10 11 M18 8 L14 12 M7 17 L11 13 M17 16 L13 13"/></svg>
+            <span class="txt">知识星图</span>
+          </div>
+          <div class="g-rail-item" data-view="atoms">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 0 1 0 20M2 12a10 10 0 0 1 20 0"/></svg>
+            <span class="txt">原子卡片</span>
+          </div>
+          <div class="g-rail-item" data-view="articles" id="rail-articles">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h12a2 2 0 0 1 2 2v14l-4-3-4 3-4-3-4 3V6a2 2 0 0 1 2-2z"/></svg>
+            <span class="txt">我的文章</span>
+            <span class="ndot" id="articles-ndot" style="display:none"></span>
+          </div>
+
+          <div class="g-rail-sec" style="margin-top:4px">文章库</div>
+          <div class="g-articles-list" id="g-articles-list">
+            <div class="g-art-item"><span class="dot"></span>摆脱 AI 腔</div>
+            <div class="g-art-item"><span class="dot"></span>知识复利的三重境界</div>
+            <div class="g-art-item"><span class="dot"></span>RSS 不死</div>
+            <div class="g-art-item"><span class="dot"></span>阅读的焦虑</div>
+            <div class="g-art-item"><span class="dot"></span>好编辑的直觉</div>
+          </div>
+
+          <div class="g-rail-zoom">
+            <button class="g-zbtn" id="zoom-in" title="放大"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M11 8v6M8 11h6M21 21l-4.3-4.3"/></svg></button>
+            <button class="g-zbtn" id="zoom-out" title="缩小"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M8 11h6M21 21l-4.3-4.3"/></svg></button>
+            <button class="g-zbtn" id="view-reset" title="重置"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></svg></button>
+          </div>
+        </div>
+
+        <!-- 中心星图画布 -->
+        <div class="g-galaxy" id="g-galaxy">
+          <div class="g-stars"></div>
+          <canvas class="g-canvas" id="g-canvas"></canvas>
+          <div class="g-tip" id="g-tip"></div>
+
+          <!-- Zoom 指示 -->
+          <div class="g-zoom-info" id="g-zoom-info">100%</div>
+
+          <!-- 小地图 -->
+          <div class="g-minimap" id="g-minimap" title="点击跳转 · 拖动平移">
+            <canvas id="g-mmcanvas"></canvas>
+            <div class="mm-label">MAP</div>
+          </div>
+
+          <!-- 聚合提示（默认隐藏） -->
+          <div class="g-forge" id="g-forge">
+            <div class="forge-ring"></div>
+            <div class="forge-ring r2"></div>
+            <div class="forge-core">
+              <div class="forge-label">正在聚合生成</div>
+              <div class="forge-title" id="forge-title">新文章</div>
+              <div class="forge-meta"><span class="forge-dots"><i></i><i></i><i></i></span><span id="forge-progress">凝聚 3 张原子中...</span></div>
+            </div>
+          </div>
+
+          <!-- 左下角图例 -->
+          <div class="g-legend">
+            <div class="lg-item"><span class="lg-dot sun"></span>文章（太阳）</div>
+            <div class="lg-item"><svg class="lg-star" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.4 6.6L20 10l-6.6 1.4L12 18l-1.4-6.6L4 10l6.6-1.4z"/></svg>观点 / 数据</div>
+            <div class="lg-item"><svg class="lg-star c2" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.4 6.6L20 10l-6.6 1.4L12 18l-1.4-6.6L4 10l6.6-1.4z"/></svg>金句 / 故事</div>
+            <div class="lg-item"><span class="lg-line"></span>标签关联</div>
+          </div>
+
+          <!-- 右下角 hint -->
+          <div class="g-hint">拖动节点感受力反馈 · 对助手说话驱动画布</div>
+        </div>
+
+        <!-- 右侧极简 Chat -->
+        <aside class="g-chat" id="g-chat">
+          <div class="gc-head">
+            <span class="gc-title">跃迁助手</span>
+            <button class="gc-new" title="新对话">＋</button>
+          </div>
+
+          <div class="gc-body" id="gc-body">
+            <div class="gc-greet">
+              想写什么？我会从你的知识宇宙里召回相关的原子。
+            </div>
+          </div>
+
+          <div class="gc-input">
+            <textarea id="gc-textarea" placeholder="向跃迁助手说..." rows="1"></textarea>
+            <button class="gc-send" id="gc-send" title="发送">↑</button>
+          </div>
+          <div class="gc-demo-row">
+            <span>试试：</span>
+            <button class="gc-demo" data-demo="ai-tone">帮我写一篇《摆脱 AI 腔》</button>
+            <button class="gc-demo" data-demo="rss">写写 RSS 为什么还没死</button>
+            <button class="gc-demo" data-demo="clear">清除激活</button>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+    <p class="lede" style="margin-top:18px">
+      <b>交互说明：</b>对 AI 说"帮我写一篇 XXX" → 相关太阳 + 原子会依次点亮（其余淡出）→ 被召回的原子顺着光线流向画布中心 → 聚合成新的"正在形成的太阳" → 文章生成完成后成为宇宙中的一个新节点。
+      悬停任何节点可看详情，点击太阳可展开它拆出的原子。
+    </p>
+  </section>
+
+
+  <!-- ===================== V1 PAPER ===================== -->
+  <section class="variation" id="v1">
+    <header>
+      <div>
+        <h3>① 稿纸派 <span style="color:var(--ink3);font-weight:400;font-size:14px">· Paper</span></h3>
+        <div class="sub">安静的米白稿纸 · 正文居中 · 两侧轻量收纳</div>
+      </div>
+      <div class="num">01</div>
+    </header>
+    <div class="tags" style="margin-bottom:12px">
+      <span class="tag">编辑器感</span><span class="tag">克制</span><span class="tag">衬线阅读</span><span class="tag">浅仪式感</span>
+    </div>
+
+    <div class="stage">
+      <div class="tiny-nav">
+        <span class="dot"></span><span class="dot g"></span><span class="dot b"></span>
+        <span class="sep"></span>
+        <span class="crumb">Writing / <b>内容创作者如何摆脱 AI 腔</b></span>
+        <span style="flex:1"></span>
+        <span style="color:var(--ink3)">Draft · 自动保存于 14:02</span>
+      </div>
+      <div class="v-paper">
+        <aside>
+          <div class="panel-title">Topic · 主题</div>
+          <div style="font-family:'Fraunces',serif;font-size:17px;line-height:1.35;margin-bottom:6px">内容创作者如何摆脱 AI 腔</div>
+          <div style="color:var(--ink3);font-size:12px;margin-bottom:22px">来自：#写作风格 · #创作者</div>
+
+          <div class="panel-title">召回的素材</div>
+          <div class="paper-card"><div class="t">观点</div><div class="c">AI 腔的根源不是语法，而是"缺乏具体的人"在说话。</div></div>
+          <div class="paper-card copper"><div class="t">金句</div><div class="c">好文字是有体温的，它知道你此刻在哪。</div></div>
+          <div class="paper-card"><div class="t">观点</div><div class="c">把抽象概念换成一个下午茶里的真实场景。</div></div>
+          <div class="paper-card ink"><div class="t">数据</div><div class="c">83% 的读者在 8 秒内跳出泛泛之谈的开头。</div></div>
+        </aside>
+
+        <div class="paper-sheet">
+          <div class="meta"><span class="live">正在写作</span><span>· 3 张卡片已引用</span><span>· 612 字</span></div>
+          <h1>当我们谈"AI 腔"，我们其实在谈什么</h1>
+          <div class="byline">草稿 · 四月二十四日 · 稿纸模式</div>
+          <p>
+            我发现自己最近写东西，句式越来越整齐，但每读一遍都觉得隔着一层东西。
+            后来一位编辑说了一句很准的话 —
+            <span class="src-mark">好文字是有体温的，它知道你此刻在哪</span>。
+            这句话像一盏灯，让我看清一直在逃避的事实。
+          </p>
+          <p class="q">
+            AI 腔的根源不是语法，而是"缺乏具体的人"在说话。
+          </p>
+          <p>
+            所以这篇不谈技巧，只谈一件事：<span class="src-mark c2">把抽象概念，换成一个下午茶里的真实场景</span>。
+            当我开始在每一段落前问自己"此刻这个人坐在哪"，句子自动有了呼吸。
+          </p>
+          <p style="color:var(--ink3);font-size:14px;font-style:italic">游标 ▍ 继续书写，或从左侧拖入更多卡片...</p>
+        </div>
+
+        <aside class="right">
+          <div class="panel-title">已引用 · 溯源</div>
+          <div class="paper-card copper"><div class="t">金句 · 已引用</div><div class="c">好文字是有体温的...</div></div>
+          <div class="paper-card"><div class="t">观点 · 已引用</div><div class="c">下午茶里的真实场景...</div></div>
+          <div style="margin-top:24px" class="panel-title">结构提示</div>
+          <div style="font-size:12px;color:var(--ink2);line-height:1.75">
+            · 开头：用一个现场 ✓<br>
+            · 中段：给出"为什么" ✓<br>
+            · 结尾：留一个动作建议 ○<br>
+          </div>
+        </aside>
+      </div>
+      <div class="composer">
+        <input placeholder='向 AI 说：「帮我把第二段写得更像一个人在说话」' />
+        <button class="btn ghost">拖卡片</button>
+        <button class="btn atom">✦ 凝聚为文章</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== V2 WORKBENCH ===================== -->
+  <section class="variation" id="v2">
+    <header>
+      <div>
+        <h3>② 工作台派 <span style="color:var(--ink3);font-weight:400;font-size:14px">· Workbench</span></h3>
+        <div class="sub">VS Code / Notion 的三栏工作台 · 效率优先 · 键盘友好</div>
+      </div>
+      <div class="num">02</div>
+    </header>
+    <div class="tags" style="margin-bottom:12px">
+      <span class="tag">编辑器感</span><span class="tag">信息密度高</span><span class="tag">适合长文</span>
+    </div>
+
+    <div class="stage">
+      <div class="tiny-nav">
+        <span class="dot"></span><span class="dot g"></span><span class="dot b"></span>
+        <span class="sep"></span>
+        <span class="crumb">write.md · <b>ai-tone.md</b></span>
+        <span style="flex:1"></span>
+        <span style="color:var(--ink3)">⌘K 主题召回 · ⌘↵ 生成</span>
+      </div>
+      <div class="v-bench">
+        <div class="col">
+          <div class="col-head"><span>Recall · 卡片库</span><span>F</span></div>
+          <div class="col-body">
+            <input class="topic-input" value="内容创作者如何摆脱 AI 腔" />
+            <div class="tagrow">
+              <button>#写作风格</button><button>#创作者</button><button>+</button>
+            </div>
+            <div style="margin-top:16px;color:var(--ink3);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase">12 张相关卡片</div>
+            <div style="margin-top:10px">
+              <div class="card-mini"><div class="t">观点</div><div class="c">AI 腔的根源是"缺乏具体的人"</div></div>
+              <div class="card-mini c2"><div class="t">金句</div><div class="c">好文字是有体温的</div></div>
+              <div class="card-mini"><div class="t">数据</div><div class="c">83% 读者 8 秒内跳出</div></div>
+              <div class="card-mini"><div class="t">故事</div><div class="c">她在咖啡馆改稿的那个下午...</div></div>
+              <div class="card-mini c2"><div class="t">观点</div><div class="c">把抽象换成下午茶场景</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col">
+          <div class="col-head"><span>内容创作者如何摆脱 AI 腔 · 草稿</span><span>MD</span></div>
+          <div class="col-body editor-body" style="padding:32px 48px">
+            <div style="font-size:11.5px;color:var(--ink3);letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px">写作 · Draft 0.2</div>
+            <h1># 当我们谈"AI 腔"，我们其实在谈什么</h1>
+            <div class="meta">612 字 · 预计 3 分钟 · 引用 3 张卡片</div>
+            <p>我发现自己最近写东西，句式越来越整齐，但每读一遍都觉得隔着一层东西。</p>
+            <p>后来一位编辑说 — <span style="background:var(--accent-soft);border-bottom:1.5px solid var(--accent);padding:0 2px">好文字是有体温的，它知道你此刻在哪</span>。这句话像一盏灯。</p>
+            <p style="border-left:3px solid var(--accent2);padding-left:12px;color:var(--ink2)">&gt; AI 腔的根源不是语法，而是"缺乏具体的人"在说话。</p>
+            <p>所以这篇不谈技巧，只谈一件事：<span style="background:var(--accent2-soft);border-bottom:1.5px solid var(--accent2);padding:0 2px">把抽象概念，换成一个下午茶里的真实场景</span>。</p>
+            <p style="color:var(--ink3)">_光标 ▍_</p>
+          </div>
+          <div class="status">
+            <span>● 已连接 AI</span><span>|</span>
+            <span class="ok">✓ 已保存</span><span>|</span>
+            <span>Markdown</span><span style="flex:1"></span>
+            <span>Ln 14, Col 7</span>
+          </div>
+        </div>
+
+        <div class="col">
+          <div class="col-head"><span>Outline · 大纲</span><span>⇧O</span></div>
+          <div class="col-body">
+            <div class="outline-item"><span class="idx">1</span>开头：一个真实现场</div>
+            <div class="outline-item" style="background:var(--accent-soft);color:var(--accent)"><span class="idx">2</span>为什么：体温 vs 整齐</div>
+            <div class="outline-item"><span class="idx">3</span>方法：下午茶场景法</div>
+            <div class="outline-item"><span class="idx">4</span>结尾：给读者一个动作</div>
+            <div style="margin-top:24px;color:var(--ink3);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase">AI Suggest</div>
+            <div style="margin-top:10px;padding:10px;background:var(--accent-soft);color:var(--accent);border-radius:8px;font-size:12px;line-height:1.6">
+              考虑在第 3 段前插入「故事卡片」以增加具体感。
+              <button class="btn ghost" style="margin-top:8px;padding:5px 10px;font-size:11.5px">插入建议</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== V3 ATOM ===================== -->
+  <section class="variation" id="v3">
+    <header>
+      <div>
+        <h3>③ 原子画布派 <span style="color:var(--ink3);font-weight:400;font-size:14px">· Atom</span></h3>
+        <div class="sub">卡片围绕主题轨道 · 拖入核心即凝聚为段落 · 强品牌叙事</div>
+      </div>
+      <div class="num">03</div>
+    </header>
+    <div class="tags" style="margin-bottom:12px">
+      <span class="tag">科幻/原子感</span><span class="tag">动效仪式</span><span class="tag">非线性</span><span class="tag">品牌</span>
+    </div>
+
+    <div class="stage">
+      <div class="tiny-nav">
+        <span class="dot"></span><span class="dot g"></span><span class="dot b"></span>
+        <span class="sep"></span>
+        <span class="crumb">Atom Space / <b>摆脱 AI 腔</b></span>
+        <span style="flex:1"></span>
+        <span style="color:var(--ink3)">拖动卡片越过虚线轨道 → 进入核心</span>
+      </div>
+      <div class="v-atom">
+        <div class="grid"></div>
+        <div class="orbit" style="left:calc(50% - 220px);top:calc(52% - 220px);width:440px;height:440px"></div>
+        <div class="orbit" style="left:calc(50% - 320px);top:calc(52% - 320px);width:640px;height:640px;opacity:.6"></div>
+
+        <svg class="links" viewBox="0 0 1000 660" preserveAspectRatio="none">
+          <path d="M 150 160 C 350 220, 400 320, 490 340" stroke="#2B6CB0" stroke-opacity=".35" fill="none" stroke-dasharray="3 4"/>
+          <path d="M 860 200 C 700 250, 620 300, 520 340" stroke="#2B6CB0" stroke-opacity=".35" fill="none" stroke-dasharray="3 4"/>
+          <path d="M 180 520 C 320 460, 420 400, 500 360" stroke="#B8864D" stroke-opacity=".45" fill="none" stroke-dasharray="3 4"/>
+        </svg>
+
+        <div class="nucleus">
+          <div class="label">✦ Nucleus · 主题核心</div>
+          <h4>内容创作者如何摆脱 AI 腔</h4>
+          <div style="font-size:12px;color:var(--ink2);line-height:1.6">已吸附 <b style="color:var(--accent)">3 张原子</b>，预估 620 字。</div>
+          <button class="gen">✦ 凝聚为文章</button>
+        </div>
+
+        <div class="particle" style="left:6%;top:18%"><div class="t">观点</div><div class="c">AI 腔的根源不是语法，而是缺乏具体的人。</div></div>
+        <div class="particle c2" style="left:78%;top:22%"><div class="t">金句</div><div class="c">好文字是有体温的。</div></div>
+        <div class="particle" style="left:10%;top:72%"><div class="t">数据</div><div class="c">83% 读者 8 秒内跳出。</div></div>
+        <div class="particle c2" style="left:74%;top:70%"><div class="t">故事</div><div class="c">她在咖啡馆改稿的那个下午...</div></div>
+        <div class="particle" style="left:40%;top:10%"><div class="t">观点</div><div class="c">把抽象换成具体的场景。</div></div>
+
+        <div class="compose">
+          <span style="color:var(--accent);font-weight:600">✦</span>
+          <input placeholder="说出主题 — 原子将环绕它自动排布" value="内容创作者如何摆脱 AI 腔" />
+          <span class="hint">5 个原子候选 · 轻按 Tab 切换</span>
+          <button class="btn atom">召回</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== V4 NOIR ===================== -->
+  <section class="variation" id="v4">
+    <header>
+      <div>
+        <h3>④ 暗色科幻派 <span style="color:var(--ink3);font-weight:400;font-size:14px">· Noir</span></h3>
+        <div class="sub">深色底 · 等宽字 · 命令条为核心交互 · 极客仪式感</div>
+      </div>
+      <div class="num">04</div>
+    </header>
+    <div class="tags" style="margin-bottom:12px">
+      <span class="tag">科幻</span><span class="tag">键盘优先</span><span class="tag">高端感</span>
+    </div>
+
+    <div class="stage" style="background:#07090D">
+      <div class="tiny-nav" style="background:#0A0D13;border-bottom-color:#141922;color:#6B7486">
+        <span class="dot"></span><span class="dot g"></span><span class="dot b"></span>
+        <span class="sep" style="background:#141922"></span>
+        <span class="crumb" style="color:#6B7486">~/writing/ <b style="color:#DDE3EC">ai-tone.md</b></span>
+        <span style="flex:1"></span>
+        <span>● streaming</span>
+      </div>
+      <div class="v-noir">
+        <div class="rail">
+          <div class="r-item on">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.6"/><ellipse cx="12" cy="12" rx="10" ry="4"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(60 12 12)"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(-60 12 12)"/></svg>
+          </div>
+          <div class="r-item">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+          </div>
+          <div class="r-item">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 10h16M10 4v16"/></svg>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h5>// recall</h5>
+          <div class="noir-card"><div class="t">observation</div><div class="c">AI 腔的根源不是语法，而是缺乏具体的人。</div></div>
+          <div class="noir-card c2"><div class="t">quote</div><div class="c">好文字是有体温的，它知道你此刻在哪。</div></div>
+          <div class="noir-card"><div class="t">data</div><div class="c">83% 读者 8 秒内跳出泛泛开头。</div></div>
+          <div class="noir-card c2"><div class="t">story</div><div class="c">她在咖啡馆改稿的那个下午...</div></div>
+        </div>
+
+        <div class="stage2">
+          <span class="tag">DRAFT · #42</span>
+          <h1>当我们谈"AI 腔"，我们其实在谈什么</h1>
+          <div class="meta">[612 words · 3 min · 3/12 atoms bonded]</div>
+          <p>我发现自己最近写东西，句式越来越整齐，但每读一遍都觉得隔着一层东西。</p>
+          <p>后来一位编辑说 — <span class="glow">好文字是有体温的，它知道你此刻在哪</span>。这句话像一盏灯。</p>
+          <p style="color:#8CB5FF;border-left:2px solid #2A3B58;padding-left:14px;font-style:italic">AI 腔的根源不是语法，而是"缺乏具体的人"在说话。</p>
+          <p>所以这篇不谈技巧，只谈一件事：<span class="glow">把抽象概念，换成一个下午茶里的真实场景</span>。</p>
+          <p style="color:#6B7486">▍</p>
+
+          <div class="cmdbar">
+            <span class="slash">/</span>
+            <input placeholder="ask · weave · summarize · cite" />
+            <kbd>⌘</kbd><kbd>↵</kbd>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== V5 HUMANIST ===================== -->
+  <section class="variation" id="v5">
+    <header>
+      <div>
+        <h3>⑤ 人文衬线派 <span style="color:var(--ink3);font-weight:400;font-size:14px">· Humanist</span></h3>
+        <div class="sub">Fraunces 斜体大标题 · 米黄纸 · 像一本正在被写的小册子</div>
+      </div>
+      <div class="num">05</div>
+    </header>
+    <div class="tags" style="margin-bottom:12px">
+      <span class="tag">温暖</span><span class="tag">人文</span><span class="tag">Noto Serif</span><span class="tag">情感</span>
+    </div>
+
+    <div class="stage">
+      <div class="tiny-nav">
+        <span class="dot"></span><span class="dot g"></span><span class="dot b"></span>
+        <span class="sep"></span>
+        <span class="crumb">Drafts / <b>四月二十四日 · 摆脱 AI 腔</b></span>
+        <span style="flex:1"></span>
+        <span style="color:var(--ink3)">✒ 写作模式</span>
+      </div>
+      <div class="v-hum">
+        <div class="reader">
+          <div class="kicker">Essay · 四月二十四日</div>
+          <h1>当我们谈 <em>"AI 腔"</em>，<br>我们其实在谈什么</h1>
+          <div class="by">草稿 · 引用了 3 张卡片 · 约 620 字</div>
+          <p><span class="drop" style="font-family:'Fraunces',serif;font-size:52px;float:left;line-height:1;padding:4px 8px 0 0;color:#b8864d">我</span>发现自己最近写东西，句式越来越整齐，但每读一遍都觉得隔着一层东西。后来一位编辑说了一句很准的话 — <span class="under">好文字是有体温的，它知道你此刻在哪</span>。这句话像一盏灯，让我看清一直在逃避的事实。</p>
+          <div class="pullquote">AI 腔的根源，不是语法，<br>��是"缺乏具体的人"在说话。</div>
+          <p>所以这篇不谈技巧，只谈一件事：<span class="under">把抽象概念，换成一个下午茶里的真实场景</span>。当我开始在每一段落前问自己"此刻这个人坐在哪"，句子自动有了呼吸。</p>
+          <p style="color:#8a7b5a;font-style:italic">▍ 继续书写 · 或从右侧拾取另一张卡片...</p>
+        </div>
+
+        <div class="rail">
+          <h5>手边的卡片</h5>
+          <div class="hcard"><div class="t">金句 · 已用</div><div class="c">好文字是有体温的，它知道你此刻在哪。</div></div>
+          <div class="hcard c2"><div class="t">观点</div><div class="c">AI 腔的根源不是语法，而是缺乏具体的人。</div></div>
+          <div class="hcard"><div class="t">数据</div><div class="c">83% 读者 8 秒内跳出泛泛开头。</div></div>
+          <div class="hcard c2"><div class="t">故事</div><div class="c">她在咖啡馆改稿的那个下午，把"内容"两个字划掉...</div></div>
+
+          <div class="pen">
+            ✒ <span>让 AI 用更像���的语气重写这段</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== ICON LAB ===================== -->
+  <section class="variation" id="icons">
+    <header>
+      <div>
+        <h3>⑥ 图标实验室 <span style="color:var(--ink3);font-weight:400;font-size:14px">· Brand Mark · 5 concepts</span></h3>
+        <div class="sub">Bold stroke（~2.2px · 原子/轨道/流 · 每一枚都围绕品牌叙事）</div>
+      </div>
+      <div class="num">06</div>
+    </header>
+
+    <div class="icon-lab" id="iconlab">
+      <!-- 5 icon cells injected by JS so they also appear at small sizes -->
+    </div>
+
+    <div class="icon-row">
+      <div class="size">
+        <svg width="16" height="16" viewBox="0 0 32 32" id="mini1"></svg><span>16px</span>
+      </div>
+      <div class="size">
+        <svg width="24" height="24" viewBox="0 0 32 32" id="mini2"></svg><span>24px</span>
+      </div>
+      <div class="size">
+        <svg width="32" height="32" viewBox="0 0 32 32" id="mini3"></svg><span>32px</span>
+      </div>
+      <div class="size">
+        <svg width="48" height="48" viewBox="0 0 32 32" id="mini4"></svg><span>48px</span>
+      </div>
+      <div style="flex:1"></div>
+      <div style="font-size:12.5px;color:var(--ink3);max-width:360px;line-height:1.6">
+        下方每个尺寸渲染的是你当前在图标栏选中的那一枚。
+        挑一枚后告诉我编号，我会把它做成 favicon + 登录页 logo + loading marker 三套。
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ===================== PICKBAR ===================== -->
+<div class="pickbar" id="pickbar">
+  <span class="lbl">我最喜欢：</span>
+  <button data-pick="1">① 稿纸</button>
+  <button data-pick="2">② 工作台</button>
+  <button data-pick="3">③ 原子</button>
+  <button data-pick="4">④ 暗色</button>
+  <button data-pick="5">⑤ 人文</button>
+  <span class="lbl" style="margin-left:8px;border-left:1px solid var(--border);padding-left:10px">图标：</span>
+  <button data-icon="A">A</button>
+  <button data-icon="B">B</button>
+  <button data-icon="C">C</button>
+  <button data-icon="D">D</button>
+  <button data-icon="E">E</button>
+</div>
+
+<script>
+/* ---------- FINAL FORM · Knowledge Galaxy (d3-force + Canvas) ---------- */
+// 数据：文章（太阳）+ 原子（行星，围绕太阳形成轨道环）+ 标签
+const GALAXY_DATA = {
+  articles: [
+    { id:'s1', title:'摆脱 AI 腔',       cx:26, cy:32, r:13, tags:['写作','风格'] },
+    { id:'s2', title:'知识复利的三重境界', cx:72, cy:26, r:11, tags:['成长','思考'] },
+    { id:'s3', title:'RSS 不死',         cx:78, cy:68, r:12, tags:['信息','产品'] },
+    { id:'s4', title:'阅读的焦虑',       cx:30, cy:74, r:11, tags:['阅读','心智'] },
+    { id:'s5', title:'好编辑的直觉',     cx:52, cy:50, r:9,  tags:['写作','编辑'] },
+  ],
+  atoms: [
+    { id:'a1', parent:'s1', type:'观点', color:'b', text:'AI 腔根源是缺乏具体的人', tags:['写作','AI'] },
+    { id:'a2', parent:'s1', type:'金句', color:'c', text:'好文字是有体温的',       tags:['写作','风格'] },
+    { id:'a3', parent:'s1', type:'数据', color:'b', text:'83% 读者 8 秒跳出',     tags:['数据','阅读'] },
+    { id:'a4', parent:'s2', type:'观点', color:'b', text:'复利来自"再用"',        tags:['成长'] },
+    { id:'a5', parent:'s2', type:'金句', color:'c', text:'知识不积累，会衰减',    tags:['思考'] },
+    { id:'a6', parent:'s3', type:'观点', color:'b', text:'信息消费转为生产',      tags:['产品','信息'] },
+    { id:'a7', parent:'s3', type:'数据', color:'b', text:'RSS 用户年增 12%',      tags:['数据'] },
+    { id:'a8', parent:'s4', type:'故事', color:'c', text:'她在咖啡馆改稿的下午',  tags:['故事','写作'] },
+    { id:'a9', parent:'s4', type:'观点', color:'b', text:'收藏夹是坟墓',          tags:['心智','阅读'] },
+    { id:'a10',parent:'s5', type:'金句', color:'c', text:'把抽象换成场景',        tags:['写作','风格'] },
+    { id:'a11',parent:'s5', type:'观点', color:'b', text:'好编辑不加字只减字',    tags:['编辑'] },
+  ],
+};
+
+// ===== 构建 nodes / links（d3-force 格式） =====
+const SUN_R = 9;           // 太阳基础半径 (px)
+const ATOM_R = 5;          // 原子基础半径
+const ORBIT_RADIUS = 100;  // 每颗太阳的原子轨道半径（受 radial force 约束）
+
+const nodes = [];
+const links = [];
+
+GALAXY_DATA.articles.forEach((s,i)=>{
+  // 围绕 world(0,0) 均匀散布，避免全堆叠
+  const cols = 3;
+  const cx = ((i%cols) - (cols-1)/2) * 260;
+  const cy = (Math.floor(i/cols) - 0.5) * 260;
+  nodes.push({
+    id: s.id, kind:'sun', title:s.title, tags:s.tags,
+    x: cx + Math.random()*40,
+    y: cy + Math.random()*40,
+    r: SUN_R
+  });
+});
+GALAXY_DATA.atoms.forEach(a=>{
+  const sun = nodes.find(n=>n.id===a.parent);
+  nodes.push({
+    id: a.id, kind:'atom', type:a.type, color:a.color,
+    text:a.text, tags:a.tags, parent:a.parent,
+    // 原子初始位置放在父太阳附近环上
+    x: sun.x + Math.cos(Math.random()*Math.PI*2) * ORBIT_RADIUS,
+    y: sun.y + Math.sin(Math.random()*Math.PI*2) * ORBIT_RADIUS,
+    r: ATOM_R
+  });
+  // 太阳-原子 从属 link（很弱的弹簧，主要靠 radial force 约束）
+  links.push({ source:a.parent, target:a.id, kind:'parent' });
+});
+// 跨文章原子 tag link
+for (let i=0;i<GALAXY_DATA.atoms.length;i++){
+  for (let j=i+1;j<GALAXY_DATA.atoms.length;j++){
+    const A=GALAXY_DATA.atoms[i], B=GALAXY_DATA.atoms[j];
+    if (A.parent===B.parent) continue;
+    if (A.tags.some(t=>B.tags.includes(t))){
+      links.push({ source:A.id, target:B.id, kind:'tag' });
+    }
+  }
+}
+
+// ===== Canvas 设置 =====
+const gGalaxy = document.getElementById('g-galaxy');
+const gForge = document.getElementById('g-forge');
+const forgeTitle = document.getElementById('forge-title');
+const forgeProgress = document.getElementById('forge-progress');
+const canvas = document.getElementById('g-canvas');
+const ctx = canvas.getContext('2d');
+const gTip = document.getElementById('g-tip');
+const mmCanvas = document.getElementById('g-mmcanvas');
+const mmCtx = mmCanvas.getContext('2d');
+const mmEl = document.getElementById('g-minimap');
+const zoomInfo = document.getElementById('g-zoom-info');
+
+let W=0, H=0, DPR=window.devicePixelRatio||1;
+
+// ===== Viewport (pan + zoom) =====
+const view = { k: 1, tx: 0, ty: 0 };
+const MIN_K = 0.15, MAX_K = 4;
+function screenToWorld(sx, sy){
+  return { x: (sx - view.tx) / view.k, y: (sy - view.ty) / view.k };
+}
+function worldToScreen(wx, wy){
+  return { x: wx * view.k + view.tx, y: wy * view.k + view.ty };
+}
+function updateZoomInfo(){
+  zoomInfo.textContent = Math.round(view.k * 100) + '%';
+}
+
+function resizeCanvas(){
+  const rect = gGalaxy.getBoundingClientRect();
+  W = rect.width; H = rect.height;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  canvas.style.width = W+'px';
+  canvas.style.height = H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+
+// ===== 状态：激活 / 拖动 / 聚合 =====
+const state = {
+  activeIds: null,    // Set<string> 或 null
+  hoverId: null,
+  dragging: null,     // node
+  flowingAtoms: new Set(),  // 正在飞向中心的原子
+  flowTargets: {},    // id -> {x,y} 飞向目标
+  forgeOn: false,
+};
+
+// ===== d3-force 模拟 =====
+// 自定义力：每个原子对其父太阳施加径向约束（保持在 ORBIT_RADIUS 的轨道环上）
+function forceOrbit(strength){
+  let nds;
+  function force(alpha){
+    for (const n of nds){
+      if (n.kind !== 'atom') continue;
+      const sun = nds.find(x=>x.id===n.parent);
+      if (!sun) continue;
+      const dx = n.x - sun.x, dy = n.y - sun.y;
+      const d = Math.sqrt(dx*dx + dy*dy) || 1e-6;
+      // 目标：距父太阳 ORBIT_RADIUS
+      const targetD = ORBIT_RADIUS;
+      const k = (targetD - d) / d * strength * alpha;
+      n.vx += dx * k;
+      n.vy += dy * k;
+    }
+  }
+  force.initialize = _ => { nds = _; };
+  return force;
+}
+
+const sim = d3.forceSimulation(nodes)
+  .force('charge', d3.forceManyBody().strength(n=> n.kind==='sun' ? -480 : -90))
+  .force('link', d3.forceLink(links).id(n=>n.id)
+    .distance(l=> l.kind==='parent' ? ORBIT_RADIUS : 220)
+    .strength(l=> l.kind==='parent' ? 0.12 : 0.03))
+  .force('orbit', forceOrbit(0.8))
+  .force('collide', d3.forceCollide().radius(n=> n.kind==='sun' ? 28 : 12).strength(0.9))
+  .force('center', d3.forceCenter(0,0).strength(0.02))
+  .alphaDecay(0.028)
+  .velocityDecay(0.4)
+  .on('tick', draw);
+
+function recenter(){
+  const rect = gGalaxy.getBoundingClientRect();
+  W = rect.width; H = rect.height;
+  // 力学中心固定在 world(0,0)，靠 view 平移把它放到屏幕中心
+  sim.force('center', d3.forceCenter(0, 0).strength(0.03));
+  view.tx = W/2;
+  view.ty = H/2;
+  updateZoomInfo();
+  sim.alpha(0.8).restart();
+}
+
+// ===== 绘制 =====
+function draw(){
+  if (W===0) return;
+  // 清屏用屏幕空间
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0,0,W,H);
+  // 之后的绘制全部在 world 空间进行：屏幕 = world * k + t
+  ctx.setTransform(DPR*view.k, 0, 0, DPR*view.k, DPR*view.tx, DPR*view.ty);
+
+  // 1) 轨道圆（每颗太阳一个淡虚线环）
+  ctx.save();
+  ctx.strokeStyle = 'rgba(120,180,255,0.10)';
+  ctx.setLineDash([2,5]);
+  ctx.lineWidth = 0.8;
+  nodes.filter(n=>n.kind==='sun').forEach(sun=>{
+    ctx.beginPath();
+    ctx.arc(sun.x, sun.y, ORBIT_RADIUS, 0, Math.PI*2);
+    ctx.stroke();
+  });
+  ctx.restore();
+
+  // 2) 边（先画暗的，后画亮的）
+  ctx.save();
+  ctx.lineCap = 'round';
+  links.forEach(l=>{
+    const a = typeof l.source==='object'?l.source:nodes.find(n=>n.id===l.source);
+    const b = typeof l.target==='object'?l.target:nodes.find(n=>n.id===l.target);
+    if (!a||!b) return;
+    const active = state.activeIds && state.activeIds.has(a.id) && state.activeIds.has(b.id);
+    const dim = state.activeIds && !active;
+    if (l.kind==='parent'){
+      ctx.strokeStyle = active ? 'rgba(120,200,255,0.75)' : dim ? 'rgba(120,180,255,0.06)' : 'rgba(120,180,255,0.2)';
+      ctx.lineWidth = active ? 1.4 : 0.8;
+      ctx.beginPath();
+      ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    } else {
+      // tag 关联：曲线
+      ctx.strokeStyle = active ? 'rgba(160,220,255,0.9)' : dim ? 'rgba(160,200,255,0.06)' : 'rgba(160,200,255,0.22)';
+      ctx.lineWidth = active ? 1.6 : 0.9;
+      if (active){
+        ctx.shadowBlur = 8;
+        ctx.shadowColor = 'rgba(120,200,255,0.8)';
+      }
+      const mx=(a.x+b.x)/2, my=(a.y+b.y)/2 - Math.hypot(a.x-b.x,a.y-b.y)*0.18;
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.quadraticCurveTo(mx,my,b.x,b.y); ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+  });
+  ctx.restore();
+
+  // 3) 节点
+  nodes.forEach(n=>{
+    // 跳过：正在飞向中心（通过其他路径绘制）
+    const flying = state.flowingAtoms.has(n.id);
+    const active = state.activeIds && state.activeIds.has(n.id);
+    const dim = state.activeIds && !active;
+    const hover = state.hoverId === n.id;
+
+    ctx.save();
+    let x=n.x, y=n.y, alpha=1;
+    if (flying){
+      // n.fx/n.fy 已被 tween 至 world(0,0)，n.x/n.y 跟随；此处仅做淡出
+      const t = n.flowT || 0;
+      alpha = 1 - t*0.95;
+    }
+    ctx.globalAlpha = dim ? 0.25 : alpha;
+
+    if (n.kind==='sun'){
+      // 光晕
+      const glowR = (active||hover) ? 34 : 22;
+      const glowA = (active||hover) ? 0.85 : 0.55;
+      const grad = ctx.createRadialGradient(x,y,2, x,y,glowR);
+      grad.addColorStop(0, `rgba(168,208,255,${glowA})`);
+      grad.addColorStop(0.35, `rgba(79,142,247,${glowA*0.55})`);
+      grad.addColorStop(1, 'rgba(79,142,247,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(x,y,glowR,0,Math.PI*2); ctx.fill();
+      // 核心
+      const coreG = ctx.createRadialGradient(x-2,y-2,1, x,y, SUN_R);
+      coreG.addColorStop(0,'#E8F2FF');
+      coreG.addColorStop(0.45,'#4F8EF7');
+      coreG.addColorStop(1,'#2556B8');
+      ctx.fillStyle = coreG;
+      ctx.shadowBlur = active ? 18 : 10;
+      ctx.shadowColor = '#4F8EF7';
+      ctx.beginPath(); ctx.arc(x,y,SUN_R*(active?1.15:1), 0, Math.PI*2); ctx.fill();
+      ctx.shadowBlur = 0;
+      // 标题（只在 hover 或 active 时显示，避免信息过载）
+      if (hover || active){
+        ctx.font = '500 11.5px Inter,"PingFang SC",sans-serif';
+        ctx.fillStyle = 'rgba(232,242,255,0.95)';
+        ctx.textAlign = 'center';
+        const pad = 5;
+        const m = ctx.measureText(n.title);
+        const w = m.width + pad*2, h = 18, tx = x, ty = y + 22;
+        ctx.fillStyle = 'rgba(10,22,50,0.72)';
+        roundRect(ctx, tx - w/2, ty, w, h, 4, true, false);
+        ctx.fillStyle = 'rgba(232,242,255,0.96)';
+        ctx.fillText(n.title, tx, ty+12);
+      }
+    } else {
+      // 原子 - 星形
+      const size = (active||hover) ? ATOM_R*1.5 : ATOM_R*1.1;
+      const color = n.color==='c' ? '#E8B87A' : '#7FB8FF';
+      const glowColor = n.color==='c' ? 'rgba(232,184,122,' : 'rgba(127,184,255,';
+      ctx.shadowBlur = (active||hover) ? 10 : 5;
+      ctx.shadowColor = glowColor + '0.9)';
+      ctx.fillStyle = (active||hover) ? (n.color==='c' ? '#FFD8A0' : '#C8E0FF') : color;
+      drawStar(ctx, x, y, size*1.6, size*0.7, 4);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+    ctx.restore();
+  });
+
+  // 4) Forge 聚合视觉（Canvas 上额外画两圈脉冲，和 DOM 圈配合）
+  if (state.forgeOn){
+    // 中心始终保持在视口中心（world 坐标）
+    const center = screenToWorld(W/2, H/2);
+    const cx=center.x, cy=center.y;
+    const t = (performance.now()/1000) % 1.6 / 1.6;
+    ctx.save();
+    ctx.strokeStyle = `rgba(120,200,255,${0.5*(1-t)})`;
+    ctx.lineWidth = 2 / view.k;
+    ctx.beginPath(); ctx.arc(cx,cy, (60+80*t)/view.k, 0, Math.PI*2); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function roundRect(ctx, x, y, w, h, r, fill, stroke){
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y,   x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x,   y+h, r);
+  ctx.arcTo(x,   y+h, x,   y,   r);
+  ctx.arcTo(x,   y,   x+w, y,   r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+function drawStar(ctx, cx, cy, spikeR, innerR, points){
+  ctx.beginPath();
+  let rot = Math.PI/2*3;
+  const step = Math.PI/points;
+  ctx.moveTo(cx, cy-spikeR);
+  for (let i=0;i<points;i++){
+    let x = cx + Math.cos(rot)*spikeR;
+    let y = cy + Math.sin(rot)*spikeR;
+    ctx.lineTo(x,y);
+    rot += step;
+    x = cx + Math.cos(rot)*innerR;
+    y = cy + Math.sin(rot)*innerR;
+    ctx.lineTo(x,y);
+    rot += step;
+  }
+  ctx.lineTo(cx, cy-spikeR);
+  ctx.closePath();
+}
+
+// ===== 命中检测 =====
+function pickNode(mx, my){
+  // mx/my 是屏幕坐标 → 转为 world 坐标再判断
+  const w = screenToWorld(mx, my);
+  // 点击半径需要随缩放调整：k 越小（缩远），屏幕上节点越小，但为了还能点中 world 空间的判定盒固定即可
+  for (let i=nodes.length-1;i>=0;i--){
+    const n = nodes[i];
+    const r = n.kind==='sun' ? 14 : 10;
+    if ((n.x-w.x)**2 + (n.y-w.y)**2 < r*r) return n;
+  }
+  return null;
+}
+
+// ===== 鼠标：Hover tooltip + 激活关联 + 拖动 =====
+canvas.addEventListener('mousemove', e=>{
+  if (state.dragging){ return; } // 拖动中由 pointer 事件处理
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const n = pickNode(mx,my);
+  state.hoverId = n ? n.id : null;
+  if (n){
+    gTip.textContent = n.kind==='sun' ? `文章 · ${n.title}` : `${n.type} · ${n.text}`;
+    gTip.className = 'g-tip on ' + (n.kind==='atom' ? (n.color==='c'?'atom-c2':'atom') : '');
+    const s = worldToScreen(n.x, n.y);
+    gTip.style.left = s.x+'px';
+    gTip.style.top = s.y+'px';
+    // 高亮关联节点
+    const related = new Set([n.id]);
+    if (n.kind==='sun'){
+      GALAXY_DATA.atoms.filter(a=>a.parent===n.id).forEach(a=>related.add(a.id));
+    } else {
+      related.add(n.parent);
+      GALAXY_DATA.atoms.forEach(o=>{
+        if (o.id!==n.id && o.tags.some(t=>n.tags.includes(t))) related.add(o.id);
+      });
+    }
+    if (!state._chatLocked) state.activeIds = related;
+  } else {
+    gTip.classList.remove('on');
+    if (!state._chatLocked) state.activeIds = null;
+  }
+  draw();
+});
+canvas.addEventListener('mouseleave', ()=>{
+  state.hoverId = null;
+  gTip.classList.remove('on');
+  if (!state._chatLocked) state.activeIds = null;
+  draw();
+});
+
+// ===== 拖动（热重启 + 松手衰减）/ 空白拖动 = 平移视图 =====
+let panState = null; // { sx, sy, tx0, ty0 }
+
+canvas.addEventListener('pointerdown', e=>{
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const n = pickNode(mx,my);
+  if (!n){
+    // 空白处：开始平移
+    panState = { sx: mx, sy: my, tx0: view.tx, ty0: view.ty };
+    canvas.classList.add('dragging');
+    canvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  state.dragging = n;
+  canvas.classList.add('dragging');
+  canvas.setPointerCapture(e.pointerId);
+  sim.alphaTarget(0.35).restart(); // 热重启
+  n.fx = n.x; n.fy = n.y;
+});
+canvas.addEventListener('pointermove', e=>{
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  if (panState){
+    view.tx = panState.tx0 + (mx - panState.sx);
+    view.ty = panState.ty0 + (my - panState.sy);
+    draw();
+    drawMinimap();
+    return;
+  }
+  if (!state.dragging) return;
+  // 拖节点时把屏幕坐标转回 world 赋给 fx/fy
+  const w = screenToWorld(mx, my);
+  state.dragging.fx = w.x;
+  state.dragging.fy = w.y;
+});
+canvas.addEventListener('pointerup', e=>{
+  if (panState){
+    panState = null;
+    canvas.classList.remove('dragging');
+    return;
+  }
+  if (!state.dragging) return;
+  sim.alphaTarget(0); // 衰减到静止
+  state.dragging.fx = null;
+  state.dragging.fy = null;
+  state.dragging = null;
+  canvas.classList.remove('dragging');
+});
+canvas.addEventListener('pointercancel', ()=>{
+  if (panState){ panState = null; canvas.classList.remove('dragging'); }
+  if (state.dragging){
+    state.dragging.fx = null; state.dragging.fy = null;
+    state.dragging = null;
+    canvas.classList.remove('dragging');
+    sim.alphaTarget(0);
+  }
+});
+
+// ===== 滚轮缩放（以光标为锚点） =====
+canvas.addEventListener('wheel', e=>{
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const w = screenToWorld(mx, my);
+  const factor = e.deltaY < 0 ? 1.12 : 1/1.12;
+  const newK = Math.max(MIN_K, Math.min(MAX_K, view.k * factor));
+  if (newK === view.k) return;
+  view.k = newK;
+  // 保持光标下的 world 点在屏幕上不动
+  view.tx = mx - w.x * view.k;
+  view.ty = my - w.y * view.k;
+  updateZoomInfo();
+  draw();
+  drawMinimap();
+}, { passive:false });
+
+// ===== 缩放按钮 + 适配视图 =====
+function zoomBy(f){
+  const cx = W/2, cy = H/2;
+  const w = screenToWorld(cx, cy);
+  const newK = Math.max(MIN_K, Math.min(MAX_K, view.k * f));
+  view.k = newK;
+  view.tx = cx - w.x * view.k;
+  view.ty = cy - w.y * view.k;
+  updateZoomInfo();
+  draw();
+  drawMinimap();
+}
+
+function fitView(ids){
+  const targets = ids
+    ? nodes.filter(n=> ids.has ? ids.has(n.id) : ids.includes(n.id))
+    : nodes;
+  if (!targets.length) return;
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  targets.forEach(n=>{
+    const pad = n.kind==='sun' ? ORBIT_RADIUS+30 : 20;
+    minX = Math.min(minX, n.x - pad);
+    minY = Math.min(minY, n.y - pad);
+    maxX = Math.max(maxX, n.x + pad);
+    maxY = Math.max(maxY, n.y + pad);
+  });
+  const bw = maxX - minX, bh = maxY - minY;
+  const margin = 40;
+  const k = Math.min((W - margin*2)/bw, (H - margin*2)/bh);
+  view.k = Math.max(MIN_K, Math.min(MAX_K, k));
+  const cx = (minX+maxX)/2, cy = (minY+maxY)/2;
+  view.tx = W/2 - cx*view.k;
+  view.ty = H/2 - cy*view.k;
+  updateZoomInfo();
+  draw();
+  drawMinimap();
+}
+
+document.getElementById('zoom-in')?.addEventListener('click', ()=> zoomBy(1.25));
+document.getElementById('zoom-out')?.addEventListener('click', ()=> zoomBy(0.8));
+document.getElementById('view-reset')?.addEventListener('click', ()=> fitView(null));
+
+// ===== Minimap =====
+function drawMinimap(){
+  const mw = mmCanvas.clientWidth, mh = mmCanvas.clientHeight;
+  if (!mw||!mh) return;
+  if (mmCanvas.width !== mw*DPR){ mmCanvas.width = mw*DPR; mmCanvas.height = mh*DPR; }
+  mmCtx.setTransform(DPR,0,0,DPR,0,0);
+  mmCtx.clearRect(0,0,mw,mh);
+
+  if (!nodes.length) return;
+  // world bbox
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  nodes.forEach(n=>{
+    minX=Math.min(minX,n.x); minY=Math.min(minY,n.y);
+    maxX=Math.max(maxX,n.x); maxY=Math.max(maxY,n.y);
+  });
+  const pad = 60;
+  minX-=pad; minY-=pad; maxX+=pad; maxY+=pad;
+  const bw = maxX-minX, bh = maxY-minY;
+  const mk = Math.min(mw/bw, mh/bh);
+  const ox = (mw - bw*mk)/2 - minX*mk;
+  const oy = (mh - bh*mk)/2 - minY*mk;
+
+  // cache for click-to-jump
+  mmEl._mapTransform = { mk, ox, oy };
+
+  // edges (只画 parent，减少噪点)
+  mmCtx.strokeStyle = 'rgba(120,180,255,0.18)';
+  mmCtx.lineWidth = 0.5;
+  links.forEach(l=>{
+    if (l.kind!=='parent') return;
+    const a = typeof l.source==='object'?l.source:nodes.find(n=>n.id===l.source);
+    const b = typeof l.target==='object'?l.target:nodes.find(n=>n.id===l.target);
+    if (!a||!b) return;
+    mmCtx.beginPath();
+    mmCtx.moveTo(a.x*mk+ox, a.y*mk+oy);
+    mmCtx.lineTo(b.x*mk+ox, b.y*mk+oy);
+    mmCtx.stroke();
+  });
+  // nodes
+  nodes.forEach(n=>{
+    const x = n.x*mk+ox, y = n.y*mk+oy;
+    if (n.kind==='sun'){
+      mmCtx.fillStyle = '#4F8EF7';
+      mmCtx.beginPath(); mmCtx.arc(x,y,2.2,0,Math.PI*2); mmCtx.fill();
+    } else {
+      mmCtx.fillStyle = n.color==='c' ? 'rgba(232,184,122,0.85)' : 'rgba(127,184,255,0.75)';
+      mmCtx.beginPath(); mmCtx.arc(x,y,1.1,0,Math.PI*2); mmCtx.fill();
+    }
+  });
+
+  // viewport rect（当前屏幕四角对应的 world 坐标 → minimap）
+  const tl = screenToWorld(0,0);
+  const br = screenToWorld(W,H);
+  const rx = tl.x*mk+ox, ry = tl.y*mk+oy;
+  const rw = (br.x-tl.x)*mk, rh = (br.y-tl.y)*mk;
+  mmCtx.strokeStyle = 'rgba(168,208,255,0.9)';
+  mmCtx.lineWidth = 1;
+  mmCtx.strokeRect(rx, ry, rw, rh);
+  mmCtx.fillStyle = 'rgba(168,208,255,0.08)';
+  mmCtx.fillRect(rx, ry, rw, rh);
+}
+
+// 点击小地图 → 将世界坐标中心对准那个点
+mmEl.addEventListener('click', e=>{
+  const rect = mmCanvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const t = mmEl._mapTransform;
+  if (!t) return;
+  const wx = (mx - t.ox)/t.mk, wy = (my - t.oy)/t.mk;
+  view.tx = W/2 - wx*view.k;
+  view.ty = H/2 - wy*view.k;
+  draw();
+  drawMinimap();
+});
+
+// 模拟 tick 时刷新 minimap（节流）
+let _mmTickCount = 0;
+sim.on('tick.minimap', ()=>{
+  if ((_mmTickCount++ % 3) === 0) drawMinimap();
+});
+
+// ===== 激活（Chat 驱动） =====
+function activateByIds(ids){
+  state._chatLocked = true;
+  state.activeIds = new Set(ids);
+  // 自动把镜头拉到这些节点的 bbox
+  fitView(state.activeIds);
+}
+function clearActivation(){
+  state._chatLocked = false;
+  state.activeIds = null;
+  draw();
+  drawMinimap();
+}
+
+// ===== 聚合动画（原子飞向中心） =====
+function triggerAggregate(atomIds, articleTitle){
+  return new Promise(resolve=>{
+    state.forgeOn = true;
+    gForge.classList.add('on');
+    forgeTitle.textContent = articleTitle;
+    forgeProgress.textContent = `凝聚 ${atomIds.length} 张原子中...`;
+
+    const cx = 0, cy = 0; // world 原点就是视口中心（由 view.tx/ty 映射到屏幕中央）
+    atomIds.forEach((id, i)=>{
+      setTimeout(()=>{
+        const n = nodes.find(x=>x.id===id);
+        if (!n) return;
+        n.flowStartX = n.x;
+        n.flowStartY = n.y;
+        n.flowT = 0;
+        n.fx = n.x; n.fy = n.y; // 固定位置，脱离力学
+        state.flowingAtoms.add(id);
+        // 手动 tween
+        const start = performance.now();
+        const dur = 1500;
+        const tick = ()=>{
+          const t = Math.min(1, (performance.now()-start)/dur);
+          n.flowT = t;
+          n.fx = n.flowStartX + (cx - n.flowStartX)*t;
+          n.fy = n.flowStartY + (cy - n.flowStartY)*t;
+          if (t < 1) requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+        const done = i+1;
+        forgeProgress.textContent = done===atomIds.length
+          ? '凝聚完成，正在生成段落...'
+          : `凝聚 ${done}/${atomIds.length} 张原子...`;
+      }, i*260);
+    });
+
+    const total = atomIds.length*260 + 1800;
+    setTimeout(resolve, total);
+  });
+}
+
+function resetFlownAtoms(){
+  state.flowingAtoms.clear();
+  state.forgeOn = false;
+  gForge.classList.remove('on');
+  nodes.forEach(n=>{
+    if (n.kind==='atom'){
+      n.fx = null; n.fy = null;
+      n.flowT = 0;
+    }
+  });
+  sim.alpha(0.6).restart();
+}
+
+// 聚合动画期间持续重绘（非 sim tick）
+function animateForge(){
+  if (state.forgeOn || state.flowingAtoms.size) draw();
+  requestAnimationFrame(animateForge);
+}
+requestAnimationFrame(animateForge);
+
+// ===== Chat =====
+const gcBody = document.getElementById('gc-body');
+const gcInput = document.getElementById('gc-textarea');
+const gcSend = document.getElementById('gc-send');
+const articlesNdot = document.getElementById('articles-ndot');
+const articlesList = document.getElementById('g-articles-list');
+
+function addUserMsg(text){
+  const el = document.createElement('div');
+  el.className = 'gc-msg user';
+  el.innerHTML = `<div class="bubble">${text}</div>`;
+  gcBody.appendChild(el);
+  gcBody.scrollTop = gcBody.scrollHeight;
+}
+function addAIMsg(html){
+  const el = document.createElement('div');
+  el.className = 'gc-msg ai';
+  el.innerHTML = `<div class="bubble">${html}</div>`;
+  gcBody.appendChild(el);
+  gcBody.scrollTop = gcBody.scrollHeight;
+  return el;
+}
+
+const DEMOS = {
+  'ai-tone': {
+    userText: '帮我写一篇《摆脱 AI 腔》',
+    recallIds: ['s1','a1','a2','a3','s5','a10'],
+    forgeAtoms: ['a1','a2','a10'],
+    title: '摆脱 AI 腔',
+    finalText: `<p>从 <b>摆脱 AI 腔</b> 和 <b>好编辑的直觉</b> 两颗太阳拎出几个关键原子：</p>
+      <div class="recall-line"><b>观点</b> AI 腔根源是缺乏具体的人 · <b>金句</b> 好文字是有体温的 · <b>金句</b> 把抽象换成场景</div>
+      <p>草稿第一段——</p>
+      <p><em>"我最近写的东西越来越整齐，但自己读着都像隔了层玻璃。上周一位编辑跟我说了句戳心的——好文字是有体温的，它知道你此刻在哪。这句话让我明白，不是技术不行，是我丢了那个『具体的人』。"</em></p>`
+  },
+  'rss': {
+    userText: '写写 RSS 为什么还没死',
+    recallIds: ['s3','a6','a7','s4','a9'],
+    forgeAtoms: ['a6','a7','a9'],
+    title: 'RSS 不死，它只是换了件衣服',
+    finalText: `<p>召回 <b>RSS 不死</b> 和 <b>阅读的焦虑</b> 上的原子：</p>
+      <div class="recall-line"><b>观点</b> 信息消费转为生产 · <b>数据</b> RSS 用户年增 12% · <b>观点</b> 收藏夹是坟墓</div>
+      <p>开头试一版——</p>
+      <p><em>"别再为 RSS 写讣告了。它年增 12%，只是不再穿 2005 年那身衣服。当算法让你刷到所有人都在看的东西，RSS 又成了你挑自己要看什么的那把钥匙。"</em></p>`
+  }
+};
+
+function markArticleSaved(title){
+  articlesNdot.style.display = 'inline-block';
+  const item = document.createElement('div');
+  item.className = 'g-art-item generated';
+  item.innerHTML = `<span class="dot"></span>${title}`;
+  articlesList.prepend(item);
+}
+
+async function runDemo(key, userText){
+  const d = { ...DEMOS[key] };
+  if (userText) d.userText = userText;
+  if (!d || !d.recallIds) return;
+  gcSend.disabled = true;
+  resetFlownAtoms();
+
+  addUserMsg(d.userText);
+  const aiEl = addAIMsg('<div class="status"><span class="dot"></span>从你的知识宇宙中检索...</div>');
+  await new Promise(r=>setTimeout(r, 500));
+
+  activateByIds(d.recallIds);
+  aiEl.querySelector('.bubble').innerHTML =
+    `<div class="status"><span class="dot"></span>画布已激活 ${d.recallIds.length} 个节点</div>
+     <p style="color:var(--ink3);font-size:12.5px;margin:0">相关太阳和原子正在亮起 → 即将聚合</p>`;
+  gcBody.scrollTop = gcBody.scrollHeight;
+  await new Promise(r=>setTimeout(r, 1200));
+
+  aiEl.querySelector('.bubble').innerHTML =
+    `<div class="status"><span class="dot"></span>正在把原子凝聚成段落...</div>`;
+  await triggerAggregate(d.forgeAtoms, d.title);
+
+  aiEl.querySelector('.bubble').innerHTML = d.finalText + `
+    <div class="saved-card">
+      <span class="sv-dot"></span>
+      <span>新文章 <b>《${d.title}》</b> 已存入文章库</span>
+      <a>查看 →</a>
+    </div>`;
+  forgeProgress.textContent = '已生成 · 新太阳已加入宇宙';
+  gcBody.scrollTop = gcBody.scrollHeight;
+  markArticleSaved(d.title);
+  gcSend.disabled = false;
+}
+
+// demo buttons
+document.querySelectorAll('.gc-demo').forEach(b=>{
+  b.addEventListener('click',()=>{
+    const k = b.dataset.demo;
+    if (k==='clear'){ clearActivation(); resetFlownAtoms(); return; }
+    runDemo(k);
+  });
+});
+
+// free-text send
+gcSend.addEventListener('click',()=>{
+  const t = gcInput.value.trim();
+  if (!t) return;
+  gcInput.value = '';
+  const key = /rss|信息|产品/.test(t) ? 'rss' : 'ai-tone';
+  runDemo(key, t);
+});
+gcInput.addEventListener('keydown', e=>{
+  if (e.key==='Enter' && !e.shiftKey){ e.preventDefault(); gcSend.click(); }
+});
+
+// 清除红点
+document.getElementById('rail-articles').addEventListener('click', ()=>{
+  articlesNdot.style.display = 'none';
+});
+
+// ===== 初始化 =====
+function initGalaxy(){
+  resizeCanvas();
+  recenter();
+  // 预热模拟
+  for (let i=0;i<80;i++) sim.tick();
+  // 初始把整幅图适配到屏幕
+  fitView(null);
+  draw();
+  drawMinimap();
+}
+if (document.readyState === 'complete') initGalaxy();
+else window.addEventListener('load', initGalaxy);
+
+window.addEventListener('resize', ()=>{
+  resizeCanvas();
+  recenter();
+  drawMinimap();
+});
+
+
+
+/* ---------- icon set: 5 concepts ---------- */
+const ICONS = {
+  A: { // Atom — 3 orbits + nucleus  (classic)
+    name:'Atom Nucleus',
+    desc:'三条轨道环绕核心 — 最直白的"原子"叙事',
+    svg:(s=2.2)=>`<g fill="none" stroke="currentColor" stroke-width="${s}" stroke-linecap="round">
+      <circle cx="16" cy="16" r="2"/>
+      <ellipse cx="16" cy="16" rx="11" ry="4"/>
+      <ellipse cx="16" cy="16" rx="11" ry="4" transform="rotate(60 16 16)"/>
+      <ellipse cx="16" cy="16" rx="11" ry="4" transform="rotate(-60 16 16)"/>
+    </g>`
+  },
+  B: { // Flow — river-like waveform through nucleus
+    name:'Atom Flow',
+    desc:'一条流过核心的笔画 — "原子 + 流" 的合体',
+    svg:(s=2.2)=>`<g fill="none" stroke="currentColor" stroke-width="${s}" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 17 C 8 9, 12 25, 16 17 S 24 9, 29 15"/>
+      <circle cx="16" cy="17" r="2.2" fill="currentColor" stroke="none"/>
+    </g>`
+  },
+  C: { // Prism — A-shape with atom inside  (AtomFlow letter-mark)
+    name:'A-Prism',
+    desc:'字母 A 内嵌原子 — 适合做 wordmark',
+    svg:(s=2.2)=>`<g fill="none" stroke="currentColor" stroke-width="${s}" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 27 L16 5 L27 27"/>
+      <path d="M9.5 19 L22.5 19"/>
+      <circle cx="16" cy="19" r="2.2" fill="currentColor" stroke="none"/>
+    </g>`
+  },
+  D: { // Spark — four-point sparkle with orbit
+    name:'Spark Orbit',
+    desc:'四芒星 + 外环轨道 — 承接现有 Sparkles favicon',
+    svg:(s=2.2)=>`<g fill="none" stroke="currentColor" stroke-width="${s}" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M16 4 L17.6 12.2 L25.8 13.8 L17.6 15.4 L16 23.6 L14.4 15.4 L6.2 13.8 L14.4 12.2 Z"/>
+      <path d="M4 26 Q 16 22, 28 26"/>
+    </g>`
+  },
+  E: { // Dots → converge: three particles flowing into a nucleus
+    name:'Converge',
+    desc:'三个点流向核心 — 强调"卡片凝聚成文章"',
+    svg:(s=2.2)=>`<g fill="none" stroke="currentColor" stroke-width="${s}" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="5" cy="7" r="1.8" fill="currentColor" stroke="none"/>
+      <circle cx="5" cy="16" r="1.8" fill="currentColor" stroke="none"/>
+      <circle cx="5" cy="25" r="1.8" fill="currentColor" stroke="none"/>
+      <path d="M8 7 C 16 10, 20 14, 22 16"/>
+      <path d="M8 16 L 22 16"/>
+      <path d="M8 25 C 16 22, 20 18, 22 16"/>
+      <circle cx="24" cy="16" r="3.2"/>
+    </g>`
+  }
+};
+
+/* render icon lab */
+function paintIconLab(selected='A'){
+  const lab = document.getElementById('iconlab');
+  lab.innerHTML = Object.entries(ICONS).map(([k,v])=>`
+    <div class="icon-cell" data-icon="${k}" style="${k===selected?'box-shadow:0 0 0 2px var(--accent)':''}">
+      <div class="box" style="color:var(--accent)">
+        <svg width="54" height="54" viewBox="0 0 32 32">${v.svg(2.2)}</svg>
+      </div>
+      <h6>${k} · ${v.name}</h6>
+      <p>${v.desc}</p>
+      <div class="mini">
+        <svg width="14" height="14" viewBox="0 0 32 32">${v.svg(2.6)}</svg>
+        <svg width="18" height="18" viewBox="0 0 32 32">${v.svg(2.4)}</svg>
+        <svg width="22" height="22" viewBox="0 0 32 32">${v.svg(2.2)}</svg>
+      </div>
+    </div>`).join('');
+  lab.querySelectorAll('.icon-cell').forEach(el=>{
+    el.addEventListener('click',()=>{
+      const k = el.dataset.icon;
+      pickIcon(k);
+    });
+  });
+  // mini size previews (bottom row)
+  ['mini1','mini2','mini3','mini4'].forEach(id=>{
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = ICONS[selected].svg(2.4);
+    if (el) el.style.color = 'var(--accent)';
+  });
+  // brand mark
+  const b = document.getElementById('brand-mark');
+  b.innerHTML = `<svg width="22" height="22" viewBox="0 0 32 32">${ICONS[selected].svg(2.4)}</svg>`;
+  b.style.color = 'var(--accent)';
+}
+
+/* pick state */
+const picked = { layout:null, icon:'A' };
+function refreshPickbar(){
+  document.querySelectorAll('#pickbar [data-pick]').forEach(b=>{
+    b.classList.toggle('picked', String(picked.layout)===b.dataset.pick);
+  });
+  document.querySelectorAll('#pickbar [data-icon]').forEach(b=>{
+    b.classList.toggle('picked', picked.icon===b.dataset.icon);
+  });
+}
+function pickLayout(n){ picked.layout=n; localStorage.setItem('af_pick_layout',n); refreshPickbar(); }
+function pickIcon(k){ picked.icon=k; localStorage.setItem('af_pick_icon',k); paintIconLab(k); refreshPickbar(); }
+document.querySelectorAll('#pickbar [data-pick]').forEach(b=> b.addEventListener('click',()=>pickLayout(b.dataset.pick)));
+document.querySelectorAll('#pickbar [data-icon]').forEach(b=> b.addEventListener('click',()=>pickIcon(b.dataset.icon)));
+
+/* segmented controls */
+function wireSeg(id, attr, fn){
+  const box = document.getElementById(id);
+  box.querySelectorAll('button').forEach(b=>{
+    b.addEventListener('click',()=>{
+      box.querySelectorAll('button').forEach(x=>x.classList.remove('on'));
+      b.classList.add('on'); fn(b.dataset[attr]);
+    });
+  });
+}
+wireSeg('theme-seg','theme',v=>{
+  document.documentElement.classList.toggle('dark', v==='dark');
+});
+wireSeg('font-seg','font',v=>{
+  document.body.style.fontFamily =
+    v==='serif' ? '"Noto Serif SC","Fraunces",serif' :
+    v==='sans'  ? 'Inter,"PingFang SC",sans-serif' :
+                  'Inter,"PingFang SC",sans-serif';
+  // toggle serif inside editors
+  document.querySelectorAll('.paper-sheet p,.v-bench .editor-body p,.v-hum .reader p').forEach(p=>{
+    p.style.fontFamily = v==='sans' ? 'Inter,"PingFang SC",sans-serif' :
+                         v==='serif'? '"Noto Serif SC","Fraunces",serif' :
+                                      '';
+  });
+});
+wireSeg('dens-seg','dens',v=>{
+  const root = document.documentElement;
+  root.style.setProperty('--radius', v==='compact'?'8px':'12px');
+  document.body.style.letterSpacing = v==='compact'?'0':'.005em';
+  document.querySelectorAll('.paper-sheet').forEach(el=>{
+    el.style.padding = v==='compact'?'28px 40px':'42px 56px';
+  });
+});
+wireSeg('tone-seg','tone',v=>{
+  const root = document.documentElement.style;
+  if(v==='warm'){
+    root.setProperty('--bg','#FAFAF8');
+    root.setProperty('--surface','#FFFFFF');
+    root.setProperty('--surface2','#F3F1EA');
+    root.setProperty('--border','#E6E2D6');
+  } else if(v==='cool'){
+    root.setProperty('--bg','#F4F6F8');
+    root.setProperty('--surface','#FFFFFF');
+    root.setProperty('--surface2','#ECEFF3');
+    root.setProperty('--border','#DCE1E7');
+  } else {
+    root.setProperty('--bg','#FFFFFF');
+    root.setProperty('--surface','#FFFFFF');
+    root.setProperty('--surface2','#F5F5F5');
+    root.setProperty('--border','#EAEAEA');
+  }
+});
+
+/* restore */
+const savedIcon = localStorage.getItem('af_pick_icon');
+const savedLayout = localStorage.getItem('af_pick_layout');
+if (savedIcon) picked.icon = savedIcon;
+if (savedLayout) picked.layout = savedLayout;
+
+paintIconLab(picked.icon);
+refreshPickbar();
+
+/* highlight current section in top chips on scroll */
+const chips = document.querySelectorAll('.nav-chips .chip');
+const sections = ['v1','v2','v3','v4','v5','icons'].map(id=>document.getElementById(id));
+window.addEventListener('scroll',()=>{
+  const y = window.scrollY + 120;
+  let cur = 0;
+  sections.forEach((s,i)=>{ if (s.offsetTop <= y) cur = i; });
+  chips.forEach((c,i)=>c.classList.toggle('current', i===cur));
+});
+</script>
+
+</body>
+</html>

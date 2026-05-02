@@ -50,6 +50,7 @@ function AppContent() {
     "feed",
   );
   const { readingArticle, showLoginModal, setShowLoginModal, handleLoginSuccess, showProfileModal, setShowProfileModal } = useAppContext();
+  const isWriteTab = activeTab === 'write';
   const containerRef = useRef<HTMLDivElement>(null);
   const [navWidth, setNavWidth] = useState(260);
   const [centerWidth, setCenterWidth] = useState(560);
@@ -77,7 +78,7 @@ function AppContent() {
       const rect = container.getBoundingClientRect();
       const minNav = 220;
       const minCenter = 360;
-      const minRight = 320;
+      const minRight = activeTab === 'write' ? 320 : 320;
       const available = rect.width - SPLITTER;
       const maxNav = Math.max(minNav, available - minCenter - minRight);
       const offsetX = event.clientX - rect.left;
@@ -172,10 +173,10 @@ function AppContent() {
       <div
         className={`
           flex flex-col overflow-hidden
-          ${isMobile ? 'flex-1' : activeTab === 'write' ? 'flex-1 border-r border-border' : 'shrink-0 border-r border-border'}
+          ${isMobile ? 'flex-1' : isWriteTab ? 'flex-1 border-r border-border' : 'shrink-0 border-r border-border'}
           ${isMobile && readingArticle ? 'hidden' : ''}
         `}
-        style={{ width: isMobile ? '100%' : activeTab === 'write' ? undefined : centerWidth }}
+        style={{ width: isMobile ? '100%' : isWriteTab ? undefined : centerWidth }}
       >
         {/* 移动端顶部栏 */}
         {isMobile && (
@@ -196,31 +197,45 @@ function AppContent() {
         
         {activeTab === "feed" && <FeedPage />}
         {activeTab === "knowledge" && <KnowledgePage />}
-        {activeTab === "write" && <WritePage />}
+        {activeTab === "write" && (
+          <div className="flex h-full min-h-0 flex-col bg-bg">
+            {isMobile ? (
+              <div className="min-h-0 flex-1 p-4">
+                <WritePage />
+              </div>
+            ) : (
+              <div className="min-h-0 flex-1 p-4">
+                <WritePage />
+              </div>
+            )}
+          </div>
+        )}
         {activeTab === "discover" && <DiscoverPage />}
       </div>
 
-      {/* 右侧阅读区 */}
-      <div
-        className={`
-          ${isMobile ? 'fixed inset-0 z-30 bg-surface' : activeTab === 'write' ? 'min-w-[400px] w-[400px] shrink-0' : 'flex-1 min-w-[320px]'}
-          overflow-hidden bg-surface
-          ${isMobile && !readingArticle ? 'hidden' : ''}
-        `}
-      >
-        {readingArticle ? (
-          <ReaderPane onClose={isMobile ? () => {} : undefined} />
-        ) : (
-          <div className="h-full flex flex-col items-center justify-center bg-surface border-l border-border">
-            <div className="w-24 h-24 mb-6 opacity-20">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" />
-              </svg>
+      {/* 右侧阅读区 / 写作助手区 */}
+      {!isWriteTab && (
+        <div
+          className={`
+            ${isMobile ? 'fixed inset-0 z-30 bg-surface' : 'flex-1 min-w-[320px]'}
+            overflow-hidden
+            ${isMobile && !readingArticle ? 'hidden' : ''}
+          `}
+        >
+          {readingArticle ? (
+            <ReaderPane onClose={isMobile ? () => {} : undefined} />
+          ) : (
+            <div className="h-full flex flex-col items-center justify-center bg-surface border-l border-border">
+              <div className="w-24 h-24 mb-6 opacity-20">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" />
+                </svg>
+              </div>
+              <p className="text-text3 text-[15px]">选择一篇文章开始阅读</p>
             </div>
-            <p className="text-text3 text-[15px]">选择一篇文章开始阅读</p>
-          </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
 
       <Toast />
       <LoginModal

@@ -3,6 +3,7 @@ import { useAppContext } from '../context/AppContext';
 import { Article, AtomCard, SavedArticle } from '../types';
 import { CARD_COLORS } from '../constants';
 import { Search, Plus, ExternalLink } from 'lucide-react';
+import { InspirationButton } from '../components/InspirationButton';
 import { findLinkedArticle, getCardSourceLabel } from '../utils/articleDisplay';
 
 export const KnowledgePage: React.FC = () => {
@@ -149,12 +150,10 @@ export const KnowledgePage: React.FC = () => {
                   {sa.excerpt}
                 </p>
                 <div className="mt-3 flex gap-2" onClick={e => e.stopPropagation()}>
-                  <button
-                    onClick={() => openSavedArticle(sa)}
-                    className="px-3 py-1.5 rounded-lg text-[13px] font-medium border border-border text-text2 hover:bg-surface2 transition-colors"
-                  >
-                    阅读全文
-                  </button>
+                  <InspirationButton
+                    articleTitle={sa.title}
+                    savedArticleId={sa.id}
+                  />
                   {sa.url && (
                     <a
                       href={sa.url}
@@ -274,7 +273,7 @@ const EditModal = ({ card, onClose }: { card: Partial<AtomCard>, onClose: () => 
               onChange={e => setFormData({...formData, type: e.target.value as any})}
               className="w-full bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none"
             >
-              {['观点', '数据', '金句', '故事'].map(t => <option key={t} value={t}>{t}</option>)}
+              {['观点', '数据', '金句', '故事', '灵感'].map(t => <option key={t} value={t}>{t}</option>)}
             </select>
           </div>
           

@@ -16,7 +16,11 @@ import bcrypt from "bcryptjs";
 import { Resend } from "resend";
 import nodemailer from "nodemailer";
 import sharp from "sharp";
-import type { IncomingMessage } from "http";
+import { createServer, type IncomingMessage } from "http";
+import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
+import { gzipSync, gunzipSync } from "zlib";
+import { randomUUID } from "crypto";
+import { URL } from "url";
 import pino from "pino";
 import pinoHttp from "pino-http";
 
@@ -626,6 +630,463 @@ const buildCardsFromArticleContent = (article: Article): Omit<AtomCard, "id" | "
       ];
 };
 
+type WritingCardInput = {
+  id?: string;
+  type: AtomCard["type"];
+  content: string;
+  tags?: string[];
+  articleTitle?: string;
+  articleId?: number;
+  savedArticleId?: number;
+};
+
+type WritingOutlineSection = {
+  heading: string;
+  goal: string;
+};
+
+type WritingPlanResult = {
+  title: string;
+  angle: string;
+  style: string;
+  outline: WritingOutlineSection[];
+};
+
+type WritingEvidenceMapItem = {
+  section: string;
+  nodeIds: string[];
+  note: string;
+};
+
+type WriteAgentState = {
+  focusedTopic?: string;
+  activatedNodeIds?: string[];
+  activationSummary?: string[];
+  latestOutline?: WritingOutlineSection[];
+  latestAngle?: string;
+  lastGeneratedNoteId?: number;
+  lastGeneratedNoteTitle?: string;
+};
+
+const sanitizeWritingCards = (cards: unknown[]): WritingCardInput[] => {
+  const normalizedCards: WritingCardInput[] = [];
+  for (const item of cards) {
+    const card = item as Record<string, unknown>;
+    if (
+      typeof card?.type !== "string" ||
+      !VALID_WRITING_CARD_TYPES.has(card.type) ||
+      typeof card?.content !== "string" ||
+      card.content.trim().length < 2
+    ) {
+      continue;
+    }
+    normalizedCards.push({
+      id: typeof card.id === "string" ? card.id : undefined,
+      type: card.type as AtomCard["type"],
+      content: card.content.trim().slice(0, 220),
+      tags: Array.isArray(card.tags) ? card.tags.filter((tag): tag is string => typeof tag === "string").slice(0, 6) : [],
+      articleTitle: typeof card.articleTitle === "string" ? card.articleTitle : undefined,
+      articleId: typeof card.articleId === "number" ? card.articleId : undefined,
+      savedArticleId: typeof card.savedArticleId === "number" ? card.savedArticleId : undefined
+    });
+  }
+  return normalizedCards;
+};
+
+const summarizeWritingCards = (cards: WritingCardInput[]) => {
+  const tagCounts = new Map<string, number>();
+  const typeCounts = new Map<string, number>();
+  cards.forEach(card => {
+    typeCounts.set(card.type, (typeCounts.get(card.type) || 0) + 1);
+    (card.tags || []).forEach(tag => tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1));
+  });
+  const topTags = Array.from(tagCounts.entries())
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 8)
+    .map(([tag]) => tag);
+  const typeSummary = Array.from(typeCounts.entries())
+    .sort((left, right) => right[1] - left[1])
+    .map(([type, count]) => `${type} x${count}`)
+    .join("、");
+  return { topTags, typeSummary };
+};
+
+const buildFallbackDraft = (topic: string, cards: WritingCardInput[]) => {
+  const { topTags } = summarizeWritingCards(cards);
+  const viewpoints = cards.filter(card => card.type === "观点" || card.type === "灵感");
+  const evidence = cards.filter(card => card.type === "数据" || card.type === "金句");
+  const stories = cards.filter(card => card.type === "故事");
+  const opening = viewpoints[0]?.content || cards[0]?.content || "这组素材里最重要的，不是信息本身，而是它们之间的关系。";
+  const secondPoint = viewpoints[1]?.content || evidence[0]?.content || cards[1]?.content || "";
+  const quote = evidence.find(card => card.type === "金句")?.content || "";
+  const dataPoint = evidence.find(card => card.type === "数据")?.content || "";
+  const story = stories[0]?.content || cards.find(card => card.articleTitle)?.content || "";
+
+  return [
+    `# ${topic}`,
+    "",
+    `${opening}${secondPoint ? ` 更进一步看，${secondPoint}` : ""}`,
+    "",
+    "## 为什么这件事值得写",
+    "",
+    `${cards.slice(0, 3).map(card => card.content).join("；")}。这些节点放在一起看，说明问题并不只是表层现象，而是已经形成了可被复用的判断框架。`,
+    "",
+    "## 这组知识之间真正的连接",
+    "",
+    dataPoint ? `${dataPoint}。这让判断不再停留在感受层面。` : "仅靠单个观点很难成立，但当这些节点彼此支撑时，文章就有了骨架。",
+    quote ? `${quote}。这句话适合作为文章里的情绪锚点。` : "",
+    story ? `${story}。案例的价值不在热闹，而在于把抽象判断落到具体场景。` : "",
+    "",
+    "## 可以如何落成一篇完整文章",
+    "",
+    `如果把这篇文章继续往下写，可以围绕“${topic}”展开三步：先把问题讲透，再把判断立住，最后把方法或启发交代清楚。${topTags.length ? ` 目前最值得继续补强的标签是：${topTags.join("、")}。` : ""}`,
+    "",
+    "## 可继续补强",
+    "",
+    "- 补 1 个更具体的数据或样本",
+    "- 补 1 个反例，让观点更稳",
+    "- 补 1 个来自原文的细节场景",
+    "- 再压缩一次开头，让判断更快出现"
+  ].filter(Boolean).join("\n");
+};
+
+const buildWritingUserPrompt = (topic: string, activeCards: WritingCardInput[], extraCards: WritingCardInput[]) => {
+  const cardBlock = activeCards
+    .map((card, index) => `${index + 1}. [${card.type}] ${card.content}${card.tags?.length ? ` | tags: ${card.tags.join("、")}` : ""}${card.articleTitle ? ` | source: ${card.articleTitle}` : ""}`)
+    .join("\n");
+  const extraBlock = extraCards.length > 0
+    ? extraCards
+      .map((card, index) => `${index + 1}. [${card.type}] ${card.content}${card.tags?.length ? ` | tags: ${card.tags.join("、")}` : ""}`)
+      .join("\n")
+    : "无";
+  const { topTags, typeSummary } = summarizeWritingCards(activeCards);
+
+  return `写作主题：${topic}
+
+参考素材概览（${activeCards.length} 条，类型分布：${typeSummary || "未统计"}，高频标签：${topTags.join("、") || "无"}）：
+
+核心参考素材：
+${cardBlock}
+
+补充参考素材：
+${extraBlock}
+
+重要提醒：以上素材仅供参考和启发，不要逐条搬运或罗列。请用自己的语言写一篇有独立观点、叙事连贯的原创文章。素材是背景知识，不是文章骨架。`;
+};
+
+const WRITING_PLAN_SYSTEM_PROMPT = `你是一位资深内容策划师。你的目标是设计一篇有独立观点、叙事连贯的原创文章结构，而不是对素材做分类整理。
+
+你必须输出严格 JSON，字段如下：
+{
+  "title": "文章标题",
+  "angle": "一句话说明文章的核心判断——必须是作者自己的立场，不是对素材的总结",
+  "style": "评论型|分析型|叙事型|方法型 中的一个",
+  "outline": [
+    { "heading": "二级标题", "goal": "这一节要完成什么论证" }
+  ]
+}
+
+规则：
+1. 提纲控制在 3 到 4 个 section，每个 section 要有自己的论点推进，不是按素材分类。
+2. 标题要像专栏作家写的，有锐度，不要空泛模板。
+3. angle 必须是可落地的判断，不是主题复述，不是"从多个角度看XXX"。
+4. outline 的结构应该是：提出问题 → 给出判断 → 展开论证 → 收束结论，而不是按素材类型罗列。
+5. 素材只是背景知识和灵感来源，文章结构要围绕作者自己的观点展开。
+6. 严格只输出 JSON。`;
+
+const WRITING_POLISH_SYSTEM_PROMPT = `你是中文写作润色 Agent。你的任务是让草稿更像真人写的，而不是改换观点。
+
+要求：
+1. 保留原有结构、结论和论证顺序。
+2. 删除套话、空话、AI 腔。
+3. 让句子更自然、更有推进感，但不要堆修辞。
+4. 输出纯 Markdown，不要解释。`;
+
+const AI_REQUEST_TIMEOUT_MS = 120000;
+const AI_DRAFT_MAX_TOKENS = 2400;
+const AI_POLISH_MAX_TOKENS = 2400;
+
+const safeJsonParse = <T>(raw: string): T | null => {
+  try {
+    const cleaned = raw.replace(/```json\s*/g, '').replace(/```/g, '').trim();
+    return JSON.parse(cleaned) as T;
+  } catch {
+    return null;
+  }
+};
+
+const sanitizeWritingPlan = (plan: WritingPlanResult | null, topic: string): WritingPlanResult => {
+  const fallbackOutline: WritingOutlineSection[] = [
+    { heading: "为什么这件事值得写", goal: "把问题和判断先立住" },
+    { heading: "这组素材真正说明了什么", goal: "把核心论证讲透" },
+    { heading: "可以怎样继续展开", goal: "把行动建议或后续写法收束出来" }
+  ];
+  if (!plan) {
+    return {
+      title: topic,
+      angle: `围绕“${topic}”提炼出一个更扎实的判断`,
+      style: "分析型",
+      outline: fallbackOutline
+    };
+  }
+  const title = typeof plan.title === "string" && plan.title.trim() ? plan.title.trim().slice(0, 40) : topic;
+  const angle = typeof plan.angle === "string" && plan.angle.trim()
+    ? plan.angle.trim().slice(0, 120)
+    : `围绕“${topic}”提炼出一个更扎实的判断`;
+  const style = typeof plan.style === "string" && ["评论型", "分析型", "叙事型", "方法型"].includes(plan.style)
+    ? plan.style
+    : "分析型";
+  const outline = Array.isArray(plan.outline)
+    ? plan.outline
+      .map(item => ({
+        heading: typeof item?.heading === "string" ? item.heading.trim().slice(0, 24) : "",
+        goal: typeof item?.goal === "string" ? item.goal.trim().slice(0, 80) : ""
+      }))
+      .filter(item => item.heading && item.goal)
+      .slice(0, 4)
+    : [];
+
+  return {
+    title,
+    angle,
+    style,
+    outline: outline.length >= 2 ? outline : fallbackOutline
+  };
+};
+
+const buildWritingPlanPrompt = (topic: string, activeCards: WritingCardInput[], extraCards: WritingCardInput[]) => {
+  return `${buildWritingUserPrompt(topic, activeCards, extraCards)}
+
+现在不要写正文，只做写作策划。`;
+};
+
+const buildDraftPrompt = (topic: string, plan: WritingPlanResult, activeCards: WritingCardInput[], extraCards: WritingCardInput[]) => {
+  const outlineText = plan.outline.map((item, index) => `${index + 1}. ${item.heading} - ${item.goal}`).join("\n");
+  const cardLookup = activeCards
+    .map((card, index) => `A${index + 1} [${card.type}] ${card.content}${card.tags?.length ? ` | ${card.tags.join("、")}` : ""}`)
+    .join("\n");
+  const extraLookup = extraCards
+    .map((card, index) => `B${index + 1} [${card.type}] ${card.content}${card.tags?.length ? ` | ${card.tags.join("、")}` : ""}`)
+    .join("\n") || "无";
+  return `主题：${topic}
+写作风格：${plan.style}
+核心判断：${plan.angle}
+文章标题：${plan.title}
+
+提纲：
+${outlineText}
+
+参考素材（仅供参考，不要逐条搬运）：
+${cardLookup}
+
+补充素材：
+${extraLookup}
+
+请按以上提纲写出完整 Markdown 正文。要求：
+1. 标题使用「# ${plan.title}」
+2. 二级标题严格对应提纲
+3. 这是一篇原创文章，不是素材汇编。用自己的语言写作，素材只是背景知识
+4. 不要逐条引用素材，不要出现”某某卡片提到””根据资料显示””从这些观点可以看出”
+5. 文章要有明确的叙事推进：提出问题 → 给出判断 → 展开论证 → 收束结论
+6. 写法像一个有见解的专栏作家，不是在做读书笔记
+7. 不要输出解释`;
+};
+
+const buildEvidenceMap = (plan: WritingPlanResult, activeCards: WritingCardInput[]): WritingEvidenceMapItem[] => {
+  const groupedCards = activeCards.map(card => ({
+    id: card.id || `${card.type}-${card.content.slice(0, 12)}`,
+    text: `${card.content} ${(card.tags || []).join(" ")} ${(card.articleTitle || "")}`.toLowerCase()
+  }));
+  return plan.outline.map(section => {
+    const sectionText = `${section.heading} ${section.goal}`.toLowerCase();
+    const matched = groupedCards
+      .filter(card => {
+        const tokens = sectionText.split(/[\s，。.!?！？、;；:：]+/).filter(Boolean);
+        return tokens.some(token => token.length >= 2 && card.text.includes(token));
+      })
+      .slice(0, 3)
+      .map(card => card.id);
+    return {
+      section: section.heading,
+      nodeIds: matched.length > 0 ? matched : groupedCards.slice(0, 2).map(card => card.id),
+      note: section.goal
+    };
+  });
+};
+
+const summarizeAgentMessages = (messages: Array<{ role: string; content: string }>) => {
+  const compact = messages
+    .slice(-10)
+    .map(message => `${message.role === 'user' ? '用户' : message.role === 'assistant' ? '助手' : '工具'}：${normalizePlainText(message.content).slice(0, 120)}`)
+    .join(' | ');
+  return compact.slice(0, 1200);
+};
+
+const inferThreadTitle = (input: string) => normalizePlainText(input).slice(0, 24) || '新的写作会话';
+
+const getRecentThreadMessages = async (pool: pg.Pool, threadId: number, limit = 16) => {
+  const rows = (await pool.query(
+    `SELECT id, role, content, meta, created_at
+     FROM write_agent_messages
+     WHERE thread_id = $1
+     ORDER BY created_at DESC
+     LIMIT $2`,
+    [threadId, limit]
+  )).rows;
+  return rows.reverse().map(row => ({
+    id: Number(row.id),
+    role: row.role as 'user' | 'assistant' | 'tool',
+    content: row.content as string,
+    meta: row.meta || {},
+    created_at: row.created_at
+  }));
+};
+
+const upsertThreadState = async (
+  pool: pg.Pool,
+  threadId: number,
+  summary: string,
+  state: WriteAgentState,
+  title?: string
+) => {
+  await pool.query(
+    `UPDATE write_agent_threads
+     SET summary = $1,
+         state = $2,
+         title = COALESCE($3, title),
+         updated_at = NOW()
+     WHERE id = $4`,
+    [summary, JSON.stringify(state || {}), title ?? null, threadId]
+  );
+};
+
+const fetchUserSavedCards = async (pool: pg.Pool, userId: number) => {
+  return (await pool.query(
+    `SELECT id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId", saved_article_id AS "savedArticleId"
+     FROM saved_cards WHERE user_id = $1`,
+    [userId]
+  )).rows.map(row => ({
+    ...row,
+    tags: typeof row.tags === 'string' ? JSON.parse(row.tags) : row.tags
+  }));
+};
+
+const toolRecallCards = (topic: string, cards: any[], excludeIds: string[] = []) => {
+  const normalizedTopic = (topic || '').trim().toLowerCase();
+  if (!normalizedTopic) return [];
+  const keywords = normalizedTopic.split(/[\s,，。.!?！？、;；:：]+/).filter(keyword => keyword.length >= 2);
+  const excludeSet = new Set(excludeIds);
+  return cards.filter(card => {
+    if (excludeSet.has(card.id)) return false;
+    const text = `${card.content} ${(card.tags || []).join(' ')} ${card.articleTitle || ''}`.toLowerCase();
+    return keywords.some(keyword => text.includes(keyword));
+  }).slice(0, 8);
+};
+
+const toolGetActiveNetwork = (cards: any[], activatedNodeIds: string[] = []) => {
+  const activatedSet = new Set(activatedNodeIds);
+  return cards.filter(card => activatedSet.has(card.id));
+};
+
+const toolListRecentNotes = async (pool: pg.Pool, userId: number, limit = 4) => {
+  return (await pool.query(
+    `SELECT id, title, content, meta, updated_at
+     FROM notes
+     WHERE user_id = $1
+     ORDER BY updated_at DESC
+     LIMIT $2`,
+    [userId, limit]
+  )).rows;
+};
+
+const buildNoteActivatedNodes = (cards: WritingCardInput[]) => {
+  return cards.map(card => ({
+    id: card.id || `${card.type}-${normalizePlainText(card.content).slice(0, 24)}`,
+    type: card.type,
+    content: card.content,
+    articleTitle: card.articleTitle || '未命名文章',
+    articleId: card.articleId,
+    tags: card.tags || []
+  }));
+};
+
+const buildNoteSourceArticles = (cards: WritingCardInput[]) => {
+  const unique = new Map<string, {
+    savedArticleId?: number;
+    articleId?: number;
+    title: string;
+    source: string;
+    excerpt?: string;
+  }>();
+  cards.forEach(card => {
+    const key = card.savedArticleId
+      ? `saved-${card.savedArticleId}`
+      : `article-${card.articleId ?? card.articleTitle ?? card.content.slice(0, 20)}`;
+    if (unique.has(key)) return;
+    unique.set(key, {
+      savedArticleId: card.savedArticleId,
+      articleId: card.articleId,
+      title: card.articleTitle || '未命名文章',
+      source: '知识库文章',
+      excerpt: card.content.slice(0, 140)
+    });
+  });
+  return Array.from(unique.values());
+};
+
+// 从写作卡片中提取唯一来源文章列表
+const buildSourceArticlesFromCards = (cardsForWriting: any[], dbCards: any[]) => {
+  const articleMap = new Map<string, { articleId?: number; articleTitle: string; url?: string; cardIds: number[] }>();
+  const allCards = dbCards.length > 0 ? dbCards : cardsForWriting;
+  for (const card of allCards) {
+    const key = card.saved_article_id ? `article_${card.saved_article_id}` : `title_${card.article_title || card.context_title || '未知来源'}`;
+    if (!articleMap.has(key)) {
+      articleMap.set(key, {
+        articleId: card.saved_article_id || undefined,
+        articleTitle: card.article_title || card.context_title || '未知来源',
+        url: card.article_url || undefined,
+        cardIds: [],
+      });
+    }
+    articleMap.get(key)!.cardIds.push(card.id);
+  }
+  return Array.from(articleMap.values());
+};
+
+const createAgentDraftNote = async (
+  pool: pg.Pool,
+  userId: number,
+  input: {
+    title: string;
+    content: string;
+    topic: string;
+    style: string;
+    outline: WritingOutlineSection[];
+    evidenceMap: WritingEvidenceMapItem[];
+    activeCards: WritingCardInput[];
+    activationSummary: string[];
+    sourceArticles?: Array<{ articleId?: number; articleTitle: string; url?: string; cardIds: number[] }>;
+  }
+) => {
+  const tags = Array.from(new Set(input.activeCards.flatMap(card => card.tags || []))).slice(0, 10);
+  const meta = {
+    topic: input.topic,
+    style: input.style,
+    outline: input.outline,
+    activationSummary: input.activationSummary,
+    activatedNodes: buildNoteActivatedNodes(input.activeCards),
+    evidenceMap: input.evidenceMap,
+    sourceArticles: input.sourceArticles || buildNoteSourceArticles(input.activeCards)
+  };
+  const row = (await pool.query(
+    `INSERT INTO notes (user_id, title, content, tags, meta)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, title, content, tags, meta, created_at, updated_at`,
+    [userId, input.title, input.content, JSON.stringify(tags), JSON.stringify(meta)]
+  )).rows[0];
+  return row;
+};
+
 // --- AI-powered card extraction (with fallback to regex) ---
 const AI_SYSTEM_PROMPT = `你是一个知识提炼助手。请从文章中提取最多3张知识卡片。
 类型：观点、数据、金句、故事
@@ -638,8 +1099,27 @@ const AI_SYSTEM_PROMPT = `你是一个知识提炼助手。请从文章中提取
 2. tags 给2-5个语义标签
 3. 严格只输出JSON数组，不要输出任何其他内容
 格式：[{"type":"观点","content":"...","tags":["标签1","标签2"]}]`;
+const WRITING_AGENT_SYSTEM_PROMPT = `你是一位优秀的中文专栏作家。你的任务是写原创文章，不是做素材汇编。
 
-const VALID_CARD_TYPES = new Set(["观点", "数据", "金句", "故事"]);
+核心原则：
+1. 你拿到的”素材”只是背景知识和灵感来源。你要基于这些素材形成自己的观点，用自己的语言写作。
+2. 绝对不要逐条搬运素材内容。不要出现”某某观点认为””某某数据表明”这种罗列式写法。
+3. 文章要有明确的叙事推进关系：提出问题 → 给出判断 → 展开论证 → 收束结论。
+4. 写法像一个有独立见解的作者在表达自己的思考，而不是在整理别人的观点。
+5. 开头不要套话，不要”在当今时代””众所周知””让我们来看看”。
+6. 如果素材里有冲突观点，要写出冲突和你的判断，而不是抹平它。
+7. 如果素材不足，就写一篇更短但更扎实的文章，不要注水。
+8. 不要 AI 腔，不要假装引用不存在的数据。
+9. 输出必须是纯 Markdown，不要输出解释，不要输出 JSON，不要使用 HTML。
+
+格式要求：
+- 第一行直接是标题
+- 正文用短段落推进
+- 使用 2-4 个二级标题（##）
+- 段落之间要有逻辑推进，不是并列罗列`;
+
+const VALID_CARD_TYPES = new Set(["观点", "数据", "金句", "故事", "灵感"]);
+const VALID_WRITING_CARD_TYPES = new Set(["观点", "数据", "金句", "故事", "灵感"]);
 
 const extractCardsWithAI = async (
   article: Article
@@ -1027,11 +1507,36 @@ async function startServer() {
       title        TEXT NOT NULL DEFAULT '',
       content      TEXT NOT NULL DEFAULT '',
       tags         JSONB NOT NULL DEFAULT '[]'::jsonb,
+      meta         JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE notes ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id, updated_at DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_agent_threads (
+      id           BIGSERIAL PRIMARY KEY,
+      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title        TEXT NOT NULL DEFAULT '新的写作会话',
+      summary      TEXT NOT NULL DEFAULT '',
+      state        JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_threads_user ON write_agent_threads(user_id, updated_at DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_agent_messages (
+      id           BIGSERIAL PRIMARY KEY,
+      thread_id    BIGINT NOT NULL REFERENCES write_agent_threads(id) ON DELETE CASCADE,
+      role         TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
+      content      TEXT NOT NULL DEFAULT '',
+      meta         JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_messages_thread ON write_agent_messages(thread_id, created_at ASC)`);
 
   // User custom subscriptions
   await pool.query(`
@@ -1606,32 +2111,33 @@ async function startServer() {
   // --- Notes routes ---
   app.get("/api/notes", requireAuth, asyncHandler(async (req, res) => {
     const rows = (await pool.query(
-      'SELECT id, title, content, tags, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC',
+      'SELECT id, title, content, tags, meta, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC',
       [req.session.userId]
     )).rows;
     return res.json(rows);
   }));
 
   app.post("/api/notes", requireAuth, asyncHandler(async (req, res) => {
-    const { title, content, tags } = req.body;
+    const { title, content, tags, meta } = req.body;
     const row = (await pool.query(
-      'INSERT INTO notes (user_id, title, content, tags) VALUES ($1, $2, $3, $4) RETURNING id, title, content, tags, created_at, updated_at',
-      [req.session.userId, title || '', content || '', tags ? JSON.stringify(tags) : '[]']
+      'INSERT INTO notes (user_id, title, content, tags, meta) VALUES ($1, $2, $3, $4, $5) RETURNING id, title, content, tags, meta, created_at, updated_at',
+      [req.session.userId, title || '', content || '', tags ? JSON.stringify(tags) : '[]', meta ? JSON.stringify(meta) : '{}']
     )).rows[0];
     return res.json(row);
   }));
 
   app.put("/api/notes/:id", requireAuth, asyncHandler(async (req, res) => {
-    const { title, content, tags } = req.body;
+    const { title, content, tags, meta } = req.body;
     const row = (await pool.query(
       `UPDATE notes SET
         title = COALESCE($1, title),
         content = COALESCE($2, content),
         tags = COALESCE($3, tags),
+        meta = COALESCE($4, meta),
         updated_at = NOW()
-      WHERE id = $4 AND user_id = $5
-      RETURNING id, title, content, tags, created_at, updated_at`,
-      [title ?? null, content ?? null, tags ? JSON.stringify(tags) : null, req.params.id, req.session.userId]
+      WHERE id = $5 AND user_id = $6
+      RETURNING id, title, content, tags, meta, created_at, updated_at`,
+      [title ?? null, content ?? null, tags ? JSON.stringify(tags) : null, meta ? JSON.stringify(meta) : null, req.params.id, req.session.userId]
     )).rows[0];
     if (!row) return res.status(404).json({ error: '笔记不存在' });
     return res.json(row);
@@ -2135,9 +2641,12 @@ async function startServer() {
       id: Math.random().toString(36).substr(2, 9),
       articleTitle: req.body.articleTitle || "手动录入"
     };
+    if (!VALID_CARD_TYPES.has(newCard.type)) {
+      return res.status(400).json({ error: '无效的卡片类型' });
+    }
     await pool.query(
-      'INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-      [newCard.id, req.session.userId, newCard.type, newCard.content, JSON.stringify(newCard.tags), newCard.articleTitle, newCard.articleId || null]
+      'INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id, origin, saved_article_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+      [newCard.id, req.session.userId, newCard.type, newCard.content, JSON.stringify(newCard.tags), newCard.articleTitle, newCard.articleId || null, req.body.origin || 'manual', req.body.savedArticleId || null]
     );
     res.json(newCard);
   }));
@@ -2324,75 +2833,346 @@ async function startServer() {
     res.json({ cards: matched.length >= 2 ? matched : cardRows.slice(0, 10) });
   }));
 
-  // --- Writing: AI generate article ---
-  app.post("/api/write/generate", requireAuth, asyncHandler(async (req, res) => {
-    const { topic, cards } = req.body;
-    if (!topic || !Array.isArray(cards) || cards.length === 0) {
-      return res.status(400).json({ error: "topic and cards are required" });
+  app.get("/api/write/agent/threads", requireAuth, asyncHandler(async (req, res) => {
+    const rows = (await pool.query(
+      `SELECT id, title, summary, state, created_at, updated_at
+       FROM write_agent_threads
+       WHERE user_id = $1
+       ORDER BY updated_at DESC
+       LIMIT 30`,
+      [req.session.userId]
+    )).rows;
+    res.json(rows);
+  }));
+
+  app.post("/api/write/agent/threads", requireAuth, asyncHandler(async (req, res) => {
+    const { title } = req.body || {};
+    const row = (await pool.query(
+      `INSERT INTO write_agent_threads (user_id, title)
+       VALUES ($1, $2)
+       RETURNING id, title, summary, state, created_at, updated_at`,
+      [req.session.userId, typeof title === 'string' && title.trim() ? title.trim() : '新的写作会话']
+    )).rows[0];
+    res.json(row);
+  }));
+
+  app.get("/api/write/agent/threads/:id/messages", requireAuth, asyncHandler(async (req, res) => {
+    const thread = (await pool.query(
+      `SELECT id, title, summary, state, created_at, updated_at
+       FROM write_agent_threads
+       WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.session.userId]
+    )).rows[0];
+    if (!thread) return res.status(404).json({ error: 'thread not found' });
+    const messages = await getRecentThreadMessages(pool, Number(req.params.id), 60);
+    res.json({ thread, messages });
+  }));
+
+  app.post("/api/write/agent/chat", requireAuth, asyncHandler(async (req, res) => {
+    const { threadId, message, focusedTopic, activatedNodeIds, activationSummary, action } = req.body || {};
+    const isCreateArticle = action === 'create_article';
+    if (!isCreateArticle && (!message || typeof message !== 'string' || !message.trim())) {
+      return res.status(400).json({ error: 'message is required' });
     }
+    const normalizedMessage = isCreateArticle
+      ? (typeof message === 'string' && message.trim() ? message.trim() : '请根据当前对话和激活网络创建一篇文章')
+      : message.trim();
+
+    let thread = threadId
+      ? (await pool.query(
+        `SELECT id, title, summary, state, created_at, updated_at
+         FROM write_agent_threads
+         WHERE id = $1 AND user_id = $2`,
+        [threadId, req.session.userId]
+      )).rows[0]
+      : null;
+
+    if (!thread) {
+      thread = (await pool.query(
+        `INSERT INTO write_agent_threads (user_id, title, state)
+         VALUES ($1, $2, $3)
+         RETURNING id, title, summary, state, created_at, updated_at`,
+        [req.session.userId, inferThreadTitle(normalizedMessage), JSON.stringify({})]
+      )).rows[0];
+    }
+
+    const normalizedThreadId = Number(thread.id);
+    const userState: WriteAgentState = {
+      focusedTopic: typeof focusedTopic === 'string' ? focusedTopic : undefined,
+      activatedNodeIds: Array.isArray(activatedNodeIds) ? activatedNodeIds.filter((id): id is string => typeof id === 'string') : undefined,
+      activationSummary: Array.isArray(activationSummary) ? activationSummary.filter((item): item is string => typeof item === 'string') : undefined
+    };
+
+    await pool.query(
+      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+       VALUES ($1, 'user', $2, $3)`,
+      [normalizedThreadId, normalizedMessage, JSON.stringify({ state: userState, action: isCreateArticle ? 'create_article' : undefined })]
+    );
+
+    const dbCards = await fetchUserSavedCards(pool, req.session.userId);
+
+    const previousMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
+    const threadState = (thread.state || {}) as WriteAgentState;
+    const mergedState: WriteAgentState = {
+      focusedTopic: userState.focusedTopic || threadState.focusedTopic,
+      activatedNodeIds: userState.activatedNodeIds || threadState.activatedNodeIds || [],
+      activationSummary: userState.activationSummary || threadState.activationSummary || [],
+      latestOutline: Array.isArray(threadState.latestOutline) ? threadState.latestOutline : [],
+      latestAngle: typeof threadState.latestAngle === 'string' ? threadState.latestAngle : undefined,
+      lastGeneratedNoteId: threadState.lastGeneratedNoteId,
+      lastGeneratedNoteTitle: typeof threadState.lastGeneratedNoteTitle === 'string' ? threadState.lastGeneratedNoteTitle : undefined
+    };
+
+    const activeCardRows = toolGetActiveNetwork(dbCards, mergedState.activatedNodeIds || []);
+    const intentPrompt = `你是 AtomFlow 写作助手的路由器。请判断用户这句最新输入最需要哪些工具。
+
+可选工具：
+- recall_cards：当用户在找主题、补素材、想激活节点时
+- get_active_network：当用户在问当前网络、当前节点、围绕当前激活内容展开时
+- list_recent_notes：当用户提到最近文章、之前草稿、继续改写时
+- generate_outline：当用户要提纲、结构、章节安排时
+- generate_draft：当用户明确要生成、写正文、出草稿时
+- just_chat：当用户只是在对话、讨论、闲聊、提问、思考方向时，不需要任何工具
+
+严格输出 JSON：
+{
+  "tools": ["tool_a", "tool_b"],
+  "reason": "一句简短理由"
+}
+
+注意：大部分日常对话应该返回 ["just_chat"]，只有明确涉及上述操作才使用对应工具。`;
 
     const apiKey = process.env.AI_API_KEY;
     const baseUrl = process.env.AI_BASE_URL;
     const model = process.env.AI_MODEL;
     if (!apiKey || !baseUrl || !model) {
-      return res.status(500).json({ error: "AI service not configured" });
+      return res.status(500).json({ error: 'AI service not configured' });
     }
 
-    const cardText = cards.map((c: any, i: number) => `${i + 1}. [${c.type}] ${c.content}`).join('\n');
-
-    const prompt = `你是一个优秀的内容创作者。请根据以下主题和素材卡片，写一篇结构清晰、有观点、有论据的文章。
-
-主题：${topic}
-
-素材卡片：
-${cardText}
-
-要求：
-1. 文章800-1500字，分段清晰
-2. 自然融入卡片中的观点、数据、金句、故事作为论据
-3. 有引人入胜的开头和有力的结尾
-4. 语言风格自然流畅，不要AI腔（不要"让我们""在当今社会"这类套话）
-5. 输出纯Markdown格式（用##做小标题，不要用HTML）`;
-
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 60000);
-
+    const requestChat = async (messages: Array<{ role: "system" | "user" | "assistant"; content: string }>, temperature: number, maxTokens: number) => {
       const response = await fetch(`${baseUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
         body: JSON.stringify({
           model,
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 3000,
-          temperature: 0.7
-        }),
-        signal: controller.signal
+          messages,
+          max_tokens: maxTokens,
+          temperature
+        })
       });
-      clearTimeout(timeout);
-
       if (!response.ok) {
-        const errText = await response.text();
+        const errorText = await response.text();
         logger.error({
           module: "ai",
           status: response.status,
-          responseBody: errText.slice(0, 1000),
-        }, "AI generation request failed");
-        return res.status(500).json({ error: "AI generation failed" });
+          responseBody: errorText.slice(0, 1000),
+        }, "AI chat request failed");
+        throw new Error(`chat failed ${response.status}: ${errorText}`);
       }
-
       const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-      const content = data.choices?.[0]?.message?.content || '';
+      return (data.choices?.[0]?.message?.content || '').trim();
+    };
 
-      if (!content) {
-        return res.status(500).json({ error: "AI returned empty content" });
+    let rawIntent = '';
+    let parsedIntent: { tools?: string[]; reason?: string } | null = null;
+    let requestedTools: string[] = [];
+
+    if (isCreateArticle) {
+      requestedTools = ['recall_cards', 'generate_outline', 'generate_draft'];
+      parsedIntent = { tools: requestedTools, reason: 'user explicitly requested create_article' };
+    } else {
+      rawIntent = await requestChat([
+        { role: 'system', content: intentPrompt },
+        { role: 'user', content: `当前状态：topic=${mergedState.focusedTopic || '无'}; activeNodes=${(mergedState.activatedNodeIds || []).length}; latestMessage=${normalizedMessage}` }
+      ], 0.1, 300);
+      parsedIntent = safeJsonParse<{ tools?: string[]; reason?: string }>(rawIntent);
+      requestedTools = Array.isArray(parsedIntent?.tools)
+        ? parsedIntent!.tools.filter(tool => ['recall_cards', 'get_active_network', 'list_recent_notes', 'generate_outline', 'generate_draft', 'just_chat'].includes(tool))
+        : [];
+      // If just_chat or no real tools, clear the tool list so we skip all tool pipelines
+      if (requestedTools.length === 0 || (requestedTools.length === 1 && requestedTools[0] === 'just_chat')) {
+        requestedTools = [];
       }
-
-      res.json({ success: true, content });
-    } catch (err) {
-      logger.error({ err, module: "ai" }, "AI generation failed");
-      res.status(500).json({ error: "AI generation failed" });
     }
+
+    const recalledCards = requestedTools.includes('recall_cards')
+      ? toolRecallCards(`${normalizedMessage} ${mergedState.focusedTopic || ''}`, dbCards, activeCardRows.map(card => card.id))
+      : [];
+
+    const recentNotes = requestedTools.includes('list_recent_notes') || requestedTools.includes('generate_draft')
+      ? await toolListRecentNotes(pool, req.session.userId, 4)
+      : [];
+
+    const systemPrompt = `你是 AtomFlow 的写作助手 Agent。你不是普通闲聊助手，而是帮助用户围绕知识库、激活网络和文章草稿持续推进写作。
+
+你的行为规则：
+1. 先结合线程上下文、当前状态、激活网络，再回答。
+2. 如果用户在讨论写作方向、提纲、段落、改写，优先围绕写作任务推进，不跑题。
+3. 回答要短、具体、可执行，不说空话。
+4. 如果当前激活网络不足以支撑结论，要明确指出还缺什么。
+5. 你可以引用”当前激活节点””补充召回节点””最近文章草稿”，但不要伪造来源。
+6. 如果工具结果里已经包含提纲或草稿，就优先基于它们回答。
+7. 除非用户明确要求长文，否则默认回答简洁。
+8. 当引用知识节点时，用「来自《文章标题》」或节点编号标注来源，不要笼统地说”根据资料”。
+9. 如果已生成文章草稿，在回复中简要说明引用了哪些节点和原文。`;
+
+    let generatedOutlineText = '';
+    let generatedDraftText = '';
+    let generatedPlan: WritingPlanResult | null = null;
+    let persistedDraftNote: any = null;
+    const shouldGenerateDraft = isCreateArticle || requestedTools.includes('generate_draft');
+    const shouldGenerateOutline = isCreateArticle || requestedTools.includes('generate_outline') || shouldGenerateDraft;
+    if (shouldGenerateOutline) {
+      const cardsForWriting = sanitizeWritingCards(activeCardRows.length > 0 ? activeCardRows : recalledCards);
+      if (cardsForWriting.length > 0) {
+        const topicForWriting = mergedState.focusedTopic || normalizedMessage;
+        const planRaw = await requestChat([
+          { role: 'system', content: WRITING_PLAN_SYSTEM_PROMPT },
+          { role: 'user', content: buildWritingPlanPrompt(topicForWriting, cardsForWriting, sanitizeWritingCards(recalledCards)) }
+        ], 0.25, 1200);
+        generatedPlan = sanitizeWritingPlan(safeJsonParse<WritingPlanResult>(planRaw), topicForWriting);
+        generatedOutlineText = generatedPlan.outline.map(item => `- ${item.heading}：${item.goal}`).join('\n');
+
+        if (shouldGenerateDraft) {
+          generatedDraftText = await requestChat([
+            { role: 'system', content: WRITING_AGENT_SYSTEM_PROMPT },
+            { role: 'user', content: buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards)) }
+          ], 0.68, 2200);
+
+          if (generatedDraftText.trim()) {
+            const activationSummaryForNote = (mergedState.activationSummary || []).length > 0
+              ? (mergedState.activationSummary || [])
+              : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
+            const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
+            const sourceArticles = buildSourceArticlesFromCards(cardsForWriting, dbCards);
+            persistedDraftNote = await createAgentDraftNote(pool, req.session.userId, {
+              title: generatedPlan.title,
+              content: generatedDraftText.trim(),
+              topic: topicForWriting,
+              style: generatedPlan.style,
+              outline: generatedPlan.outline,
+              evidenceMap,
+              activeCards: cardsForWriting,
+              activationSummary: activationSummaryForNote,
+              sourceArticles
+            });
+          }
+        }
+      } else if (isCreateArticle) {
+        return res.status(400).json({ error: '知识库中没有可用的卡片，请先收藏一些文章并提取知识卡片' });
+      }
+    }
+
+    const toolPayload = {
+      requestedTools,
+      reason: parsedIntent?.reason || '',
+      activeCardIds: activeCardRows.map(card => card.id),
+      recalledCardIds: recalledCards.map(card => card.id),
+      outline: generatedPlan?.outline || [],
+      draftPreview: generatedDraftText.slice(0, 400),
+      noteId: persistedDraftNote ? Number(persistedDraftNote.id) : undefined,
+      noteTitle: persistedDraftNote?.title,
+      noteSaved: Boolean(persistedDraftNote),
+      noteTopic: mergedState.focusedTopic || normalizedMessage
+    };
+
+    if (requestedTools.length > 0) {
+      await pool.query(
+        `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+         VALUES ($1, 'tool', $2, $3)`,
+        [
+          normalizedThreadId,
+          [
+            `tools: ${requestedTools.join(', ')}`,
+            generatedOutlineText ? `outline:\n${generatedOutlineText}` : '',
+            generatedDraftText ? `draft:\n${generatedDraftText.slice(0, 600)}` : ''
+          ].filter(Boolean).join('\n\n'),
+          JSON.stringify(toolPayload)
+        ]
+      );
+    }
+
+    const userContextPrompt = `当前线程摘要：
+${typeof thread.summary === 'string' && thread.summary.trim() ? thread.summary : '暂无摘要'}
+
+当前状态：
+- focusedTopic: ${mergedState.focusedTopic || '无'}
+- activatedNodeIds: ${(mergedState.activatedNodeIds || []).join('、') || '无'}
+- activationSummary: ${(mergedState.activationSummary || []).join(' | ') || '无'}
+
+当前激活节点：
+${activeCardRows.length > 0 ? activeCardRows.map((card, index) => `${index + 1}. [${card.type}] ${card.content}`).join('\n') : '无'}
+
+补充召回节点：
+${recalledCards.length > 0 ? recalledCards.map((card, index) => `${index + 1}. [${card.type}] ${card.content}`).join('\n') : '无'}
+
+最近文章草稿：
+${recentNotes.length > 0 ? recentNotes.map((note, index) => `${index + 1}. ${note.title}\n${normalizePlainText(note.content).slice(0, 180)}`).join('\n\n') : '无'}
+
+工具路由：
+- selectedTools: ${requestedTools.join('、') || '无'}
+- toolReason: ${parsedIntent?.reason || '无'}
+
+提纲工具结果：
+${generatedOutlineText || '无'}
+
+正文工具结果：
+${generatedDraftText ? generatedDraftText.slice(0, 1200) : '无'}
+
+用户最新消息：
+${normalizedMessage}`;
+
+    const assistantContent = await requestChat([
+      { role: 'system', content: systemPrompt },
+      ...previousMessages
+        .filter((item): item is typeof item & { role: 'user' | 'assistant' } => item.role === 'user' || item.role === 'assistant')
+        .map(item => ({ role: item.role, content: item.content }))
+        .slice(-10),
+      { role: 'user', content: userContextPrompt }
+    ], 0.55, 1200);
+    if (!assistantContent) {
+      return res.status(500).json({ error: 'agent returned empty message' });
+    }
+
+    await pool.query(
+      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+       VALUES ($1, 'assistant', $2, $3)`,
+      [normalizedThreadId, assistantContent, JSON.stringify(toolPayload)]
+    );
+
+    const nextState: WriteAgentState = {
+      ...mergedState,
+      latestOutline: generatedPlan?.outline || mergedState.latestOutline || [],
+      latestAngle: generatedPlan?.angle || mergedState.latestAngle,
+      lastGeneratedNoteId: persistedDraftNote ? Number(persistedDraftNote.id) : mergedState.lastGeneratedNoteId,
+      lastGeneratedNoteTitle: persistedDraftNote?.title || mergedState.lastGeneratedNoteTitle
+    };
+
+    const finalMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
+    const summary = summarizeAgentMessages(finalMessages.map(item => ({ role: item.role, content: item.content })));
+    await upsertThreadState(pool, normalizedThreadId, summary, nextState, thread.title || inferThreadTitle(normalizedMessage));
+
+    res.json({
+      threadId: normalizedThreadId,
+      threadState: nextState,
+      assistant: {
+        role: 'assistant',
+        content: assistantContent
+      },
+      toolResult: toolPayload,
+      note: persistedDraftNote
+        ? {
+          id: Number(persistedDraftNote.id),
+          title: persistedDraftNote.title,
+          created_at: persistedDraftNote.created_at,
+          updated_at: persistedDraftNote.updated_at
+        }
+        : null,
+      context: {
+        activeCards: activeCardRows.length,
+        recalledCards: recalledCards.length
+      }
+    });
   }));
 
   // Vite middleware for development
@@ -2421,7 +3201,181 @@ ${cardText}
     res.status(500).json({ error: "Internal server error" });
   });
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const httpServer = createServer(app);
+
+  // ── Volcengine ASR WebSocket Proxy ──────────────────────────
+  const ASR_APPID = process.env.VOLCENGINE_ASR_APPID || "";
+  const ASR_TOKEN = process.env.VOLCENGINE_ASR_TOKEN || "";
+  const ASR_CLUSTER = process.env.VOLCENGINE_ASR_CLUSTER || "volcengine_streaming_common";
+  const ASR_WS_URL = "wss://openspeech.bytedance.com/api/v2/asr";
+
+  function buildAsrHeader(messageType: number, flags: number, serialization: number, compression: number): Buffer {
+    const header = Buffer.alloc(4);
+    header[0] = (0x01 << 4) | 0x01; // version 1, header size 1
+    header[1] = (messageType << 4) | flags;
+    header[2] = (serialization << 4) | compression;
+    header[3] = 0x00;
+    return header;
+  }
+
+  function buildFullClientRequest(reqid: string): Buffer {
+    const payload = JSON.stringify({
+      app: { appid: ASR_APPID, cluster: ASR_CLUSTER, token: ASR_TOKEN },
+      user: { uid: "atomflow-user" },
+      audio: { format: "raw", codec: "raw", rate: 16000, bits: 16, channel: 1, language: "zh-CN" },
+      request: {
+        reqid,
+        nbest: 1,
+        workflow: "audio_in,resample,partition,vad,fe,decode,itn,nlu_punctuate",
+        show_utterances: true,
+        result_type: "single",
+        sequence: 1,
+      },
+    });
+    const compressed = gzipSync(Buffer.from(payload, "utf-8"));
+    const header = buildAsrHeader(0x01, 0x00, 0x01, 0x01); // full client request, JSON, gzip
+    const sizeBuf = Buffer.alloc(4);
+    sizeBuf.writeUInt32BE(compressed.length);
+    return Buffer.concat([header, sizeBuf, compressed]);
+  }
+
+  function buildAudioRequest(audioData: Buffer, isLast: boolean): Buffer {
+    const compressed = gzipSync(audioData);
+    const header = buildAsrHeader(0x02, isLast ? 0x02 : 0x00, 0x00, 0x01); // audio only, no serialization, gzip
+    const sizeBuf = Buffer.alloc(4);
+    sizeBuf.writeUInt32BE(compressed.length);
+    return Buffer.concat([header, sizeBuf, compressed]);
+  }
+
+  function parseAsrResponse(data: Buffer): { code?: number; text?: string; utterances?: Array<{ text: string; definite: boolean }> } | null {
+    if (data.length < 4) return null;
+    const messageType = data[1] >> 4;
+    const compression = data[2] & 0x0f;
+    const headerSize = (data[0] & 0x0f) * 4;
+
+    if (messageType === 0x0f) {
+      // Error response
+      const code = data.readUInt32BE(headerSize);
+      const msgSize = data.readUInt32BE(headerSize + 4);
+      const msg = data.subarray(headerSize + 8, headerSize + 8 + msgSize).toString("utf-8");
+      logger.error({ module: "asr", code, upstreamMessage: msg }, "ASR upstream returned error response");
+      return { code };
+    }
+
+    if (messageType === 0x09) {
+      // Full server response
+      const payloadSize = data.readUInt32BE(headerSize);
+      let payload = data.subarray(headerSize + 4, headerSize + 4 + payloadSize);
+      if (compression === 0x01) {
+        payload = gunzipSync(payload);
+      }
+      const json = JSON.parse(payload.toString("utf-8"));
+      const result: { code?: number; text?: string; utterances?: Array<{ text: string; definite: boolean }> } = { code: json.code };
+      if (json.result && json.result.length > 0) {
+        result.text = json.result[0].text || "";
+        if (json.result[0].utterances) {
+          result.utterances = json.result[0].utterances;
+        }
+      }
+      return result;
+    }
+
+    return null;
+  }
+
+  const wss = new WebSocketServer({ server: httpServer, path: "/api/asr" });
+
+  wss.on("connection", (clientWs) => {
+    if (!ASR_APPID || !ASR_TOKEN) {
+      clientWs.send(JSON.stringify({ error: "ASR credentials not configured" }));
+      clientWs.close();
+      return;
+    }
+
+    const reqid = randomUUID();
+    let upstreamWs: WsWebSocket | null = null;
+    let upstreamReady = false;
+    const pendingAudio: Buffer[] = [];
+
+    const upstream = new WsWebSocket(ASR_WS_URL, {
+      headers: { Authorization: `Bearer; ${ASR_TOKEN}` },
+    });
+
+    upstream.on("open", () => {
+      upstreamWs = upstream;
+      // Send full client request
+      upstream.send(buildFullClientRequest(reqid));
+    });
+
+    upstream.on("message", (rawData) => {
+      const data = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData as ArrayBuffer);
+      const parsed = parseAsrResponse(data);
+      if (!parsed) return;
+
+      if (parsed.code === 1000) {
+        if (!upstreamReady) {
+          upstreamReady = true;
+          // Flush pending audio
+          for (const chunk of pendingAudio) {
+            upstream.send(buildAudioRequest(chunk, false));
+          }
+          pendingAudio.length = 0;
+        }
+        // Send transcript to client
+        if (parsed.text !== undefined) {
+          clientWs.send(JSON.stringify({ text: parsed.text, utterances: parsed.utterances }));
+        }
+      } else {
+        clientWs.send(JSON.stringify({ error: `ASR error code: ${parsed.code}` }));
+      }
+    });
+
+    upstream.on("error", (err) => {
+      logger.error({ err, module: "asr" }, "ASR upstream error");
+      clientWs.send(JSON.stringify({ error: "ASR connection error" }));
+    });
+
+    upstream.on("close", () => {
+      upstreamWs = null;
+      upstreamReady = false;
+    });
+
+    clientWs.on("message", (rawData) => {
+      const data = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData as ArrayBuffer);
+
+      // Check if it's a text control message
+      if (typeof rawData === "string") {
+        try {
+          const msg = JSON.parse(rawData);
+          if (msg.type === "stop") {
+            // Send last audio packet (empty)
+            if (upstreamWs && upstreamWs.readyState === WsWebSocket.OPEN) {
+              upstreamWs.send(buildAudioRequest(Buffer.alloc(0), true));
+            }
+            return;
+          }
+        } catch { /* not JSON, treat as binary */ }
+      }
+
+      // Binary audio data
+      if (upstreamReady && upstreamWs && upstreamWs.readyState === WsWebSocket.OPEN) {
+        upstreamWs.send(buildAudioRequest(data, false));
+      } else {
+        pendingAudio.push(data);
+      }
+    });
+
+    clientWs.on("close", () => {
+      if (upstreamWs && upstreamWs.readyState === WsWebSocket.OPEN) {
+        try {
+          upstreamWs.send(buildAudioRequest(Buffer.alloc(0), true));
+        } catch { /* ignore */ }
+        upstreamWs.close();
+      }
+    });
+  });
+
+  httpServer.listen(PORT, "0.0.0.0", () => {
     logger.info({ module: "server", port: PORT }, `Server running on http://localhost:${PORT}`);
   });
 }

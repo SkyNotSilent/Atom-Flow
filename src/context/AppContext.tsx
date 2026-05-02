@@ -1,6 +1,9 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
-import { Article, AtomCard, User, Note, SavedArticle } from '../types';
+import { Article, AtomCard, User, Note, NoteMeta, SavedArticle } from '../types';
 import { logger } from '../utils/logger';
+
+export type WriteWorkspaceMode = 'graph' | 'articles';
+export type WriteGraphView = 'all' | 'activated';
 
 interface AppState {
   articles: Article[];
@@ -40,10 +43,21 @@ interface AppState {
   showProfileModal: boolean;
   setShowProfileModal: (show: boolean) => void;
   notes: Note[];
-  createNote: () => Promise<Note | null>;
-  updateNote: (id: number, data: Partial<{ title: string; content: string; tags: string[] }>) => Promise<void>;
+  reloadNotes: () => Promise<void>;
+  createNote: (data?: Partial<{ title: string; content: string; tags: string[]; meta: NoteMeta }>) => Promise<Note | null>;
+  updateNote: (id: number, data: Partial<{ title: string; content: string; tags: string[]; meta: NoteMeta }>) => Promise<void>;
   deleteNote: (id: number) => Promise<void>;
   syncPreferences: (prefs: { source_layout?: any; theme?: string; view_mode?: string }) => void;
+  writeWorkspaceMode: WriteWorkspaceMode;
+  setWriteWorkspaceMode: (mode: WriteWorkspaceMode) => void;
+  writeGraphView: WriteGraphView;
+  setWriteGraphView: (view: WriteGraphView) => void;
+  writeFocusedTopic: string;
+  setWriteFocusedTopic: (topic: string) => void;
+  writeActivatedNodeIds: string[];
+  setWriteActivatedNodeIds: (ids: string[]) => void;
+  writeActivationSummary: string[];
+  setWriteActivationSummary: (items: string[]) => void;
 }
 
 const AppContext = createContext<AppState | undefined>(undefined);
@@ -66,6 +80,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [viewMode, setViewModeState] = useState<'card' | 'compact'>('card');
   const [notes, setNotes] = useState<Note[]>([]);
+  const [writeWorkspaceMode, setWriteWorkspaceMode] = useState<WriteWorkspaceMode>('graph');
+  const [writeGraphView, setWriteGraphView] = useState<WriteGraphView>('all');
+  const [writeFocusedTopic, setWriteFocusedTopic] = useState('');
+  const [writeActivatedNodeIds, setWriteActivatedNodeIds] = useState<string[]>([]);
+  const [writeActivationSummary, setWriteActivationSummary] = useState<string[]>([]);
   const syncTimerRef = useRef<number | null>(null);
   const quickOpenMode = true;
   const forceRefetchInTesting = false;
@@ -217,6 +236,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (res.ok) setNotes(await res.json());
     } catch {}
   };
+  const reloadNotes = loadNotes;
 
   const loadSavedArticles = async () => {
     try {
@@ -265,12 +285,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } catch {}
   };
 
-  const createNote = async (): Promise<Note | null> => {
+  const createNote = async (data?: Partial<{ title: string; content: string; tags: string[]; meta: NoteMeta }>): Promise<Note | null> => {
     try {
       const res = await fetch('/api/notes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: '', content: '' })
+        body: JSON.stringify({
+          title: data?.title || '',
+          content: data?.content || '',
+          tags: data?.tags || [],
+          meta: data?.meta || {}
+        })
       });
       if (res.ok) {
         const note = await res.json();
@@ -283,7 +308,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return null;
   };
 
-  const updateNote = async (id: number, data: Partial<{ title: string; content: string; tags: string[] }>) => {
+  const updateNote = async (id: number, data: Partial<{ title: string; content: string; tags: string[]; meta: NoteMeta }>) => {
     try {
       const res = await fetch(`/api/notes/${id}`, {
         method: 'PUT',
@@ -495,6 +520,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       readingArticle, setReadingArticle,
       activeSource, setActiveSource,
       reloadArticles,
+      reloadNotes,
       isSavingArticle,
       getSavingStageText,
       knowledgeTypeFilter,
@@ -504,7 +530,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       user, isAuthLoading, showLoginModal, setShowLoginModal,
       loginAndDo, handleLoginSuccess, logout,
       updateProfile, updateAvatar, showProfileModal, setShowProfileModal,
-      notes, createNote, updateNote, deleteNote, syncPreferences
+      notes, createNote, updateNote, deleteNote, syncPreferences,
+      writeWorkspaceMode, setWriteWorkspaceMode,
+      writeGraphView, setWriteGraphView,
+      writeFocusedTopic, setWriteFocusedTopic,
+      writeActivatedNodeIds, setWriteActivatedNodeIds,
+      writeActivationSummary, setWriteActivationSummary
     }}>
       {children}
     </AppContext.Provider>
