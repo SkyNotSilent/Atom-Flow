@@ -19,10 +19,11 @@ import sharp from "sharp";
 import { createServer, type IncomingMessage } from "http";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { gzipSync, gunzipSync } from "zlib";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import { URL } from "url";
 import pino from "pino";
 import pinoHttp from "pino-http";
+import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 
 dotenv.config();
 
@@ -255,6 +256,7 @@ function mergeArticles(previous: Article[], next: Article[]): Article[] {
     if (!prev) return article;
     return {
       ...article,
+      id: prev.id,
       saved: prev.saved,
       cards: prev.cards,
       fullFetched: prev.fullFetched,
@@ -340,6 +342,44 @@ async function loadUserArticlesAsArticles(userId: number, pool: pg.Pool): Promis
     fullFetched: row.full_fetched as boolean,
     cards: []
   }));
+}
+
+async function applyUserSavedStateToArticles(userId: number, articleList: Article[], pool: pg.Pool): Promise<Article[]> {
+  if (articleList.length === 0) return articleList;
+
+  const [cardResult, savedArticleResult] = await Promise.all([
+    pool.query(
+      `SELECT DISTINCT article_id
+       FROM saved_cards
+       WHERE user_id = $1 AND article_id IS NOT NULL`,
+      [userId]
+    ),
+    pool.query(
+      `SELECT url, title, source
+       FROM saved_articles
+       WHERE user_id = $1`,
+      [userId]
+    )
+  ]);
+
+  const savedArticleIds = new Set(cardResult.rows.map(row => Number(row.article_id)));
+  const savedUrls = new Set(
+    savedArticleResult.rows
+      .map(row => row.url)
+      .filter((url): url is string => typeof url === "string" && url.length > 0)
+  );
+  const savedSourceTitles = new Set(
+    savedArticleResult.rows.map(row => `${row.source || ""}\t${row.title || ""}`)
+  );
+
+  return articleList.map(article => {
+    const savedByCurrentUser = savedArticleIds.has(article.id)
+      || Boolean(article.url && savedUrls.has(article.url))
+      || savedSourceTitles.has(`${article.source}\t${article.title}`)
+      || (!BUILTIN_SOURCE_NAMES.has(article.source) && article.saved);
+
+    return { ...article, saved: savedByCurrentUser };
+  });
 }
 
 const SOURCE_PRIORITY: Record<string, number> = {
@@ -428,6 +468,24 @@ function extractFeedIcon(parsed: Parser.Output<any>): string | undefined {
   return undefined;
 }
 
+function stableArticleId(source: string, item: Parser.Item, idOffset: number, index: number) {
+  const key = [
+    source,
+    idOffset,
+    item.guid || '',
+    item.link || '',
+    item.title || '',
+    item.pubDate || '',
+    index
+  ].join('|');
+  let hash = 2166136261;
+  for (let i = 0; i < key.length; i += 1) {
+    hash ^= key.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return 1_000_000_000_000 + (hash >>> 0);
+}
+
 function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: string, idOffset: number, feedIcon?: string) {
   const maxItems = source === '36氪' || source === '虎嗅' ? 8 : 12;
   return items.slice(0, maxItems).map((item, index) => {
@@ -453,7 +511,7 @@ function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: 
     const audioDuration = (item as any).itunes?.duration;
     
     return {
-      id: Date.now() + idOffset + index,
+      id: stableArticleId(source, item, idOffset, index),
       saved: false,
       source,
       sourceIcon: feedIcon,
@@ -594,6 +652,84 @@ const normalizePlainText = (content: string) => {
     .trim();
 };
 
+const normalizeImageUrl = (url: string, baseUrl?: string) => {
+  const candidate = (url || '').trim();
+  if (!candidate || candidate.startsWith('data:') || candidate.startsWith('blob:')) return null;
+  try {
+    const parsed = baseUrl ? new URL(candidate, baseUrl) : new URL(candidate);
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+};
+
+const extractImageUrlsFromArticle = (article: Pick<Article, "content" | "markdownContent" | "url">, limit = 12) => {
+  const content = `${article.markdownContent || ""}\n${article.content || ""}`;
+  const urls = new Set<string>();
+  const add = (raw?: string | null) => {
+    if (!raw) return;
+    const normalized = normalizeImageUrl(raw, article.url);
+    if (normalized) urls.add(normalized);
+  };
+
+  for (const match of content.matchAll(/!\[[^\]]*]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)) {
+    add(match[1]);
+  }
+  for (const match of content.matchAll(/<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi)) {
+    add(match[1]);
+  }
+  for (const match of content.matchAll(/\b(?:src|data-src|data-original)=["']([^"']+)["']/gi)) {
+    add(match[1]);
+  }
+
+  return Array.from(urls).slice(0, limit);
+};
+
+const normalizeJsonStringArray = (value: unknown): string[] => {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+};
+
+/**
+ * Normalize article URL to avoid duplicate saves due to URL variations
+ * - Removes query parameters (utm_source, etc.)
+ * - Removes hash fragments
+ * - Removes trailing slashes
+ * - Converts to lowercase for case-insensitive comparison
+ */
+const normalizeArticleUrl = (url: string | undefined): string | undefined => {
+  if (!url) return undefined;
+  try {
+    const parsed = new URL(url);
+    parsed.search = '';  // Remove query parameters
+    parsed.hash = '';    // Remove hash fragments
+    let normalized = parsed.href.replace(/\/$/, ''); // Remove trailing slash
+    // Keep protocol and domain case-sensitive, but normalize path
+    return normalized;
+  } catch {
+    // Invalid URL, return as-is
+    return url;
+  }
+};
+
+/**
+ * Generate content hash for articles without URL
+ * Used to detect duplicates based on title + source + excerpt
+ */
+const generateContentHash = (title: string, source: string, excerpt: string): string => {
+  const content = `${title.trim()}|${source.trim()}|${excerpt.trim().slice(0, 200)}`;
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+};
+
 const buildCardsFromArticleContent = (article: Article): Omit<AtomCard, "id" | "articleTitle" | "articleId">[] => {
   const contentPool = article.markdownContent || article.content || article.excerpt;
   const plain = normalizePlainText(contentPool);
@@ -634,10 +770,22 @@ type WritingCardInput = {
   id?: string;
   type: AtomCard["type"];
   content: string;
+  summary?: string;
+  originalQuote?: string;
+  context?: string;
+  citationNote?: string;
+  evidenceRole?: string;
   tags?: string[];
   articleTitle?: string;
   articleId?: number;
   savedArticleId?: number;
+  sourceName?: string;
+  sourceUrl?: string;
+  sourceExcerpt?: string;
+  sourceContext?: string;
+  sourceImages?: string[];
+  publishedAt?: number;
+  savedAt?: string;
 };
 
 type WritingOutlineSection = {
@@ -662,10 +810,388 @@ type WriteAgentState = {
   focusedTopic?: string;
   activatedNodeIds?: string[];
   activationSummary?: string[];
+  selectedStyleSkillId?: number | string;
+  selectedSkillIds?: Array<number | string>;
+  effectiveSkillIds?: Array<number | string>;
+  writingGoal?: string;
+  pendingChoice?: {
+    type: "card_selection" | "style_selection" | "draft_confirmation";
+    prompt: string;
+    cardIds?: string[];
+    styleSkillIds?: Array<number | string>;
+    createdAt?: string;
+  };
+  selectedCardIds?: string[];
+  sourceImageIds?: string[];
+  lastIntent?: string;
   latestOutline?: WritingOutlineSection[];
   latestAngle?: string;
   lastGeneratedNoteId?: number;
   lastGeneratedNoteTitle?: string;
+};
+
+type WriteAgentSkillType = "card_storage" | "citation" | "writing" | "style";
+type WriteAgentSkillScenario = "storage" | "citation" | "drafting" | "style";
+
+type WriteAgentSkillRecord = {
+  id: number | string;
+  name: string;
+  type: WriteAgentSkillType;
+  scenario?: WriteAgentSkillScenario;
+  description?: string;
+  prompt: string;
+  examples?: string[];
+  constraints?: string[];
+  visibility: "system" | "user";
+  isDefault?: boolean;
+  isBaseline?: boolean;
+  usageCount?: number;
+  lastUsedAt?: string;
+  recentNotes?: Array<{ id: number; title: string; updatedAt?: string }>;
+  recentCards?: Array<{ id: string; content: string; articleTitle?: string; createdAt?: string }>;
+  generatedPrompt?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type WriteStyleSkillRecord = WriteAgentSkillRecord;
+
+type WriteAgentChoiceRecord = {
+  id: string;
+  label: string;
+  action: "use_cards" | "exclude_card" | "refresh_cards" | "generate_outline" | "generate_draft" | "select_style" | "export_to_draft" | "switch_style" | "smart_reply";
+  payload?: Record<string, unknown>;
+};
+
+type WriteAgentGraphTraceRecord = {
+  node: string;
+  durationMs: number;
+  inputSummary?: string;
+  outputSummary?: string;
+  meta?: Record<string, unknown>;
+  createdAt?: string;
+};
+
+type WriteAgentSourcesRecord = {
+  cards: any[];
+  articles: Array<{
+    id?: number;
+    title: string;
+    source?: string;
+    url?: string;
+    citationContext?: string;
+    imageUrls?: string[];
+  }>;
+  quotes: Array<{
+    cardId: string;
+    articleTitle?: string;
+    quote: string;
+  }>;
+  images: Array<{
+    id: string;
+    url: string;
+    articleTitle?: string;
+  }>;
+};
+
+const WRITE_AGENT_NODE_LABELS: Record<string, { start: string; end: string }> = {
+  hydrate_context: { start: "读取会话与当前写作上下文", end: "上下文已就绪" },
+  load_effective_skills: { start: "加载基础规范与增强 Skills", end: "本次生效规范已确定" },
+  classify_intent: { start: "判断用户意图与所需工具", end: "意图路由完成" },
+  retrieve_knowledge: { start: "召回知识库卡片", end: "知识卡片召回完成" },
+  enrich_sources: { start: "补齐来源、原文摘录与图片", end: "来源信息已整理" },
+  decide_next: { start: "决定下一步动作", end: "已生成可选动作" },
+  human_selection: { start: "同步激活知识节点", end: "节点激活完成" },
+  generate_answer_or_draft: { start: "生成回答或文章草稿", end: "生成完成" },
+  persist_memory: { start: "保存对话、引用链路与文章元信息", end: "记忆已保存" },
+  respond: { start: "整理最终回复", end: "回复完成" }
+};
+
+const getWriteAgentNodeLabel = (node: string, phase: "start" | "end") => {
+  return WRITE_AGENT_NODE_LABELS[node]?.[phase] || (phase === "start" ? `运行 ${node}` : `${node} 完成`);
+};
+
+const SYSTEM_WRITE_AGENT_SKILLS: WriteAgentSkillRecord[] = [
+  {
+    id: "system-card-storage",
+    name: "知识入库基础规范",
+    type: "card_storage",
+    scenario: "storage",
+    description: "拆卡时保留来源、上下文、原文摘录和引用用途，避免没头没尾。",
+    prompt: "保存知识卡片时，每张卡必须能脱离原文被理解：保留文章背景、原文摘录、卡片语境、适合引用的位置和来源信息。卡片内容可以精炼，但不要牺牲可引用性。",
+    examples: ["把'为什么重要'和'来自哪篇文章的哪个语境'一起存，而不是只存一句孤立观点。"],
+    constraints: ["不得丢失来源标题", "优先保留原文摘录", "摘要要说明背景和用途"],
+    visibility: "system",
+    isDefault: true,
+    isBaseline: true
+  },
+  {
+    id: "system-citation",
+    name: "引用链路基础规范",
+    type: "citation",
+    scenario: "citation",
+    description: "回答和成文时必须能追溯到卡片、原文、图片和来源文章。",
+    prompt: "引用知识库时，优先呈现来源文章、原文摘录、文章背景和图片线索。正文可以不堆满引用，但生成结果的依据必须能在 sources/note meta 中追溯。",
+    examples: ["来自《某篇文章》的原文摘录可以支撑这个判断；图片适合放在这一段旁边作为现场证据。"],
+    constraints: ["不要伪造来源", "不要把卡片当作无出处常识", "图片只引用已保存 URL"],
+    visibility: "system",
+    isDefault: true,
+    isBaseline: true
+  },
+  {
+    id: "system-writing",
+    name: "写作输出基础规范",
+    type: "writing",
+    scenario: "drafting",
+    description: "素材服务观点，文章围绕判断推进，而不是逐条罗列卡片。",
+    prompt: "写作时先形成作者自己的判断，再选择素材服务论证。结构应从问题、判断、证据、反思或方法自然推进，避免把知识库内容机械分类。",
+    examples: ["先说'这其实不是工具问题，而是流程可解释性问题'，再用素材证明。"],
+    constraints: ["不要素材堆砌", "每节要有推进", "结尾要收束到观点或方法"],
+    visibility: "system",
+    isDefault: true,
+    isBaseline: true
+  },
+  {
+    id: "system-deep-analysis",
+    name: "深度分析型公众号文章",
+    type: "style",
+    scenario: "style",
+    description: "用事实和逻辑说服，场景开篇，留白收尾，用「我们」不用「你」。适合认知升级、趋势分析、观点输出。",
+    prompt: [
+      "风格基因：用事实和逻辑说服读者，而不是情绪煽动。开头从一个具体场景切入，结尾留白让读者自己思考。",
+      "结构方式：场景引入 → 核心论点 → 多层论证（数据+案例+逻辑推演） → 开放式收束。用「我们」拉近距离，不用「你」说教。",
+      "素材搭配：用 @数据 建立事实基础，用 @观点 形成核心判断，用 @故事 让抽象概念落地，用 @金句 做关键转折的记忆锚点。",
+      "表达边界：克制、冷静、有分量。不堆感叹号，不用情绪化词汇，让逻辑本身产生说服力。"
+    ].join("\n"),
+    examples: ["用一个真实场景开篇，再用 @数据 和 @观点 层层推进判断，最后留一个问题让读者自己想。"],
+    constraints: ["不要用「你」说教", "不要情绪化煽动", "不要堆砌感叹号", "收尾不要总结陈词，留白"],
+    visibility: "system",
+    isDefault: true
+  },
+  {
+    id: "system-hot-event",
+    name: "热点事件解析型文章",
+    type: "style",
+    scenario: "style",
+    description: "四层递进：事件还原→技术拆解→商业价值→行业意义。强调冲击力和时效感。",
+    prompt: [
+      "风格基因：不是跟风蹭热点，而是用专业视角拆解一个事件为什么重要、背后发生了什么、对我们意味着什么。",
+      "结构方式：四层递进——事件还原（发生了什么）→ 技术拆解（怎么做到的）→ 商业价值（钱在哪里）→ 行业意义（格局怎么变）。",
+      "素材搭配：用 @故事 还原事件现场，用 @数据 量化冲击力，用 @观点 给出专业判断，用 @金句 做标题或段落记忆点。",
+      "表达边界：可以有兴奋感和紧迫感，但要有事实支撑。时效性要强，判断要快，但不能为了快而粗糙。"
+    ].join("\n"),
+    examples: ["先用 @故事 还原事件现场，再用 @数据 说明冲击力，最后用 @观点 判断行业影响。"],
+    constraints: ["不要空喊「重磅」", "不要只复述新闻不给判断", "推测必须标注", "引用必须能追溯"],
+    visibility: "system"
+  },
+  {
+    id: "system-product-analysis",
+    name: "产品经理视角·产品分析",
+    type: "style",
+    scenario: "style",
+    description: "面向产品社区，开篇黄金公式（案例→联系→转折→观点），场景化+可落地。适合产品方法论、AI行业分析、ToB实战。",
+    prompt: [
+      "风格基因：产品经理视角写分析，必须回答「这对产品经理意味着什么」。不是旁观者评论，而是从业者实战复盘。",
+      "开篇黄金公式：用一个具体案例开篇 → 和读者建立联系（你可能也遇到过）→ 转折（但真正的问题是…）→ 抛出核心观点。",
+      "结构方式：问题定义 → 拆解机制 → 案例验证 → 可执行的产品启示。每一节都要有「所以呢」的落地感。",
+      "素材搭配：用 @故事 讲产品案例，用 @数据 佐证判断，用 @观点 给产品启示，用 @金句 做标题或核心论点。",
+      "表达边界：允许专业术语但要解释，可以用对比表格和 bullet point，收尾必须有可执行的产品启示。"
+    ].join("\n"),
+    examples: ["用一个产品决策的 @故事 开篇，用 @数据 和 @观点 拆解决策逻辑，最后给出可复用的产品方法论。"],
+    constraints: ["不要旁观者口吻", "收尾必须有产品启示", "不要空泛方法论", "不要堆砌专业术语不解释"],
+    visibility: "system"
+  },
+  {
+    id: "system-ai-news",
+    name: "量子位·AI新闻报道",
+    type: "style",
+    scenario: "style",
+    description: "感叹号标题、权威背书前置、口语化+网络用语、数据对比密集。适合AI科技新闻、产品发布、技术突破。",
+    prompt: [
+      "风格基因：科技新闻报道风格，强调信息密度和冲击力。标题要有新闻感，内容要有「刚刚发生」的紧迫感。",
+      "结构方式：冲击力标题 → 权威背书或核心数据前置 → 技术细节拆解 → 对比（和上一代/竞品/预期）→ 影响判断。",
+      "素材搭配：用 @数据 做对比和量化，用 @观点 引用权威人士判断，用 @故事 讲产品发布现场或技术突破过程，用 @金句 做标题。",
+      "表达边界：可以口语化、可以用网络用语、可以用感叹号，但信息必须准确。产品名、模型名、数据必须具体可查证。"
+    ].join("\n"),
+    examples: ["用 @金句 做标题，开头直接上 @数据 核心对比，再用 @故事 补充技术细节和发布背景。"],
+    constraints: ["不要模糊的产品名", "数据必须具体可查证", "不要空喊「颠覆」", "不要把未发布当已发布"],
+    visibility: "system"
+  },
+  {
+    id: "system-light-essay",
+    name: "朋友圈·轻量思辨文",
+    type: "style",
+    scenario: "style",
+    description: "三层递进（事件→放下争议→时代映射），≤800字，悖论揭示法。适合朋友圈、短视频文案、个人随笔。",
+    prompt: [
+      "风格基因：不是长篇大论，而是一条让人停下来想一想的朋友圈。用悖论揭示法——表面看是A，其实是B，但更深想是C。",
+      "结构方式：三层递进——事件引入（一句话）→ 放下争议看本质 → 时代映射（这个现象说明了什么）。严格控制在800字以内。",
+      "素材搭配：用 @故事 一句话带过事件，用 @观点 做悖论揭示，用 @金句 做收尾记忆点。数据慎用，短文里数据容易显得笨重。",
+      "表达边界：克制、轻盈、有思辨感。不堆砌论据，不展开论证，像和朋友聊天时随口说的一句有分量的话。"
+    ].join("\n"),
+    examples: ["一句话用 @故事 带过事件，用 @观点 揭示悖论，用 @金句 收尾——整个过程不超过三段。"],
+    constraints: ["不超过800字", "不要展开论证", "不要堆砌数据", "不要说教口吻"],
+    visibility: "system"
+  },
+  {
+    id: "system-cold-observation",
+    name: "冷观察·纵横分析",
+    type: "style",
+    scenario: "style",
+    description: "纵横双轴法（时间递进×维度拆解），冷静克制，横纵交汇出洞察。适合AI深度分析、商业趋势、产品方法论拆解。",
+    prompt: [
+      "风格基因：冷静的观察者，不急不躁，用时间和维度两条线把一个现象拆透。不是热点评论，而是事后复盘式的深度分析。",
+      "结构方式：纵轴——追踪对象从诞生到当下的完整历程（叙事故事呈现）；横轴——在当下时间截面上与竞品/同类做系统性对比；交汇点——两条轴交叉产出独到洞察。",
+      "素材搭配：用 @故事 做纵向叙事的时间节点，用 @数据 做横向对比的事实支撑，用 @观点 在交汇点给出判断，用 @金句 做核心结论的记忆锚点。",
+      "表达边界：冷静、克制、有距离感。不用感叹号，不煽情，让分析本身产生力量。可以有小标题帮助导航。"
+    ].join("\n"),
+    examples: ["用 @故事 串起时间线，用 @数据 做横向对比表，在纵横交汇处用 @观点 给出核心洞察。"],
+    constraints: ["不要情绪化表达", "不要急于下结论", "纵横两条线必须清晰", "推测必须标注"],
+    visibility: "system"
+  },
+  {
+    id: "system-tutorial",
+    name: "教程类·操作指南",
+    type: "style",
+    scenario: "style",
+    description: "「学完就会」导向，每步只做一件事，步骤可验证。适合操作指南、工具教程、实战手册。",
+    prompt: [
+      "风格基因：不是百科全书式的功能介绍，而是「学完就会」的实战教程。读者跟着做完就能得到一个可验证的结果。",
+      "结构方式：开头说清楚「学完你能做到什么」 → 每步只做一件事 → 每步有验证点（你怎么知道自己做对了）→ 最后有一个完整的实战案例。",
+      "素材搭配：用 @观点 说明「为什么这么做」，用 @数据 说明工具选择的依据，用 @故事 讲「我踩过的坑」帮读者避雷。",
+      "表达边界：步骤编号清晰，截图/代码块/示意图为必备元素。不要假设读者已有背景知识，但也不要啰嗦。"
+    ].join("\n"),
+    examples: ["用 @观点 说明为什么要用这个工具，列出清晰步骤，最后用 @故事 补充实战经验和踩坑提醒。"],
+    constraints: ["每步只做一件事", "必须有验证点", "不要假设背景知识", "不要功能罗列式写法"],
+    visibility: "system"
+  }
+];
+
+const SYSTEM_WRITE_STYLE_SKILLS = SYSTEM_WRITE_AGENT_SKILLS.filter(skill => skill.type === "style");
+
+const normalizeAgentSkillType = (value: unknown): WriteAgentSkillType => (
+  value === "card_storage" || value === "citation" || value === "writing" || value === "style"
+    ? value
+    : "style"
+);
+
+const skillScenarioForType = (type: WriteAgentSkillType): WriteAgentSkillScenario => {
+  if (type === "card_storage") return "storage";
+  if (type === "citation") return "citation";
+  if (type === "writing") return "drafting";
+  return "style";
+};
+
+const BASELINE_SKILL_TYPES = new Set<WriteAgentSkillType>(["card_storage", "citation", "writing"]);
+
+const isBaselineSkill = (skill: WriteAgentSkillRecord) => skill.visibility === "system" && Boolean(skill.isBaseline);
+
+const getBaselineWriteAgentSkills = (types?: WriteAgentSkillType[]) => {
+  const allowed = types ? new Set(types) : null;
+  return SYSTEM_WRITE_AGENT_SKILLS.filter(skill => skill.isBaseline && (!allowed || allowed.has(skill.type)));
+};
+
+const fetchWriteAgentSkills = async (pool: pg.Pool, userId: number, typeFilter?: WriteAgentSkillType): Promise<WriteAgentSkillRecord[]> => {
+  const rows = (await pool.query(
+    `SELECT id, name, type, description, prompt, examples, constraints, is_default AS "isDefault",
+            created_at AS "createdAt", updated_at AS "updatedAt"
+     FROM write_style_skills
+     WHERE user_id = $1
+       AND ($2::text IS NULL OR type = $2::text)
+     ORDER BY is_default DESC, updated_at DESC`,
+    [userId, typeFilter || null]
+  )).rows.map(row => ({
+    id: Number(row.id),
+    name: row.name as string,
+    type: normalizeAgentSkillType(row.type),
+    scenario: skillScenarioForType(normalizeAgentSkillType(row.type)),
+    description: row.description as string,
+    prompt: row.prompt as string,
+    examples: normalizeJsonStringArray(row.examples),
+    constraints: normalizeJsonStringArray(row.constraints),
+    visibility: "user" as const,
+    isBaseline: false,
+    generatedPrompt: row.prompt as string,
+    isDefault: Boolean(row.isDefault),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  }));
+  const systemSkills = typeFilter
+    ? SYSTEM_WRITE_AGENT_SKILLS.filter(skill => skill.type === typeFilter)
+    : SYSTEM_WRITE_AGENT_SKILLS;
+  return [...systemSkills, ...rows];
+};
+
+const fetchWriteStyleSkills = async (pool: pg.Pool, userId: number): Promise<WriteStyleSkillRecord[]> => {
+  return fetchWriteAgentSkills(pool, userId, "style");
+};
+
+const resolveWriteStyleSkill = async (
+  pool: pg.Pool,
+  userId: number,
+  styleSkillId?: number | string
+): Promise<WriteStyleSkillRecord> => {
+  const skills = await fetchWriteStyleSkills(pool, userId);
+  if (styleSkillId !== undefined && styleSkillId !== null) {
+    const normalized = String(styleSkillId);
+    const found = skills.find(skill => String(skill.id) === normalized);
+    if (found) return found;
+  }
+  return skills.find(skill => skill.visibility === "user" && skill.isDefault)
+    || skills.find(skill => skill.isDefault)
+    || SYSTEM_WRITE_STYLE_SKILLS[0];
+};
+
+const resolveWriteAgentSkills = async (
+  pool: pg.Pool,
+  userId: number,
+  selectedSkillIds?: Array<number | string>,
+  selectedStyleSkillId?: number | string
+): Promise<WriteAgentSkillRecord[]> => {
+  const skills = await fetchWriteAgentSkills(pool, userId);
+  const selectedSet = new Set((selectedSkillIds || []).map(id => String(id)));
+  if (selectedStyleSkillId !== undefined && selectedStyleSkillId !== null) {
+    selectedSet.add(String(selectedStyleSkillId));
+  }
+  const selected = skills.filter(skill => selectedSet.has(String(skill.id)) && !isBaselineSkill(skill));
+  const result: WriteAgentSkillRecord[] = [];
+  getBaselineWriteAgentSkills().forEach(skill => result.push(skill));
+  selected.forEach(skill => {
+    if (!result.some(item => String(item.id) === String(skill.id))) result.push(skill);
+  });
+  const hasStyle = result.some(skill => skill.type === "style");
+  const fallbackStyle = skills.find(skill => skill.type === "style" && skill.visibility === "user" && skill.isDefault)
+    || skills.find(skill => skill.type === "style" && skill.isDefault)
+    || skills.find(skill => skill.type === "style");
+  if (!hasStyle && fallbackStyle) result.push(fallbackStyle);
+  return result;
+};
+
+const buildAgentSkillSnapshot = (skill: WriteAgentSkillRecord) => ({
+  id: skill.id,
+  name: skill.name,
+  type: skill.type,
+  scenario: skill.scenario || skillScenarioForType(skill.type),
+  description: skill.description,
+  prompt: skill.prompt,
+  examples: skill.examples || [],
+  constraints: skill.constraints || [],
+  isBaseline: Boolean(skill.isBaseline)
+});
+
+const buildStyleSkillSnapshot = buildAgentSkillSnapshot;
+
+const buildAgentSkillSnapshots = (skills: WriteAgentSkillRecord[]) => skills.map(buildAgentSkillSnapshot);
+
+const formatAgentSkillInstructions = (skills: WriteAgentSkillRecord[], types?: WriteAgentSkillType[]) => {
+  const allowed = types ? new Set(types) : null;
+  const scoped = skills.filter(skill => !allowed || allowed.has(skill.type));
+  if (scoped.length === 0) return "";
+  return scoped.map(skill => [
+    `Skill「${skill.name}」(${skill.type})：${skill.prompt}`,
+    (skill.constraints || []).length ? `约束：${(skill.constraints || []).join("；")}` : "",
+    (skill.examples || []).length ? `示例：${(skill.examples || []).join("；")}` : ""
+  ].filter(Boolean).join("\n")).join("\n\n");
 };
 
 const sanitizeWritingCards = (cards: unknown[]): WritingCardInput[] => {
@@ -683,11 +1209,23 @@ const sanitizeWritingCards = (cards: unknown[]): WritingCardInput[] => {
     normalizedCards.push({
       id: typeof card.id === "string" ? card.id : undefined,
       type: card.type as AtomCard["type"],
-      content: card.content.trim().slice(0, 220),
+      content: card.content.trim().slice(0, 520),
+      summary: typeof card.summary === "string" ? card.summary.trim().slice(0, 180) : undefined,
+      originalQuote: typeof card.originalQuote === "string" ? card.originalQuote.trim().slice(0, 260) : undefined,
+      context: typeof card.context === "string" ? card.context.trim().slice(0, 360) : undefined,
+      citationNote: typeof card.citationNote === "string" ? card.citationNote.trim().slice(0, 220) : undefined,
+      evidenceRole: typeof card.evidenceRole === "string" ? card.evidenceRole.trim().slice(0, 40) : undefined,
       tags: Array.isArray(card.tags) ? card.tags.filter((tag): tag is string => typeof tag === "string").slice(0, 6) : [],
       articleTitle: typeof card.articleTitle === "string" ? card.articleTitle : undefined,
       articleId: typeof card.articleId === "number" ? card.articleId : undefined,
-      savedArticleId: typeof card.savedArticleId === "number" ? card.savedArticleId : undefined
+      savedArticleId: typeof card.savedArticleId === "number" ? card.savedArticleId : undefined,
+      sourceName: typeof card.sourceName === "string" ? card.sourceName : undefined,
+      sourceUrl: typeof card.sourceUrl === "string" ? card.sourceUrl : undefined,
+      sourceExcerpt: typeof card.sourceExcerpt === "string" ? card.sourceExcerpt.trim().slice(0, 260) : undefined,
+      sourceContext: typeof card.sourceContext === "string" ? card.sourceContext.trim().slice(0, 700) : undefined,
+      sourceImages: normalizeJsonStringArray(card.sourceImages).slice(0, 8),
+      publishedAt: typeof card.publishedAt === "number" ? card.publishedAt : undefined,
+      savedAt: typeof card.savedAt === "string" ? card.savedAt : undefined
     });
   }
   return normalizedCards;
@@ -750,18 +1288,33 @@ const buildFallbackDraft = (topic: string, cards: WritingCardInput[]) => {
   ].filter(Boolean).join("\n");
 };
 
-const buildWritingUserPrompt = (topic: string, activeCards: WritingCardInput[], extraCards: WritingCardInput[]) => {
+const buildWritingUserPrompt = (
+  topic: string,
+  activeCards: WritingCardInput[],
+  extraCards: WritingCardInput[],
+  styleSkill?: WriteStyleSkillRecord,
+  agentSkills: WriteAgentSkillRecord[] = []
+) => {
   const cardBlock = activeCards
-    .map((card, index) => `${index + 1}. [${card.type}] ${card.content}${card.tags?.length ? ` | tags: ${card.tags.join("、")}` : ""}${card.articleTitle ? ` | source: ${card.articleTitle}` : ""}`)
+    .map((card, index) => formatCardForWriting(card, index))
     .join("\n");
   const extraBlock = extraCards.length > 0
     ? extraCards
-      .map((card, index) => `${index + 1}. [${card.type}] ${card.content}${card.tags?.length ? ` | tags: ${card.tags.join("、")}` : ""}`)
+      .map((card, index) => formatCardForWriting(card, index))
       .join("\n")
     : "无";
   const { topTags, typeSummary } = summarizeWritingCards(activeCards);
 
   return `写作主题：${topic}
+${styleSkill ? `
+选用风格 Skill：${styleSkill.name}
+风格要求：${styleSkill.prompt}
+风格约束：${(styleSkill.constraints || []).join("；") || "无"}
+` : ""}
+${agentSkills.length ? `
+本次适用 Skills：
+${formatAgentSkillInstructions(agentSkills, ["citation", "writing"])}
+` : ""}
 
 参考素材概览（${activeCards.length} 条，类型分布：${typeSummary || "未统计"}，高频标签：${topTags.join("、") || "无"}）：
 
@@ -771,8 +1324,20 @@ ${cardBlock}
 补充参考素材：
 ${extraBlock}
 
-重要提醒：以上素材仅供参考和启发，不要逐条搬运或罗列。请用自己的语言写一篇有独立观点、叙事连贯的原创文章。素材是背景知识，不是文章骨架。`;
+重要提醒：以上素材仅供参考和启发，不要逐条搬运或罗列。请用自己的语言写一篇有独立观点、叙事连贯的原创文章。素材是背景知识，不是文章骨架；需要引用时优先使用“原文摘录/来源/引用建议”，不要伪造来源。`;
 };
+
+const formatCardForWriting = (card: WritingCardInput, index: number, prefix = "") => [
+  `${prefix}${index + 1}. [${card.type}${card.evidenceRole ? `/${card.evidenceRole}` : ""}] ${card.content}`,
+  card.summary ? `   摘要：${card.summary}` : "",
+  card.sourceContext ? `   文章背景：${card.sourceContext}` : "",
+  card.context ? `   卡片语境：${card.context}` : "",
+  card.originalQuote ? `   原文摘录：${card.originalQuote}` : "",
+  card.citationNote ? `   引用建议：${card.citationNote}` : "",
+  card.sourceImages?.length ? `   原文图片：${card.sourceImages.slice(0, 3).join("、")}` : "",
+  card.tags?.length ? `   tags：${card.tags.join("、")}` : "",
+  card.articleTitle ? `   来源：${card.sourceName ? `${card.sourceName} · ` : ""}${card.articleTitle}${card.sourceUrl ? ` · ${card.sourceUrl}` : ""}` : ""
+].filter(Boolean).join("\n");
 
 const WRITING_PLAN_SYSTEM_PROMPT = `你是一位资深内容策划师。你的目标是设计一篇有独立观点、叙事连贯的原创文章结构，而不是对素材做分类整理。
 
@@ -854,27 +1419,57 @@ const sanitizeWritingPlan = (plan: WritingPlanResult | null, topic: string): Wri
   };
 };
 
-const buildWritingPlanPrompt = (topic: string, activeCards: WritingCardInput[], extraCards: WritingCardInput[]) => {
-  return `${buildWritingUserPrompt(topic, activeCards, extraCards)}
+const buildWritingPlanPrompt = (topic: string, activeCards: WritingCardInput[], extraCards: WritingCardInput[], styleSkill?: WriteStyleSkillRecord, agentSkills: WriteAgentSkillRecord[] = []) => {
+  return `${buildWritingUserPrompt(topic, activeCards, extraCards, styleSkill, agentSkills)}
 
 现在不要写正文，只做写作策划。`;
 };
 
-const buildDraftPrompt = (topic: string, plan: WritingPlanResult, activeCards: WritingCardInput[], extraCards: WritingCardInput[]) => {
+const buildDraftPrompt = (topic: string, plan: WritingPlanResult, activeCards: WritingCardInput[], extraCards: WritingCardInput[], evidenceMap: WritingEvidenceMapItem[] = [], styleSkill?: WriteStyleSkillRecord, agentSkills: WriteAgentSkillRecord[] = []) => {
   const outlineText = plan.outline.map((item, index) => `${index + 1}. ${item.heading} - ${item.goal}`).join("\n");
+  const evidenceText = evidenceMap.length
+    ? evidenceMap.map((item, index) => `${index + 1}. ${item.section}：只使用节点 ${item.nodeIds.join("、")}；引用目的：${item.note}`).join("\n")
+    : "无";
   const cardLookup = activeCards
-    .map((card, index) => `A${index + 1} [${card.type}] ${card.content}${card.tags?.length ? ` | ${card.tags.join("、")}` : ""}`)
+    .map((card, index) => [
+      `A${index + 1} [${card.type}${card.evidenceRole ? `/${card.evidenceRole}` : ""}] ${card.content}`,
+      card.sourceContext ? `文章背景：${card.sourceContext}` : "",
+      card.context ? `卡片语境：${card.context}` : "",
+      card.originalQuote ? `原文摘录：${card.originalQuote}` : "",
+      card.citationNote ? `引用建议：${card.citationNote}` : "",
+      card.sourceImages?.length ? `原文图片：${card.sourceImages.slice(0, 3).join("、")}` : "",
+      card.articleTitle ? `来源：${card.sourceName ? `${card.sourceName} · ` : ""}${card.articleTitle}` : "",
+      card.tags?.length ? `标签：${card.tags.join("、")}` : ""
+    ].filter(Boolean).join("\n"))
     .join("\n");
   const extraLookup = extraCards
-    .map((card, index) => `B${index + 1} [${card.type}] ${card.content}${card.tags?.length ? ` | ${card.tags.join("、")}` : ""}`)
+    .map((card, index) => [
+      `B${index + 1} [${card.type}${card.evidenceRole ? `/${card.evidenceRole}` : ""}] ${card.content}`,
+      card.sourceContext ? `文章背景：${card.sourceContext}` : "",
+      card.context ? `卡片语境：${card.context}` : "",
+      card.originalQuote ? `原文摘录：${card.originalQuote}` : "",
+      card.sourceImages?.length ? `原文图片：${card.sourceImages.slice(0, 2).join("、")}` : "",
+      card.articleTitle ? `来源：${card.sourceName ? `${card.sourceName} · ` : ""}${card.articleTitle}` : "",
+      card.tags?.length ? `标签：${card.tags.join("、")}` : ""
+    ].filter(Boolean).join("\n"))
     .join("\n") || "无";
   return `主题：${topic}
 写作风格：${plan.style}
+${styleSkill ? `风格 Skill：${styleSkill.name}
+风格要求：${styleSkill.prompt}
+风格约束：${(styleSkill.constraints || []).join("；") || "无"}
+` : ""}
+${agentSkills.length ? `适用 Skills：
+${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"])}
+` : ""}
 核心判断：${plan.angle}
 文章标题：${plan.title}
 
 提纲：
 ${outlineText}
+
+确定性引用映射：
+${evidenceText}
 
 参考素材（仅供参考，不要逐条搬运）：
 ${cardLookup}
@@ -885,17 +1480,18 @@ ${extraLookup}
 请按以上提纲写出完整 Markdown 正文。要求：
 1. 标题使用「# ${plan.title}」
 2. 二级标题严格对应提纲
-3. 这是一篇原创文章，不是素材汇编。用自己的语言写作，素材只是背景知识
-4. 不要逐条引用素材，不要出现”某某卡片提到””根据资料显示””从这些观点可以看出”
-5. 文章要有明确的叙事推进：提出问题 → 给出判断 → 展开论证 → 收束结论
-6. 写法像一个有见解的专栏作家，不是在做读书笔记
-7. 不要输出解释`;
+3. 每个二级标题只围绕“确定性引用映射”里分配给该 section 的节点写，不要跨 section 随意挪用节点
+4. 每个 section 至少有一个可追踪依据：优先用原文摘录；没有原文摘录时，用卡片语境或文章背景改写支撑
+5. 如果直接引用原文，必须写成「……」（来自《文章标题》）；不要伪造没有出现在原文摘录里的直接引语
+6. 这是一篇原创文章，不是素材汇编。不要出现“某某卡片提到”“根据资料显示”“从这些观点可以看出”
+7. 文章要有明确的叙事推进：提出问题 → 给出判断 → 展开论证 → 收束结论
+8. 不要改变 section 顺序，不要新增二级标题，不要输出解释`;
 };
 
 const buildEvidenceMap = (plan: WritingPlanResult, activeCards: WritingCardInput[]): WritingEvidenceMapItem[] => {
   const groupedCards = activeCards.map(card => ({
     id: card.id || `${card.type}-${card.content.slice(0, 12)}`,
-    text: `${card.content} ${(card.tags || []).join(" ")} ${(card.articleTitle || "")}`.toLowerCase()
+    text: `${card.content} ${card.summary || ""} ${card.sourceContext || ""} ${card.context || ""} ${card.originalQuote || ""} ${card.citationNote || ""} ${(card.tags || []).join(" ")} ${(card.articleTitle || "")}`.toLowerCase()
   }));
   return plan.outline.map(section => {
     const sectionText = `${section.heading} ${section.goal}`.toLowerCase();
@@ -937,7 +1533,12 @@ const getRecentThreadMessages = async (pool: pg.Pool, threadId: number, limit = 
     id: Number(row.id),
     role: row.role as 'user' | 'assistant' | 'tool',
     content: row.content as string,
-    meta: row.meta || {},
+    meta: {
+      ...(row.meta || {}),
+      messageId: Number(row.id),
+      feedback: row.role === 'assistant' ? (row.meta?.feedback || 'none') : row.meta?.feedback,
+      sourceCollapsed: row.role === 'assistant' ? (row.meta?.sourceCollapsed ?? true) : row.meta?.sourceCollapsed
+    },
     created_at: row.created_at
   }));
 };
@@ -960,14 +1561,55 @@ const upsertThreadState = async (
   );
 };
 
+const persistAgentGraphEvents = async (
+  pool: pg.Pool,
+  userId: number,
+  threadId: number,
+  trace: WriteAgentGraphTraceRecord[]
+) => {
+  for (const item of trace) {
+    await pool.query(
+      `INSERT INTO write_agent_events (thread_id, user_id, node, duration_ms, input_summary, output_summary, meta)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        threadId,
+        userId,
+        item.node,
+        Math.max(0, Math.round(item.durationMs || 0)),
+        item.inputSummary || null,
+        item.outputSummary || null,
+        JSON.stringify(item.meta || {})
+      ]
+    );
+  }
+};
+
 const fetchUserSavedCards = async (pool: pg.Pool, userId: number) => {
   return (await pool.query(
-    `SELECT id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId", saved_article_id AS "savedArticleId"
-     FROM saved_cards WHERE user_id = $1`,
+    `SELECT sc.id, sc.type, sc.content, sc.summary,
+            sc.original_quote AS "originalQuote",
+            sc.context,
+            sc.citation_note AS "citationNote",
+            sc.evidence_role AS "evidenceRole",
+            sc.tags,
+            sc.article_title AS "articleTitle",
+            sc.article_id AS "articleId",
+            sc.saved_article_id AS "savedArticleId",
+            sa.source AS "sourceName",
+            sa.url AS "sourceUrl",
+            sa.excerpt AS "sourceExcerpt",
+            sa.citation_context AS "sourceContext",
+            sa.image_urls AS "sourceImages",
+            sa.published_at AS "publishedAt",
+            sa.saved_at AS "savedAt"
+     FROM saved_cards sc
+     LEFT JOIN saved_articles sa ON sa.id = sc.saved_article_id AND sa.user_id = sc.user_id
+     WHERE sc.user_id = $1`,
     [userId]
   )).rows.map(row => ({
     ...row,
-    tags: typeof row.tags === 'string' ? JSON.parse(row.tags) : row.tags
+    tags: typeof row.tags === 'string' ? JSON.parse(row.tags) : row.tags,
+    sourceImages: normalizeJsonStringArray(row.sourceImages)
   }));
 };
 
@@ -978,7 +1620,7 @@ const toolRecallCards = (topic: string, cards: any[], excludeIds: string[] = [])
   const excludeSet = new Set(excludeIds);
   return cards.filter(card => {
     if (excludeSet.has(card.id)) return false;
-    const text = `${card.content} ${(card.tags || []).join(' ')} ${card.articleTitle || ''}`.toLowerCase();
+    const text = `${card.content} ${card.summary || ''} ${card.sourceContext || ''} ${card.context || ''} ${card.originalQuote || ''} ${card.citationNote || ''} ${(card.tags || []).join(' ')} ${card.articleTitle || ''} ${card.sourceName || ''}`.toLowerCase();
     return keywords.some(keyword => text.includes(keyword));
   }).slice(0, 8);
 };
@@ -999,13 +1641,747 @@ const toolListRecentNotes = async (pool: pg.Pool, userId: number, limit = 4) => 
   )).rows;
 };
 
+const WriteAgentGraphAnnotation = Annotation.Root({
+  userId: Annotation<number>(),
+  threadId: Annotation<number | undefined>(),
+  thread: Annotation<any>(),
+  message: Annotation<string>(),
+  isCreateArticle: Annotation<boolean>(),
+  userState: Annotation<WriteAgentState>(),
+  mergedState: Annotation<WriteAgentState>(),
+  previousMessages: Annotation<any[]>({ reducer: (_left, right) => right, default: () => [] }),
+  dbCards: Annotation<any[]>({ reducer: (_left, right) => right, default: () => [] }),
+  activeCards: Annotation<any[]>({ reducer: (_left, right) => right, default: () => [] }),
+  recalledCards: Annotation<any[]>({ reducer: (_left, right) => right, default: () => [] }),
+  recentNotes: Annotation<any[]>({ reducer: (_left, right) => right, default: () => [] }),
+  intent: Annotation<{ tools?: string[]; reason?: string; intent?: string } | null>(),
+  requestedTools: Annotation<string[]>({ reducer: (_left, right) => right, default: () => [] }),
+  styleSkill: Annotation<WriteStyleSkillRecord | undefined>(),
+  agentSkills: Annotation<WriteAgentSkillRecord[]>({ reducer: (_left, right) => right, default: () => [] }),
+  generatedPlan: Annotation<WritingPlanResult | null>(),
+  generatedOutlineText: Annotation<string>(),
+  generatedDraftText: Annotation<string>(),
+  persistedDraftNote: Annotation<any>(),
+  assistantContent: Annotation<string>(),
+  assistantMessageId: Annotation<number | undefined>(),
+  toolPayload: Annotation<any>(),
+  sources: Annotation<WriteAgentSourcesRecord | undefined>(),
+  choices: Annotation<WriteAgentChoiceRecord[]>({ reducer: (_left, right) => right, default: () => [] }),
+  uiBlocks: Annotation<any[]>({ reducer: (_left, right) => right, default: () => [] }),
+  graphTrace: Annotation<WriteAgentGraphTraceRecord[]>({
+    reducer: (left, right) => left.concat(right),
+    default: () => []
+  })
+});
+
+type WriteAgentGraphState = typeof WriteAgentGraphAnnotation.State;
+
+const runWriteAgentGraph = async (
+  pool: pg.Pool,
+  input: {
+    userId: number;
+    threadId?: number;
+    message: string;
+    isCreateArticle: boolean;
+    userState: WriteAgentState;
+    onStep?: (event: { type: string; node?: string; message?: string; data?: unknown }) => void | Promise<void>;
+  }
+) => {
+  const requestChat = async (messages: AiChatMessage[], temperature: number, maxTokens: number) => {
+    return requestAiChatCompletion(messages, {
+      temperature,
+      maxTokens,
+      timeoutMs: AI_REQUEST_TIMEOUT_MS,
+      logLabel: "write_agent_langgraph",
+      disableThinking: true
+    });
+  };
+
+  const withTrace = (
+    node: string,
+    handler: (state: WriteAgentGraphState) => Promise<Partial<WriteAgentGraphState>> | Partial<WriteAgentGraphState>,
+    summarize?: (state: WriteAgentGraphState, update: Partial<WriteAgentGraphState>) => string
+  ) => async (state: WriteAgentGraphState) => {
+    const started = Date.now();
+    await input.onStep?.({
+      type: "step_start",
+      node,
+      message: getWriteAgentNodeLabel(node, "start")
+    });
+    const update = await handler(state);
+    const traceItem = {
+      node,
+      durationMs: Date.now() - started,
+      inputSummary: normalizePlainText(state.message || "").slice(0, 160),
+      outputSummary: summarize ? summarize(state, update) : "",
+      meta: {
+        requestedTools: update.requestedTools || state.requestedTools || [],
+        activeCards: update.activeCards?.length ?? state.activeCards?.length ?? 0,
+        recalledCards: update.recalledCards?.length ?? state.recalledCards?.length ?? 0
+      },
+      createdAt: new Date().toISOString()
+    };
+    await input.onStep?.({
+      type: "step_end",
+      node,
+      message: getWriteAgentNodeLabel(node, "end"),
+      data: traceItem
+    });
+    const selectedIds = update.mergedState?.selectedCardIds;
+    if ((node === "human_selection" || node === "persist_memory") && Array.isArray(selectedIds)) {
+      await input.onStep?.({
+        type: "activation",
+        node,
+        message: "已同步激活知识节点",
+        data: {
+          activatedNodeIds: selectedIds,
+          activationSummary: update.mergedState?.activationSummary || []
+        }
+      });
+    }
+    return {
+      ...update,
+      graphTrace: [traceItem]
+    };
+  };
+
+  const graph = new StateGraph(WriteAgentGraphAnnotation)
+    .addNode("hydrate_context", withTrace("hydrate_context", async state => {
+      let thread = state.threadId
+        ? (await pool.query(
+          `SELECT id, title, summary, state, created_at, updated_at
+           FROM write_agent_threads
+           WHERE id = $1 AND user_id = $2`,
+          [state.threadId, state.userId]
+        )).rows[0]
+        : null;
+
+      if (!thread) {
+        thread = (await pool.query(
+          `INSERT INTO write_agent_threads (user_id, title, state, thread_type)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id, title, summary, state, thread_type, created_at, updated_at`,
+          [state.userId, inferThreadTitle(state.message), JSON.stringify({}), 'chat']
+        )).rows[0];
+      }
+
+      const normalizedThreadId = Number(thread.id);
+      await pool.query(
+        `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+         VALUES ($1, 'user', $2, $3)`,
+        [normalizedThreadId, state.message, JSON.stringify({ state: state.userState, action: state.isCreateArticle ? "create_article" : undefined })]
+      );
+
+      const dbCards = await fetchUserSavedCards(pool, state.userId);
+      const previousMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
+      const threadState = (thread.state || {}) as WriteAgentState;
+      const mergedState: WriteAgentState = {
+        focusedTopic: state.userState.focusedTopic || threadState.focusedTopic,
+        activatedNodeIds: state.userState.activatedNodeIds || threadState.activatedNodeIds || [],
+        activationSummary: state.userState.activationSummary || threadState.activationSummary || [],
+        selectedStyleSkillId: state.userState.selectedStyleSkillId || threadState.selectedStyleSkillId,
+        selectedSkillIds: state.userState.selectedSkillIds || threadState.selectedSkillIds || [],
+        effectiveSkillIds: Array.isArray(threadState.effectiveSkillIds) ? threadState.effectiveSkillIds : [],
+        writingGoal: state.userState.writingGoal || threadState.writingGoal,
+        pendingChoice: state.userState.pendingChoice || threadState.pendingChoice,
+        selectedCardIds: state.userState.selectedCardIds || threadState.selectedCardIds || [],
+        sourceImageIds: state.userState.sourceImageIds || threadState.sourceImageIds || [],
+        lastIntent: threadState.lastIntent,
+        latestOutline: Array.isArray(threadState.latestOutline) ? threadState.latestOutline : [],
+        latestAngle: typeof threadState.latestAngle === "string" ? threadState.latestAngle : undefined,
+        lastGeneratedNoteId: threadState.lastGeneratedNoteId,
+        lastGeneratedNoteTitle: typeof threadState.lastGeneratedNoteTitle === "string" ? threadState.lastGeneratedNoteTitle : undefined
+      };
+      const activeCards = toolGetActiveNetwork(dbCards, mergedState.activatedNodeIds || []);
+
+      return {
+        threadId: normalizedThreadId,
+        thread,
+        dbCards,
+        previousMessages,
+        mergedState,
+        activeCards
+      };
+    }, (_state, update) => `thread=${update.threadId}; cards=${update.dbCards?.length || 0}`))
+    .addNode("load_effective_skills", withTrace("load_effective_skills", async state => {
+      const agentSkills = await resolveWriteAgentSkills(pool, state.userId, state.mergedState?.selectedSkillIds, state.mergedState?.selectedStyleSkillId);
+      const styleSkill = agentSkills.find(skill => skill.type === "style")
+        || await resolveWriteStyleSkill(pool, state.userId, state.mergedState?.selectedStyleSkillId);
+      const userCount = agentSkills.filter(skill => skill.visibility === "user").length;
+      await input.onStep?.({
+        type: "partial_status",
+        node: "load_effective_skills",
+        message: `基础规范已加载，用户增强 Skills ${userCount} 个已启用`
+      });
+      return {
+        styleSkill,
+        agentSkills
+      };
+    }, (_state, update) => `baseline=${update.agentSkills?.filter(isBaselineSkill).length || 0}; user=${update.agentSkills?.filter(skill => skill.visibility === "user").length || 0}`))
+    .addNode("classify_intent", withTrace("classify_intent", async state => {
+      if (state.isCreateArticle) {
+        return {
+          intent: { tools: ["recall_cards", "generate_outline", "generate_draft"], reason: "user explicitly requested create_article", intent: "draft" },
+          requestedTools: ["recall_cards", "generate_outline", "generate_draft"]
+        };
+      }
+
+      const intentPrompt = `你是 AtomFlow 写作助手的路由器。默认优先基于知识库回答，不要把日常知识问题误判成闲聊。
+
+可选工具：
+- recall_cards：需要基于知识库回答、找主题、补素材、选择卡片、引用原文或来源
+- get_active_network：用户在问当前网络、当前节点、围绕当前激活内容展开
+- list_recent_notes：用户提到最近文章、之前草稿、继续改写
+- generate_outline：用户要提纲、结构、章节安排
+- generate_draft：用户明确要生成、写正文、出草稿
+- just_chat：只有用户完全不涉及知识、写作、素材时使用
+
+严格输出 JSON：{"tools":["tool_a"],"reason":"一句简短理由","intent":"knowledge_answer|select_material|outline|draft|revise|chat"}`;
+
+      const rawIntent = await requestChat([
+        { role: "system", content: intentPrompt },
+        { role: "user", content: `当前状态：topic=${state.mergedState?.focusedTopic || "无"}; activeNodes=${(state.mergedState?.activatedNodeIds || []).length}; latestMessage=${state.message}` }
+      ], 0.1, 300);
+      const parsedIntent = safeJsonParse<{ tools?: string[]; reason?: string; intent?: string }>(rawIntent) || {};
+      let requestedTools = Array.isArray(parsedIntent.tools)
+        ? parsedIntent.tools.filter(tool => ["recall_cards", "get_active_network", "list_recent_notes", "generate_outline", "generate_draft", "just_chat"].includes(tool))
+        : [];
+
+      if (requestedTools.length === 0 || (requestedTools.length === 1 && requestedTools[0] === "just_chat")) {
+        requestedTools = [];
+      }
+      if (
+        requestedTools.length === 0 &&
+        /(知识库|素材|节点|卡片|原文|图片|引用|来源|基于|围绕|总结|提炼|写|文章|草稿|选题|观点|证据|资料)/.test(state.message)
+      ) {
+        requestedTools = ["recall_cards"];
+        parsedIntent.reason = "message refers to knowledge-base material";
+        parsedIntent.intent = "knowledge_answer";
+      }
+
+      return { intent: parsedIntent, requestedTools };
+    }, (_state, update) => `${update.requestedTools?.join(",") || "answer"}`))
+    .addNode("retrieve_knowledge", withTrace("retrieve_knowledge", async state => {
+      const recalledCards = state.requestedTools.includes("recall_cards")
+        ? toolRecallCards(`${state.message} ${state.mergedState?.focusedTopic || ""}`, state.dbCards, state.activeCards.map(card => card.id))
+        : [];
+      const recentNotes = state.requestedTools.includes("list_recent_notes") || state.requestedTools.includes("generate_draft")
+        ? await toolListRecentNotes(pool, state.userId, 4)
+        : [];
+      return { recalledCards, recentNotes };
+    }, (_state, update) => `recalled=${update.recalledCards?.length || 0}`))
+    .addNode("enrich_sources", withTrace("enrich_sources", state => {
+      const cardsForSources = state.activeCards.length > 0
+        ? state.activeCards.concat(state.recalledCards)
+        : state.recalledCards;
+      const sources = buildAgentSources(cardsForSources);
+      return { sources };
+    }, (_state, update) => `sources=${update.sources?.cards.length || 0}; images=${update.sources?.images.length || 0}`))
+    .addNode("decide_next", withTrace("decide_next", state => {
+      const intent = state.intent?.intent || (state.isCreateArticle ? "draft" : "knowledge_answer");
+      const shouldGenerateDraft = state.isCreateArticle || state.requestedTools.includes("generate_draft");
+      const shouldGenerateOutline = state.isCreateArticle || state.requestedTools.includes("generate_outline") || shouldGenerateDraft;
+      const choiceCards = state.activeCards.length > 0 ? state.activeCards : state.recalledCards;
+      const choices = buildAgentChoices(choiceCards, state.styleSkill);
+      const pendingChoice = choiceCards.length > 0 && !shouldGenerateDraft
+        ? {
+          type: "card_selection" as const,
+          prompt: "选择这次要使用的知识卡片，或直接生成提纲/文章。",
+          cardIds: choiceCards.map(card => card.id).filter((id): id is string => typeof id === "string"),
+          styleSkillIds: state.styleSkill ? [state.styleSkill.id] : [],
+          createdAt: new Date().toISOString()
+        }
+        : undefined;
+      return {
+        choices,
+        mergedState: {
+	          ...state.mergedState,
+	          lastIntent: intent,
+	          pendingChoice,
+	          selectedStyleSkillId: state.styleSkill?.id,
+	          selectedSkillIds: state.agentSkills.filter(skill => !isBaselineSkill(skill)).map(skill => skill.id),
+	          effectiveSkillIds: state.agentSkills.map(skill => skill.id)
+	        },
+        requestedTools: shouldGenerateOutline && !state.requestedTools.includes("generate_outline")
+          ? Array.from(new Set([...state.requestedTools, "generate_outline"]))
+          : state.requestedTools
+      };
+    }, (_state, update) => `choices=${update.choices?.length || 0}`))
+    .addNode("human_selection", withTrace("human_selection", state => {
+      return {
+        mergedState: {
+          ...state.mergedState,
+          selectedCardIds: (state.activeCards.length > 0 ? state.activeCards : state.recalledCards)
+            .map(card => card.id)
+            .filter((id): id is string => typeof id === "string")
+        }
+      };
+    }, (_state, update) => `selected=${update.mergedState?.selectedCardIds?.length || 0}`))
+    .addNode("generate_answer_or_draft", withTrace("generate_answer_or_draft", async state => {
+      let generatedOutlineText = "";
+      let generatedDraftText = "";
+      let generatedPlan: WritingPlanResult | null = null;
+      let persistedDraftNote: any = null;
+      const shouldGenerateDraft = state.isCreateArticle || state.requestedTools.includes("generate_draft");
+      const shouldGenerateOutline = state.isCreateArticle || state.requestedTools.includes("generate_outline") || shouldGenerateDraft;
+      const cardsForWriting = sanitizeWritingCards(state.activeCards.length > 0 ? state.activeCards : state.recalledCards);
+
+    if (shouldGenerateOutline) {
+      await input.onStep?.({
+        type: "partial_status",
+        node: "generate_answer_or_draft",
+        message: shouldGenerateDraft ? "正在规划文章结构" : "正在生成提纲"
+      });
+      if (cardsForWriting.length > 0) {
+          const topicForWriting = state.mergedState?.focusedTopic || state.message;
+          const planRaw = await requestChat([
+            { role: "system", content: WRITING_PLAN_SYSTEM_PROMPT },
+	            { role: "user", content: buildWritingPlanPrompt(topicForWriting, cardsForWriting, sanitizeWritingCards(state.recalledCards), state.styleSkill, state.agentSkills) }
+          ], 0.25, 1200);
+          generatedPlan = sanitizeWritingPlan(safeJsonParse<WritingPlanResult>(planRaw), topicForWriting);
+          generatedOutlineText = generatedPlan.outline.map(item => `- ${item.heading}：${item.goal}`).join("\n");
+          const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
+
+          if (shouldGenerateDraft) {
+            await input.onStep?.({
+              type: "partial_status",
+              node: "generate_answer_or_draft",
+              message: "正在生成完整文章草稿"
+            });
+            generatedDraftText = await requestChat([
+              { role: "system", content: WRITING_AGENT_SYSTEM_PROMPT },
+		              { role: "user", content: buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(state.recalledCards), evidenceMap, state.styleSkill, state.agentSkills) }
+            ], 0.38, 1800);
+
+            if (generatedDraftText.trim()) {
+              await input.onStep?.({
+                type: "partial_status",
+                node: "persist_memory",
+                message: "正在保存文章与引用链路"
+              });
+              const activationSummaryForNote = (state.mergedState?.activationSummary || []).length > 0
+                ? (state.mergedState?.activationSummary || [])
+                : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
+              persistedDraftNote = await createAgentDraftNote(pool, state.userId, {
+                title: generatedPlan.title,
+                content: generatedDraftText.trim(),
+	                topic: topicForWriting,
+	                style: generatedPlan.style,
+	                outline: generatedPlan.outline,
+	                evidenceMap,
+                activeCards: cardsForWriting,
+                activationSummary: activationSummaryForNote,
+	                sourceArticles: buildSourceArticlesFromCards(cardsForWriting, state.dbCards),
+	                styleSkillSnapshot: state.styleSkill ? buildStyleSkillSnapshot(state.styleSkill) : undefined,
+	                skillSnapshots: buildAgentSkillSnapshots(state.agentSkills),
+	                effectiveSkillSnapshots: {
+	                  baselineSkills: buildAgentSkillSnapshots(state.agentSkills.filter(isBaselineSkill)),
+	                  userSelectedSkills: buildAgentSkillSnapshots(state.agentSkills.filter(skill => !isBaselineSkill(skill)))
+	                }
+	              });
+            }
+          }
+        } else if (state.isCreateArticle) {
+          throw new Error("知识库中没有可用的卡片，请先收藏一些文章并提取知识卡片");
+        }
+      }
+
+      const systemPrompt = `你是 AtomFlow 的写作助手 Agent。默认基于用户知识库回答，不要频繁反问。
+
+规则：
+1. 先用知识库、线程上下文和激活网络回答。
+2. 回答要短、具体、可执行。
+3. 引用知识节点时，用「来自《文章标题》」或节点编号标注来源。
+4. 优先使用文章背景、卡片语境、原文摘录、引用建议和原文图片。
+5. 如果信息不足，先给出当前可判断的部分，再列出可点击的下一步，而不是空泛追问。
+6. 如果已生成文章草稿，简要说明使用了哪些节点和来源。
+7. 当前风格 Skill：${state.styleSkill?.name || "默认"}。${state.styleSkill?.prompt || ""}
+8. 当前适用 Skills：
+${formatAgentSkillInstructions(state.agentSkills, ["citation", "writing", "style"]) || "默认规范"}`;
+
+      const userContextPrompt = `当前线程摘要：
+${typeof state.thread?.summary === "string" && state.thread.summary.trim() ? state.thread.summary : "暂无摘要"}
+
+当前状态：
+- focusedTopic: ${state.mergedState?.focusedTopic || "无"}
+- activatedNodeIds: ${(state.mergedState?.activatedNodeIds || []).join("、") || "无"}
+- activationSummary: ${(state.mergedState?.activationSummary || []).join(" | ") || "无"}
+- styleSkill: ${state.styleSkill?.name || "默认"}
+- skills: ${state.agentSkills.map(skill => `${skill.type}:${skill.name}`).join(" | ") || "默认"}
+
+当前激活节点：
+${state.activeCards.length > 0 ? sanitizeWritingCards(state.activeCards).map((card, index) => formatCardForWriting(card, index)).join("\n\n") : "无"}
+
+补充召回节点：
+${state.recalledCards.length > 0 ? sanitizeWritingCards(state.recalledCards).map((card, index) => formatCardForWriting(card, index)).join("\n\n") : "无"}
+
+最近文章草稿：
+${state.recentNotes.length > 0 ? state.recentNotes.map((note, index) => `${index + 1}. ${note.title}\n${normalizePlainText(note.content).slice(0, 180)}`).join("\n\n") : "无"}
+
+提纲工具结果：
+${generatedOutlineText || "无"}
+
+正文工具结果：
+${generatedDraftText ? generatedDraftText.slice(0, 5000) : "无"}
+
+用户最新消息：
+${state.message}`;
+
+      const assistantContent = state.isCreateArticle && persistedDraftNote
+        ? [
+          `已基于当前激活网络创建文章《${persistedDraftNote.title || generatedPlan?.title || "未命名文章"}》。`,
+          "",
+          `这次使用了 ${cardsForWriting.length} 个知识节点，来源文章 ${buildSourceArticlesFromCards(cardsForWriting, state.dbCards).length} 篇。`,
+          state.styleSkill ? `写作风格：${state.styleSkill.name}` : "",
+          generatedPlan?.angle ? `核心判断：${generatedPlan.angle}` : "",
+          "你可以在「我的文章」里继续编辑；知识节点、原文摘录、来源图片和引用映射已经写入文章元信息。"
+        ].filter(Boolean).join("\n")
+        : await requestChat([
+          { role: "system", content: systemPrompt },
+          ...state.previousMessages
+            .filter((item): item is typeof item & { role: "user" | "assistant" } => item.role === "user" || item.role === "assistant")
+            .map(item => ({ role: item.role, content: item.content }))
+            .slice(-10),
+          { role: "user", content: userContextPrompt }
+        ], 0.55, 1200);
+
+      return {
+        generatedOutlineText,
+        generatedDraftText,
+        generatedPlan,
+        persistedDraftNote,
+        assistantContent
+      };
+    }, (_state, update) => update.persistedDraftNote ? `note=${update.persistedDraftNote.id}` : `answer=${(update.assistantContent || "").length}`))
+    .addNode("persist_memory", withTrace("persist_memory", async state => {
+      if (!state.assistantContent) throw new Error("agent returned empty message");
+
+      const cardsForSources = state.activeCards.length > 0
+        ? state.activeCards.concat(state.recalledCards)
+        : state.recalledCards;
+      const sources = state.sources || buildAgentSources(cardsForSources);
+      const selectedCardIds = (state.mergedState?.selectedCardIds || []).length > 0
+        ? state.mergedState?.selectedCardIds || []
+        : sources.cards.map(card => card.id).filter((id): id is string => typeof id === "string");
+      const toolPayload = {
+        requestedTools: state.requestedTools,
+        reason: state.intent?.reason || "",
+        activeCardIds: state.activeCards.map(card => card.id),
+        recalledCardIds: state.recalledCards.map(card => card.id),
+        outline: state.generatedPlan?.outline || [],
+        draftPreview: (state.generatedDraftText || "").slice(0, 400),
+        noteId: state.persistedDraftNote ? Number(state.persistedDraftNote.id) : undefined,
+        noteTitle: state.persistedDraftNote?.title,
+        noteSaved: Boolean(state.persistedDraftNote),
+        noteTopic: state.mergedState?.focusedTopic || state.message,
+        choices: state.choices,
+	        sources,
+	        graphTrace: state.graphTrace,
+	        skillSnapshots: buildAgentSkillSnapshots(state.agentSkills),
+	        effectiveSkills: buildAgentSkillSnapshots(state.agentSkills),
+	        effectiveSkillSnapshots: {
+	          baselineSkills: buildAgentSkillSnapshots(state.agentSkills.filter(isBaselineSkill)),
+	          userSelectedSkills: buildAgentSkillSnapshots(state.agentSkills.filter(skill => !isBaselineSkill(skill)))
+	        }
+	      };
+
+      if (state.requestedTools.length > 0) {
+        await pool.query(
+          `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+           VALUES ($1, 'tool', $2, $3)`,
+          [
+            state.threadId,
+            [
+              `tools: ${state.requestedTools.join(", ")}`,
+              state.generatedOutlineText ? `outline:\n${state.generatedOutlineText}` : "",
+              state.generatedDraftText ? `draft:\n${state.generatedDraftText.slice(0, 600)}` : ""
+            ].filter(Boolean).join("\n\n"),
+            JSON.stringify(toolPayload)
+          ]
+        );
+      }
+
+      const uiBlocks = buildAgentUiBlocks({
+        answer: state.assistantContent,
+        sources,
+        selectedCardIds,
+        choices: state.choices,
+        note: state.persistedDraftNote
+      });
+      const finalPayload: any = { ...toolPayload, uiBlocks, feedback: "none", sourceCollapsed: true };
+      const assistantMessageRow = (await pool.query(
+        `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+         VALUES ($1, 'assistant', $2, $3)
+         RETURNING id`,
+        [state.threadId, state.assistantContent, JSON.stringify(finalPayload)]
+      )).rows[0];
+      const assistantMessageId = Number(assistantMessageRow.id);
+      finalPayload.messageId = assistantMessageId;
+
+      const nextState: WriteAgentState = {
+        ...state.mergedState,
+        activatedNodeIds: selectedCardIds.length > 0 ? selectedCardIds : state.mergedState?.activatedNodeIds || [],
+        selectedCardIds,
+        activationSummary: selectedCardIds.length > 0
+          ? sanitizeWritingCards(sources.cards).slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`)
+          : state.mergedState?.activationSummary || [],
+        sourceImageIds: sources.images.map(image => image.id),
+        latestOutline: state.generatedPlan?.outline || state.mergedState?.latestOutline || [],
+        latestAngle: state.generatedPlan?.angle || state.mergedState?.latestAngle,
+	        lastGeneratedNoteId: state.persistedDraftNote ? Number(state.persistedDraftNote.id) : state.mergedState?.lastGeneratedNoteId,
+	        lastGeneratedNoteTitle: state.persistedDraftNote?.title || state.mergedState?.lastGeneratedNoteTitle,
+	        selectedStyleSkillId: state.styleSkill?.id,
+	        selectedSkillIds: state.agentSkills.filter(skill => !isBaselineSkill(skill)).map(skill => skill.id),
+	        effectiveSkillIds: state.agentSkills.map(skill => skill.id)
+	      };
+
+      const finalMessages = await getRecentThreadMessages(pool, Number(state.threadId), 14);
+      const summary = summarizeAgentMessages(finalMessages.map(item => ({ role: item.role, content: item.content })));
+      await upsertThreadState(pool, Number(state.threadId), summary, nextState, state.thread?.title || inferThreadTitle(state.message));
+
+      return {
+        mergedState: nextState,
+        toolPayload: finalPayload,
+        assistantMessageId,
+        sources,
+        uiBlocks
+      };
+    }, (_state, update) => `uiBlocks=${update.uiBlocks?.length || 0}`))
+    .addNode("respond", withTrace("respond", state => state, state => `thread=${state.threadId}`))
+    .addEdge(START, "hydrate_context")
+    .addEdge("hydrate_context", "load_effective_skills")
+    .addEdge("load_effective_skills", "classify_intent")
+    .addEdge("classify_intent", "retrieve_knowledge")
+    .addEdge("retrieve_knowledge", "enrich_sources")
+    .addEdge("enrich_sources", "decide_next")
+    .addEdge("decide_next", "human_selection")
+    .addEdge("human_selection", "generate_answer_or_draft")
+    .addEdge("generate_answer_or_draft", "persist_memory")
+    .addEdge("persist_memory", "respond")
+    .addEdge("respond", END)
+    .compile();
+
+  const finalState = await graph.invoke({
+    userId: input.userId,
+    threadId: input.threadId,
+    message: input.message,
+    isCreateArticle: input.isCreateArticle,
+    userState: input.userState,
+    generatedPlan: null,
+    generatedOutlineText: "",
+    generatedDraftText: "",
+    assistantContent: "",
+    assistantMessageId: undefined
+  });
+
+  await persistAgentGraphEvents(pool, input.userId, Number(finalState.threadId), finalState.graphTrace || []);
+  return finalState;
+};
+
+const SkillCreationGraphAnnotation = Annotation.Root({
+  userId: Annotation<number>(),
+  userInput: Annotation<string>(),
+  sampleText: Annotation<string | undefined>(),
+  inputType: Annotation<"description" | "sample" | "both">(),
+  extractedFeatures: Annotation<{
+    tone?: string[];
+    structure?: string[];
+    citationStyle?: string;
+    constraints?: string[];
+    examples?: string[];
+  }>(),
+  generatedSkill: Annotation<{
+    name: string;
+    description: string;
+    prompt: string;
+    constraints: string[];
+    examples: string[];
+  }>(),
+  validationErrors: Annotation<string[]>({ reducer: (_left, right) => right, default: () => [] }),
+  graphTrace: Annotation<any[]>({ reducer: (left, right) => left.concat(right), default: () => [] })
+});
+
+type SkillCreationGraphState = typeof SkillCreationGraphAnnotation.State;
+
+const runSkillCreationGraph = async (
+  pool: pg.Pool,
+  input: {
+    userId: number;
+    userInput: string;
+    sampleText?: string;
+    onStep?: (event: { type: string; node?: string; message?: string; data?: unknown }) => void | Promise<void>;
+  }
+) => {
+  const requestChat = async (messages: AiChatMessage[], temperature: number, maxTokens: number) => {
+    return requestAiChatCompletion(messages, {
+      temperature,
+      maxTokens,
+      timeoutMs: AI_REQUEST_TIMEOUT_MS,
+      logLabel: "skill_creation_graph",
+      disableThinking: true
+    });
+  };
+
+  const withTrace = (
+    node: string,
+    handler: (state: SkillCreationGraphState) => Promise<Partial<SkillCreationGraphState>> | Partial<SkillCreationGraphState>
+  ) => async (state: SkillCreationGraphState) => {
+    const started = Date.now();
+    await input.onStep?.({ type: "step_start", node, message: `开始 ${node}` });
+    const update = await handler(state);
+    const traceItem = { node, durationMs: Date.now() - started, createdAt: new Date().toISOString() };
+    await input.onStep?.({ type: "step_end", node, message: `完成 ${node}`, data: traceItem });
+    return { ...update, graphTrace: [traceItem] };
+  };
+
+  const graph = new StateGraph(SkillCreationGraphAnnotation)
+    .addNode("analyze_user_input", withTrace("analyze_user_input", async state => {
+      const hasSample = Boolean(state.sampleText && state.sampleText.trim().length > 20);
+      const hasDescription = Boolean(state.userInput && state.userInput.trim().length > 10);
+
+      let inputType: "description" | "sample" | "both" = "description";
+      if (hasSample && hasDescription) inputType = "both";
+      else if (hasSample) inputType = "sample";
+
+      await input.onStep?.({ type: "partial_status", node: "analyze_user_input", message: `输入类型: ${inputType}` });
+      return { inputType };
+    }))
+    .addNode("extract_style_features", withTrace("extract_style_features", async state => {
+      const systemPrompt = `你是 AtomFlow 写作风格分析专家。分析用户提供的内容，提取写作风格特征。
+
+输出严格 JSON 格式：
+{
+  "tone": ["特征1", "特征2"],
+  "structure": ["特征1", "特征2"],
+  "citationStyle": "引用风格描述",
+  "constraints": ["约束1", "约束2"],
+  "examples": ["示例1", "示例2"]
+}`;
+
+      const userPrompt = state.inputType === "sample"
+        ? `分析这段样本文本的写作风格：\n\n${state.sampleText}`
+        : state.inputType === "both"
+        ? `用户描述：${state.userInput}\n\n样本文本：\n${state.sampleText}\n\n综合分析写作风格特征。`
+        : `用户描述的写作风格：${state.userInput}`;
+
+      const rawResponse = await requestChat([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ], 0.3, 800);
+
+      const extractedFeatures = safeJsonParse<any>(rawResponse) || {
+        tone: ["自定义风格"],
+        structure: [],
+        citationStyle: "标准引用",
+        constraints: [],
+        examples: []
+      };
+
+      await input.onStep?.({ type: "partial_status", node: "extract_style_features", message: `提取特征: ${extractedFeatures.tone?.join(", ")}` });
+      return { extractedFeatures };
+    }))
+    .addNode("generate_skill_draft", withTrace("generate_skill_draft", async state => {
+      const systemPrompt = `你是 AtomFlow 写作 Skill 生成器。基于提取的风格特征，生成一个完整的写作风格 Skill 定义。
+
+输出严格 JSON 格式：
+{
+  "name": "风格名称",
+  "description": "风格描述",
+  "prompt": "详细的写作指令",
+  "constraints": ["约束1", "约束2"],
+  "examples": ["示例1", "示例2"]
+}
+
+要求：
+1. name 要简洁有辨识度，如"产品经理面试体"、"数据驱动论证"
+2. description 说明适用场景和核心特点
+3. prompt 要具体可执行，不要空泛的"保持风格"
+4. constraints 要具体，如"每个观点必须有数据支撑"而非"注意质量"
+5. examples 要真实可参考`;
+
+      const userPrompt = `基于以下风格特征生成 Skill：
+语气: ${state.extractedFeatures?.tone?.join(", ") || "未指定"}
+结构: ${state.extractedFeatures?.structure?.join(", ") || "未指定"}
+引用风格: ${state.extractedFeatures?.citationStyle || "标准引用"}
+约束: ${state.extractedFeatures?.constraints?.join("; ") || "无"}
+示例: ${state.extractedFeatures?.examples?.join("; ") || "无"}
+
+原始用户输入: ${state.userInput}`;
+
+      const rawResponse = await requestChat([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ], 0.4, 1200);
+
+      const generatedSkill = safeJsonParse<any>(rawResponse) || {
+        name: "自定义写作风格",
+        description: state.userInput.slice(0, 180),
+        prompt: `写作时遵循用户描述的风格：${state.userInput}`,
+        constraints: ["保持风格一致性"],
+        examples: []
+      };
+
+      await input.onStep?.({ type: "partial_status", node: "generate_skill_draft", message: `生成 Skill: ${generatedSkill.name}` });
+      return { generatedSkill };
+    }))
+    .addNode("validate_and_format", withTrace("validate_and_format", state => {
+      const errors: string[] = [];
+      const skill = state.generatedSkill!;
+
+      if (skill.name.length > 40) {
+        skill.name = skill.name.slice(0, 40);
+        errors.push("名称过长，已截断至40字符");
+      }
+      if (skill.description.length > 180) {
+        skill.description = skill.description.slice(0, 180);
+        errors.push("描述过长，已截断至180字符");
+      }
+
+      if (skill.name.length < 2) {
+        skill.name = "自定义写作风格";
+        errors.push("名称过短，使用默认名称");
+      }
+      if (skill.constraints.length === 0) {
+        skill.constraints = ["保持风格一致性", "不编造来源"];
+      }
+
+      return { generatedSkill: skill, validationErrors: errors };
+    }))
+    .addNode("respond_with_preview", withTrace("respond_with_preview", state => state))
+    .addEdge(START, "analyze_user_input")
+    .addEdge("analyze_user_input", "extract_style_features")
+    .addEdge("extract_style_features", "generate_skill_draft")
+    .addEdge("generate_skill_draft", "validate_and_format")
+    .addEdge("validate_and_format", "respond_with_preview")
+    .addEdge("respond_with_preview", END)
+    .compile();
+
+  const result = await graph.invoke({
+    userId: input.userId,
+    userInput: input.userInput,
+    sampleText: input.sampleText
+  });
+
+  return result;
+};
+
 const buildNoteActivatedNodes = (cards: WritingCardInput[]) => {
   return cards.map(card => ({
     id: card.id || `${card.type}-${normalizePlainText(card.content).slice(0, 24)}`,
     type: card.type,
     content: card.content,
+    summary: card.summary,
+    originalQuote: card.originalQuote,
+    context: card.context,
+    citationNote: card.citationNote,
+    evidenceRole: card.evidenceRole,
     articleTitle: card.articleTitle || '未命名文章',
     articleId: card.articleId,
+    savedArticleId: card.savedArticleId,
+    sourceName: card.sourceName,
+    sourceUrl: card.sourceUrl,
+    sourceContext: card.sourceContext,
+    sourceImages: card.sourceImages || [],
     tags: card.tags || []
   }));
 };
@@ -1015,8 +2391,12 @@ const buildNoteSourceArticles = (cards: WritingCardInput[]) => {
     savedArticleId?: number;
     articleId?: number;
     title: string;
-    source: string;
-    excerpt?: string;
+              source: string;
+              url?: string;
+              excerpt?: string;
+              citationContext?: string;
+              sourceImages?: string[];
+              savedAt?: string;
   }>();
   cards.forEach(card => {
     const key = card.savedArticleId
@@ -1027,8 +2407,12 @@ const buildNoteSourceArticles = (cards: WritingCardInput[]) => {
       savedArticleId: card.savedArticleId,
       articleId: card.articleId,
       title: card.articleTitle || '未命名文章',
-      source: '知识库文章',
-      excerpt: card.content.slice(0, 140)
+      source: card.sourceName || '知识库文章',
+      url: card.sourceUrl,
+      excerpt: card.sourceExcerpt || card.sourceContext || card.context || card.content.slice(0, 140),
+      citationContext: card.sourceContext,
+      sourceImages: card.sourceImages || [],
+      savedAt: card.savedAt
     });
   });
   return Array.from(unique.values());
@@ -1036,22 +2420,128 @@ const buildNoteSourceArticles = (cards: WritingCardInput[]) => {
 
 // 从写作卡片中提取唯一来源文章列表
 const buildSourceArticlesFromCards = (cardsForWriting: any[], dbCards: any[]) => {
-  const articleMap = new Map<string, { articleId?: number; articleTitle: string; url?: string; cardIds: number[] }>();
+  const articleMap = new Map<string, { articleId?: number; articleTitle: string; url?: string; cardIds: string[]; imageUrls?: string[] }>();
   const allCards = dbCards.length > 0 ? dbCards : cardsForWriting;
   for (const card of allCards) {
-    const key = card.saved_article_id ? `article_${card.saved_article_id}` : `title_${card.article_title || card.context_title || '未知来源'}`;
+    const savedArticleId = card.savedArticleId ?? card.saved_article_id;
+    const articleTitle = card.articleTitle ?? card.article_title ?? card.context_title ?? '未知来源';
+    const sourceUrl = card.sourceUrl ?? card.article_url;
+    const key = savedArticleId ? `article_${savedArticleId}` : `title_${articleTitle}`;
     if (!articleMap.has(key)) {
       articleMap.set(key, {
-        articleId: card.saved_article_id || undefined,
-        articleTitle: card.article_title || card.context_title || '未知来源',
-        url: card.article_url || undefined,
+        articleId: savedArticleId || undefined,
+        articleTitle,
+        url: sourceUrl || undefined,
         cardIds: [],
+        imageUrls: normalizeJsonStringArray(card.sourceImages),
       });
     }
-    articleMap.get(key)!.cardIds.push(card.id);
+    if (typeof card.id === "string") {
+      articleMap.get(key)!.cardIds.push(card.id);
+    }
   }
   return Array.from(articleMap.values());
 };
+
+const buildAgentSources = (cards: any[]): WriteAgentSourcesRecord => {
+  const safeCards = sanitizeWritingCards(cards);
+  const articles = new Map<string, WriteAgentSourcesRecord["articles"][number]>();
+  const quotes: WriteAgentSourcesRecord["quotes"] = [];
+  const images = new Map<string, WriteAgentSourcesRecord["images"][number]>();
+
+  safeCards.forEach(card => {
+    const articleKey = card.savedArticleId
+      ? `saved-${card.savedArticleId}`
+      : `${card.articleTitle || "unknown"}-${card.sourceUrl || ""}`;
+    if (!articles.has(articleKey)) {
+      articles.set(articleKey, {
+        id: card.savedArticleId || card.articleId,
+        title: card.articleTitle || "未命名文章",
+        source: card.sourceName,
+        url: card.sourceUrl,
+        citationContext: card.sourceContext,
+        imageUrls: card.sourceImages || []
+      });
+    }
+    if (card.originalQuote && card.id) {
+      quotes.push({
+        cardId: card.id,
+        articleTitle: card.articleTitle,
+        quote: card.originalQuote
+      });
+    }
+    (card.sourceImages || []).slice(0, 4).forEach((url, index) => {
+      const imageId = `${articleKey}-${index}`;
+      if (!images.has(imageId)) {
+        images.set(imageId, {
+          id: imageId,
+          url,
+          articleTitle: card.articleTitle
+        });
+      }
+    });
+  });
+
+  return {
+    cards,
+    articles: Array.from(articles.values()),
+    quotes: quotes.slice(0, 8),
+    images: Array.from(images.values()).slice(0, 12)
+  };
+};
+
+const buildAgentChoices = (cards: any[], styleSkill?: WriteStyleSkillRecord): WriteAgentChoiceRecord[] => {
+  const cardIds = cards.map(card => card.id).filter((id): id is string => typeof id === "string");
+  const choices: Array<WriteAgentChoiceRecord | null> = [
+    cardIds.length > 0 ? {
+      id: "use-recalled-cards",
+      label: `使用这 ${cardIds.length} 张卡片`,
+      action: "use_cards",
+      payload: { cardIds }
+    } : null,
+    {
+      id: "refresh-cards",
+      label: "换一组素材",
+      action: "refresh_cards",
+      payload: {}
+    },
+    {
+      id: "generate-outline",
+      label: "生成提纲",
+      action: "generate_outline",
+      payload: { cardIds }
+    },
+    {
+      id: "generate-draft",
+      label: styleSkill ? `用「${styleSkill.name}」创建文章` : "创建文章",
+      action: "generate_draft",
+      payload: { cardIds, styleSkillId: styleSkill?.id }
+    }
+  ];
+  return choices.filter((item): item is WriteAgentChoiceRecord => Boolean(item));
+};
+
+const buildAgentUiBlocks = (input: {
+  answer: string;
+  sources: WriteAgentSourcesRecord;
+  selectedCardIds: string[];
+  choices: WriteAgentChoiceRecord[];
+  note?: any;
+}) => [
+  { type: "answer" as const, markdown: input.answer },
+  input.sources.images.length > 0 ? { type: "source_gallery" as const, images: input.sources.images } : null,
+  input.sources.cards.length > 0 ? {
+    type: "card_selector" as const,
+    cards: input.sources.cards,
+    selectedCardIds: input.selectedCardIds
+  } : null,
+  input.choices.length > 0 ? { type: "action_bar" as const, choices: input.choices } : null,
+  input.note ? {
+    type: "draft_created" as const,
+    noteId: Number(input.note.id),
+    noteTitle: input.note.title || "未命名文章"
+  } : null
+].filter(Boolean);
 
 const createAgentDraftNote = async (
   pool: pg.Pool,
@@ -1065,8 +2555,49 @@ const createAgentDraftNote = async (
     evidenceMap: WritingEvidenceMapItem[];
     activeCards: WritingCardInput[];
     activationSummary: string[];
-    sourceArticles?: Array<{ articleId?: number; articleTitle: string; url?: string; cardIds: number[] }>;
-  }
+    sourceArticles?: Array<{ articleId?: number; articleTitle: string; url?: string; cardIds: string[]; imageUrls?: string[] }>;
+	    styleSkillSnapshot?: {
+	      id?: number | string;
+	      name: string;
+	      type?: WriteAgentSkillType;
+	      description?: string;
+	      prompt: string;
+	      examples?: string[];
+	      constraints?: string[];
+	    };
+	    skillSnapshots?: Array<{
+	      id?: number | string;
+	      name: string;
+	      type?: WriteAgentSkillType;
+	      description?: string;
+	      prompt: string;
+	      examples?: string[];
+	      constraints?: string[];
+	      isBaseline?: boolean;
+	    }>;
+	    effectiveSkillSnapshots?: {
+	      baselineSkills: Array<{
+	        id?: number | string;
+	        name: string;
+	        type?: WriteAgentSkillType;
+	        description?: string;
+	        prompt: string;
+	        examples?: string[];
+	        constraints?: string[];
+	        isBaseline?: boolean;
+	      }>;
+	      userSelectedSkills: Array<{
+	        id?: number | string;
+	        name: string;
+	        type?: WriteAgentSkillType;
+	        description?: string;
+	        prompt: string;
+	        examples?: string[];
+	        constraints?: string[];
+	        isBaseline?: boolean;
+	      }>;
+	    };
+	  }
 ) => {
   const tags = Array.from(new Set(input.activeCards.flatMap(card => card.tags || []))).slice(0, 10);
   const meta = {
@@ -1075,9 +2606,15 @@ const createAgentDraftNote = async (
     outline: input.outline,
     activationSummary: input.activationSummary,
     activatedNodes: buildNoteActivatedNodes(input.activeCards),
-    evidenceMap: input.evidenceMap,
-    sourceArticles: input.sourceArticles || buildNoteSourceArticles(input.activeCards)
-  };
+	    evidenceMap: input.evidenceMap,
+	    sourceArticles: input.sourceArticles || buildNoteSourceArticles(input.activeCards),
+	    styleSkillSnapshot: input.styleSkillSnapshot,
+	    skillSnapshots: input.skillSnapshots || (input.styleSkillSnapshot ? [input.styleSkillSnapshot] : []),
+	    effectiveSkillSnapshots: input.effectiveSkillSnapshots || {
+	      baselineSkills: (input.skillSnapshots || []).filter(skill => skill.isBaseline),
+	      userSelectedSkills: (input.skillSnapshots || []).filter(skill => !skill.isBaseline)
+	    }
+	  };
   const row = (await pool.query(
     `INSERT INTO notes (user_id, title, content, tags, meta)
      VALUES ($1, $2, $3, $4, $5)
@@ -1088,17 +2625,33 @@ const createAgentDraftNote = async (
 };
 
 // --- AI-powered card extraction (with fallback to regex) ---
-const AI_SYSTEM_PROMPT = `你是一个知识提炼助手。请从文章中提取最多3张知识卡片。
+const AI_SYSTEM_PROMPT = `你是一个面向后续写作引用的知识提炼助手。请先为整篇文章生成一个统一引用背景，再提取最多4张知识卡片。
 类型：观点、数据、金句、故事
-- 观点：文章核心主张，用自己的话提炼，最多100字
-- 数据：含具体数字/百分比/研究结论，原文摘录，最多100字
-- 金句：表达精炼值得收藏的原话，直接引用，最多100字
-- 故事：具体案例或叙事片段，最多100字
+- 观点：文章核心判断或机制解释，用自己的话提炼
+- 数据：具体数字、比例、报告结论、市场信号，尽量保留原文数字
+- 金句：可直接引用的原话，必须来自原文
+- 故事：案例、场景、人物、公司、事件或叙事片段
+
+必须先生成 articleCitationContext：
+- 这是这篇文章统一复用的引用背景，所有卡片都共用它
+- 180-360字，尽量全面但不啰嗦
+- 必须交代：文章讨论对象、来源/场景、关键时间或地域、主要问题、核心矛盾、作者结论、重要边界
+- 不要只复述标题，不要没头没尾；读者没看过原文，也应能理解卡片为什么成立
+
+每张卡片不是越短越好，而是要能在未来写作时被引用。必须包含：
+- content：这张卡的可复用知识点，120-220字，写成完整判断
+- summary：一句话说明它解决什么问题，40-80字
+- originalQuote：原文中最关键的一句或一小段；如果不是原文摘录，填空字符串
+- context：只写这张卡独有的局部语境，60-140字；不要重复 articleCitationContext
+- citationNote：未来写作中适合怎么引用它，例如“可用于说明……”“可作为……的例子”
+- evidenceRole：claim|data|example|quote|counterpoint|definition|trend 中选一个
+- tags：3-6个语义标签
+
 规则：
-1. 优先提取有信息量的类型，没有就不硬凑
-2. tags 给2-5个语义标签
-3. 严格只输出JSON数组，不要输出任何其他内容
-格式：[{"type":"观点","content":"...","tags":["标签1","标签2"]}]`;
+1. 优先提取有信息密度、能支撑写作论证的内容，没有就不硬凑
+2. 不要只做标题复述，要保留对象、时间、场景、因果、边界条件
+3. 严格只输出JSON对象，不要输出任何其他内容
+格式：{"articleCitationContext":"...","cards":[{"type":"观点","content":"...","summary":"...","originalQuote":"...","context":"...","citationNote":"...","evidenceRole":"claim","tags":["标签1","标签2"]}]}`;
 const WRITING_AGENT_SYSTEM_PROMPT = `你是一位优秀的中文专栏作家。你的任务是写原创文章，不是做素材汇编。
 
 核心原则：
@@ -1121,44 +2674,64 @@ const WRITING_AGENT_SYSTEM_PROMPT = `你是一位优秀的中文专栏作家。�
 const VALID_CARD_TYPES = new Set(["观点", "数据", "金句", "故事", "灵感"]);
 const VALID_WRITING_CARD_TYPES = new Set(["观点", "数据", "金句", "故事", "灵感"]);
 
-const extractCardsWithAI = async (
-  article: Article
-): Promise<Omit<AtomCard, "id" | "articleTitle" | "articleId">[]> => {
-  const apiKey = process.env.AI_API_KEY;
-  const baseUrl = process.env.AI_BASE_URL;
-  const model = process.env.AI_MODEL;
-  if (!apiKey || !baseUrl || !model) return [];
+type AiChatMessage = { role: "system" | "user" | "assistant"; content: string };
+
+type AiChatConfig = {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+};
+
+const getAiChatConfig = (): AiChatConfig | null => {
+  const apiKey = process.env.AI_API_KEY?.trim();
+  const baseUrl = process.env.AI_BASE_URL?.trim().replace(/\/+$/, "");
+  const model = process.env.AI_MODEL?.trim();
+  if (!apiKey || !baseUrl || !model || apiKey === "your-ai-api-key") {
+    return null;
+  }
+  return { apiKey, baseUrl, model };
+};
+
+const isAiFallbackDisabled = () => process.env.DISABLE_AI_FALLBACK === "true";
+
+const requestAiChatCompletion = async (
+  messages: AiChatMessage[],
+  options: {
+    temperature: number;
+    maxTokens: number;
+    timeoutMs?: number;
+    logLabel: string;
+    disableThinking?: boolean;
+  }
+) => {
+  const config = getAiChatConfig();
+  if (!config) {
+    throw new Error("AI service not configured");
+  }
+
+  const controller = new AbortController();
+  const timeout = options.timeoutMs
+    ? setTimeout(() => controller.abort(), options.timeoutMs)
+    : null;
 
   try {
-    const plainContent = normalizePlainText(
-      article.markdownContent || article.content || article.excerpt
-    ).slice(0, 3000);
-
-    if (plainContent.length < 30) return [];
-
-    const userPrompt = `标题：${article.title}\n来源：${article.source}\n话题：${article.topic}\n\n正文：${plainContent}`;
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-
-    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: 'POST',
+    const response = await fetch(`${config.baseUrl}/v1/chat/completions`, {
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'user', content: `${AI_SYSTEM_PROMPT}\n\n===文章===\n${userPrompt}` }
-        ],
-        max_tokens: 1000,
-        temperature: 0.3
+        model: config.model,
+        messages,
+        max_tokens: options.maxTokens,
+        temperature: options.temperature,
+        ...(options.disableThinking && config.model.toLowerCase().startsWith("qwen")
+          ? { enable_thinking: false }
+          : {}),
       }),
-      signal: controller.signal
+      signal: controller.signal,
     });
-
-    clearTimeout(timeout);
 
     if (!response.ok) {
       const responseBody = await response.text();
@@ -1166,25 +2739,84 @@ const extractCardsWithAI = async (
         module: "ai",
         status: response.status,
         responseBody: responseBody.slice(0, 1000),
+        operation: options.logLabel,
       }, "AI API request failed");
-      return [];
+      throw new Error(`AI request failed ${response.status}: ${responseBody}`);
     }
 
     const data = await response.json() as {
       choices?: Array<{ message?: { content?: string } }>;
     };
-    const raw = data.choices?.[0]?.message?.content;
-    if (!raw) return [];
+    return (data.choices?.[0]?.message?.content || "").trim();
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
+
+type ExtractedKnowledge = {
+  cards: Omit<AtomCard, "id" | "articleTitle" | "articleId">[];
+  articleCitationContext?: string;
+};
+
+const buildDefaultArticleCitationContext = (article: Article) => {
+  const parts = [
+    `来源：${article.source || "未知来源"}`,
+    article.topic ? `话题：${article.topic}` : "",
+    article.title ? `标题：${article.title}` : "",
+    article.publishedAt ? `发布时间：${new Date(article.publishedAt).toLocaleDateString("zh-CN")}` : "",
+    article.excerpt ? `摘要：${normalizePlainText(article.excerpt).slice(0, 220)}` : ""
+  ].filter(Boolean);
+  return parts.join("；").slice(0, 700);
+};
+
+const extractKnowledgeWithAI = async (
+  article: Article,
+  storageSkills: WriteAgentSkillRecord[] = []
+): Promise<ExtractedKnowledge> => {
+  if (!getAiChatConfig()) return { cards: [] };
+
+  try {
+    const plainContent = normalizePlainText(
+      article.markdownContent || article.content || article.excerpt
+    ).slice(0, 5200);
+
+    if (plainContent.length < 30) return { cards: [] };
+
+    const skillPrompt = formatAgentSkillInstructions(storageSkills, ["card_storage", "citation"]);
+    const userPrompt = `标题：${article.title}\n来源：${article.source}\n话题：${article.topic}
+${skillPrompt ? `\n本次入库必须遵循的 Skills：\n${skillPrompt}` : ""}
+
+正文：${plainContent}`;
+
+    const raw = await requestAiChatCompletion([
+      { role: 'user', content: `${AI_SYSTEM_PROMPT}\n\n===文章===\n${userPrompt}` }
+    ], {
+      maxTokens: 1800,
+      temperature: 0.3,
+      timeoutMs: 45000,
+      logLabel: "card_extraction",
+      disableThinking: true
+    });
+    if (!raw) return { cards: [] };
 
     // Strip markdown code fences if present
     const cleaned = raw.replace(/```json\s*/g, '').replace(/```/g, '').trim();
     const parsed: unknown = JSON.parse(cleaned);
+    const parsedRecord = isPlainRecord(parsed) ? parsed : null;
+    const rawCards = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsedRecord?.cards)
+        ? parsedRecord.cards
+        : [];
+    const articleCitationContext = typeof parsedRecord?.articleCitationContext === 'string'
+      ? parsedRecord.articleCitationContext.trim().slice(0, 700)
+      : undefined;
 
-    if (!Array.isArray(parsed)) return [];
+    if (!Array.isArray(rawCards)) return { cards: [], articleCitationContext };
 
     // Validate and sanitize each card
     const validCards: Omit<AtomCard, "id" | "articleTitle" | "articleId">[] = [];
-    for (const item of parsed.slice(0, 3)) {
+    for (const item of rawCards.slice(0, 4)) {
       const card = item as Record<string, unknown>;
       if (
         typeof card.type === 'string' &&
@@ -1196,8 +2828,13 @@ const extractCardsWithAI = async (
       ) {
         validCards.push({
           type: card.type as AtomCard['type'],
-          content: card.content.trim().slice(0, 100),
-          tags: (card.tags as string[]).slice(0, 5)
+          content: card.content.trim().slice(0, 520),
+          summary: typeof card.summary === 'string' ? card.summary.trim().slice(0, 180) : undefined,
+          originalQuote: typeof card.originalQuote === 'string' ? card.originalQuote.trim().slice(0, 260) : undefined,
+          context: typeof card.context === 'string' ? card.context.trim().slice(0, 360) : undefined,
+          citationNote: typeof card.citationNote === 'string' ? card.citationNote.trim().slice(0, 220) : undefined,
+          evidenceRole: typeof card.evidenceRole === 'string' ? card.evidenceRole.trim().slice(0, 40) : undefined,
+          tags: (card.tags as string[]).slice(0, 6)
         });
       }
     }
@@ -1209,10 +2846,10 @@ const extractCardsWithAI = async (
         articleTitle: article.title.slice(0, 80),
       }, "AI cards extracted");
     }
-    return validCards;
+    return { cards: validCards, articleCitationContext };
   } catch (err) {
     logger.error({ err, module: "ai", articleTitle: article.title.slice(0, 80) }, "AI card extraction failed");
-    return [];
+    return { cards: [] };
   }
 };
 
@@ -1483,10 +3120,13 @@ async function startServer() {
       tags           JSONB NOT NULL DEFAULT '[]'::jsonb,
       article_title  TEXT NOT NULL DEFAULT '',
       article_id     BIGINT,
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_user ON saved_cards(user_id)`);
+  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_updated ON saved_cards(user_id, updated_at DESC)`);
 
   // --- Schema migrations for password auth, preferences, notes ---
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT`);
@@ -1521,11 +3161,13 @@ async function startServer() {
       title        TEXT NOT NULL DEFAULT '新的写作会话',
       summary      TEXT NOT NULL DEFAULT '',
       state        JSONB NOT NULL DEFAULT '{}'::jsonb,
+      thread_type  TEXT NOT NULL DEFAULT 'chat' CHECK (thread_type IN ('chat', 'skill')),
       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_threads_user ON write_agent_threads(user_id, updated_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_threads_type ON write_agent_threads(user_id, thread_type, updated_at DESC)`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS write_agent_messages (
       id           BIGSERIAL PRIMARY KEY,
@@ -1595,16 +3237,61 @@ async function startServer() {
       topic         TEXT NOT NULL DEFAULT '',
       excerpt       TEXT NOT NULL DEFAULT '',
       content       TEXT NOT NULL DEFAULT '',
+      citation_context TEXT,
+      image_urls    JSONB NOT NULL DEFAULT '[]'::jsonb,
       published_at  BIGINT,
       saved_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS citation_context TEXT`);
+  await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS image_urls JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS content_hash TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_articles_user ON saved_articles(user_id, saved_at DESC)`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_articles_unique ON saved_articles(user_id, url) WHERE url IS NOT NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_articles_content_hash ON saved_articles(user_id, content_hash) WHERE content_hash IS NOT NULL`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_agent_events (
+      id           BIGSERIAL PRIMARY KEY,
+      thread_id    BIGINT NOT NULL REFERENCES write_agent_threads(id) ON DELETE CASCADE,
+      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      node         TEXT NOT NULL,
+      duration_ms  INTEGER NOT NULL DEFAULT 0,
+      input_summary TEXT,
+      output_summary TEXT,
+      meta         JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_events_thread ON write_agent_events(thread_id, created_at ASC)`);
+
+	  await pool.query(`
+	    CREATE TABLE IF NOT EXISTS write_style_skills (
+      id           BIGSERIAL PRIMARY KEY,
+      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name         TEXT NOT NULL,
+      description  TEXT NOT NULL DEFAULT '',
+      prompt       TEXT NOT NULL,
+      examples     JSONB NOT NULL DEFAULT '[]'::jsonb,
+      constraints  JSONB NOT NULL DEFAULT '[]'::jsonb,
+      is_default   BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+	  `);
+	  await pool.query(`ALTER TABLE write_style_skills ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'style'`);
+	  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_style_skills_user ON write_style_skills(user_id, updated_at DESC)`);
+	  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_style_skills_user_type ON write_style_skills(user_id, type, updated_at DESC)`);
 
   // --- saved_cards: add origin and saved_article_id columns ---
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'manual'`);
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS saved_article_id BIGINT REFERENCES saved_articles(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS summary TEXT`);
+  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS original_quote TEXT`);
+  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS context TEXT`);
+  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS citation_note TEXT`);
+  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS evidence_role TEXT`);
+  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS raw_card_meta JSONB NOT NULL DEFAULT '{}'::jsonb`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_saved_article ON saved_cards(saved_article_id)`);
 
   // --- card_relations: knowledge graph (reserved for future use) ---
@@ -2158,12 +3845,13 @@ async function startServer() {
     }
     const userArticles = await loadUserArticlesAsArticles(req.session.userId, pool);
     if (userArticles.length === 0) {
-      return res.json(articles);
+      return res.json(await applyUserSavedStateToArticles(req.session.userId, articles, pool));
     }
     // Deduplicate: skip user articles whose URL already exists in global store
     const globalUrls = new Set(articles.filter(a => a.url).map(a => a.url as string));
     const uniqueUserArticles = userArticles.filter(a => !a.url || !globalUrls.has(a.url));
-    return res.json(rankArticles([...articles, ...uniqueUserArticles]));
+    const rankedArticles = rankArticles([...articles, ...uniqueUserArticles]);
+    return res.json(await applyUserSavedStateToArticles(req.session.userId, rankedArticles, pool));
   }));
 
   app.post("/api/sources/fetch", asyncHandler(async (req, res) => {
@@ -2400,31 +4088,67 @@ async function startServer() {
       return res.status(404).json({ error: "Article not found" });
     }
 
-    // Check if this user already saved cards for this article
-    const existingCard = (await pool.query('SELECT id FROM saved_cards WHERE user_id = $1 AND article_id = $2', [req.session.userId, articleId])).rows[0];
-    if (!existingCard) {
-      article.saved = true;
+    // First, we need to determine the saved_article_id to check for duplicates properly
+    // This is a pre-check to see if we've already saved this article
+    const normalizedUrl = normalizeArticleUrl(article.url);
+    const contentHash = normalizedUrl ? null : generateContentHash(article.title, article.source, article.excerpt);
 
-      // AI extraction BEFORE transaction (may take up to 15s, don't hold DB conn)
+    let existingSavedArticleId: number | null = null;
+    if (normalizedUrl) {
+      const existingSavedArticle = await pool.query(
+        'SELECT id FROM saved_articles WHERE user_id = $1 AND url = $2',
+        [req.session.userId, normalizedUrl]
+      );
+      existingSavedArticleId = existingSavedArticle.rows[0]?.id ?? null;
+    } else if (contentHash) {
+      const existingSavedArticle = await pool.query(
+        'SELECT id FROM saved_articles WHERE user_id = $1 AND content_hash = $2',
+        [req.session.userId, contentHash]
+      );
+      existingSavedArticleId = existingSavedArticle.rows[0]?.id ?? null;
+    }
+
+    // Check if this user already saved cards for this article (using saved_article_id, not article_id)
+    const existingCard = existingSavedArticleId
+      ? (await pool.query('SELECT id FROM saved_cards WHERE user_id = $1 AND saved_article_id = $2', [req.session.userId, existingSavedArticleId])).rows[0]
+      : null;
+
+    if (!existingCard) {
+      // AI extraction BEFORE transaction (may take up to 45s, don't hold DB conn)
       let cardsToSave = article.cards;
-      let origin: 'ai' | 'manual' = 'manual';
-      if (!cardsToSave || cardsToSave.length === 0) {
-        const aiCards = await extractCardsWithAI(article);
+	      let articleCitationContext = buildDefaultArticleCitationContext(article);
+	      let origin: 'ai' | 'manual' = 'manual';
+	      let extractionSkills: WriteAgentSkillRecord[] = [];
+	      if (!cardsToSave || cardsToSave.length === 0) {
+	        extractionSkills = (await resolveWriteAgentSkills(pool, req.session.userId)).filter(skill => skill.type === "card_storage" || skill.type === "citation");
+	        const extracted = await extractKnowledgeWithAI(article, extractionSkills);
+        const aiCards = extracted.cards;
+        if (extracted.articleCitationContext) {
+          articleCitationContext = extracted.articleCitationContext;
+        }
         if (aiCards.length > 0) {
           cardsToSave = aiCards;
           origin = 'ai';
+        } else if (isAiFallbackDisabled()) {
+          return res.status(502).json({ error: "AI extraction failed", fallbackDisabled: true });
         } else {
           cardsToSave = buildCardsFromArticleContent(article);
+          // Mark fallback cards with a tag so users know they're lower quality
+          cardsToSave = cardsToSave.map(card => ({
+            ...card,
+            tags: [...(card.tags || []), '自动提取']
+          }));
         }
         article.cards = cardsToSave;
       }
 
       const newCards: AtomCard[] = cardsToSave.map(c => ({
         ...c,
-        id: Math.random().toString(36).substr(2, 9),
+        id: randomUUID(),
         articleTitle: article.title,
         articleId: article.id
       }));
+      const articleImageUrls = extractImageUrlsFromArticle(article);
 
       const client = await pool.connect();
       try {
@@ -2432,40 +4156,62 @@ async function startServer() {
 
         // Persist original article to saved_articles
         let savedArticleId: number | null = null;
-        if (article.url) {
-          // URL exists: upsert using unique index
+        const normalizedUrl = normalizeArticleUrl(article.url);
+        if (normalizedUrl) {
+          // URL exists: upsert using unique index (with normalized URL)
           const savedArticleResult = await client.query(
-            `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, published_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, citation_context, image_urls, published_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT (user_id, url) WHERE url IS NOT NULL
-             DO UPDATE SET title = EXCLUDED.title, content = EXCLUDED.content, excerpt = EXCLUDED.excerpt, source_icon = EXCLUDED.source_icon
+             DO UPDATE SET title = EXCLUDED.title, content = EXCLUDED.content, excerpt = EXCLUDED.excerpt, source_icon = EXCLUDED.source_icon, citation_context = EXCLUDED.citation_context, image_urls = EXCLUDED.image_urls
              RETURNING id`,
             [
-              req.session.userId, article.title, article.url,
+              req.session.userId, article.title, normalizedUrl,
               article.source, article.sourceIcon || null, article.topic,
               article.excerpt, article.markdownContent || article.content || article.excerpt,
+              articleCitationContext,
+              JSON.stringify(articleImageUrls),
               article.publishedAt || null
             ]
           );
           savedArticleId = savedArticleResult.rows[0]?.id ?? null;
         } else {
-          // No URL: check by title to avoid duplicates, then insert if not found
+          // No URL: use content hash to detect duplicates
+          const contentHash = generateContentHash(article.title, article.source, article.excerpt);
           const existing = await client.query(
-            `SELECT id FROM saved_articles WHERE user_id = $1 AND url IS NULL AND title = $2 LIMIT 1`,
-            [req.session.userId, article.title]
+            `SELECT id FROM saved_articles WHERE user_id = $1 AND content_hash = $2 LIMIT 1`,
+            [req.session.userId, contentHash]
           );
           if (existing.rows[0]) {
             savedArticleId = existing.rows[0].id;
+            await client.query(
+              `UPDATE saved_articles
+               SET title = $1, content = $2, excerpt = $3, source_icon = $4, citation_context = $5, image_urls = $6
+               WHERE id = $7 AND user_id = $8`,
+              [
+                article.title,
+                article.markdownContent || article.content || article.excerpt,
+                article.excerpt,
+                article.sourceIcon || null,
+                articleCitationContext,
+                JSON.stringify(articleImageUrls),
+                savedArticleId,
+                req.session.userId
+              ]
+            );
           } else {
             const insertResult = await client.query(
-              `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, published_at)
-               VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8)
+              `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, citation_context, image_urls, published_at, content_hash)
+               VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                RETURNING id`,
               [
                 req.session.userId, article.title,
                 article.source, article.sourceIcon || null, article.topic,
                 article.excerpt, article.markdownContent || article.content || article.excerpt,
-                article.publishedAt || null
+                articleCitationContext,
+                JSON.stringify(articleImageUrls),
+                article.publishedAt || null,
+                contentHash
               ]
             );
             savedArticleId = insertResult.rows[0]?.id ?? null;
@@ -2474,10 +4220,26 @@ async function startServer() {
 
         for (const card of newCards) {
           await client.query(
-            `INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id, origin, saved_article_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-            [card.id, req.session.userId, card.type, card.content, JSON.stringify(card.tags),
-             card.articleTitle, card.articleId || null, origin, savedArticleId || null]
+            `INSERT INTO saved_cards (
+               id, user_id, type, content, summary, original_quote, context,
+               citation_note, evidence_role, tags, article_title, article_id,
+               origin, saved_article_id, raw_card_meta
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+            [card.id, req.session.userId, card.type, card.content,
+             card.summary || null, card.originalQuote || null, card.context || null,
+             card.citationNote || null, card.evidenceRole || null, JSON.stringify(card.tags || []),
+             card.articleTitle, card.articleId || null, origin, savedArticleId || null,
+             JSON.stringify({
+               extractionModel: getAiChatConfig()?.model || null,
+               extractedAt: new Date().toISOString(),
+               articleSource: article.source,
+               articleTopic: article.topic,
+               effectiveSkillSnapshots: {
+                 baselineSkills: buildAgentSkillSnapshots(extractionSkills.filter(isBaselineSkill)),
+                 userSelectedSkills: buildAgentSkillSnapshots(extractionSkills.filter(skill => !isBaselineSkill(skill)))
+               }
+             })]
           );
         }
         await client.query('COMMIT');
@@ -2488,6 +4250,7 @@ async function startServer() {
         client.release();
       }
     }
+    article.saved = true;
 
     // Also update saved flag in user_articles if this is a user article
     if (isUserArticle) {
@@ -2626,27 +4389,57 @@ async function startServer() {
   // Get all saved cards
   app.get("/api/cards", requireAuth, asyncHandler(async (req, res) => {
     const rows = (await pool.query(
-      `SELECT id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId",
-              origin, saved_article_id AS "savedArticleId"
-       FROM saved_cards WHERE user_id = $1 ORDER BY created_at DESC`,
+      `SELECT sc.id, sc.type, sc.content, sc.summary,
+              sc.original_quote AS "originalQuote",
+              sc.context,
+              sc.citation_note AS "citationNote",
+              sc.evidence_role AS "evidenceRole",
+              sc.tags,
+              sc.article_title AS "articleTitle",
+              sc.article_id AS "articleId",
+              sc.origin,
+              sc.saved_article_id AS "savedArticleId",
+              sa.source AS "sourceName",
+              sa.url AS "sourceUrl",
+              sa.excerpt AS "sourceExcerpt",
+              sa.citation_context AS "sourceContext",
+              sa.image_urls AS "sourceImages",
+              sa.published_at AS "publishedAt",
+              sa.saved_at AS "savedAt"
+       FROM saved_cards sc
+       LEFT JOIN saved_articles sa ON sa.id = sc.saved_article_id AND sa.user_id = sc.user_id
+       WHERE sc.user_id = $1
+       ORDER BY sc.created_at DESC`,
       [req.session.userId]
     )).rows;
-    res.json(rows);
+    res.json(rows.map(row => ({ ...row, sourceImages: normalizeJsonStringArray(row.sourceImages) })));
   }));
 
   // Add a new manual card
   app.post("/api/cards", requireAuth, asyncHandler(async (req, res) => {
     const newCard: AtomCard = {
       ...req.body,
-      id: Math.random().toString(36).substr(2, 9),
+      id: randomUUID(),
       articleTitle: req.body.articleTitle || "手动录入"
     };
     if (!VALID_CARD_TYPES.has(newCard.type)) {
       return res.status(400).json({ error: '无效的卡片类型' });
     }
     await pool.query(
-      'INSERT INTO saved_cards (id, user_id, type, content, tags, article_title, article_id, origin, saved_article_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
-      [newCard.id, req.session.userId, newCard.type, newCard.content, JSON.stringify(newCard.tags), newCard.articleTitle, newCard.articleId || null, req.body.origin || 'manual', req.body.savedArticleId || null]
+      `INSERT INTO saved_cards (
+         id, user_id, type, content, summary, original_quote, context,
+         citation_note, evidence_role, tags, article_title, article_id,
+         origin, saved_article_id, raw_card_meta
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+      [
+        newCard.id, req.session.userId, newCard.type, newCard.content,
+        newCard.summary || null, newCard.originalQuote || null, newCard.context || null,
+        newCard.citationNote || null, newCard.evidenceRole || null,
+        JSON.stringify(newCard.tags || []), newCard.articleTitle, newCard.articleId || null,
+        req.body.origin || 'manual', req.body.savedArticleId || null,
+        JSON.stringify({ createdBy: 'manual', createdAt: new Date().toISOString() })
+      ]
     );
     res.json(newCard);
   }));
@@ -2654,16 +4447,38 @@ async function startServer() {
   // Update a card (single atomic UPDATE)
   app.put("/api/cards/:id", requireAuth, asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const { type, content, tags } = req.body;
+    const { type, content, tags, summary, originalQuote, context, citationNote, evidenceRole } = req.body;
 
     const row = (await pool.query(
       `UPDATE saved_cards SET
         type = COALESCE($1, type),
         content = COALESCE($2, content),
-        tags = COALESCE($3, tags)
-      WHERE id = $4 AND user_id = $5
-      RETURNING id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId"`,
-      [type ?? null, content ?? null, tags ? JSON.stringify(tags) : null, id, req.session.userId]
+        tags = COALESCE($3, tags),
+        summary = COALESCE($4, summary),
+        original_quote = COALESCE($5, original_quote),
+        context = COALESCE($6, context),
+        citation_note = COALESCE($7, citation_note),
+        evidence_role = COALESCE($8, evidence_role),
+        updated_at = NOW()
+      WHERE id = $9 AND user_id = $10
+      RETURNING id, type, content, summary,
+                original_quote AS "originalQuote",
+                context,
+                citation_note AS "citationNote",
+                evidence_role AS "evidenceRole",
+                tags, article_title AS "articleTitle", article_id AS "articleId"`,
+      [
+        type ?? null,
+        content ?? null,
+        tags ? JSON.stringify(tags) : null,
+        summary ?? null,
+        originalQuote ?? null,
+        context ?? null,
+        citationNote ?? null,
+        evidenceRole ?? null,
+        id,
+        req.session.userId
+      ]
     )).rows[0];
     if (!row) return res.status(404).json({ error: "Card not found" });
     res.json(row);
@@ -2685,23 +4500,27 @@ async function startServer() {
   app.get("/api/saved-articles", requireAuth, asyncHandler(async (req, res) => {
     const rows = (await pool.query(
       `SELECT id, title, url, source, source_icon AS "sourceIcon", topic, excerpt,
+              citation_context AS "citationContext",
+              image_urls AS "sourceImages",
               published_at AS "publishedAt", saved_at AS "savedAt"
        FROM saved_articles WHERE user_id = $1 ORDER BY saved_at DESC`,
       [req.session.userId]
     )).rows;
-    res.json(rows);
+    res.json(rows.map(row => ({ ...row, sourceImages: normalizeJsonStringArray(row.sourceImages) })));
   }));
 
   // Get a single saved article (with full content)
   app.get("/api/saved-articles/:id", requireAuth, asyncHandler(async (req, res) => {
     const row = (await pool.query(
       `SELECT id, title, url, source, source_icon AS "sourceIcon", topic, excerpt, content,
+              citation_context AS "citationContext",
+              image_urls AS "sourceImages",
               published_at AS "publishedAt", saved_at AS "savedAt"
        FROM saved_articles WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.session.userId]
     )).rows[0];
     if (!row) return res.status(404).json({ error: "Saved article not found" });
-    res.json(row);
+    res.json({ ...row, sourceImages: normalizeJsonStringArray(row.sourceImages) });
   }));
 
   // Translate article content (Baidu Translate API)
@@ -2817,16 +4636,37 @@ async function startServer() {
 
     // Get user's saved cards
     const cardRows = (await pool.query(
-      `SELECT id, type, content, tags, article_title AS "articleTitle", article_id AS "articleId"
-       FROM saved_cards WHERE user_id = $1`,
+      `SELECT sc.id, sc.type, sc.content, sc.summary,
+              sc.original_quote AS "originalQuote",
+              sc.context,
+              sc.citation_note AS "citationNote",
+              sc.evidence_role AS "evidenceRole",
+              sc.tags,
+              sc.article_title AS "articleTitle",
+              sc.article_id AS "articleId",
+              sc.saved_article_id AS "savedArticleId",
+              sa.source AS "sourceName",
+              sa.url AS "sourceUrl",
+              sa.excerpt AS "sourceExcerpt",
+              sa.citation_context AS "sourceContext",
+              sa.image_urls AS "sourceImages",
+              sa.published_at AS "publishedAt",
+              sa.saved_at AS "savedAt"
+       FROM saved_cards sc
+       LEFT JOIN saved_articles sa ON sa.id = sc.saved_article_id AND sa.user_id = sc.user_id
+       WHERE sc.user_id = $1`,
       [req.session.userId]
-    )).rows.map(r => ({ ...r, tags: typeof r.tags === 'string' ? JSON.parse(r.tags) : r.tags }));
+    )).rows.map(r => ({
+      ...r,
+      tags: typeof r.tags === 'string' ? JSON.parse(r.tags) : r.tags,
+      sourceImages: normalizeJsonStringArray(r.sourceImages)
+    }));
 
     if (cardRows.length === 0) return res.json({ cards: [] });
 
     const keywords = topic.split(/[\s,、]+/).filter(Boolean);
     const matched = cardRows.filter(c => {
-      const text = `${c.content} ${(c.tags || []).join(' ')} ${c.articleTitle || ''}`.toLowerCase();
+      const text = `${c.content} ${c.summary || ''} ${c.sourceContext || ''} ${c.context || ''} ${c.originalQuote || ''} ${c.citationNote || ''} ${(c.tags || []).join(' ')} ${c.articleTitle || ''} ${c.sourceName || ''}`.toLowerCase();
       return keywords.some((k: string) => text.includes(k.toLowerCase()));
     });
 
@@ -2834,31 +4674,33 @@ async function startServer() {
   }));
 
   app.get("/api/write/agent/threads", requireAuth, asyncHandler(async (req, res) => {
+    const threadType = req.query.type === 'skill' ? 'skill' : 'chat';
     const rows = (await pool.query(
-      `SELECT id, title, summary, state, created_at, updated_at
+      `SELECT id, title, summary, state, thread_type, created_at, updated_at
        FROM write_agent_threads
-       WHERE user_id = $1
+       WHERE user_id = $1 AND thread_type = $2
        ORDER BY updated_at DESC
        LIMIT 30`,
-      [req.session.userId]
+      [req.session.userId, threadType]
     )).rows;
     res.json(rows);
   }));
 
   app.post("/api/write/agent/threads", requireAuth, asyncHandler(async (req, res) => {
-    const { title } = req.body || {};
+    const { title, threadType } = req.body || {};
+    const normalizedType = threadType === 'skill' ? 'skill' : 'chat';
     const row = (await pool.query(
-      `INSERT INTO write_agent_threads (user_id, title)
-       VALUES ($1, $2)
-       RETURNING id, title, summary, state, created_at, updated_at`,
-      [req.session.userId, typeof title === 'string' && title.trim() ? title.trim() : '新的写作会话']
+      `INSERT INTO write_agent_threads (user_id, title, thread_type)
+       VALUES ($1, $2, $3)
+       RETURNING id, title, summary, state, thread_type, created_at, updated_at`,
+      [req.session.userId, typeof title === 'string' && title.trim() ? title.trim() : '新的写作会话', normalizedType]
     )).rows[0];
     res.json(row);
   }));
 
   app.get("/api/write/agent/threads/:id/messages", requireAuth, asyncHandler(async (req, res) => {
     const thread = (await pool.query(
-      `SELECT id, title, summary, state, created_at, updated_at
+      `SELECT id, title, summary, state, thread_type, created_at, updated_at
        FROM write_agent_threads
        WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.session.userId]
@@ -2866,6 +4708,380 @@ async function startServer() {
     if (!thread) return res.status(404).json({ error: 'thread not found' });
     const messages = await getRecentThreadMessages(pool, Number(req.params.id), 60);
     res.json({ thread, messages });
+  }));
+
+  app.post("/api/write/agent/messages/:id/feedback", requireAuth, asyncHandler(async (req, res) => {
+    const feedback = typeof req.body?.feedback === 'string' ? req.body.feedback : 'none';
+    if (!['liked', 'disliked', 'none'].includes(feedback)) {
+      return res.status(400).json({ error: 'unsupported feedback' });
+    }
+    const result = await pool.query(
+      `UPDATE write_agent_messages wam
+       SET meta = jsonb_set(
+         COALESCE(wam.meta, '{}'::jsonb),
+         '{feedback}',
+         to_jsonb($1::text),
+         true
+       )
+       FROM write_agent_threads wat
+       WHERE wam.id = $2
+         AND wam.thread_id = wat.id
+         AND wat.user_id = $3
+         AND wam.role = 'assistant'
+       RETURNING wam.id, wam.meta`,
+      [feedback, req.params.id, req.session.userId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'message not found' });
+    res.json({ success: true, feedback, messageId: Number(result.rows[0].id) });
+  }));
+
+	  app.get("/api/write/agent/threads/:id/events", requireAuth, asyncHandler(async (req, res) => {
+    const thread = (await pool.query(
+      `SELECT id FROM write_agent_threads WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.session.userId]
+    )).rows[0];
+    if (!thread) return res.status(404).json({ error: 'thread not found' });
+    const rows = (await pool.query(
+      `SELECT node, duration_ms AS "durationMs", input_summary AS "inputSummary",
+              output_summary AS "outputSummary", meta, created_at AS "createdAt"
+       FROM write_agent_events
+       WHERE thread_id = $1 AND user_id = $2
+       ORDER BY created_at ASC
+       LIMIT 200`,
+      [req.params.id, req.session.userId]
+    )).rows;
+	    res.json({ events: rows });
+	  }));
+
+	  const sanitizeSkillList = (items: unknown, max: number) => (
+	    Array.isArray(items)
+	      ? items.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map(item => item.trim().slice(0, 180)).slice(0, max)
+	      : []
+	  );
+
+	  app.get("/api/write/agent/skills", requireAuth, asyncHandler(async (req, res) => {
+	    const type = normalizeAgentSkillType(req.query.type);
+	    const hasTypeFilter = typeof req.query.type === "string" && ["card_storage", "citation", "writing", "style"].includes(req.query.type);
+	    res.json({ skills: await fetchWriteAgentSkills(pool, req.session.userId, hasTypeFilter ? type : undefined) });
+	  }));
+
+	  app.post("/api/write/agent/skills", requireAuth, asyncHandler(async (req, res) => {
+	    const { name, description = "", prompt, examples = [], constraints = [], isDefault = false } = req.body || {};
+	    const type = normalizeAgentSkillType(req.body?.type);
+	    if (typeof name !== "string" || !name.trim()) return res.status(400).json({ error: "name is required" });
+	    if (typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "prompt is required" });
+	    const client = await pool.connect();
+	    try {
+	      await client.query("BEGIN");
+	      if (isDefault) {
+	        await client.query(`UPDATE write_style_skills SET is_default = FALSE WHERE user_id = $1 AND type = $2`, [req.session.userId, type]);
+	      }
+	      const row = (await client.query(
+	        `INSERT INTO write_style_skills (user_id, name, type, description, prompt, examples, constraints, is_default)
+	         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	         RETURNING id, name, type, description, prompt, examples, constraints, is_default AS "isDefault",
+	                   created_at AS "createdAt", updated_at AS "updatedAt"`,
+	        [
+	          req.session.userId,
+	          name.trim().slice(0, 40),
+	          type,
+	          typeof description === "string" ? description.trim().slice(0, 180) : "",
+	          prompt.trim().slice(0, 2000),
+	          JSON.stringify(sanitizeSkillList(examples, 8)),
+	          JSON.stringify(sanitizeSkillList(constraints, 12)),
+	          Boolean(isDefault)
+	        ]
+	      )).rows[0];
+	      await client.query("COMMIT");
+	      res.json({ skill: { ...row, id: Number(row.id), type: normalizeAgentSkillType(row.type), visibility: "user" } });
+	    } catch (error) {
+	      await client.query("ROLLBACK");
+	      throw error;
+	    } finally {
+	      client.release();
+	    }
+	  }));
+
+	  app.put("/api/write/agent/skills/:id", requireAuth, asyncHandler(async (req, res) => {
+	    const skillId = Number(req.params.id);
+	    if (!Number.isFinite(skillId)) return res.status(400).json({ error: "invalid skill id" });
+	    const current = (await pool.query(`SELECT type FROM write_style_skills WHERE id = $1 AND user_id = $2`, [skillId, req.session.userId])).rows[0];
+	    if (!current) return res.status(404).json({ error: "skill not found" });
+	    const currentType = normalizeAgentSkillType(current.type);
+	    const nextType = req.body?.type ? normalizeAgentSkillType(req.body.type) : currentType;
+	    const { name, description, prompt, examples, constraints, isDefault } = req.body || {};
+	    const client = await pool.connect();
+	    try {
+	      await client.query("BEGIN");
+	      if (isDefault) {
+	        await client.query(`UPDATE write_style_skills SET is_default = FALSE WHERE user_id = $1 AND type = $2`, [req.session.userId, nextType]);
+	      }
+	      const row = (await client.query(
+	        `UPDATE write_style_skills SET
+	           name = COALESCE($1, name),
+	           type = $2,
+	           description = COALESCE($3, description),
+	           prompt = COALESCE($4, prompt),
+	           examples = COALESCE($5, examples),
+	           constraints = COALESCE($6, constraints),
+	           is_default = COALESCE($7, is_default),
+	           updated_at = NOW()
+	         WHERE id = $8 AND user_id = $9
+	         RETURNING id, name, type, description, prompt, examples, constraints, is_default AS "isDefault",
+	                   created_at AS "createdAt", updated_at AS "updatedAt"`,
+	        [
+	          typeof name === "string" && name.trim() ? name.trim().slice(0, 40) : null,
+	          nextType,
+	          typeof description === "string" ? description.trim().slice(0, 180) : null,
+	          typeof prompt === "string" && prompt.trim() ? prompt.trim().slice(0, 2000) : null,
+	          Array.isArray(examples) ? JSON.stringify(sanitizeSkillList(examples, 8)) : null,
+	          Array.isArray(constraints) ? JSON.stringify(sanitizeSkillList(constraints, 12)) : null,
+	          typeof isDefault === "boolean" ? isDefault : null,
+	          skillId,
+	          req.session.userId
+	        ]
+	      )).rows[0];
+	      await client.query("COMMIT");
+	      res.json({ skill: { ...row, id: Number(row.id), type: normalizeAgentSkillType(row.type), visibility: "user" } });
+	    } catch (error) {
+	      await client.query("ROLLBACK");
+	      throw error;
+	    } finally {
+	      client.release();
+	    }
+	  }));
+
+	  app.delete("/api/write/agent/skills/:id", requireAuth, asyncHandler(async (req, res) => {
+	    const result = await pool.query(
+	      `DELETE FROM write_style_skills WHERE id = $1 AND user_id = $2`,
+	      [req.params.id, req.session.userId]
+	    );
+	    if (result.rowCount === 0) return res.status(404).json({ error: "skill not found" });
+	    res.json({ success: true });
+	  }));
+
+	  app.post("/api/write/agent/skills/generate", requireAuth, asyncHandler(async (req, res) => {
+	    const { userInput, sampleText } = req.body;
+
+	    if (!userInput || typeof userInput !== "string" || userInput.trim().length < 5) {
+	      return res.status(400).json({ error: "userInput is required and must be at least 5 characters" });
+	    }
+
+	    if (sampleText !== undefined && typeof sampleText !== "string") {
+	      return res.status(400).json({ error: "sampleText must be a string if provided" });
+	    }
+
+	    const result = await runSkillCreationGraph(pool, {
+	      userId: req.session.userId!,
+	      userInput: userInput.trim(),
+	      sampleText: sampleText?.trim(),
+	      onStep: async (event) => {
+	        logger.debug({ event }, "Skill creation graph step");
+	      }
+	    });
+
+	    res.json({
+	      success: true,
+	      skill: result.generatedSkill,
+	      validationErrors: result.validationErrors || [],
+	      trace: result.graphTrace
+	    });
+	  }));
+
+	  app.get("/api/write/style-skills", requireAuth, asyncHandler(async (req, res) => {
+	    res.json({ skills: await fetchWriteStyleSkills(pool, req.session.userId) });
+  }));
+
+	  app.post("/api/write/style-skills", requireAuth, asyncHandler(async (req, res) => {
+    const { name, description = "", prompt, examples = [], constraints = [], isDefault = false } = req.body || {};
+    if (typeof name !== "string" || !name.trim()) return res.status(400).json({ error: "name is required" });
+    if (typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "prompt is required" });
+    const client = await pool.connect();
+    try {
+	      await client.query("BEGIN");
+	      if (isDefault) {
+	        await client.query(`UPDATE write_style_skills SET is_default = FALSE WHERE user_id = $1 AND type = 'style'`, [req.session.userId]);
+	      }
+	      const row = (await client.query(
+	        `INSERT INTO write_style_skills (user_id, name, type, description, prompt, examples, constraints, is_default)
+	         VALUES ($1, $2, 'style', $3, $4, $5, $6, $7)
+	         RETURNING id, name, type, description, prompt, examples, constraints, is_default AS "isDefault",
+	                   created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [
+          req.session.userId,
+          name.trim().slice(0, 40),
+          typeof description === "string" ? description.trim().slice(0, 160) : "",
+          prompt.trim().slice(0, 1600),
+          JSON.stringify(Array.isArray(examples) ? examples.filter((item): item is string => typeof item === "string").slice(0, 8) : []),
+          JSON.stringify(Array.isArray(constraints) ? constraints.filter((item): item is string => typeof item === "string").slice(0, 12) : []),
+          Boolean(isDefault)
+        ]
+      )).rows[0];
+      await client.query("COMMIT");
+	      res.json({ skill: { ...row, id: Number(row.id), type: "style", visibility: "user" } });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.put("/api/write/style-skills/:id", requireAuth, asyncHandler(async (req, res) => {
+    const skillId = Number(req.params.id);
+    if (!Number.isFinite(skillId)) return res.status(400).json({ error: "invalid skill id" });
+    const { name, description, prompt, examples, constraints, isDefault } = req.body || {};
+    const client = await pool.connect();
+    try {
+	      await client.query("BEGIN");
+	      if (isDefault) {
+	        await client.query(`UPDATE write_style_skills SET is_default = FALSE WHERE user_id = $1 AND type = 'style'`, [req.session.userId]);
+	      }
+	      const row = (await client.query(
+        `UPDATE write_style_skills SET
+           name = COALESCE($1, name),
+           description = COALESCE($2, description),
+           prompt = COALESCE($3, prompt),
+           examples = COALESCE($4, examples),
+           constraints = COALESCE($5, constraints),
+           is_default = COALESCE($6, is_default),
+           updated_at = NOW()
+	         WHERE id = $7 AND user_id = $8 AND type = 'style'
+	         RETURNING id, name, type, description, prompt, examples, constraints, is_default AS "isDefault",
+                   created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [
+          typeof name === "string" && name.trim() ? name.trim().slice(0, 40) : null,
+          typeof description === "string" ? description.trim().slice(0, 160) : null,
+          typeof prompt === "string" && prompt.trim() ? prompt.trim().slice(0, 1600) : null,
+          Array.isArray(examples) ? JSON.stringify(examples.filter((item): item is string => typeof item === "string").slice(0, 8)) : null,
+          Array.isArray(constraints) ? JSON.stringify(constraints.filter((item): item is string => typeof item === "string").slice(0, 12)) : null,
+          typeof isDefault === "boolean" ? isDefault : null,
+          skillId,
+          req.session.userId
+        ]
+      )).rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "style skill not found" });
+      }
+      await client.query("COMMIT");
+	      res.json({ skill: { ...row, id: Number(row.id), type: "style", visibility: "user" } });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.delete("/api/write/style-skills/:id", requireAuth, asyncHandler(async (req, res) => {
+	    const result = await pool.query(
+	      `DELETE FROM write_style_skills WHERE id = $1 AND user_id = $2 AND type = 'style'`,
+      [req.params.id, req.session.userId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "style skill not found" });
+    res.json({ success: true });
+  }));
+
+  const buildWriteAgentRequest = (body: any) => {
+    const { threadId, message, focusedTopic, activatedNodeIds, activationSummary, action } = body || {};
+    const isCreateArticle = action === 'create_article';
+    if (!isCreateArticle && (!message || typeof message !== 'string' || !message.trim())) {
+      return { error: 'message is required' };
+    }
+    const normalizedMessage = isCreateArticle
+      ? (typeof message === 'string' && message.trim() ? message.trim() : '请根据当前对话和激活网络创建一篇文章')
+      : message.trim();
+    const graphUserState: WriteAgentState = {
+      focusedTopic: typeof focusedTopic === 'string' ? focusedTopic : undefined,
+      activatedNodeIds: Array.isArray(activatedNodeIds) ? activatedNodeIds.filter((id): id is string => typeof id === 'string') : undefined,
+      activationSummary: Array.isArray(activationSummary) ? activationSummary.filter((item): item is string => typeof item === 'string') : undefined,
+	      selectedStyleSkillId: typeof body?.selectedStyleSkillId === 'string' || typeof body?.selectedStyleSkillId === 'number'
+	        ? body.selectedStyleSkillId
+	        : undefined,
+	      selectedSkillIds: Array.isArray(body?.selectedSkillIds)
+	        ? body.selectedSkillIds.filter((id): id is number | string => typeof id === 'string' || typeof id === 'number')
+	        : undefined,
+	      writingGoal: typeof body?.writingGoal === 'string' ? body.writingGoal : undefined,
+      selectedCardIds: Array.isArray(body?.selectedCardIds) ? body.selectedCardIds.filter((id): id is string => typeof id === 'string') : undefined
+    };
+    return {
+      threadId: threadId ? Number(threadId) : undefined,
+      normalizedMessage,
+      isCreateArticle,
+      graphUserState
+    };
+  };
+
+  const buildWriteAgentResponse = (graphState: WriteAgentGraphState) => ({
+    threadId: Number(graphState.threadId),
+    threadState: graphState.mergedState,
+    assistant: {
+      role: 'assistant',
+      content: graphState.assistantContent
+    },
+    assistantMessage: graphState.assistantContent,
+    messageId: graphState.assistantMessageId || graphState.toolPayload?.messageId,
+    toolResult: graphState.toolPayload,
+    uiBlocks: graphState.uiBlocks || [],
+    choices: graphState.choices || [],
+    sources: graphState.sources,
+    graphTrace: graphState.graphTrace || [],
+    note: graphState.persistedDraftNote
+      ? {
+        id: Number(graphState.persistedDraftNote.id),
+        title: graphState.persistedDraftNote.title,
+        created_at: graphState.persistedDraftNote.created_at,
+        updated_at: graphState.persistedDraftNote.updated_at
+      }
+      : null,
+    noteCreated: Boolean(graphState.persistedDraftNote),
+    context: {
+      activeCards: graphState.activeCards?.length || 0,
+      recalledCards: graphState.recalledCards?.length || 0
+    }
+  });
+
+  app.post("/api/write/agent/chat/stream", requireAuth, asyncHandler(async (req, res) => {
+    const parsed = buildWriteAgentRequest(req.body);
+    if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+    if (!getAiChatConfig()) return res.status(500).json({ error: 'AI service not configured' });
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const send = (type: string, data: unknown) => {
+      res.write(`event: ${type}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    try {
+      send('partial_status', { message: '启动写作 Agent' });
+      const graphState = await runWriteAgentGraph(pool, {
+        userId: req.session.userId,
+        threadId: parsed.threadId,
+        message: parsed.normalizedMessage,
+        isCreateArticle: parsed.isCreateArticle,
+        userState: parsed.graphUserState,
+        onStep: async event => {
+          send(event.type, {
+            node: event.node,
+            message: event.message,
+            ...(event.data && typeof event.data === 'object' ? event.data as Record<string, unknown> : { data: event.data })
+          });
+        }
+      });
+      send('final', buildWriteAgentResponse(graphState));
+      res.end();
+    } catch (error) {
+      logger.error({ err: error, module: "write-agent-stream" }, "Streaming write agent failed");
+      send('error', {
+        message: error instanceof Error && error.message ? error.message : '写作助手暂时不可用'
+      });
+      res.end();
+    }
   }));
 
   app.post("/api/write/agent/chat", requireAuth, asyncHandler(async (req, res) => {
@@ -2878,9 +5094,63 @@ async function startServer() {
       ? (typeof message === 'string' && message.trim() ? message.trim() : '请根据当前对话和激活网络创建一篇文章')
       : message.trim();
 
+    if (!getAiChatConfig()) {
+      return res.status(500).json({ error: 'AI service not configured' });
+    }
+
+    const graphUserState: WriteAgentState = {
+      focusedTopic: typeof focusedTopic === 'string' ? focusedTopic : undefined,
+      activatedNodeIds: Array.isArray(activatedNodeIds) ? activatedNodeIds.filter((id): id is string => typeof id === 'string') : undefined,
+      activationSummary: Array.isArray(activationSummary) ? activationSummary.filter((item): item is string => typeof item === 'string') : undefined,
+	      selectedStyleSkillId: typeof req.body?.selectedStyleSkillId === 'string' || typeof req.body?.selectedStyleSkillId === 'number'
+	        ? req.body.selectedStyleSkillId
+	        : undefined,
+	      selectedSkillIds: Array.isArray(req.body?.selectedSkillIds)
+	        ? req.body.selectedSkillIds.filter((id): id is number | string => typeof id === 'string' || typeof id === 'number')
+	        : undefined,
+	      writingGoal: typeof req.body?.writingGoal === 'string' ? req.body.writingGoal : undefined,
+      selectedCardIds: Array.isArray(req.body?.selectedCardIds) ? req.body.selectedCardIds.filter((id): id is string => typeof id === 'string') : undefined
+    };
+
+    const graphState = await runWriteAgentGraph(pool, {
+      userId: req.session.userId,
+      threadId: threadId ? Number(threadId) : undefined,
+      message: normalizedMessage,
+      isCreateArticle,
+      userState: graphUserState
+    });
+
+    return res.json({
+      threadId: Number(graphState.threadId),
+      threadState: graphState.mergedState,
+      assistant: {
+        role: 'assistant',
+        content: graphState.assistantContent
+      },
+      assistantMessage: graphState.assistantContent,
+      toolResult: graphState.toolPayload,
+      uiBlocks: graphState.uiBlocks || [],
+      choices: graphState.choices || [],
+      sources: graphState.sources,
+      graphTrace: graphState.graphTrace || [],
+      note: graphState.persistedDraftNote
+        ? {
+          id: Number(graphState.persistedDraftNote.id),
+          title: graphState.persistedDraftNote.title,
+          created_at: graphState.persistedDraftNote.created_at,
+          updated_at: graphState.persistedDraftNote.updated_at
+        }
+        : null,
+      noteCreated: Boolean(graphState.persistedDraftNote),
+      context: {
+        activeCards: graphState.activeCards?.length || 0,
+        recalledCards: graphState.recalledCards?.length || 0
+      }
+    });
+
     let thread = threadId
       ? (await pool.query(
-        `SELECT id, title, summary, state, created_at, updated_at
+        `SELECT id, title, summary, state, thread_type, created_at, updated_at
          FROM write_agent_threads
          WHERE id = $1 AND user_id = $2`,
         [threadId, req.session.userId]
@@ -2889,10 +5159,10 @@ async function startServer() {
 
     if (!thread) {
       thread = (await pool.query(
-        `INSERT INTO write_agent_threads (user_id, title, state)
-         VALUES ($1, $2, $3)
-         RETURNING id, title, summary, state, created_at, updated_at`,
-        [req.session.userId, inferThreadTitle(normalizedMessage), JSON.stringify({})]
+        `INSERT INTO write_agent_threads (user_id, title, state, thread_type)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, title, summary, state, thread_type, created_at, updated_at`,
+        [req.session.userId, inferThreadTitle(normalizedMessage), JSON.stringify({}), 'chat']
       )).rows[0];
     }
 
@@ -2942,35 +5212,18 @@ async function startServer() {
 
 注意：大部分日常对话应该返回 ["just_chat"]，只有明确涉及上述操作才使用对应工具。`;
 
-    const apiKey = process.env.AI_API_KEY;
-    const baseUrl = process.env.AI_BASE_URL;
-    const model = process.env.AI_MODEL;
-    if (!apiKey || !baseUrl || !model) {
+    if (!getAiChatConfig()) {
       return res.status(500).json({ error: 'AI service not configured' });
     }
 
-    const requestChat = async (messages: Array<{ role: "system" | "user" | "assistant"; content: string }>, temperature: number, maxTokens: number) => {
-      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model,
-          messages,
-          max_tokens: maxTokens,
-          temperature
-        })
+    const requestChat = async (messages: AiChatMessage[], temperature: number, maxTokens: number) => {
+      return requestAiChatCompletion(messages, {
+        temperature,
+        maxTokens,
+        timeoutMs: AI_REQUEST_TIMEOUT_MS,
+        logLabel: "write_agent",
+        disableThinking: true
       });
-      if (!response.ok) {
-        const errorText = await response.text();
-        logger.error({
-          module: "ai",
-          status: response.status,
-          responseBody: errorText.slice(0, 1000),
-        }, "AI chat request failed");
-        throw new Error(`chat failed ${response.status}: ${errorText}`);
-      }
-      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-      return (data.choices?.[0]?.message?.content || '').trim();
     };
 
     let rawIntent = '';
@@ -2993,6 +5246,17 @@ async function startServer() {
       if (requestedTools.length === 0 || (requestedTools.length === 1 && requestedTools[0] === 'just_chat')) {
         requestedTools = [];
       }
+      if (
+        requestedTools.length === 0 &&
+        /(知识库|素材|节点|卡片|原文|引用|来源|基于|围绕|总结|提炼|写|文章|草稿|选题|观点|证据)/.test(normalizedMessage)
+      ) {
+        requestedTools = ['recall_cards'];
+        parsedIntent = {
+          ...(parsedIntent || {}),
+          tools: requestedTools,
+          reason: 'message refers to knowledge-base material'
+        };
+      }
     }
 
     const recalledCards = requestedTools.includes('recall_cards')
@@ -3014,7 +5278,8 @@ async function startServer() {
 6. 如果工具结果里已经包含提纲或草稿，就优先基于它们回答。
 7. 除非用户明确要求长文，否则默认回答简洁。
 8. 当引用知识节点时，用「来自《文章标题》」或节点编号标注来源，不要笼统地说”根据资料”。
-9. 如果已生成文章草稿，在回复中简要说明引用了哪些节点和原文。`;
+9. 如果已生成文章草稿，在回复中简要说明引用了哪些节点和原文。
+10. 回答和写作都要优先使用“文章背景、卡片语境、原文摘录、引用建议”，不要只看节点摘要。`;
 
     let generatedOutlineText = '';
     let generatedDraftText = '';
@@ -3034,16 +5299,16 @@ async function startServer() {
         generatedOutlineText = generatedPlan.outline.map(item => `- ${item.heading}：${item.goal}`).join('\n');
 
         if (shouldGenerateDraft) {
+          const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
           generatedDraftText = await requestChat([
             { role: 'system', content: WRITING_AGENT_SYSTEM_PROMPT },
-            { role: 'user', content: buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards)) }
-          ], 0.68, 2200);
+            { role: 'user', content: buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards), evidenceMap) }
+          ], 0.38, 1800);
 
           if (generatedDraftText.trim()) {
             const activationSummaryForNote = (mergedState.activationSummary || []).length > 0
               ? (mergedState.activationSummary || [])
               : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
-            const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
             const sourceArticles = buildSourceArticlesFromCards(cardsForWriting, dbCards);
             persistedDraftNote = await createAgentDraftNote(pool, req.session.userId, {
               title: generatedPlan.title,
@@ -3101,10 +5366,10 @@ ${typeof thread.summary === 'string' && thread.summary.trim() ? thread.summary :
 - activationSummary: ${(mergedState.activationSummary || []).join(' | ') || '无'}
 
 当前激活节点：
-${activeCardRows.length > 0 ? activeCardRows.map((card, index) => `${index + 1}. [${card.type}] ${card.content}`).join('\n') : '无'}
+${activeCardRows.length > 0 ? sanitizeWritingCards(activeCardRows).map((card, index) => formatCardForWriting(card, index)).join('\n\n') : '无'}
 
 补充召回节点：
-${recalledCards.length > 0 ? recalledCards.map((card, index) => `${index + 1}. [${card.type}] ${card.content}`).join('\n') : '无'}
+${recalledCards.length > 0 ? sanitizeWritingCards(recalledCards).map((card, index) => formatCardForWriting(card, index)).join('\n\n') : '无'}
 
 最近文章草稿：
 ${recentNotes.length > 0 ? recentNotes.map((note, index) => `${index + 1}. ${note.title}\n${normalizePlainText(note.content).slice(0, 180)}`).join('\n\n') : '无'}
@@ -3117,19 +5382,27 @@ ${recentNotes.length > 0 ? recentNotes.map((note, index) => `${index + 1}. ${not
 ${generatedOutlineText || '无'}
 
 正文工具结果：
-${generatedDraftText ? generatedDraftText.slice(0, 1200) : '无'}
+${generatedDraftText ? generatedDraftText.slice(0, 5000) : '无'}
 
 用户最新消息：
 ${normalizedMessage}`;
 
-    const assistantContent = await requestChat([
-      { role: 'system', content: systemPrompt },
-      ...previousMessages
-        .filter((item): item is typeof item & { role: 'user' | 'assistant' } => item.role === 'user' || item.role === 'assistant')
-        .map(item => ({ role: item.role, content: item.content }))
-        .slice(-10),
-      { role: 'user', content: userContextPrompt }
-    ], 0.55, 1200);
+    const assistantContent = isCreateArticle && persistedDraftNote
+      ? [
+        `已基于当前激活网络创建文章《${persistedDraftNote.title || generatedPlan?.title || '未命名文章'}》。`,
+        '',
+        `这次使用了 ${activeCardRows.length || sanitizeWritingCards(recalledCards).length} 个知识节点，来源文章 ${buildSourceArticlesFromCards(sanitizeWritingCards(activeCardRows.length > 0 ? activeCardRows : recalledCards), dbCards).length} 篇。`,
+        generatedPlan?.angle ? `核心判断：${generatedPlan.angle}` : '',
+        '你可以在「我的文章」里继续编辑；知识节点、原文摘录和引用映射已经写入文章元信息。'
+      ].filter(Boolean).join('\n')
+      : await requestChat([
+        { role: 'system', content: systemPrompt },
+        ...previousMessages
+          .filter((item): item is typeof item & { role: 'user' | 'assistant' } => item.role === 'user' || item.role === 'assistant')
+          .map(item => ({ role: item.role, content: item.content }))
+          .slice(-10),
+        { role: 'user', content: userContextPrompt }
+      ], 0.55, 1200);
     if (!assistantContent) {
       return res.status(500).json({ error: 'agent returned empty message' });
     }
@@ -3159,6 +5432,7 @@ ${normalizedMessage}`;
         role: 'assistant',
         content: assistantContent
       },
+      assistantMessage: assistantContent,
       toolResult: toolPayload,
       note: persistedDraftNote
         ? {
@@ -3168,6 +5442,7 @@ ${normalizedMessage}`;
           updated_at: persistedDraftNote.updated_at
         }
         : null,
+      noteCreated: Boolean(persistedDraftNote),
       context: {
         activeCards: activeCardRows.length,
         recalledCards: recalledCards.length

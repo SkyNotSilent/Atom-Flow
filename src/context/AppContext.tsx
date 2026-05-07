@@ -1,15 +1,15 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
-import { Article, AtomCard, User, Note, NoteMeta, SavedArticle } from '../types';
+import { Article, AtomCard, User, Note, NoteMeta, SavedArticle, WriteAgentSkill, WriteAgentThread } from '../types';
 import { logger } from '../utils/logger';
 
-export type WriteWorkspaceMode = 'graph' | 'articles';
+export type WriteWorkspaceMode = 'graph' | 'articles' | 'skills';
 export type WriteGraphView = 'all' | 'activated';
 
 interface AppState {
   articles: Article[];
   savedCards: AtomCard[];
   savedArticles: SavedArticle[];
-  saveArticle: (articleId: number) => Promise<void>;
+  saveArticle: (articleId: number) => Promise<boolean>;
   addCards: (cards: AtomCard[]) => void;
   addCard: (card: AtomCard) => Promise<void>;
   updateCard: (id: string, card: Partial<AtomCard>) => Promise<void>;
@@ -58,6 +58,20 @@ interface AppState {
   setWriteActivatedNodeIds: (ids: string[]) => void;
   writeActivationSummary: string[];
   setWriteActivationSummary: (items: string[]) => void;
+  assistantThreads: WriteAgentThread[];
+  assistantThreadId: number | null;
+  setAssistantThreadId: (id: number | null) => void;
+  loadAssistantThreads: (threadType?: 'chat' | 'skill') => Promise<WriteAgentThread[]>;
+  createAssistantThread: (threadType?: 'chat' | 'skill') => Promise<WriteAgentThread | null>;
+  writeAgentSkills: WriteAgentSkill[];
+  selectedStyleSkillId: number | string;
+  setSelectedStyleSkillId: (id: number | string) => void;
+  selectedSkillIds: Array<number | string>;
+  setSelectedSkillIds: (ids: Array<number | string>) => void;
+  loadWriteAgentSkills: () => Promise<WriteAgentSkill[]>;
+  createWriteAgentSkill: (data: Partial<WriteAgentSkill> & { name: string; prompt: string }) => Promise<WriteAgentSkill | null>;
+  updateWriteAgentSkill: (id: number | string, data: Partial<WriteAgentSkill>) => Promise<WriteAgentSkill | null>;
+  deleteWriteAgentSkill: (id: number | string) => Promise<boolean>;
 }
 
 const AppContext = createContext<AppState | undefined>(undefined);
@@ -70,7 +84,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [readingArticle, setReadingArticleState] = useState<Article | null>(null);
   const [activeSource, setActiveSource] = useState<string | null>(null);
-  const [savingState, setSavingState] = useState<{ articleId: number | null; stage: string | null }>({ articleId: null, stage: null });
+  const [savingState, setSavingState] = useState<{ articleIds: number[]; stage: string | null }>({ articleIds: [], stage: null });
   const [knowledgeTypeFilter, setKnowledgeTypeFilter] = useState('来源');
   const [knowledgeSourceFilter, setKnowledgeSourceFilter] = useState('全部');
   const [user, setUser] = useState<User | null>(null);
@@ -85,6 +99,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [writeFocusedTopic, setWriteFocusedTopic] = useState('');
   const [writeActivatedNodeIds, setWriteActivatedNodeIds] = useState<string[]>([]);
   const [writeActivationSummary, setWriteActivationSummary] = useState<string[]>([]);
+  const [assistantThreads, setAssistantThreads] = useState<WriteAgentThread[]>([]);
+  const [assistantThreadId, setAssistantThreadId] = useState<number | null>(null);
+  const [writeAgentSkills, setWriteAgentSkills] = useState<WriteAgentSkill[]>([]);
+  const [selectedStyleSkillId, setSelectedStyleSkillId] = useState<number | string>('system-columnist');
+  const [selectedSkillIds, setSelectedSkillIds] = useState<Array<number | string>>(['system-card-storage', 'system-citation', 'system-writing', 'system-columnist']);
   const syncTimerRef = useRef<number | null>(null);
   const quickOpenMode = true;
   const forceRefetchInTesting = false;
@@ -335,57 +354,278 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
+  const normalizeSkillSelection = (skills: WriteAgentSkill[]) => {
+    const defaults = ['card_storage', 'citation', 'writing', 'style'].map(type => (
+      skills.find(skill => skill.type === type && skill.visibility === 'user' && skill.isDefault)
+      || skills.find(skill => skill.type === type && skill.isDefault)
+      || skills.find(skill => skill.type === type)
+    )).filter((skill): skill is WriteAgentSkill => Boolean(skill));
+    const defaultIds = defaults.map(skill => skill.id);
+    setSelectedSkillIds(prev => {
+      const available = new Set(skills.map(skill => String(skill.id)));
+      const kept = prev.filter(id => available.has(String(id)));
+      return kept.length > 0 ? kept : defaultIds;
+    });
+    const defaultStyle = defaults.find(skill => skill.type === 'style') || skills.find(skill => skill.type === 'style');
+    if (defaultStyle) {
+      setSelectedStyleSkillId(prev => skills.some(skill => String(skill.id) === String(prev)) ? prev : defaultStyle.id);
+    }
+  };
+
+  const loadAssistantThreads = useCallback(async (threadType: 'chat' | 'skill' = 'chat') => {
+    if (!user) {
+      setAssistantThreads([]);
+      setAssistantThreadId(null);
+      return [];
+    }
+    try {
+      const response = await fetch(`/api/write/agent/threads?type=${threadType}`, { method: 'GET' });
+      if (!response.ok) return [];
+      const threads: WriteAgentThread[] = await response.json();
+      const normalized = Array.isArray(threads) ? threads : [];
+      setAssistantThreads(normalized);
+      setAssistantThreadId(prev => prev || (normalized[0]?.id ? Number(normalized[0].id) : null));
+      return normalized;
+    } catch {
+      return [];
+    }
+  }, [user]);
+
+  const createAssistantThread = useCallback(async (threadType: 'chat' | 'skill' = 'chat') => {
+    if (!user) {
+      setShowLoginModal(true);
+      return null;
+    }
+    try {
+      const response = await fetch('/api/write/agent/threads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: '新的写作会话', threadType })
+      });
+      if (!response.ok) {
+        showToast('新建会话失败');
+        return null;
+      }
+      const thread: WriteAgentThread = await response.json();
+      setAssistantThreads(prev => [thread, ...prev.filter(item => Number(item.id) !== Number(thread.id))]);
+      setAssistantThreadId(Number(thread.id));
+      return thread;
+    } catch {
+      showToast('网络错误，新建会话失败');
+      return null;
+    }
+  }, [user]);
+
+  const loadWriteAgentSkills = useCallback(async () => {
+    if (!user) {
+      const fallback: WriteAgentSkill[] = [];
+      setWriteAgentSkills(fallback);
+      setSelectedStyleSkillId('system-columnist');
+      setSelectedSkillIds(['system-card-storage', 'system-citation', 'system-writing', 'system-columnist']);
+      return fallback;
+    }
+    try {
+      const response = await fetch('/api/write/agent/skills');
+      if (!response.ok) return [];
+      const data = await response.json();
+      const skills: WriteAgentSkill[] = Array.isArray(data.skills) ? data.skills : [];
+      setWriteAgentSkills(skills);
+      normalizeSkillSelection(skills);
+      return skills;
+    } catch {
+      return [];
+    }
+  }, [user]);
+
+  const createWriteAgentSkill = useCallback(async (data: Partial<WriteAgentSkill> & { name: string; prompt: string }) => {
+    if (!user) {
+      setShowLoginModal(true);
+      return null;
+    }
+    try {
+      const response = await fetch('/api/write/agent/skills', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      if (!response.ok) {
+        showToast('Skill 保存失败');
+        return null;
+      }
+      const payload = await response.json();
+      if (payload.skill) {
+        setWriteAgentSkills(prev => [...prev, payload.skill]);
+        setSelectedSkillIds(prev => Array.from(new Set([...prev, payload.skill.id])));
+        if (payload.skill.type === 'style') setSelectedStyleSkillId(payload.skill.id);
+        showToast(`已添加 Skill「${payload.skill.name}」`);
+      }
+      return payload.skill || null;
+    } catch {
+      showToast('网络错误，Skill 保存失败');
+      return null;
+    }
+  }, [user]);
+
+  const updateWriteAgentSkill = useCallback(async (id: number | string, data: Partial<WriteAgentSkill>) => {
+    if (!user || typeof id === 'string') return null;
+    try {
+      const response = await fetch(`/api/write/agent/skills/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      if (!response.ok) {
+        showToast('Skill 更新失败');
+        return null;
+      }
+      const payload = await response.json();
+      if (payload.skill) {
+        setWriteAgentSkills(prev => prev.map(skill => String(skill.id) === String(id) ? payload.skill : skill));
+        showToast(`已更新 Skill「${payload.skill.name}」`);
+      }
+      return payload.skill || null;
+    } catch {
+      showToast('网络错误，Skill 更新失败');
+      return null;
+    }
+  }, [user]);
+
+  const deleteWriteAgentSkill = useCallback(async (id: number | string) => {
+    if (!user || typeof id === 'string') return false;
+    try {
+      const response = await fetch(`/api/write/agent/skills/${id}`, { method: 'DELETE' });
+      if (!response.ok) {
+        showToast('Skill 删除失败');
+        return false;
+      }
+      setWriteAgentSkills(prev => prev.filter(skill => String(skill.id) !== String(id)));
+      setSelectedSkillIds(prev => prev.filter(skillId => String(skillId) !== String(id)));
+      showToast('已删除 Skill');
+      return true;
+    } catch {
+      showToast('网络错误，Skill 删除失败');
+      return false;
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) {
+      setAssistantThreads([]);
+      setAssistantThreadId(null);
+      setWriteAgentSkills([]);
+      return;
+    }
+    void loadAssistantThreads();
+    void loadWriteAgentSkills();
+  }, [loadAssistantThreads, loadWriteAgentSkills, user]);
+
   const saveArticle = async (articleId: number) => {
     if (!user) {
       setPendingAction(() => () => { void saveArticle(articleId); });
       setShowLoginModal(true);
-      return;
+      return false;
     }
-    if (savingState.articleId !== null) return;
+    if (savingState.articleIds.length > 0) return false;
+    const setSaveProgress = (ids: number[], stage: string) => {
+      setSavingState({ articleIds: Array.from(new Set(ids)), stage });
+    };
     try {
-      setSavingState({ articleId, stage: saveStages[0] });
+      setSaveProgress([articleId], saveStages[0]);
       const targetArticle = articles.find(a => a.id === articleId);
-      if (quickOpenMode && targetArticle?.url) {
-        const fullRes = await fetch(`/api/articles/${articleId}/full?force=1&t=${Date.now()}`, { cache: 'no-store' });
+      let resolvedArticleId = articleId;
+      let resolvedArticle = targetArticle;
+      const refreshArticleIdentity = async () => {
+        if (!targetArticle) return false;
+        const articlesRes = await fetch('/api/articles', { cache: 'no-store' });
+        if (!articlesRes.ok) return false;
+        const freshArticles: Article[] = await articlesRes.json();
+        setArticles(freshArticles);
+        const matched = freshArticles.find(a => targetArticle.url && a.url === targetArticle.url)
+          || freshArticles.find(a => a.title === targetArticle.title && a.source === targetArticle.source)
+          || freshArticles.find(a => a.title === targetArticle.title);
+        if (!matched) return false;
+        resolvedArticleId = matched.id;
+        resolvedArticle = matched;
+        setSaveProgress([articleId, resolvedArticleId], saveStages[0]);
+        return true;
+      };
+
+      if (quickOpenMode && resolvedArticle?.url) {
+        let fullRes = await fetch(`/api/articles/${resolvedArticleId}/full?force=1&t=${Date.now()}`, { cache: 'no-store' });
+        if (fullRes.status === 404 && await refreshArticleIdentity()) {
+          fullRes = await fetch(`/api/articles/${resolvedArticleId}/full?force=1&t=${Date.now()}`, { cache: 'no-store' });
+        }
         if (fullRes.ok) {
           const fullData = await fullRes.json();
-          setArticles(prev => prev.map(a => a.id === articleId ? fullData.article : a));
-          if (readingArticle?.id === articleId) {
+          setArticles(prev => prev.map(a => a.id === resolvedArticleId ? fullData.article : a));
+          if (readingArticle?.id === articleId || readingArticle?.id === resolvedArticleId) {
             setReadingArticleState(fullData.article);
           }
         }
       }
-      setSavingState({ articleId, stage: saveStages[1] });
+      setSaveProgress([articleId, resolvedArticleId], saveStages[1]);
       await new Promise(resolve => setTimeout(resolve, 220));
-      setSavingState({ articleId, stage: saveStages[2] });
-      const res = await fetch(`/api/articles/${articleId}/save`, { method: 'POST' });
+      setSaveProgress([articleId, resolvedArticleId], saveStages[2]);
+      let res = await fetch(`/api/articles/${resolvedArticleId}/save`, { method: 'POST' });
+      if (res.status === 404 && await refreshArticleIdentity()) {
+        res = await fetch(`/api/articles/${resolvedArticleId}/save`, { method: 'POST' });
+      }
       if (res.ok) {
-        setSavingState({ articleId, stage: saveStages[3] });
+        const saveData = await res.json().catch(() => null);
+        const savedArticleFromResponse = saveData?.article as Article | undefined;
+        setSaveProgress([articleId, resolvedArticleId], saveStages[3]);
         // Refresh data to get the new cards and updated article state
         const [articlesRes, cardsRes, savedArticlesRes] = await Promise.all([
           fetch('/api/articles'),
           fetch('/api/cards'),
           fetch('/api/saved-articles')
         ]);
-        if (articlesRes.ok) setArticles(await articlesRes.json());
+        if (articlesRes.ok) {
+          const freshArticles: Article[] = await articlesRes.json();
+          setArticles(freshArticles);
+          const freshReadingArticle = freshArticles.find(a => a.id === articleId || a.id === resolvedArticleId)
+            || freshArticles.find(a => resolvedArticle?.url && a.url === resolvedArticle.url)
+            || freshArticles.find(a => resolvedArticle && a.title === resolvedArticle.title && a.source === resolvedArticle.source)
+            || savedArticleFromResponse;
+          if (readingArticle && freshReadingArticle && (readingArticle.id === articleId || readingArticle.id === resolvedArticleId || Boolean(readingArticle.url && readingArticle.url === freshReadingArticle.url))) {
+            setReadingArticleState({ ...freshReadingArticle, saved: true });
+          }
+        } else if (readingArticle && savedArticleFromResponse) {
+          setReadingArticleState({ ...savedArticleFromResponse, saved: true });
+        }
         if (cardsRes.ok) setSavedCards(await cardsRes.json());
         if (savedArticlesRes.ok) setSavedArticles(await savedArticlesRes.json());
+        showToast('已存入知识库');
+        return true;
       } else {
         const errBody = await res.text().catch(() => '');
-        logger.error('Save article API failed', { articleId, status: res.status, responseBody: errBody });
-        showToast(`保存失败: ${res.status}`);
+        logger.error('Save article API failed', { articleId: resolvedArticleId, originalArticleId: articleId, status: res.status, responseBody: errBody });
+        let message = `保存失败: ${res.status}`;
+        try {
+          const parsed = JSON.parse(errBody);
+          if (typeof parsed?.error === 'string') {
+            message = parsed.fallbackDisabled
+              ? 'AI 原子化失败，规则兜底已关闭'
+              : parsed.error;
+          }
+        } catch {
+          // keep status fallback
+        }
+        showToast(message);
+        return false;
       }
     } catch (error) {
       logger.error("Failed to save article", { error, articleId });
       showToast('保存失败: 网络错误');
+      return false;
     } finally {
       await new Promise(resolve => setTimeout(resolve, 260));
-      setSavingState({ articleId: null, stage: null });
+      setSavingState({ articleIds: [], stage: null });
     }
   };
 
-  const isSavingArticle = (articleId: number) => savingState.articleId === articleId;
-  const getSavingStageText = (articleId: number) => savingState.articleId === articleId ? savingState.stage : null;
+  const isSavingArticle = (articleId: number) => savingState.articleIds.includes(articleId);
+  const getSavingStageText = (articleId: number) => savingState.articleIds.includes(articleId) ? savingState.stage : null;
 
   const addCards = (cards: AtomCard[]) => {
     // This is mostly handled by saveArticle now, but keeping for compatibility if needed
@@ -473,6 +713,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setSavedCards([]);
     setSavedArticles([]);
     setNotes([]);
+    setAssistantThreads([]);
+    setAssistantThreadId(null);
+    setWriteAgentSkills([]);
     await reloadArticles(); // reload without user articles
   };
 
@@ -533,10 +776,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       notes, createNote, updateNote, deleteNote, syncPreferences,
       writeWorkspaceMode, setWriteWorkspaceMode,
       writeGraphView, setWriteGraphView,
-      writeFocusedTopic, setWriteFocusedTopic,
-      writeActivatedNodeIds, setWriteActivatedNodeIds,
-      writeActivationSummary, setWriteActivationSummary
-    }}>
+	      writeFocusedTopic, setWriteFocusedTopic,
+	      writeActivatedNodeIds, setWriteActivatedNodeIds,
+	      writeActivationSummary, setWriteActivationSummary,
+	      assistantThreads, assistantThreadId, setAssistantThreadId, loadAssistantThreads, createAssistantThread,
+	      writeAgentSkills, selectedStyleSkillId, setSelectedStyleSkillId,
+	      selectedSkillIds, setSelectedSkillIds, loadWriteAgentSkills,
+	      createWriteAgentSkill, updateWriteAgentSkill, deleteWriteAgentSkill
+	    }}>
       {children}
     </AppContext.Provider>
   );
