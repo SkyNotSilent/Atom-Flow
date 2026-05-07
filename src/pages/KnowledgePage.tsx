@@ -37,6 +37,7 @@ export const KnowledgePage: React.FC = () => {
         publishedAt: data.publishedAt || sa.publishedAt,
         title: data.title || sa.title,
         excerpt: data.excerpt || sa.excerpt,
+        citationContext: data.citationContext || sa.citationContext,
         content: data.content || sa.excerpt,
         markdownContent: data.content || undefined,
         url: data.url || sa.url,
@@ -87,6 +88,11 @@ export const KnowledgePage: React.FC = () => {
       || sourceLabel === knowledgeSourceFilter;
     const matchSearch = search === '' || 
       card.content.toLowerCase().includes(search.toLowerCase()) || 
+      (card.summary || '').toLowerCase().includes(search.toLowerCase()) ||
+      (card.sourceContext || '').toLowerCase().includes(search.toLowerCase()) ||
+      (card.context || '').toLowerCase().includes(search.toLowerCase()) ||
+      (card.originalQuote || '').toLowerCase().includes(search.toLowerCase()) ||
+      (card.citationNote || '').toLowerCase().includes(search.toLowerCase()) ||
       card.tags.some(t => t.toLowerCase().includes(search.toLowerCase()));
     return matchType && matchSource && matchSearch;
   });
@@ -209,6 +215,16 @@ export const KnowledgePage: React.FC = () => {
                     <div className={`text-text-main leading-[1.7] line-clamp-2 ${isQuote ? 'font-serif text-[15px] font-semibold' : 'text-[13.5px]'}`}>
                       {card.content}
                     </div>
+                    {(card.summary || card.sourceContext || card.context || card.originalQuote || card.citationNote) && (
+                      <div className="mt-1.5 text-[12px] text-text2 leading-[1.6] line-clamp-2">
+                        {card.summary || card.sourceContext || card.context || card.originalQuote || card.citationNote}
+                      </div>
+                    )}
+                    {(card.originalQuote || card.citationNote) && (
+                      <div className="mt-1.5 text-[11px] text-text3 leading-[1.5] line-clamp-1">
+                        {card.originalQuote ? `原文：${card.originalQuote}` : card.citationNote}
+                      </div>
+                    )}
                   </div>
                   {/* 右侧标签 + 来源 */}
                   <div className="shrink-0 flex flex-col items-end gap-1.5 ml-2">
@@ -225,7 +241,7 @@ export const KnowledgePage: React.FC = () => {
                     </div>
                     {(linkedArticle || card.articleTitle) && (
                       <div className="text-[10px] text-text3 max-w-[120px] truncate">
-                        {linkedArticle?.title || card.articleTitle}
+                        {card.sourceName ? `${card.sourceName} · ` : ''}{linkedArticle?.title || card.articleTitle}
                       </div>
                     )}
                   </div>
@@ -262,7 +278,7 @@ const EditModal = ({ card, onClose }: { card: Partial<AtomCard>, onClose: () => 
 
   return (
     <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[200] flex items-center justify-center p-4" onClick={onClose}>
-      <div className="w-[500px] max-w-[95vw] bg-surface rounded-2xl p-6 shadow-xl" onClick={e => e.stopPropagation()}>
+      <div className="w-[500px] max-w-[95vw] max-h-[90vh] overflow-y-auto bg-surface rounded-2xl p-6 shadow-xl" onClick={e => e.stopPropagation()}>
         <h2 className="text-lg font-bold text-text-main mb-4">{isNew ? '新建卡片' : '编辑卡片'}</h2>
         
         <div className="space-y-4">
@@ -283,6 +299,53 @@ const EditModal = ({ card, onClose }: { card: Partial<AtomCard>, onClose: () => 
               value={formData.content}
               onChange={e => setFormData({...formData, content: e.target.value})}
               className="w-full h-24 bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none resize-none"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs text-text3 mb-1">摘要</label>
+            <input
+              type="text"
+              value={formData.summary || ''}
+              onChange={e => setFormData({...formData, summary: e.target.value})}
+              className="w-full bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none"
+            />
+          </div>
+
+          {!isNew && formData.sourceContext && (
+            <div>
+              <label className="block text-xs text-text3 mb-1">文章引用背景</label>
+              <div className="w-full rounded-lg border border-border bg-surface2 p-3 text-[13px] leading-[1.7] text-text2 whitespace-pre-wrap">
+                {formData.sourceContext}
+              </div>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs text-text3 mb-1">原文摘录</label>
+            <textarea
+              value={formData.originalQuote || ''}
+              onChange={e => setFormData({...formData, originalQuote: e.target.value})}
+              className="w-full h-20 bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none resize-none"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs text-text3 mb-1">卡片语境</label>
+            <textarea
+              value={formData.context || ''}
+              onChange={e => setFormData({...formData, context: e.target.value})}
+              className="w-full h-20 bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none resize-none"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs text-text3 mb-1">引用建议</label>
+            <input
+              type="text"
+              value={formData.citationNote || ''}
+              onChange={e => setFormData({...formData, citationNote: e.target.value})}
+              className="w-full bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none"
             />
           </div>
 

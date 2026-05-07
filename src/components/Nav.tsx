@@ -2,8 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut, Orbit, FileText, Sparkles } from 'lucide-react';
+import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut, Orbit, FileText, ChevronDown } from 'lucide-react';
 import { logger } from '../utils/logger';
+import { AtomFlowGalaxyIcon } from './AtomFlowGalaxyIcon';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -241,13 +242,11 @@ const loadEntriesFromStorage = (): NavEntry[] => {
 export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const {
     articles, savedCards, savedArticles, theme, toggleTheme, setActiveSource, showToast, reloadArticles, activeSource,
-    knowledgeTypeFilter, setKnowledgeTypeFilter, setKnowledgeSourceFilter,
-    user, loginAndDo, logout, setShowProfileModal, syncPreferences,
-    writeWorkspaceMode, setWriteWorkspaceMode,
-    writeGraphView, setWriteGraphView,
-    writeActivatedNodeIds,
-    writeActivationSummary
-  } = useAppContext();
+	    knowledgeTypeFilter, setKnowledgeTypeFilter, setKnowledgeSourceFilter,
+	    user, loginAndDo, logout, setShowProfileModal, syncPreferences,
+	    writeWorkspaceMode, setWriteWorkspaceMode,
+	    assistantThreads, assistantThreadId, setAssistantThreadId, createAssistantThread
+	  } = useAppContext();
   const [sourceEntries, setSourceEntries] = useState<NavEntry[]>(() => loadEntriesFromStorage());
 
   // Reload source entries when server preferences are loaded
@@ -264,10 +263,11 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const [showAddSourceModal, setShowAddSourceModal] = useState(false);
   const [newSourceInput, setNewSourceInput] = useState('');
   const [newSourceAlias, setNewSourceAlias] = useState('');
-  const [renameDialog, setRenameDialog] = useState<RenameDialogState>(null);
-  const [renameValue, setRenameValue] = useState('');
-  const [loadingSourceId, setLoadingSourceId] = useState<string | null>(null);
-  const holdTimerRef = useRef<number | null>(null);
+	  const [renameDialog, setRenameDialog] = useState<RenameDialogState>(null);
+	  const [renameValue, setRenameValue] = useState('');
+	  const [loadingSourceId, setLoadingSourceId] = useState<string | null>(null);
+	  const [historyDialogExpanded, setHistoryDialogExpanded] = useState(false);
+	  const holdTimerRef = useRef<number | null>(null);
   const pointerSessionRef = useRef<{ entryId: string; pointerId: number; startX: number; startY: number; active: boolean } | null>(null);
   const suppressClickRef = useRef(false);
   const iconUpdateDoneRef = useRef(false); // 标记icon是否已更新过
@@ -898,7 +898,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     return 'bg-accent-light/60';
   };
 
-  const SourceRow: React.FC<{ source: SourceEntry; nested?: boolean; parentCollectionId?: string }> = ({ source, nested = false, parentCollectionId }) => {
+	  const SourceRow: React.FC<{ source: SourceEntry; nested?: boolean; parentCollectionId?: string }> = ({ source, nested = false, parentCollectionId }) => {
     const isActive = activeSource === source.name;
     
     return (
@@ -947,8 +947,9 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
         </div>
       </div>
     );
-  };
+	  };
 
+  const currentThread = assistantThreads.find(thread => Number(thread.id) === assistantThreadId) || null;
   return (
     <nav className="w-full h-full bg-surface border-r border-border flex flex-col shrink-0 transition-colors">
       <div className="h-28 flex items-end justify-center px-4 pb-3 shrink-0">
@@ -1078,20 +1079,15 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
             </div>
           </div>
         )}
-        {activeTab === 'write' && (
-          <div className="mt-6 flex flex-col gap-3">
-            <div className="px-3 text-[11px] font-semibold uppercase text-text3">写作工作台</div>
-            <div className="px-3 grid grid-cols-1 gap-2">
-              <div className="rounded-lg border border-border bg-surface2 px-3 py-2">
-                <div className="text-[16px] font-semibold text-text-main">{writeActivatedNodeIds.length}</div>
-                <div className="text-[11px] text-text3">当前激活节点</div>
-              </div>
-            </div>
-            <div className="px-2 flex flex-col gap-0.5">
-              {[
-                { key: 'graph', label: '视图', icon: Orbit },
-                { key: 'articles', label: '我的文章', icon: FileText }
-              ].map(item => {
+	        {activeTab === 'write' && (
+	          <div className="mt-6 flex flex-col gap-3">
+	            <div className="px-3 text-[11px] font-semibold uppercase text-text3">写作工作台</div>
+	            <div className="px-2 flex flex-col gap-0.5">
+		              {[
+		                { key: 'graph', label: '知识图谱', icon: Orbit },
+		                { key: 'articles', label: '我的文章', icon: FileText },
+			                { key: 'skills', label: '自定义风格 Skills', icon: AtomFlowGalaxyIcon }
+		              ].map(item => {
                 const Icon = item.icon;
                 return (
                   <button
@@ -1108,42 +1104,42 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
                     </span>
                     <ChevronRight size={13} className={writeWorkspaceMode === item.key ? 'opacity-100' : 'opacity-35'} />
                   </button>
-                );
-              })}
-            </div>
-            {writeWorkspaceMode === 'graph' && (
-              <>
-                <div className="px-3 pt-1 text-[11px] font-semibold uppercase text-text3">图谱视图</div>
-                <div className="px-2 flex flex-col gap-0.5">
-                  {[
-                    { key: 'all', label: '全部知识' },
-                    { key: 'activated', label: '激活网络' }
-                  ].map(view => (
-                    <button
-                      key={view.key}
-                      onClick={() => setWriteGraphView(view.key as typeof writeGraphView)}
-                      className={cn(
-                        'w-full flex items-center justify-between px-3 py-1.5 rounded-lg text-[13px] transition-colors',
-                        writeGraphView === view.key ? 'bg-accent-light text-accent' : 'text-text2 hover:bg-surface2'
-                      )}
-                    >
-                      <span>{view.label}</span>
-                      {writeGraphView === view.key && <Sparkles size={13} />}
-                    </button>
-                  ))}
-                </div>
-                <div className="px-3 pt-1 text-[11px] font-semibold uppercase text-text3">激活摘要</div>
-                <div className="px-3 flex flex-col gap-2">
-                  {writeActivationSummary.length > 0 ? writeActivationSummary.map(item => (
-                    <div key={item} className="rounded-xl border border-border bg-surface2 px-3 py-2 text-[12px] text-text2">{item}</div>
-                  )) : (
-                    <div className="rounded-xl border border-dashed border-border bg-surface2/40 px-3 py-3 text-[12px] text-text3">右侧 Chat 回答后，这里会同步展示被激活的文章节点、卡片与连接。</div>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
-        )}
+	                );
+	              })}
+	            </div>
+	            <div>
+	              <button
+	                onClick={() => setHistoryDialogExpanded(!historyDialogExpanded)}
+	                className="flex w-full items-center justify-between px-3 pt-1 text-[11px] font-semibold uppercase text-text3 hover:text-text-main transition-colors"
+	              >
+	                历史对话
+	                <ChevronDown size={13} className={cn("transition-transform", historyDialogExpanded ? "rotate-180" : "")} />
+	              </button>
+	              {historyDialogExpanded && (
+	                <div className="px-2 py-2 space-y-1">
+	                  {assistantThreads.filter(t => t.thread_type === 'chat').length === 0 ? (
+	                    <div className="px-3 py-2 text-[12px] text-text3">暂无会话</div>
+	                  ) : assistantThreads.filter(t => t.thread_type === 'chat').map(thread => (
+	                    <button
+	                      key={thread.id}
+	                      onClick={() => setAssistantThreadId(thread.id)}
+	                      className={cn(
+	                        "w-full text-left rounded-xl px-3 py-2 text-[12px] transition-colors truncate",
+	                        assistantThreadId === thread.id
+	                          ? "bg-accent-light text-accent font-medium"
+	                          : "text-text-main hover:bg-surface2"
+	                      )}
+	                      title={thread.title}
+	                    >
+	                      {thread.title}
+	                    </button>
+	                  ))}
+	                </div>
+	              )}
+	            </div>
+
+	          </div>
+	        )}
       </div>
       {dragPreview && (
         <div

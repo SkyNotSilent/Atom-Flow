@@ -96,3 +96,347 @@ body {
 .atomflow-force-link-layer path {
   transition: stroke 220ms ease, opacity 220ms ease, stroke-width 220ms ease;
 }
+
+/* ── 风格建议轮播 ── */
+@keyframes carousel-scroll {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+.carousel-track {
+  display: flex;
+  gap: 0.5rem;
+  animation: carousel-scroll 20s linear infinite;
+  width: max-content;
+}
+
+.carousel-track:hover {
+  animation-play-state: paused;
+}
+
+/* ── 魔法卡牌 ── */
+.magic-card {
+  position: relative;
+  border-radius: 16px;
+  padding: var(--card-border-width, 2px);
+  background: linear-gradient(135deg, var(--card-border-1) 0%, var(--card-border-3) 25%, var(--card-border-2) 50%, var(--card-border-3) 75%, var(--card-border-1) 100%);
+  transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.3s ease, z-index 0s;
+  transform-origin: bottom center;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+}
+
+.magic-card-inner {
+  position: relative;
+  border-radius: 14px;
+  background: linear-gradient(160deg, var(--theme-surface) 0%, var(--theme-surface2) 100%);
+  overflow: hidden;
+  flex: 1;
+}
+
+/* 背景纹理层 */
+.magic-card-inner::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--card-bg-texture, none);
+  opacity: var(--card-bg-opacity, 0.15);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* 顶部装饰条 — 增大高度并支持图案 */
+.magic-card-inner::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 6px;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    var(--card-bar-1) 15%,
+    var(--card-bar-2) 30%,
+    var(--card-bar-3) 50%,
+    var(--card-bar-2) 70%,
+    var(--card-bar-1) 85%,
+    transparent 100%
+  ), var(--card-bar-pattern, none);
+  background-blend-mode: overlay;
+  z-index: 1;
+}
+
+/* 角落宝石装饰 — 增大尺寸并支持自定义图案 */
+.magic-card-gem {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--card-gem-pattern, radial-gradient(circle at 35% 35%, var(--card-gem-1), var(--card-gem-2), var(--card-gem-3)));
+  box-shadow: 0 0 6px var(--card-gem-glow);
+  z-index: 2;
+}
+
+.magic-card-gem-tl { top: 8px; left: 8px; }
+.magic-card-gem-tr { top: 8px; right: 8px; }
+.magic-card-gem-bl { bottom: 8px; left: 8px; }
+.magic-card-gem-br { bottom: 8px; right: 8px; }
+
+/* 角落装饰元素 */
+.magic-card-corner-accent {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  background: var(--card-corner-accent, none);
+  z-index: 2;
+  pointer-events: none;
+}
+
+.magic-card-corner-accent-tl { top: 4px; left: 4px; }
+.magic-card-corner-accent-tr { top: 4px; right: 4px; transform: scaleX(-1); }
+.magic-card-corner-accent-bl { bottom: 4px; left: 4px; transform: scaleY(-1); }
+.magic-card-corner-accent-br { bottom: 4px; right: 4px; transform: scale(-1); }
+
+/* 卡牌容器 — 悬停时扇形展开 */
+.magic-cards-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  perspective: 1200px;
+  padding: 12px 0 24px;
+}
+
+.magic-cards-container:hover .magic-card {
+  transform: rotate(var(--card-rotate)) translateY(var(--card-lift));
+}
+
+.magic-card:hover {
+  transform: rotate(0deg) translateY(-12px) scale(1.06) !important;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.15), 0 0 20px var(--card-hover-glow);
+  z-index: 10;
+}
+
+/* 暗色主题卡牌调整 */
+.dark .magic-card-inner {
+  background: linear-gradient(160deg, var(--theme-surface) 0%, #1F1C18 100%);
+}
+
+/* ── 卡牌翻转 ── */
+.magic-card-flipper {
+  position: relative;
+  transform-style: preserve-3d;
+  transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.magic-card.flipped .magic-card-flipper {
+  transform: rotateY(180deg);
+}
+
+.magic-card.flipped {
+  z-index: 20 !important;
+}
+
+.magic-card-front,
+.magic-card-back {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.magic-card-front {
+  position: relative;
+  z-index: 2;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.magic-card-back {
+  position: absolute;
+  inset: 0;
+  transform: rotateY(180deg);
+  border-radius: 14px;
+  overflow: hidden;
+  z-index: 1;
+}
+
+.magic-card-back::-webkit-scrollbar {
+  width: 3px;
+}
+
+.magic-card-back::-webkit-scrollbar-thumb {
+  background: rgba(201, 168, 76, 0.3);
+  border-radius: 3px;
+}
+
+/* 龙纹底纹 */
+.magic-card-back-dragon {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(160deg, #1C1916 0%, #2A2621 40%, #1C1916 100%);
+  opacity: 1;
+  transition: opacity 0.4s ease 0.3s;
+}
+
+.magic-card-back-dragon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.magic-card-back-content {
+  position: relative;
+  z-index: 2;
+  height: 100%;
+  overflow-y: auto;
+  background: linear-gradient(160deg, rgba(28, 25, 22, 0.92) 0%, rgba(42, 38, 33, 0.95) 100%);
+  opacity: 0;
+  transform: scale(0.96);
+  transition: opacity 0.35s ease, transform 0.35s ease;
+}
+
+.magic-card.flipped .magic-card-back-content {
+  opacity: 1;
+  transform: scale(1);
+  transition-delay: 0.55s;
+}
+
+.magic-card-front {
+  position: relative;
+  z-index: 2;
+}
+
+.magic-card-back {
+  position: absolute;
+  inset: 0;
+  transform: rotateY(180deg);
+  border-radius: 14px;
+  background: linear-gradient(160deg, var(--theme-surface) 0%, var(--theme-surface2) 100%);
+  overflow-y: auto;
+  overflow-x: hidden;
+  z-index: 1;
+}
+
+.magic-card-back::-webkit-scrollbar {
+  width: 3px;
+}
+
+.magic-card-back::-webkit-scrollbar-thumb {
+  background: var(--theme-border);
+  border-radius: 3px;
+}
+
+/* ── Tiptap Editor ── */
+.tiptap {
+  outline: none;
+  min-height: 100%;
+}
+
+.tiptap p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: var(--theme-text3);
+  opacity: 0.5;
+  pointer-events: none;
+  height: 0;
+}
+
+.tiptap h1 {
+  font-size: 1.75rem;
+  font-weight: 700;
+  margin-top: 1.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.tiptap h2 {
+  font-size: 1.35rem;
+  font-weight: 600;
+  margin-top: 1.25rem;
+  margin-bottom: 0.5rem;
+}
+
+.tiptap h3 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-top: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.tiptap p {
+  margin-bottom: 0.5rem;
+  line-height: 1.9;
+}
+
+.tiptap blockquote {
+  border-left: 3px solid var(--theme-accent2);
+  padding-left: 1rem;
+  margin: 0.75rem 0;
+  color: var(--theme-text2);
+}
+
+.tiptap ul,
+.tiptap ol {
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+
+.tiptap ul {
+  list-style: disc;
+}
+
+.tiptap ol {
+  list-style: decimal;
+}
+
+.tiptap li {
+  margin-bottom: 0.25rem;
+}
+
+.tiptap hr {
+  border: none;
+  border-top: 1px solid var(--theme-border);
+  margin: 1.5rem 0;
+}
+
+.tiptap mark {
+  background-color: #fef08a;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+.tiptap a {
+  color: var(--theme-accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.tiptap table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.75rem 0;
+  font-size: 0.875rem;
+}
+
+.tiptap th,
+.tiptap td {
+  border: 1px solid var(--theme-border);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+
+.tiptap th {
+  background-color: var(--theme-surface2);
+  font-weight: 600;
+}
+
+.tiptap .selectedCell {
+  background-color: var(--theme-accent-light);
+}
+
+.tiptap .resize-handle {
+  background-color: var(--theme-accent);
+  width: 3px;
+  border-radius: 3px;
+}

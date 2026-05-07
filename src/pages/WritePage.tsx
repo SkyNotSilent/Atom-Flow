@@ -2866,45 +2866,45 @@ export const WritePage: React.FC = () => {
 	  return (
     <div className="flex h-full min-h-0 gap-4 bg-bg">
       <div id="page-write" className="flex h-full min-h-0 flex-1 flex-col overflow-hidden rounded-[30px] border border-[#E7DAC0] bg-[#FBF7EF] shadow-[0_20px_48px_rgba(150,120,78,0.1)]">
-        <div className="border-b border-[#E9DFC9] bg-[#FFFCF5] px-5 py-4">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-[15px] font-semibold text-[#3C2A19]">知识关系图</div>
-              <div className="mt-1 text-[12px] text-[#8B745C]">平面的 2D 受力系统。文章拆成原子星点，父子天然相连，跨节点只保留真实语义连接。</div>
-	            </div>
-	            <div className="flex items-center gap-2">
-	              {writeActivatedNodeIds.length > 0 ? (
-	                <div className="flex items-center gap-1 rounded-full border border-[#E5D6BB] bg-white px-1 py-1">
-	                  <span className="px-2 text-[11px] text-[#8A7359]">显示范围</span>
-	                  {[
-	                    { key: 'all', label: '全部' },
-	                    { key: 'activated', label: '激活' }
-	                  ].map(item => (
-	                    <button
-	                      key={item.key}
-	                      onClick={() => setWriteGraphView(item.key as typeof writeGraphView)}
-	                      className={cn(
-	                        'rounded-full px-2.5 py-1 text-[11px] transition-colors',
-	                        writeGraphView === item.key ? 'bg-[#F1E2C7] text-[#6F4E2D]' : 'text-[#9A8064] hover:bg-[#FCF4E4]'
-	                      )}
-	                    >
-	                      {item.label}
-	                    </button>
-	                  ))}
-	                </div>
-	              ) : null}
-	              <div className="rounded-full border border-[#E5D6BB] bg-white px-2.5 py-1 text-[11px] text-[#8A7359]">{zoomLabel}</div>
-              <button onClick={() => setZoom(prev => Math.min(1.35, +(prev + 0.05).toFixed(2)))} className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#E5D6BB] bg-white text-[#7F654C] transition-colors hover:bg-[#FCF4E4]">
+        <div ref={graphCanvasRef} className="atomflow-force-canvas relative min-h-0 flex-1 overflow-hidden">
+            <div className="absolute right-4 top-4 z-20 flex items-center gap-2 rounded-full border border-[#E5D6BB]/90 bg-white/85 px-2 py-1.5 shadow-[0_14px_34px_rgba(128,96,56,0.16)] backdrop-blur-md">
+              {writeActivatedNodeIds.length > 0 ? (
+                <div className="flex items-center gap-1 rounded-full border border-[#E5D6BB] bg-[#FFFCF5] px-1 py-1">
+                  <span className="px-2 text-[11px] text-[#8A7359]">显示范围</span>
+                  {[
+                    { key: 'all', label: '全部' },
+                    { key: 'activated', label: '激活' }
+                  ].map(item => (
+                    <button
+                      key={item.key}
+                      onClick={() => setWriteGraphView(item.key as typeof writeGraphView)}
+                      className={cn(
+                        'rounded-full px-2.5 py-1 text-[11px] transition-colors',
+                        writeGraphView === item.key ? 'bg-[#F1E2C7] text-[#6F4E2D]' : 'text-[#9A8064] hover:bg-[#FCF4E4]'
+                      )}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <div className="rounded-full border border-[#E5D6BB] bg-[#FFFCF5] px-2.5 py-1 text-[11px] text-[#8A7359]">{zoomLabel}</div>
+              <button
+                onClick={() => setZoom(prev => Math.min(1.35, +(prev + 0.05).toFixed(2)))}
+                className="flex h-8 w-8 items-center justify-center rounded-full border border-[#E5D6BB] bg-[#FFFCF5] text-[#7F654C] transition-colors hover:bg-[#FCF4E4] focus:outline-none focus:ring-2 focus:ring-[#D8B878]/40"
+                aria-label="放大知识关系图"
+              >
                 <ZoomIn size={14} />
               </button>
-              <button onClick={() => setZoom(prev => Math.max(0.85, +(prev - 0.05).toFixed(2)))} className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#E5D6BB] bg-white text-[#7F654C] transition-colors hover:bg-[#FCF4E4]">
+              <button
+                onClick={() => setZoom(prev => Math.max(0.85, +(prev - 0.05).toFixed(2)))}
+                className="flex h-8 w-8 items-center justify-center rounded-full border border-[#E5D6BB] bg-[#FFFCF5] text-[#7F654C] transition-colors hover:bg-[#FCF4E4] focus:outline-none focus:ring-2 focus:ring-[#D8B878]/40"
+                aria-label="缩小知识关系图"
+              >
                 <ZoomOut size={14} />
               </button>
             </div>
-          </div>
-        </div>
 
-        <div ref={graphCanvasRef} className="atomflow-force-canvas relative min-h-0 flex-1 overflow-hidden">
             <div className="atomflow-force-grid absolute inset-0 pointer-events-none" />
 
             {graph.cards.length === 0 ? (

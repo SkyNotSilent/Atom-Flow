@@ -1,12 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
-import { Check, X, Bookmark, Share, MoreHorizontal, Loader2, ExternalLink, Sparkles, Languages, Play, Pause } from 'lucide-react';
+import { Check, X, Bookmark, Share, MoreHorizontal, Loader2, ExternalLink, Languages, Play, Pause } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { cn } from './Nav';
 import { getDisplaySource } from '../utils/articleDisplay';
 import { logger } from '../utils/logger';
+import { AtomFlowGalaxyIcon } from './AtomFlowGalaxyIcon';
 
 const LANG_OPTIONS = [
   { value: 'zh', label: '中文' },
@@ -225,7 +226,6 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
       return;
     }
     await saveArticle(currentArticle.id);
-    showToast('已收藏');
   };
 
   const handleShare = async () => {
@@ -351,7 +351,7 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
 
             <div className="p-5 bg-accent-light/30 rounded-2xl border border-accent/10 mb-6">
               <div className="flex items-center gap-2 mb-3 text-accent font-medium text-[14px]">
-                <span>✦</span> AI 总结
+                <AtomFlowGalaxyIcon size={14} /> AI 总结
               </div>
               <div className="text-[14px] text-text2 leading-relaxed">
                 {currentArticle.excerpt}
@@ -362,7 +362,7 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
                   disabled={isSavingArticle(currentArticle.id)}
                   className="mt-4 px-4 py-2 rounded-xl text-[13px] font-medium bg-accent text-white hover:bg-opacity-90 transition-colors flex items-center gap-1.5 shadow-sm disabled:cursor-wait"
                 >
-                  <Sparkles size={14} className={cn(isSavingArticle(currentArticle.id) && "animate-spin")} />
+                  <AtomFlowGalaxyIcon size={14} className={cn(isSavingArticle(currentArticle.id) && "animate-spin")} />
                   {isSavingArticle(currentArticle.id) ? getSavingStageText(currentArticle.id) || '处理中...' : '一键存入知识库'}
                 </button>
               ) : (

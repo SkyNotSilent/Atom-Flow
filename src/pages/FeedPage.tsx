@@ -2,9 +2,10 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { Article } from '../types';
 import { cn } from '../components/Nav';
-import { Check, LayoutGrid, List, Sparkles } from 'lucide-react';
+import { Check, LayoutGrid, List } from 'lucide-react';
 import { InspirationButton } from '../components/InspirationButton';
 import { getDisplaySource, sourceMatches } from '../utils/articleDisplay';
+import { AtomFlowGalaxyIcon } from '../components/AtomFlowGalaxyIcon';
 
 export const FeedPage: React.FC = () => {
   const { articles, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText, showToast, reloadArticles, viewMode, setViewMode } = useAppContext();
@@ -151,7 +152,7 @@ export const FeedPage: React.FC = () => {
           <h1 className="font-serif text-[18px] sm:text-[20px] font-bold text-text-main">{activeSource || '今日推送'}</h1>
           {isInitialLoading && filteredArticles.length === 0 ? (
             <div className="flex items-center gap-2 mt-1">
-              <Sparkles className="text-accent animate-spin" size={14} />
+              <AtomFlowGalaxyIcon className="animate-spin" size={14} />
               <p className="text-[11px] sm:text-[12px] text-accent">正在聚合信息源，请稍等...</p>
             </div>
           ) : activeSource && filteredArticles.length === 0 ? (
@@ -174,7 +175,7 @@ export const FeedPage: React.FC = () => {
 
       {isInitialLoading && filteredArticles.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20">
-          <Sparkles className="w-16 h-16 text-accent animate-spin mb-4" />
+          <AtomFlowGalaxyIcon className="animate-spin mb-4" size={64} />
           <p className="text-text2 text-[15px] font-medium mb-2">正在聚合信息源</p>
           <p className="text-text3 text-[13px]">首次加载可能需要几秒钟...</p>
         </div>
@@ -251,7 +252,7 @@ export const FeedPage: React.FC = () => {
                           : "bg-accent-light text-accent hover:bg-accent hover:text-white"
                       )}
                     >
-                      <Sparkles size={14} className={cn(isSavingArticle(article.id) && "animate-spin")} />
+                      <AtomFlowGalaxyIcon size={14} className={cn(isSavingArticle(article.id) && "animate-spin")} />
                       <span className="hidden sm:inline">{isSavingArticle(article.id) ? getSavingStageText(article.id) || '处理中...' : '存入知识库'}</span>
                       <span className="sm:hidden">{isSavingArticle(article.id) ? '处理中' : '存入'}</span>
                     </button>
