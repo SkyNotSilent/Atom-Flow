@@ -3091,6 +3091,7 @@ async function startServer() {
   }
 
   if (pool) {
+  try {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id           SERIAL PRIMARY KEY,
@@ -3320,6 +3321,9 @@ async function startServer() {
 
   // Backfill: set default nickname for existing users who don't have one
   await pool.query("UPDATE users SET nickname = split_part(email, '@', 1) WHERE nickname IS NULL");
+  } catch (err) {
+    logger.error({ err, module: "db" }, "Database schema migration failed; some features may be unavailable");
+  }
   } // end if (pool)
 
   const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
@@ -3435,7 +3439,7 @@ async function startServer() {
   // 如果有缓存数据，不阻塞启动，后台异步刷新
   if (articles.length > 0) {
     logger.info({ module: "rss", articleCount: articles.length }, "Using cached articles, refreshing in background");
-    refreshFeeds();
+    refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds in background"));
   } else {
     await refreshFeeds();
   }
@@ -5650,9 +5654,17 @@ ${normalizedMessage}`;
     });
   });
 
+  httpServer.on("error", (err) => {
+    logger.fatal({ err, module: "server", port: PORT }, "HTTP server failed to start");
+    process.exit(1);
+  });
+
   httpServer.listen(PORT, "0.0.0.0", () => {
     logger.info({ module: "server", port: PORT }, `Server running on http://localhost:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  logger.fatal({ err }, "Fatal error during server startup");
+  process.exit(1);
+});
