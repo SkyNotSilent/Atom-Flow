@@ -3168,6 +3168,7 @@ async function startServer() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_threads_user ON write_agent_threads(user_id, updated_at DESC)`);
+  await pool.query(`ALTER TABLE write_agent_threads ADD COLUMN IF NOT EXISTS thread_type TEXT NOT NULL DEFAULT 'chat'`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_threads_type ON write_agent_threads(user_id, thread_type, updated_at DESC)`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS write_agent_messages (
