@@ -362,7 +362,7 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
                   disabled={isSavingArticle(currentArticle.id)}
                   className="mt-4 px-4 py-2 rounded-xl text-[13px] font-medium bg-accent text-white hover:bg-opacity-90 transition-colors flex items-center gap-1.5 shadow-sm disabled:cursor-wait"
                 >
-                  <AtomFlowGalaxyIcon size={14} className={cn(isSavingArticle(currentArticle.id) && "animate-spin")} />
+                  <AtomFlowGalaxyIcon size={14} animated={isSavingArticle(currentArticle.id)} />
                   {isSavingArticle(currentArticle.id) ? getSavingStageText(currentArticle.id) || '处理中...' : '一键存入知识库'}
                 </button>
               ) : (

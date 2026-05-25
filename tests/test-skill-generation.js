@@ -4,7 +4,7 @@
  */
 
 const testSkillGeneration = async () => {
-  const baseUrl = 'http://localhost:3005';
+  const baseUrl = process.env.API_BASE || 'http://localhost:1000';
 
   console.log('🧪 Testing AI-powered skill generation...\n');
 

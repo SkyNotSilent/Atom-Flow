@@ -4,7 +4,7 @@
  */
 
 const testEndpoint = async () => {
-  const baseUrl = 'http://localhost:3005';
+  const baseUrl = process.env.API_BASE || 'http://localhost:1000';
 
   console.log('🧪 Testing skill generation endpoint...\n');
 
@@ -76,7 +76,7 @@ const testEndpoint = async () => {
   console.log('   - Input validation: ✅');
   console.log('   - Authentication required: ✅');
   console.log('\n💡 To test full functionality:');
-  console.log('   1. Open browser: http://localhost:3005');
+  console.log(`   1. Open browser: ${baseUrl}`);
   console.log('   2. Login with test@atomflow.local');
   console.log('   3. Go to Write page → Skills 助手');
   console.log('   4. Enter: "像产品经理面试复盘，必须讲机制和取舍"');

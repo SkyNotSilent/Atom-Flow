@@ -4,16 +4,16 @@
  * Tests the full flow: login -> get articles -> save article -> verify cards & saved articles.
  *
  * Prerequisites:
- *   - Server running at http://localhost:3001
+ *   - Server running at http://localhost:1000
  *   - A test user account (set TEST_EMAIL / TEST_PASSWORD env vars, or defaults below)
  *
  * Run:
  *   npx tsx tests/save-to-knowledge.test.ts
  */
 
-const BASE = process.env.API_BASE ?? 'http://localhost:3001';
+const BASE = process.env.API_BASE ?? 'http://localhost:1000';
 const EMAIL = process.env.TEST_EMAIL ?? 'test@atomflow.local';
-const PASSWORD = process.env.TEST_PASSWORD ?? 'test123';
+const PASSWORD = process.env.TEST_PASSWORD ?? 'test123456';
 
 let cookie = '';
 

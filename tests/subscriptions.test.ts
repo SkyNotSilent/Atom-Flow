@@ -2,7 +2,7 @@
  * Integration tests for user subscription persistence.
  *
  * Prerequisites:
- *   - Server running at http://localhost:3001
+ *   - Server running at http://localhost:1000
  *   - A test user account already created (set TEST_EMAIL / TEST_PASSWORD env vars,
  *     or defaults below are used)
  *
@@ -10,7 +10,7 @@
  *   npx tsx tests/subscriptions.test.ts
  */
 
-const BASE = process.env.API_BASE ?? 'http://localhost:3001';
+const BASE = process.env.API_BASE ?? 'http://localhost:1000';
 const EMAIL = process.env.TEST_EMAIL ?? 'test@example.com';
 const PASSWORD = process.env.TEST_PASSWORD ?? 'test123456';
 

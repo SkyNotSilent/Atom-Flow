@@ -1370,6 +1370,7 @@ const WRITING_POLISH_SYSTEM_PROMPT = `你是中文写作润色 Agent。你的任
 const AI_REQUEST_TIMEOUT_MS = 120000;
 const AI_DRAFT_MAX_TOKENS = 2400;
 const AI_POLISH_MAX_TOKENS = 2400;
+const MIMO_MIN_STRUCTURED_OUTPUT_TOKENS = 4096;
 
 const safeJsonParse = <T>(raw: string): T | null => {
   try {
@@ -2679,17 +2680,57 @@ type AiChatMessage = { role: "system" | "user" | "assistant"; content: string };
 type AiChatConfig = {
   apiKey: string;
   baseUrl: string;
+  chatCompletionsUrl: string;
   model: string;
+};
+
+const buildOpenAiCompatibleChatCompletionsUrl = (baseUrl: string) => {
+  const normalized = baseUrl.trim().replace(/\/+$/, "");
+  if (normalized.endsWith("/chat/completions")) {
+    return normalized;
+  }
+  if (normalized.endsWith("/v1")) {
+    return `${normalized}/chat/completions`;
+  }
+  return `${normalized}/v1/chat/completions`;
+};
+
+const normalizeAiModelName = (model: string) => {
+  const trimmed = model.trim();
+  return trimmed.toLowerCase().startsWith("mimo-")
+    ? trimmed.toLowerCase()
+    : trimmed;
+};
+
+const isPlaceholderAiApiKey = (apiKey: string) => {
+  return [
+    "your-ai-api-key",
+    "your-mimo-token-plan-api-key",
+    "your_api_key",
+    "your-openai-compatible-api-key",
+  ].includes(apiKey.trim().toLowerCase());
+};
+
+const getEffectiveAiMaxTokens = (model: string, requestedMaxTokens: number, disableThinking?: boolean) => {
+  if (disableThinking && model.toLowerCase().startsWith("mimo-")) {
+    return Math.max(requestedMaxTokens, MIMO_MIN_STRUCTURED_OUTPUT_TOKENS);
+  }
+  return requestedMaxTokens;
 };
 
 const getAiChatConfig = (): AiChatConfig | null => {
   const apiKey = process.env.AI_API_KEY?.trim();
   const baseUrl = process.env.AI_BASE_URL?.trim().replace(/\/+$/, "");
   const model = process.env.AI_MODEL?.trim();
-  if (!apiKey || !baseUrl || !model || apiKey === "your-ai-api-key") {
+  if (!apiKey || !baseUrl || !model || isPlaceholderAiApiKey(apiKey)) {
     return null;
   }
-  return { apiKey, baseUrl, model };
+  return {
+    apiKey,
+    baseUrl,
+    chatCompletionsUrl: buildOpenAiCompatibleChatCompletionsUrl(baseUrl),
+    model: normalizeAiModelName(model),
+  };
 };
 
 const isAiFallbackDisabled = () => process.env.DISABLE_AI_FALLBACK === "true";
@@ -2715,7 +2756,8 @@ const requestAiChatCompletion = async (
     : null;
 
   try {
-    const response = await fetch(`${config.baseUrl}/v1/chat/completions`, {
+    const maxTokens = getEffectiveAiMaxTokens(config.model, options.maxTokens, options.disableThinking);
+    const response = await fetch(config.chatCompletionsUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -2724,7 +2766,7 @@ const requestAiChatCompletion = async (
       body: JSON.stringify({
         model: config.model,
         messages,
-        max_tokens: options.maxTokens,
+        max_tokens: maxTokens,
         temperature: options.temperature,
         ...(options.disableThinking && config.model.toLowerCase().startsWith("qwen")
           ? { enable_thinking: false }
@@ -2793,7 +2835,7 @@ ${skillPrompt ? `\n本次入库必须遵循的 Skills：\n${skillPrompt}` : ""}
     ], {
       maxTokens: 1800,
       temperature: 0.3,
-      timeoutMs: 45000,
+      timeoutMs: AI_REQUEST_TIMEOUT_MS,
       logLabel: "card_extraction",
       disableThinking: true
     });
@@ -3066,7 +3108,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
 
 async function startServer() {
   const app = express();
-  const PORT = Number(process.env.PORT || 3001);
+  const PORT = Number(process.env.PORT || 1000);
 
   // --- Database init (PostgreSQL) ---
   // Note: rejectUnauthorized: false is required for Railway's self-signed PG certs.
@@ -5655,8 +5697,15 @@ ${normalizedMessage}`;
     });
   });
 
-  httpServer.on("error", (err) => {
-    logger.fatal({ err, module: "server", port: PORT }, "HTTP server failed to start");
+  httpServer.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      logger.fatal(
+        { module: "server", port: PORT },
+        `Port ${PORT} is already in use. AtomFlow uses a fixed local port; stop the existing process instead of switching ports.`
+      );
+    } else {
+      logger.fatal({ err, module: "server", port: PORT }, "HTTP server failed to start");
+    }
     process.exit(1);
   });
 

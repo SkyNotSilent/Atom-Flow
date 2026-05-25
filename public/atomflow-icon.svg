@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none">
+  <defs>
+    <linearGradient id="background" x1="4" y1="3" x2="20" y2="21" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4EA6FF"/>
+      <stop offset="0.44" stop-color="#2B6CB0"/>
+      <stop offset="1" stop-color="#0B2A5B"/>
+    </linearGradient>
+    <linearGradient id="stream" x1="5" y1="16" x2="19" y2="8" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#BFDBFE" stop-opacity="0.38"/>
+      <stop offset="0.48" stop-color="#7DD3FC"/>
+      <stop offset="1" stop-color="#F8FBFF"/>
+    </linearGradient>
+    <linearGradient id="line" x1="6" y1="17" x2="18" y2="7" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#BAE6FD" stop-opacity="0.72"/>
+      <stop offset="1" stop-color="#F8FBFF"/>
+    </linearGradient>
+    <radialGradient id="main-node" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(8.4 12.85) rotate(45) scale(3.2)">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.4" stop-color="#DFF7FF"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </radialGradient>
+    <filter id="glow" x="-35%" y="-35%" width="170%" height="170%">
+      <feDropShadow dx="0" dy="0" stdDeviation="0.7" flood-color="#38BDF8" flood-opacity="0.62"/>
+    </filter>
+  </defs>
+  <rect x="2" y="2" width="20" height="20" rx="4.8" fill="url(#background)"/>
+  <g filter="url(#glow)">
+    <path d="M4.75 16.35C7.35 9.75 13.35 6.05 19.15 8.45" stroke="#BAE6FD" stroke-width="1.45" stroke-linecap="round" opacity="0.13"/>
+    <path d="M5.1 15.85C7.65 10.55 13 6.9 18.9 8.45" stroke="url(#stream)" stroke-width="0.92" stroke-linecap="round"/>
+    <path d="M6.1 8.85L8.4 12.85L11.9 7.25L16.05 9.25L17.6 13.35L14.15 16.65L8.4 12.85L7.05 15.8" stroke="url(#line)" stroke-width="0.78" stroke-linecap="round" stroke-linejoin="round" opacity="0.82"/>
+    <path d="M8.4 12.85L16.05 9.25M8.4 12.85L17.6 13.35" stroke="#7DD3FC" stroke-width="0.5" stroke-linecap="round" opacity="0.62"/>
+    <circle cx="8.4" cy="12.85" r="2.15" fill="#7DD3FC" opacity="0.2"/>
+    <circle cx="8.4" cy="12.85" r="1.36" fill="url(#main-node)"/>
+    <circle cx="8.4" cy="12.85" r="0.42" fill="#FFFFFF"/>
+    <circle cx="6.1" cy="8.85" r="0.56" fill="#EAFBFF"/>
+    <circle cx="11.9" cy="7.25" r="0.52" fill="#BFEFFF"/>
+    <circle cx="16.05" cy="9.25" r="0.56" fill="#EAFBFF"/>
+    <circle cx="17.6" cy="13.35" r="0.56" fill="#BFEFFF"/>
+    <circle cx="14.15" cy="16.65" r="0.52" fill="#EAFBFF"/>
+    <circle cx="7.05" cy="15.8" r="0.52" fill="#BFEFFF"/>
+    <circle cx="19.45" cy="6.45" r="0.3" fill="#F8FBFF" opacity="0.7"/>
+    <circle cx="4.55" cy="11.2" r="0.28" fill="#38BDF8" opacity="0.62"/>
+  </g>
+</svg>

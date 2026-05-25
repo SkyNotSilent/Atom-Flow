@@ -15,8 +15,8 @@ COPY . .
 # Build frontend
 RUN npm run build
 
-# Expose port
-EXPOSE 3001
+# Expose local fallback port; Railway injects PORT at runtime.
+EXPOSE 1000
 
 # Start server
 CMD ["npm", "start"]

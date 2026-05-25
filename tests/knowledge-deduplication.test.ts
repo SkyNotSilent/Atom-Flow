@@ -7,10 +7,11 @@
  * 3. saved_article_id based duplicate detection (not article_id)
  */
 
-import { describe, it, expect } from '@jest/globals';
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
 
 describe('Knowledge Base Deduplication', () => {
-  const BASE_URL = 'http://localhost:3001';
+  const BASE_URL = process.env.API_BASE ?? 'http://localhost:1000';
 
   describe('URL Normalization', () => {
     it('should treat URLs with different query params as same article', async () => {
@@ -22,7 +23,7 @@ describe('Knowledge Base Deduplication', () => {
 
       // All three should normalize to: https://example.com/article
       // And should be treated as the same article in saved_articles table
-      expect(true).toBe(true); // Placeholder
+      assert.equal(true, true); // Placeholder
     });
 
     it('should treat URLs with/without trailing slash as same', async () => {
@@ -30,7 +31,7 @@ describe('Knowledge Base Deduplication', () => {
       const url2 = 'https://example.com/article';
 
       // Both should normalize to: https://example.com/article
-      expect(true).toBe(true); // Placeholder
+      assert.equal(true, true); // Placeholder
     });
 
     it('should treat URLs with different hash fragments as same', async () => {
@@ -38,7 +39,7 @@ describe('Knowledge Base Deduplication', () => {
       const url2 = 'https://example.com/article#section2';
 
       // Both should normalize to: https://example.com/article
-      expect(true).toBe(true); // Placeholder
+      assert.equal(true, true); // Placeholder
     });
   });
 
@@ -59,7 +60,7 @@ describe('Knowledge Base Deduplication', () => {
       };
 
       // These should be treated as duplicates
-      expect(true).toBe(true); // Placeholder
+      assert.equal(true, true); // Placeholder
     });
 
     it('should allow different articles with same title but different source', async () => {
@@ -76,7 +77,7 @@ describe('Knowledge Base Deduplication', () => {
       };
 
       // These should NOT be treated as duplicates
-      expect(true).toBe(true); // Placeholder
+      assert.equal(true, true); // Placeholder
     });
   });
 
@@ -87,7 +88,7 @@ describe('Knowledge Base Deduplication', () => {
 
       // This ensures that after server restart, the same article
       // won't be saved again even though RSS article_id changed
-      expect(true).toBe(true); // Placeholder
+      assert.equal(true, true); // Placeholder
     });
   });
 
@@ -95,7 +96,7 @@ describe('Knowledge Base Deduplication', () => {
     it('should tag non-AI extracted cards with "自动提取"', async () => {
       // When AI extraction fails and fallback to regex extraction,
       // cards should be tagged with "自动提取" to indicate lower quality
-      expect(true).toBe(true); // Placeholder
+      assert.equal(true, true); // Placeholder
     });
   });
 
@@ -112,14 +113,14 @@ describe('Knowledge Base Deduplication', () => {
         ids.add(crypto.randomUUID());
       }
 
-      expect(ids.size).toBe(10000); // All unique
+      assert.equal(ids.size, 10000); // All unique
     });
   });
 
   describe('updated_at Timestamp', () => {
     it('should update updated_at when card is modified', async () => {
       // Cards should have updated_at field that gets updated on every modification
-      expect(true).toBe(true); // Placeholder
+      assert.equal(true, true); // Placeholder
     });
   });
 });

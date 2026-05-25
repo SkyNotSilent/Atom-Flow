@@ -35,8 +35,8 @@ AtomFlow 是一个全栈应用，包含：
 # 构建镜像
 docker build -t atomflow .
 
-# 运行容器
-docker run -d -p 3001:3001 --name atomflow atomflow
+# 运行容器（本地默认端口 1000；云平台通常注入 PORT）
+docker run -d -p 1000:1000 --name atomflow atomflow
 ```
 
 ### 方案4：传统 VPS 部署
@@ -70,14 +70,14 @@ npm run dev
 ```env
 DATABASE_URL=postgresql://user:pass@host:5432/dbname
 SESSION_SECRET=your-random-secret-string
-AI_API_KEY=your-openai-compatible-api-key
-AI_BASE_URL=https://api-us.aiznt.com
-AI_MODEL=qwen3.6-plus
+AI_API_KEY=your-mimo-token-plan-api-key
+AI_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
+AI_MODEL=mimo-v2.5-pro
 ```
 
 ### 可选
 ```env
-PORT=3001
+PORT=1000
 NODE_ENV=production
 RSSHUB_BASE=https://rsshub.app
 RESEND_API_KEY=your-resend-key
@@ -111,4 +111,4 @@ A:
 - VPS：使用 `pm2 logs atomflow` 或 `docker logs atomflow`
 
 ### Q: 端口配置
-A: 默认端口是 3001，可以通过环境变量 `PORT` 修改。大多数云平台会自动设置端口。
+A: 本地默认端口是 1000，可以通过环境变量 `PORT` 修改。大多数云平台会自动设置端口。
