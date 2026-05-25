@@ -70,14 +70,35 @@ const BASE_SOURCES: Array<{ name: string; color: string }> = [
   { name: 'Andrej Karpathy', color: '#FF0000' }
 ];
 
+const SOURCE_ICON_URLS: Record<string, string> = {
+  '36氪': 'https://36kr.com/favicon.ico',
+  '虎嗅': 'https://www.huxiu.com/favicon.ico',
+  '少数派': 'https://cdn.sspai.com/sspai/assets/img/favicon.ico',
+  '人人都是产品经理': 'https://www.woshipm.com/favicon.ico',
+  '即刻话题': 'https://web.okjike.com/favicon.ico',
+  '张小珺商业访谈录': 'https://xyzfm.space/favicon.ico',
+  'Lex Fridman': 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png',
+  'Sam Altman': 'https://abs.twimg.com/favicons/twitter.3.ico',
+  'Y Combinator': 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png',
+  'Andrej Karpathy': 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png',
+  '数字生命卡兹克': 'https://bestblogs.dev/favicon.ico',
+  '新智元': 'https://plink.anyfeeder.com/favicon.ico',
+  'GitHub Blog': 'https://github.githubassets.com/favicons/favicon.svg'
+};
+
 const createSourceEntry = (name: string, color: string, rssUrl?: string, icon?: string): SourceEntry => ({
   id: `source:${name}`,
   type: 'source',
   name,
   color,
   rssUrl,
-  icon
+  icon: icon || SOURCE_ICON_URLS[name]
 });
+
+const getProxiedIconUrl = (icon?: string) => {
+  if (!icon) return undefined;
+  return `/api/favicon-proxy?url=${encodeURIComponent(icon)}`;
+};
 
 const createDefaultEntries = (): NavEntry[] => {
   // 创建默认的合集结构
@@ -270,39 +291,29 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
 	  const holdTimerRef = useRef<number | null>(null);
   const pointerSessionRef = useRef<{ entryId: string; pointerId: number; startX: number; startY: number; active: boolean } | null>(null);
   const suppressClickRef = useRef(false);
-  const iconUpdateDoneRef = useRef(false); // 标记icon是否已更新过
+  const [failedIconIds, setFailedIconIds] = useState<Set<string>>(() => new Set());
+  const [proxiedIconIds, setProxiedIconIds] = useState<Set<string>>(() => new Set());
   const unreadCount = articles.filter(a => !a.saved).length;
 
-  // 处理图标加载失败，永久删除无效的 icon URL
-  const handleIconError = React.useCallback((sourceId: string) => {
-    setSourceEntries(prev => prev.map(entry => {
-      if (entry.type === 'source' && entry.id === sourceId) {
-        const updated = { ...entry };
-        delete updated.icon;
-        return updated;
-      } else if (entry.type === 'collection') {
-        const updatedChildren = entry.children.map(child => {
-          if (child.id === sourceId) {
-            const updated = { ...child };
-            delete updated.icon;
-            return updated;
-          }
-          return child;
-        });
-        if (updatedChildren.some((child, i) => child !== entry.children[i])) {
-          return { ...entry, children: updatedChildren };
-        }
-      }
-      return entry;
-    }));
-  }, []);
+  const handleIconError = React.useCallback((source: SourceEntry) => {
+    if (source.icon && /^https?:\/\//i.test(source.icon) && !proxiedIconIds.has(source.id)) {
+      setProxiedIconIds(prev => new Set(prev).add(source.id));
+      return;
+    }
+    setFailedIconIds(prev => new Set(prev).add(source.id));
+  }, [proxiedIconIds]);
 
-  // 从articles中提取sourceIcon并更新到sourceEntries（只在首次有数据时执行一次）
+  const getSourceIconSrc = React.useCallback((source: SourceEntry) => {
+    if (!source.icon) return undefined;
+    if (/^https?:\/\//i.test(source.icon) && proxiedIconIds.has(source.id)) {
+      return getProxiedIconUrl(source.icon);
+    }
+    return source.icon;
+  }, [proxiedIconIds]);
+
   useEffect(() => {
-    // 如果已经更新过，或者没有文章数据，则跳过
-    if (iconUpdateDoneRef.current || articles.length === 0) return;
-    
     const sourceIconMap = new Map<string, string>();
+    Object.entries(SOURCE_ICON_URLS).forEach(([source, icon]) => sourceIconMap.set(source, icon));
     articles.forEach(article => {
       if (article.sourceIcon && !sourceIconMap.has(article.source)) {
         sourceIconMap.set(article.source, article.sourceIcon);
@@ -311,29 +322,34 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     
     if (sourceIconMap.size === 0) return;
     
-    setSourceEntries(prev => prev.map(entry => {
-      if (entry.type === 'source') {
-        const icon = sourceIconMap.get(entry.name);
-        if (icon && !entry.icon) { // 只在没有icon时才设置
-          return { ...entry, icon };
-        }
-      } else if (entry.type === 'collection') {
-        const updatedChildren = entry.children.map(child => {
-          const icon = sourceIconMap.get(child.name);
-          if (icon && !child.icon) { // 只在没有icon时才设置
-            return { ...child, icon };
+    setSourceEntries(prev => {
+      let changed = false;
+      const nextEntries = prev.map(entry => {
+        if (entry.type === 'source') {
+          const icon = sourceIconMap.get(entry.name);
+          if (icon && entry.icon !== icon) {
+            changed = true;
+            return { ...entry, icon };
           }
-          return child;
-        });
-        if (updatedChildren.some((child, i) => child !== entry.children[i])) {
-          return { ...entry, children: updatedChildren };
+        } else if (entry.type === 'collection') {
+          const updatedChildren = entry.children.map(child => {
+            const icon = sourceIconMap.get(child.name);
+            if (icon && child.icon !== icon) {
+              changed = true;
+              return { ...child, icon };
+            }
+            return child;
+          });
+          if (updatedChildren.some((child, i) => child !== entry.children[i])) {
+            return { ...entry, children: updatedChildren };
+          }
         }
-      }
-      return entry;
-    }));
-    
-    // 标记为已更新
-    iconUpdateDoneRef.current = true;
+        return entry;
+      });
+      return changed ? nextEntries : prev;
+    });
+    setFailedIconIds(prev => prev.size > 0 ? new Set() : prev);
+    setProxiedIconIds(prev => prev.size > 0 ? new Set() : prev);
   }, [articles]);
 
   useEffect(() => {
@@ -924,16 +940,14 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
         <div className="flex items-center gap-2">
           {/* 固定尺寸的图标容器，始终占据 16x16px 空间 */}
           <div className="relative w-4 h-4 shrink-0 flex items-center justify-center">
-            {source.icon ? (
-              // 有图标：显示图标
+            {source.icon && !failedIconIds.has(source.id) ? (
               <img 
-                src={source.icon} 
+                src={getSourceIconSrc(source)} 
                 alt={source.name}
                 className="w-4 h-4 rounded-sm object-cover"
-                onError={() => handleIconError(source.id)}
+                onError={() => handleIconError(source)}
               />
             ) : (
-              // 无图标：显示颜色点
               <div 
                 className="w-[10px] h-[10px] rounded-full" 
                 style={{ backgroundColor: source.color }}

@@ -4423,6 +4423,81 @@ async function startServer() {
     }
   }));
 
+  // Favicon proxy for RSS source icons. Unlike article images, source icons can
+  // come from arbitrary subscription domains, so keep the response small.
+  app.get("/api/favicon-proxy", asyncHandler(async (req, res) => {
+    const targetUrl = req.query.url as string;
+    if (!targetUrl) {
+      return res.status(400).send("Missing url parameter");
+    }
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(targetUrl);
+    } catch {
+      return res.status(400).send("Invalid url parameter");
+    }
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      return res.status(400).send("Invalid url protocol");
+    }
+    const hostname = parsedUrl.hostname.toLowerCase();
+    const blockedHostname =
+      hostname === "localhost" ||
+      hostname.endsWith(".local") ||
+      hostname === "0.0.0.0" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      /^10\./.test(hostname) ||
+      /^192\.168\./.test(hostname) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname);
+    if (blockedHostname) {
+      return res.status(400).send("Invalid url hostname");
+    }
+
+    const hasImageFileExtension = /\.(?:ico|png|jpe?g|gif|webp|svg|avif)$/i.test(parsedUrl.pathname);
+    const fallbackUrls = hasImageFileExtension ? [] : [
+      `${parsedUrl.origin}/favicon.ico`,
+      `${parsedUrl.origin}/favicon.png`,
+      `${parsedUrl.origin}/apple-touch-icon.png`,
+      `${parsedUrl.origin}/apple-touch-icon-precomposed.png`
+    ];
+    const faviconUrls = Array.from(new Set([
+      parsedUrl.toString(),
+      ...fallbackUrls
+    ]));
+
+    for (const faviconUrl of faviconUrls) {
+      try {
+        const response = await fetch(faviconUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+          },
+          signal: AbortSignal.timeout(2500)
+        });
+        if (!response.ok) continue;
+
+        const contentType = response.headers.get('content-type') || '';
+        const contentLength = Number(response.headers.get('content-length') || 0);
+        const isImage = contentType.includes('image/') || contentType.includes('icon') || hasImageFileExtension;
+        if (!isImage || contentLength > 1024 * 1024) continue;
+
+        const arrayBuffer = await response.arrayBuffer();
+        if (arrayBuffer.byteLength > 1024 * 1024) continue;
+
+        if (contentType) {
+          res.setHeader('Content-Type', contentType);
+        }
+        res.setHeader('Cache-Control', 'public, max-age=604800');
+        res.send(Buffer.from(arrayBuffer));
+        return;
+      } catch (error) {
+        logger.debug({ err: error, module: "favicon-proxy", faviconUrl }, "Favicon candidate failed");
+      }
+    }
+
+    res.status(404).send("Favicon not found");
+  }));
+
   // Get user's custom subscriptions (for cross-device restore)
   app.get("/api/subscriptions", requireAuth, asyncHandler(async (req, res) => {
     const rows = (await pool.query(

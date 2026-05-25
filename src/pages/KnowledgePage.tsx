@@ -263,6 +263,13 @@ const EditModal = ({ card, onClose }: { card: Partial<AtomCard>, onClose: () => 
   const { updateCard, addCard, deleteCard, showToast } = useAppContext();
   const [formData, setFormData] = useState(card);
   const isNew = !card.id;
+  const getTextRows = (value?: string, minRows = 3) => {
+    if (!value) return minRows;
+    return Math.max(
+      minRows,
+      value.split('\n').reduce((rows, line) => rows + Math.max(1, Math.ceil(line.length / 34)), 0)
+    );
+  };
 
   const handleSave = () => {
     if (!formData.content) return showToast('内容不能为空');
@@ -298,17 +305,28 @@ const EditModal = ({ card, onClose }: { card: Partial<AtomCard>, onClose: () => 
             <textarea 
               value={formData.content}
               onChange={e => setFormData({...formData, content: e.target.value})}
-              className="w-full h-24 bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none resize-none"
+              rows={getTextRows(formData.content, 4)}
+              className="w-full bg-surface border border-border rounded-lg p-2 text-sm leading-6 text-text-main focus:border-accent outline-none resize-y"
             />
           </div>
 
           <div>
             <label className="block text-xs text-text3 mb-1">摘要</label>
-            <input
-              type="text"
+            <textarea
               value={formData.summary || ''}
               onChange={e => setFormData({...formData, summary: e.target.value})}
-              className="w-full bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none"
+              rows={getTextRows(formData.summary, 2)}
+              className="w-full bg-surface border border-border rounded-lg p-2 text-sm leading-6 text-text-main focus:border-accent outline-none resize-y"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs text-text3 mb-1">原文摘录</label>
+            <textarea
+              value={formData.originalQuote || ''}
+              onChange={e => setFormData({...formData, originalQuote: e.target.value})}
+              rows={getTextRows(formData.originalQuote, 4)}
+              className="w-full bg-surface border border-border rounded-lg p-2 text-sm leading-6 text-text-main focus:border-accent outline-none resize-y"
             />
           </div>
 
@@ -322,30 +340,22 @@ const EditModal = ({ card, onClose }: { card: Partial<AtomCard>, onClose: () => 
           )}
 
           <div>
-            <label className="block text-xs text-text3 mb-1">原文摘录</label>
-            <textarea
-              value={formData.originalQuote || ''}
-              onChange={e => setFormData({...formData, originalQuote: e.target.value})}
-              className="w-full h-20 bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none resize-none"
-            />
-          </div>
-
-          <div>
             <label className="block text-xs text-text3 mb-1">卡片语境</label>
             <textarea
               value={formData.context || ''}
               onChange={e => setFormData({...formData, context: e.target.value})}
-              className="w-full h-20 bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none resize-none"
+              rows={getTextRows(formData.context, 3)}
+              className="w-full bg-surface border border-border rounded-lg p-2 text-sm leading-6 text-text-main focus:border-accent outline-none resize-y"
             />
           </div>
 
           <div>
             <label className="block text-xs text-text3 mb-1">引用建议</label>
-            <input
-              type="text"
+            <textarea
               value={formData.citationNote || ''}
               onChange={e => setFormData({...formData, citationNote: e.target.value})}
-              className="w-full bg-surface border border-border rounded-lg p-2 text-sm text-text-main focus:border-accent outline-none"
+              rows={getTextRows(formData.citationNote, 2)}
+              className="w-full bg-surface border border-border rounded-lg p-2 text-sm leading-6 text-text-main focus:border-accent outline-none resize-y"
             />
           </div>
 
