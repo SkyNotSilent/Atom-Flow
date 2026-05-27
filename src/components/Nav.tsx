@@ -5,6 +5,7 @@ import { twMerge } from 'tailwind-merge';
 import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut, Orbit, FileText, ChevronDown } from 'lucide-react';
 import { logger } from '../utils/logger';
 import { AtomFlowGalaxyIcon } from './AtomFlowGalaxyIcon';
+import { OFFICIAL_SOURCE_ICON_URLS } from '../data/sourceIcons';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -70,29 +71,13 @@ const BASE_SOURCES: Array<{ name: string; color: string }> = [
   { name: 'Andrej Karpathy', color: '#FF0000' }
 ];
 
-const SOURCE_ICON_URLS: Record<string, string> = {
-  '36氪': 'https://36kr.com/favicon.ico',
-  '虎嗅': 'https://www.huxiu.com/favicon.ico',
-  '少数派': 'https://cdn.sspai.com/sspai/assets/img/favicon.ico',
-  '人人都是产品经理': 'https://www.woshipm.com/favicon.ico',
-  '即刻话题': 'https://web.okjike.com/favicon.ico',
-  '张小珺商业访谈录': 'https://xyzfm.space/favicon.ico',
-  'Lex Fridman': 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png',
-  'Sam Altman': 'https://abs.twimg.com/favicons/twitter.3.ico',
-  'Y Combinator': 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png',
-  'Andrej Karpathy': 'https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png',
-  '数字生命卡兹克': 'https://bestblogs.dev/favicon.ico',
-  '新智元': 'https://plink.anyfeeder.com/favicon.ico',
-  'GitHub Blog': 'https://github.githubassets.com/favicons/favicon.svg'
-};
-
 const createSourceEntry = (name: string, color: string, rssUrl?: string, icon?: string): SourceEntry => ({
   id: `source:${name}`,
   type: 'source',
   name,
   color,
   rssUrl,
-  icon: icon || SOURCE_ICON_URLS[name]
+  icon: OFFICIAL_SOURCE_ICON_URLS[name] || icon
 });
 
 const getProxiedIconUrl = (icon?: string) => {
@@ -313,7 +298,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
 
   useEffect(() => {
     const sourceIconMap = new Map<string, string>();
-    Object.entries(SOURCE_ICON_URLS).forEach(([source, icon]) => sourceIconMap.set(source, icon));
+    Object.entries(OFFICIAL_SOURCE_ICON_URLS).forEach(([source, icon]) => sourceIconMap.set(source, icon));
     articles.forEach(article => {
       if (article.sourceIcon && !sourceIconMap.has(article.source)) {
         sourceIconMap.set(article.source, article.sourceIcon);
