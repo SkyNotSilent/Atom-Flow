@@ -8,13 +8,17 @@ import { OFFICIAL_SOURCE_ICON_URLS } from '../data/sourceIcons';
 interface SourceRecommendation {
   name: string;
   description: string;
-  categories: Array<'国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'>;
+  categories: Array<'AI' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'>;
   url: string;
   color: string;
   icon?: string;
 }
 
 const RECOMMENDED_SOURCES: SourceRecommendation[] = [
+  // AI
+  { name: 'AI HOT 精选', description: '中文 AI 行业精选动态', categories: ['AI'], url: 'https://aihot.virxact.com/feed.xml', color: '#4F46E5', icon: OFFICIAL_SOURCE_ICON_URLS['AI HOT 精选'] },
+  { name: 'AI HOT 全部', description: '最近 7 天 AI 动态全量流', categories: ['AI'], url: 'https://aihot.virxact.com/feed/all.xml', color: '#06B6D4', icon: OFFICIAL_SOURCE_ICON_URLS['AI HOT 全部'] },
+
   // 国内媒体
   { name: '36氪', description: '创投商业资讯', categories: ['国内媒体'], url: 'rsshub://36kr/hot-list', color: '#E53E3E', icon: OFFICIAL_SOURCE_ICON_URLS['36氪'] },
   { name: '虎嗅', description: '商业深度分析', categories: ['国内媒体'], url: 'https://www.huxiu.com/rss/0.xml', color: '#DD6B20', icon: OFFICIAL_SOURCE_ICON_URLS['虎嗅'] },
@@ -43,7 +47,7 @@ const RECOMMENDED_SOURCES: SourceRecommendation[] = [
 
 export const DiscoverPage: React.FC = () => {
   const { showToast, reloadArticles } = useAppContext();
-  const [selectedCategory, setSelectedCategory] = useState<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'>('全部');
+  const [selectedCategory, setSelectedCategory] = useState<'全部' | 'AI' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'>('全部');
   const [addedSources, setAddedSources] = useState<Set<string>>(new Set());
   const [loadingSources, setLoadingSources] = useState<Set<string>>(new Set());
   const [customInput, setCustomInput] = useState('');
@@ -219,7 +223,7 @@ export const DiscoverPage: React.FC = () => {
     }
   };
 
-  const categories: Array<'全部' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'> = ['全部', '国内媒体', '播客', 'X', 'YouTube', '公众号', '其他'];
+  const categories: Array<'全部' | 'AI' | '国内媒体' | '播客' | 'X' | 'YouTube' | '公众号' | '其他'> = ['全部', 'AI', '国内媒体', '播客', 'X', 'YouTube', '公众号', '其他'];
 
   return (
     <div className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6 w-full">

@@ -309,7 +309,8 @@ async function saveArticlesCache(articles: Article[]) {
 const BUILTIN_SOURCE_NAMES = new Set([
   '少数派', '人人都是产品经理', '36氪', '虎嗅', '数字生命卡兹克',
   '新智元', '即刻话题', 'GitHub Blog', 'Sam Altman',
-  '张小珺商业访谈录', 'Lex Fridman', 'Y Combinator', 'Andrej Karpathy'
+  '张小珺商业访谈录', 'Lex Fridman', 'Y Combinator', 'Andrej Karpathy',
+  'AI HOT 精选', 'AI HOT 全部'
 ]);
 
 async function loadUserArticlesAsArticles(userId: number, pool: pg.Pool): Promise<Article[]> {
@@ -383,7 +384,9 @@ async function applyUserSavedStateToArticles(userId: number, articleList: Articl
 }
 
 const SOURCE_PRIORITY: Record<string, number> = {
-  '36氪': 5,
+  '36氪': 5.5,
+  'AI HOT 精选': 5.0,
+  'AI HOT 全部': 4.9,
   'Lex Fridman': 4.8,
   'Y Combinator': 4.6,
   'Andrej Karpathy': 4.4,
@@ -486,9 +489,21 @@ function stableArticleId(source: string, item: Parser.Item, idOffset: number, in
   return 1_000_000_000_000 + (hash >>> 0);
 }
 
-function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: string, idOffset: number, feedIcon?: string) {
-  const maxItems = source === '36氪' || source === '虎嗅' ? 8 : 12;
-  return items.slice(0, maxItems).map((item, index) => {
+function getDefaultFeedLimit(source: string) {
+  return source === '36氪' || source === '虎嗅' ? 8 : 12;
+}
+
+function normalizeFeedItems(
+  items: Parser.Item[],
+  source: string,
+  defaultTopic: string,
+  idOffset: number,
+  feedIcon?: string,
+  options?: { maxItems?: number | null }
+) {
+  const maxItems = options?.maxItems === undefined ? getDefaultFeedLimit(source) : options.maxItems;
+  const normalizedItems = maxItems === null ? items : items.slice(0, maxItems);
+  return normalizedItems.map((item, index) => {
     const rawContent = item['content:encoded'] || item.content || item.contentSnippet || '';
     const formattedContent = source === '即刻话题' ? formatJikeContent(rawContent) : rawContent;
     const excerpt = formattedContent.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').substring(0, 120) + '...';
@@ -3004,6 +3019,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       parseWithRetry([
           'rsshub://youtube/user/@AndrejKarpathy',
           'https://www.youtube.com/feeds/videos.xml?channel_id=UCYO_jab_esuFRV4b17AJtAw'
+        ], 20000, 2),
+      parseWithRetry([
+          'https://aihot.virxact.com/feed.xml'
         ], 20000, 2)
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
@@ -3045,6 +3063,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     const karpathyArticles = results[12].status === 'fulfilled'
       ? normalizeFeedItems(results[12].value.items, 'Andrej Karpathy', 'YouTube', 12000, extractFeedIcon(results[12].value))
       : [];
+    const aiHotSelectedArticles = results[13].status === 'fulfilled'
+      ? normalizeFeedItems(results[13].value.items, 'AI HOT 精选', 'AI 资讯', 13000, extractFeedIcon(results[13].value))
+      : [];
     logger.info({
       module: "rss",
       counts: {
@@ -3060,7 +3081,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
         xyzfm: xyzfmArticles.length,
         lex: lexArticles.length,
         yc: ycArticles.length,
-        karpathy: karpathyArticles.length
+        karpathy: karpathyArticles.length,
+        aiHotSelected: aiHotSelectedArticles.length
       }
     }, "RSS feed counts");
     const feedNames = [
@@ -3077,6 +3099,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       'Lex Fridman',
       'Y Combinator',
       'Andrej Karpathy',
+      'AI HOT 精选',
     ];
     results.forEach((result, index) => {
       if (result.status === 'rejected') {
@@ -3096,7 +3119,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ...xyzfmArticles,
       ...lexArticles,
       ...ycArticles,
-      ...karpathyArticles
+      ...karpathyArticles,
+      ...aiHotSelectedArticles
     ];
     const ordered = rankArticles(merged);
     return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
@@ -3904,6 +3928,7 @@ async function startServer() {
   app.post("/api/sources/fetch", asyncHandler(async (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
+    const fullFeed = req.body?.full === true;
     if (!source || !input) {
       return res.status(400).json({ error: "source and input are required" });
     }
@@ -3912,7 +3937,9 @@ async function startServer() {
     try {
       const parsed = await parseWithRetry([input], 15000, 2);
       const feedIcon = extractFeedIcon(parsed);
-      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon);
+      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon, {
+        maxItems: fullFeed ? null : undefined
+      });
 
       // Anonymous user OR fetching a built-in source → global in-memory store
       if (!userId || isBuiltin) {
@@ -3967,6 +3994,7 @@ async function startServer() {
   app.post("/api/sources/retry", asyncHandler(async (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
+    const fullFeed = req.body?.full === true;
     if (!source || !input) {
       return res.status(400).json({ error: "source and input are required" });
     }
@@ -3975,7 +4003,9 @@ async function startServer() {
     try {
       const parsed = await parseWithRetry([input], 60000, 1);
       const feedIcon = extractFeedIcon(parsed);
-      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon);
+      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon, {
+        maxItems: fullFeed ? null : undefined
+      });
 
       if (!userId || isBuiltin) {
         const combined = [...fetched, ...articles];

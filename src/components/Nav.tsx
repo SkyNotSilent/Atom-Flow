@@ -55,21 +55,26 @@ type RenameDialogState =
 const SOURCE_LAYOUT_STORAGE_KEY = 'atomflow:source-layout:v1';
 const SOURCE_LAYOUT_VERSION = 2; // 版本2：合集结构
 
-const BASE_SOURCES: Array<{ name: string; color: string }> = [
-  { name: '少数派', color: '#553C9A' },
-  { name: '人人都是产品经理', color: '#2B6CB0' },
-  { name: '36氪', color: '#E53E3E' },
-  { name: '虎嗅', color: '#DD6B20' },
-  { name: '数字生命卡兹克', color: '#6B46C1' },
-  { name: '新智元', color: '#2F855A' },
-  { name: '即刻话题', color: '#38A169' },
-  { name: 'GitHub Blog', color: '#24292F' },
-  { name: 'Sam Altman', color: '#1DA1F2' },
-  { name: '张小珺商业访谈录', color: '#FF6B6B' },
-  { name: 'Lex Fridman', color: '#000000' },
-  { name: 'Y Combinator', color: '#FF0000' },
-  { name: 'Andrej Karpathy', color: '#FF0000' }
+const BASE_SOURCES: Array<{ name: string; color: string; rssUrl?: string }> = [
+  { name: 'AI HOT 精选', color: '#4F46E5', rssUrl: 'https://aihot.virxact.com/feed.xml' },
+  { name: 'AI HOT 全部', color: '#06B6D4', rssUrl: 'https://aihot.virxact.com/feed/all.xml' },
+  { name: '少数派', color: '#553C9A', rssUrl: 'rsshub://sspai/index' },
+  { name: '人人都是产品经理', color: '#2B6CB0', rssUrl: 'https://www.woshipm.com/feed' },
+  { name: '36氪', color: '#E53E3E', rssUrl: 'rsshub://36kr/hot-list' },
+  { name: '虎嗅', color: '#DD6B20', rssUrl: 'https://www.huxiu.com/rss/0.xml' },
+  { name: '数字生命卡兹克', color: '#6B46C1', rssUrl: 'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml' },
+  { name: '新智元', color: '#2F855A', rssUrl: 'https://plink.anyfeeder.com/weixin/AI_era' },
+  { name: '即刻话题', color: '#38A169', rssUrl: 'rsshub://jike/topic/63579abb6724cc583b9bba9a' },
+  { name: 'GitHub Blog', color: '#24292F', rssUrl: 'https://github.blog/feed/' },
+  { name: 'Sam Altman', color: '#1DA1F2', rssUrl: 'rsshub://twitter/user/sama' },
+  { name: '张小珺商业访谈录', color: '#FF6B6B', rssUrl: 'https://feed.xyzfm.space/dk4yh3pkpjp3' },
+  { name: 'Lex Fridman', color: '#000000', rssUrl: 'rsshub://youtube/user/%40lexfridman' },
+  { name: 'Y Combinator', color: '#FF0000', rssUrl: 'rsshub://youtube/user/%40ycombinator' },
+  { name: 'Andrej Karpathy', color: '#FF0000', rssUrl: 'rsshub://youtube/user/@AndrejKarpathy' }
 ];
+
+const baseSourceByName = new Map(BASE_SOURCES.map(item => [item.name, item]));
+const AI_HOT_SOURCE_CONFIG = BASE_SOURCES.filter(source => source.name.startsWith('AI HOT'));
 
 const createSourceEntry = (name: string, color: string, rssUrl?: string, icon?: string): SourceEntry => ({
   id: `source:${name}`,
@@ -89,16 +94,26 @@ const createDefaultEntries = (): NavEntry[] => {
   // 创建默认的合集结构
   const collections: NavEntry[] = [
     {
+      id: 'collection:AI HOT',
+      type: 'collection',
+      name: 'AI HOT',
+      collapsed: false,
+      children: [
+        createSourceEntry('AI HOT 精选', '#4F46E5', 'https://aihot.virxact.com/feed.xml'),
+        createSourceEntry('AI HOT 全部', '#06B6D4', 'https://aihot.virxact.com/feed/all.xml')
+      ]
+    },
+    {
       id: 'collection:国内媒体',
       type: 'collection',
       name: '国内媒体',
       collapsed: true,
       children: [
-        createSourceEntry('36氪', '#E53E3E'),
-        createSourceEntry('虎嗅', '#DD6B20'),
-        createSourceEntry('少数派', '#553C9A'),
-        createSourceEntry('人人都是产品经理', '#2B6CB0'),
-        createSourceEntry('即刻话题', '#38A169')
+        createSourceEntry('36氪', '#E53E3E', baseSourceByName.get('36氪')?.rssUrl),
+        createSourceEntry('虎嗅', '#DD6B20', baseSourceByName.get('虎嗅')?.rssUrl),
+        createSourceEntry('少数派', '#553C9A', baseSourceByName.get('少数派')?.rssUrl),
+        createSourceEntry('人人都是产品经理', '#2B6CB0', baseSourceByName.get('人人都是产品经理')?.rssUrl),
+        createSourceEntry('即刻话题', '#38A169', baseSourceByName.get('即刻话题')?.rssUrl)
       ]
     },
     {
@@ -107,7 +122,7 @@ const createDefaultEntries = (): NavEntry[] => {
       name: '播客',
       collapsed: true,
       children: [
-        createSourceEntry('张小珺商业访谈录', '#FF6B6B')
+        createSourceEntry('张小珺商业访谈录', '#FF6B6B', baseSourceByName.get('张小珺商业访谈录')?.rssUrl)
       ]
     },
     {
@@ -116,7 +131,7 @@ const createDefaultEntries = (): NavEntry[] => {
       name: 'X',
       collapsed: true,
       children: [
-        createSourceEntry('Sam Altman', '#1DA1F2')
+        createSourceEntry('Sam Altman', '#1DA1F2', baseSourceByName.get('Sam Altman')?.rssUrl)
       ]
     },
     {
@@ -125,9 +140,9 @@ const createDefaultEntries = (): NavEntry[] => {
       name: 'YouTube',
       collapsed: true,
       children: [
-        createSourceEntry('Y Combinator', '#FF0000'),
-        createSourceEntry('Andrej Karpathy', '#FF0000'),
-        createSourceEntry('Lex Fridman', '#000000')
+        createSourceEntry('Y Combinator', '#FF0000', baseSourceByName.get('Y Combinator')?.rssUrl),
+        createSourceEntry('Andrej Karpathy', '#FF0000', baseSourceByName.get('Andrej Karpathy')?.rssUrl),
+        createSourceEntry('Lex Fridman', '#000000', baseSourceByName.get('Lex Fridman')?.rssUrl)
       ]
     },
     {
@@ -136,8 +151,8 @@ const createDefaultEntries = (): NavEntry[] => {
       name: '公众号',
       collapsed: true,
       children: [
-        createSourceEntry('数字生命卡兹克', '#6B46C1'),
-        createSourceEntry('新智元', '#2F855A')
+        createSourceEntry('数字生命卡兹克', '#6B46C1', baseSourceByName.get('数字生命卡兹克')?.rssUrl),
+        createSourceEntry('新智元', '#2F855A', baseSourceByName.get('新智元')?.rssUrl)
       ]
     },
     {
@@ -146,7 +161,7 @@ const createDefaultEntries = (): NavEntry[] => {
       name: '其他',
       collapsed: true,
       children: [
-        createSourceEntry('GitHub Blog', '#24292F')
+        createSourceEntry('GitHub Blog', '#24292F', baseSourceByName.get('GitHub Blog')?.rssUrl)
       ]
     }
   ];
@@ -158,9 +173,10 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
   if (!Array.isArray(raw)) return createDefaultEntries();
   const parsed: NavEntry[] = [];
   const baseColorMap = new Map(BASE_SOURCES.map(item => [item.name, item.color]));
+  const baseRssUrlMap = new Map(BASE_SOURCES.map(item => [item.name, item.rssUrl]));
   
   // 已删除的源列表
-  const DELETED_SOURCES = new Set(['XYZ播客', '极客公园']);
+  const DELETED_SOURCES = new Set(['XYZ播客', '极客公园', 'AI HOT 日报']);
   
   for (const item of raw) {
     if (!item || typeof item !== 'object') continue;
@@ -170,12 +186,13 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
       if (DELETED_SOURCES.has(entry.name)) continue;
       
       const color = typeof entry.color === 'string' ? entry.color : (baseColorMap.get(entry.name) || '#718096');
-      const rssUrl = typeof entry.rssUrl === 'string' ? entry.rssUrl : undefined;
+      const rssUrl = typeof entry.rssUrl === 'string' ? entry.rssUrl : baseRssUrlMap.get(entry.name);
       const icon = typeof entry.icon === 'string' ? entry.icon : undefined;
       parsed.push(createSourceEntry(entry.name, color, rssUrl, icon));
       continue;
     }
     if (entry.type === 'collection' && typeof entry.name === 'string' && Array.isArray(entry.children)) {
+      const collectionName = entry.name === 'AI 热点' ? 'AI HOT' : entry.name;
       const children = entry.children
         .filter(child => child && typeof child === 'object')
         .map(child => child as Record<string, unknown>)
@@ -184,15 +201,15 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
         .map(child => {
           const childName = child.name as string;
           const color = typeof child.color === 'string' ? child.color : (baseColorMap.get(childName) || '#718096');
-          const rssUrl = typeof child.rssUrl === 'string' ? child.rssUrl : undefined;
+          const rssUrl = typeof child.rssUrl === 'string' ? child.rssUrl : baseRssUrlMap.get(childName);
           const icon = typeof child.icon === 'string' ? child.icon : undefined;
           return createSourceEntry(childName, color, rssUrl, icon);
         });
       if (children.length > 0) {
         parsed.push({
-          id: typeof entry.id === 'string' ? entry.id : `collection:${entry.name}`,
+          id: collectionName === 'AI HOT' ? 'collection:AI HOT' : (typeof entry.id === 'string' ? entry.id : `collection:${collectionName}`),
           type: 'collection',
-          name: entry.name,
+          name: collectionName,
           collapsed: Boolean(entry.collapsed),
           children
         });
@@ -207,12 +224,24 @@ const sanitizeStoredEntries = (raw: unknown): NavEntry[] => {
     if (entry.type === 'collection') entry.children.forEach(child => usedNames.add(child.name));
   });
 
+  const missingAiHotSources = AI_HOT_SOURCE_CONFIG.filter(source => !usedNames.has(source.name));
+  if (missingAiHotSources.length > 0) {
+    parsed.unshift({
+      id: 'collection:AI HOT',
+      type: 'collection',
+      name: 'AI HOT',
+      collapsed: false,
+      children: missingAiHotSources.map(source => createSourceEntry(source.name, source.color, source.rssUrl))
+    });
+    missingAiHotSources.forEach(source => usedNames.add(source.name));
+  }
+
   const missingBaseSources = BASE_SOURCES.filter(source => !usedNames.has(source.name));
 
   // 只补充缺失的基础源，保留用户自定义源
   if (missingBaseSources.length > 0) {
     for (const src of missingBaseSources) {
-      parsed.push({ id: `source:${src.name}`, type: 'source', name: src.name, color: src.color });
+      parsed.push({ id: `source:${src.name}`, type: 'source', name: src.name, color: src.color, rssUrl: src.rssUrl });
     }
   }
 
@@ -269,10 +298,11 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const [showAddSourceModal, setShowAddSourceModal] = useState(false);
   const [newSourceInput, setNewSourceInput] = useState('');
   const [newSourceAlias, setNewSourceAlias] = useState('');
-	  const [renameDialog, setRenameDialog] = useState<RenameDialogState>(null);
-	  const [renameValue, setRenameValue] = useState('');
-	  const [loadingSourceId, setLoadingSourceId] = useState<string | null>(null);
-	  const [historyDialogExpanded, setHistoryDialogExpanded] = useState(false);
+		  const [renameDialog, setRenameDialog] = useState<RenameDialogState>(null);
+		  const [renameValue, setRenameValue] = useState('');
+		  const [loadingSourceId, setLoadingSourceId] = useState<string | null>(null);
+		  const [fullyFetchedSourceIds, setFullyFetchedSourceIds] = useState<Set<string>>(new Set());
+		  const [historyDialogExpanded, setHistoryDialogExpanded] = useState(false);
 	  const holdTimerRef = useRef<number | null>(null);
   const pointerSessionRef = useRef<{ entryId: string; pointerId: number; startX: number; startY: number; active: boolean } | null>(null);
   const suppressClickRef = useRef(false);
@@ -838,20 +868,22 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     setActiveSource(source.name);
     setActiveTab('feed');
     const hasArticles = articles.some(article => article.source === source.name);
-    if (hasArticles || !source.rssUrl || loadingSourceId === source.id) return;
+    const shouldFetchFullFeed = Boolean(source.rssUrl && !fullyFetchedSourceIds.has(source.id));
+    if ((!shouldFetchFullFeed && hasArticles) || !source.rssUrl || loadingSourceId === source.id) return;
     try {
       setLoadingSourceId(source.id);
       showToast('正在抓取信息源...');
       const res = await fetch('/api/sources/fetch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: source.name, input: source.rssUrl })
+        body: JSON.stringify({ source: source.name, input: source.rssUrl, full: true })
       });
       if (!res.ok) {
         showToast('抓取失败，请检查订阅链接');
         return;
       }
       await reloadArticles();
+      setFullyFetchedSourceIds(prev => new Set(prev).add(source.id));
       showToast('信息源已更新');
     } catch {
       showToast('抓取失败，请稍后重试');
