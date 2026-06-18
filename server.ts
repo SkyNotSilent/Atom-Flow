@@ -6,7 +6,9 @@ import multer from "multer";
 import Parser from "rss-parser";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
+import createDOMPurify from "dompurify";
 import { promises as fs } from "fs";
+import { marked } from "marked";
 import path from "path";
 import dotenv from "dotenv";
 import pg from "pg";
@@ -24,6 +26,13 @@ import { URL } from "url";
 import pino from "pino";
 import pinoHttp from "pino-http";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
+import { Agent, OpenAIProvider, Runner, setTracingDisabled, tool } from "@openai/agents";
+import { z } from "zod";
+import {
+  classifyWriteAgentIntent,
+  mergeWriteAgentModelRouterResult,
+  type WriteAgentIntentClassification,
+} from "./src/utils/writeAgentIntent.js";
 
 dotenv.config();
 
@@ -1370,9 +1379,10 @@ const WRITING_PLAN_SYSTEM_PROMPT = `你是一位资深内容策划师。你的�
 1. 提纲控制在 3 到 4 个 section，每个 section 要有自己的论点推进，不是按素材分类。
 2. 标题要像专栏作家写的，有锐度，不要空泛模板。
 3. angle 必须是可落地的判断，不是主题复述，不是"从多个角度看XXX"。
-4. outline 的结构应该是：提出问题 → 给出判断 → 展开论证 → 收束结论，而不是按素材类型罗列。
+4. outline 的结构必须符合 Scratch 成稿标准：开场有具体问题或场景，承接作者核心判断，转入矛盾/代价/反常识，再收束到结论或行动。
 5. 素材只是背景知识和灵感来源，文章结构要围绕作者自己的观点展开。
-6. 严格只输出 JSON。`;
+6. 不要出现“素材对齐”“观点对齐”“节点映射”“引用映射”等过程性栏目。
+7. 严格只输出 JSON。`;
 
 const WRITING_POLISH_SYSTEM_PROMPT = `你是中文写作润色 Agent。你的任务是让草稿更像真人写的，而不是改换观点。
 
@@ -1383,9 +1393,65 @@ const WRITING_POLISH_SYSTEM_PROMPT = `你是中文写作润色 Agent。你的任
 4. 输出纯 Markdown，不要解释。`;
 
 const AI_REQUEST_TIMEOUT_MS = 120000;
+const WRITE_AGENT_MAX_MESSAGE_LENGTH = 120000;
 const AI_DRAFT_MAX_TOKENS = 2400;
 const AI_POLISH_MAX_TOKENS = 2400;
 const MIMO_MIN_STRUCTURED_OUTPUT_TOKENS = 4096;
+const draftSanitizer = createDOMPurify(new JSDOM("").window as unknown as Parameters<typeof createDOMPurify>[0]);
+
+const DRAFT_META_LINE_PATTERN = /^(?:正文草稿|正文章稿|标题建议|主标题|副标题|核心逻辑|写作思路|写作说明|素材对齐|观点对齐|观点的对齐|引用映射|节点映射|确定性引用映射|使用素材|参考素材|以下是|下面是)[:：\s]/;
+const DRAFT_META_HEADING_PATTERN = /^#{1,6}\s*(?:正文草稿|正文章稿|写作思路|写作说明|素材对齐|观点对齐|观点的对齐|引用映射|节点映射|确定性引用映射)\s*$/;
+
+const cleanGeneratedDraftMarkdown = (raw: string): string => {
+  const normalized = raw
+    .replace(/^```(?:markdown|md)?\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  const lines = normalized.split("\n");
+  const cleanedLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      cleanedLines.push(line);
+      continue;
+    }
+    if (DRAFT_META_LINE_PATTERN.test(trimmed) || DRAFT_META_HEADING_PATTERN.test(trimmed)) {
+      continue;
+    }
+    cleanedLines.push(line);
+  }
+
+  return cleanedLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+};
+
+const stripLeadingTitleHeading = (markdown: string, title: string): string => {
+  const lines = markdown.split("\n");
+  const normalizedTitle = normalizePlainText(title).replace(/^#+\s*/, "").trim();
+  if (!lines.length || !normalizedTitle) return markdown;
+  const firstMeaningfulIndex = lines.findIndex(line => line.trim());
+  if (firstMeaningfulIndex < 0) return markdown;
+  const firstLine = lines[firstMeaningfulIndex].trim();
+  const headingText = firstLine.replace(/^#{1,6}\s*/, "").trim();
+  if (firstLine.startsWith("#") && normalizePlainText(headingText) === normalizedTitle) {
+    return lines.slice(firstMeaningfulIndex + 1).join("\n").trim();
+  }
+  return markdown;
+};
+
+const renderAgentDraftMarkdownToHtml = (markdown: string): string => {
+  const rawHtml = marked.parse(markdown, { async: false, gfm: true, breaks: false }) as string;
+  return draftSanitizer.sanitize(rawHtml);
+};
+
+const prepareAgentDraftForNote = (rawDraft: string, title: string) => {
+  const markdown = stripLeadingTitleHeading(cleanGeneratedDraftMarkdown(rawDraft), title);
+  return {
+    markdown,
+    html: renderAgentDraftMarkdownToHtml(markdown)
+  };
+};
 
 const safeJsonParse = <T>(raw: string): T | null => {
   try {
@@ -1493,15 +1559,16 @@ ${cardLookup}
 补充素材：
 ${extraLookup}
 
-请按以上提纲写出完整 Markdown 正文。要求：
-1. 标题使用「# ${plan.title}」
-2. 二级标题严格对应提纲
-3. 每个二级标题只围绕“确定性引用映射”里分配给该 section 的节点写，不要跨 section 随意挪用节点
-4. 每个 section 至少有一个可追踪依据：优先用原文摘录；没有原文摘录时，用卡片语境或文章背景改写支撑
-5. 如果直接引用原文，必须写成「……」（来自《文章标题》）；不要伪造没有出现在原文摘录里的直接引语
-6. 这是一篇原创文章，不是素材汇编。不要出现“某某卡片提到”“根据资料显示”“从这些观点可以看出”
-7. 文章要有明确的叙事推进：提出问题 → 给出判断 → 展开论证 → 收束结论
-8. 不要改变 section 顺序，不要新增二级标题，不要输出解释`;
+请按以上提纲写出一篇可以直接进入「我的文章」编辑器的完整 Markdown 成稿。要求：
+1. 第一行使用「# ${plan.title}」，后面直接进入正文，不要写任何说明。
+2. 正文必须符合 Scratch 标准：开头抓住具体问题/场景，承接作者核心判断，转入矛盾/代价/反常识，最后收束到结论或行动。
+3. 二级标题严格对应提纲，但标题要像文章小标题，不要像工作流标签。
+4. 每个 section 只围绕“确定性引用映射”里分配给该 section 的节点写，不要跨 section 随意挪用节点。
+5. 每个 section 至少有一个可追踪依据：优先用原文摘录；没有原文摘录时，用卡片语境或文章背景改写支撑。
+6. 如果直接引用原文，必须写成「……」（来自《文章标题》）；不要伪造没有出现在原文摘录里的直接引语。
+7. 这是一篇原创文章，不是素材汇编。不要出现“某某卡片提到”“根据资料显示”“从这些观点可以看出”。
+8. 严禁输出“素材对齐”“观点对齐”“节点映射”“引用映射”“写作思路”“正文草稿”等过程性栏目。
+9. 不要改变 section 顺序，不要新增二级标题，不要输出解释。`;
 };
 
 const buildEvidenceMap = (plan: WritingPlanResult, activeCards: WritingCardInput[]): WritingEvidenceMapItem[] => {
@@ -1581,7 +1648,8 @@ const persistAgentGraphEvents = async (
   pool: pg.Pool,
   userId: number,
   threadId: number,
-  trace: WriteAgentGraphTraceRecord[]
+  trace: WriteAgentGraphTraceRecord[],
+  runId?: string
 ) => {
   for (const item of trace) {
     await pool.query(
@@ -1594,10 +1662,50 @@ const persistAgentGraphEvents = async (
         Math.max(0, Math.round(item.durationMs || 0)),
         item.inputSummary || null,
         item.outputSummary || null,
-        JSON.stringify(item.meta || {})
+        JSON.stringify({ ...(item.meta || {}), ...(runId ? { runId } : {}) })
       ]
     );
   }
+};
+
+const persistAgentRunEvent = async (
+  pool: pg.Pool,
+  input: {
+    userId: number;
+    threadId: number;
+    runId: string;
+    status: "completed" | "error";
+    durationMs: number;
+    intent?: string;
+    requestedTools?: string[];
+    provider?: string;
+    model?: string;
+    noteId?: number;
+    error?: string;
+  }
+) => {
+  await pool.query(
+    `INSERT INTO write_agent_events (thread_id, user_id, node, duration_ms, input_summary, output_summary, meta)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      input.threadId,
+      input.userId,
+      input.status === "completed" ? "run_complete" : "run_error",
+      Math.max(0, Math.round(input.durationMs || 0)),
+      input.intent || null,
+      input.status,
+      JSON.stringify({
+        runId: input.runId,
+        status: input.status,
+        intent: input.intent,
+        requestedTools: input.requestedTools || [],
+        provider: input.provider,
+        model: input.model,
+        noteId: input.noteId,
+        error: input.error
+      })
+    ]
+  );
 };
 
 const fetchUserSavedCards = async (pool: pg.Pool, userId: number) => {
@@ -1629,16 +1737,77 @@ const fetchUserSavedCards = async (pool: pg.Pool, userId: number) => {
   }));
 };
 
+const tokenizeRecallQuery = (topic: string) => {
+  const normalized = (topic || '').trim().toLowerCase();
+  const tokens = normalized
+    .split(/[\s,，。.!?！？、;；:："'“”‘’()（）[\]【】<>《》/\\|+-]+/)
+    .map(token => token.trim())
+    .filter(token => token.length >= 2);
+  const compactChinese = normalized
+    .replace(/[a-z0-9\s,，。.!?！？、;；:："'“”‘’()（）[\]【】<>《》/\\|+-]+/gi, '')
+    .trim();
+  const phrases = [
+    normalized,
+    compactChinese,
+    ...tokens
+  ].filter((token, index, arr) => token.length >= 2 && arr.indexOf(token) === index);
+  return { normalized, tokens, phrases };
+};
+
+const scoreRecallCard = (card: any, query: ReturnType<typeof tokenizeRecallQuery>) => {
+  const title = `${card.articleTitle || ''}`.toLowerCase();
+  const tags = `${(card.tags || []).join(' ')}`.toLowerCase();
+  const content = `${card.content || ''} ${card.summary || ''}`.toLowerCase();
+  const context = `${card.sourceContext || ''} ${card.context || ''} ${card.originalQuote || ''} ${card.citationNote || ''} ${card.sourceExcerpt || ''}`.toLowerCase();
+  const source = `${card.sourceName || ''}`.toLowerCase();
+  let score = 0;
+  const hits: string[] = [];
+  for (const phrase of query.phrases) {
+    if (!phrase) continue;
+    if (title.includes(phrase)) {
+      score += 7;
+      hits.push(`title:${phrase}`);
+    }
+    if (tags.includes(phrase)) {
+      score += 5;
+      hits.push(`tag:${phrase}`);
+    }
+    if (content.includes(phrase)) {
+      score += 4;
+      hits.push(`content:${phrase}`);
+    }
+    if (context.includes(phrase)) {
+      score += 2;
+      hits.push(`context:${phrase}`);
+    }
+    if (source.includes(phrase)) {
+      score += 1;
+      hits.push(`source:${phrase}`);
+    }
+  }
+  const uniqueArticleBoost = card.savedArticleId || card.articleId ? 0.5 : 0;
+  return { score: score + uniqueArticleBoost, hits };
+};
+
 const toolRecallCards = (topic: string, cards: any[], excludeIds: string[] = []) => {
   const normalizedTopic = (topic || '').trim().toLowerCase();
   if (!normalizedTopic) return [];
-  const keywords = normalizedTopic.split(/[\s,，。.!?！？、;；:：]+/).filter(keyword => keyword.length >= 2);
+  const query = tokenizeRecallQuery(normalizedTopic);
   const excludeSet = new Set(excludeIds);
-  return cards.filter(card => {
-    if (excludeSet.has(card.id)) return false;
-    const text = `${card.content} ${card.summary || ''} ${card.sourceContext || ''} ${card.context || ''} ${card.originalQuote || ''} ${card.citationNote || ''} ${(card.tags || []).join(' ')} ${card.articleTitle || ''} ${card.sourceName || ''}`.toLowerCase();
-    return keywords.some(keyword => text.includes(keyword));
-  }).slice(0, 8);
+  return cards
+    .filter(card => !excludeSet.has(card.id))
+    .map(card => {
+      const { score, hits } = scoreRecallCard(card, query);
+      return { card, score, hits };
+    })
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8)
+    .map(item => ({
+      ...item.card,
+      recallScore: item.score,
+      recallHits: item.hits
+    }));
 };
 
 const toolGetActiveNetwork = (cards: any[], activatedNodeIds: string[] = []) => {
@@ -1970,6 +2139,7 @@ const runWriteAgentGraph = async (
             ], 0.38, 1800);
 
             if (generatedDraftText.trim()) {
+              const preparedDraft = prepareAgentDraftForNote(generatedDraftText, generatedPlan.title);
               await input.onStep?.({
                 type: "partial_status",
                 node: "persist_memory",
@@ -1980,10 +2150,10 @@ const runWriteAgentGraph = async (
                 : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
               persistedDraftNote = await createAgentDraftNote(pool, state.userId, {
                 title: generatedPlan.title,
-                content: generatedDraftText.trim(),
-	                topic: topicForWriting,
-	                style: generatedPlan.style,
-	                outline: generatedPlan.outline,
+                content: preparedDraft.html,
+		                topic: topicForWriting,
+		                style: generatedPlan.style,
+		                outline: generatedPlan.outline,
 	                evidenceMap,
                 activeCards: cardsForWriting,
                 activationSummary: activationSummaryForNote,
@@ -2192,6 +2362,642 @@ ${state.message}`;
 
   await persistAgentGraphEvents(pool, input.userId, Number(finalState.threadId), finalState.graphTrace || []);
   return finalState;
+};
+
+type OpenAIWriteAgentContext = {
+  pool: pg.Pool;
+  userId: number;
+  dbCards: any[];
+  activeCards: any[];
+  recalledCards: any[];
+  recentNotes: any[];
+  agentSkills: WriteAgentSkillRecord[];
+  styleSkill?: WriteAgentSkillRecord;
+};
+
+const formatOpenAIWriteAgentPrompt = (input: {
+  thread: any;
+  message: string;
+  mergedState: WriteAgentState;
+  activeCards: any[];
+  recalledCards: any[];
+  recentNotes: any[];
+  generatedOutlineText: string;
+  generatedDraftText: string;
+  agentSkills: WriteAgentSkillRecord[];
+  styleSkill?: WriteAgentSkillRecord;
+}) => `当前线程摘要：
+${typeof input.thread?.summary === "string" && input.thread.summary.trim() ? input.thread.summary : "暂无摘要"}
+
+当前状态：
+- focusedTopic: ${input.mergedState.focusedTopic || "无"}
+- activatedNodeIds: ${(input.mergedState.activatedNodeIds || []).join("、") || "无"}
+- activationSummary: ${(input.mergedState.activationSummary || []).join(" | ") || "无"}
+- styleSkill: ${input.styleSkill?.name || "默认"}
+- skills: ${input.agentSkills.map(skill => `${skill.type}:${skill.name}`).join(" | ") || "默认"}
+
+当前激活节点：
+${input.activeCards.length > 0 ? sanitizeWritingCards(input.activeCards).map((card, index) => formatCardForWriting(card, index)).join("\n\n") : "无"}
+
+补充召回节点：
+${input.recalledCards.length > 0 ? sanitizeWritingCards(input.recalledCards).map((card, index) => formatCardForWriting(card, index)).join("\n\n") : "无"}
+
+最近文章草稿：
+${input.recentNotes.length > 0 ? input.recentNotes.map((note, index) => `${index + 1}. ${note.title}\n${normalizePlainText(note.content).slice(0, 180)}`).join("\n\n") : "无"}
+
+提纲工具结果：
+${input.generatedOutlineText || "无"}
+
+正文工具结果：
+${input.generatedDraftText ? input.generatedDraftText.slice(0, 5000) : "无"}
+
+用户最新消息：
+${input.message}`;
+
+const createOpenAIWriteAgentRunner = (config: OpenAIWriteAgentConfig) => {
+  const tracingDisabled = config.providerLabel !== "openai";
+  setTracingDisabled(tracingDisabled);
+  return new Runner({
+    model: config.model,
+    modelProvider: new OpenAIProvider({
+      apiKey: config.apiKey,
+      baseURL: config.baseURL,
+      useResponses: false,
+      strictFeatureValidation: false
+    }),
+    workflowName: "AtomFlow Write Agent",
+    tracingDisabled,
+    traceIncludeSensitiveData: false
+  });
+};
+
+const createWriteAgentSdkTools = () => {
+  const recallCardsTool = tool({
+    name: "recallCardsTool",
+    description: "Return already-recalled AtomFlow knowledge cards for the current writing request.",
+    parameters: z.object({ reason: z.string().optional() }),
+    execute: async (_input: { reason?: string }, runContext: any) => {
+      const context = runContext?.context as OpenAIWriteAgentContext | undefined;
+      const cards = context?.recalledCards || [];
+      return {
+        cards: cards.slice(0, 8),
+        reason: cards.length > 0 ? "matched local weighted knowledge recall" : "no relevant cards were found",
+        confidence: cards.length >= 3 ? "medium" : cards.length > 0 ? "low" : "none"
+      };
+    }
+  });
+
+  const listRecentNotesTool = tool({
+    name: "listRecentNotesTool",
+    description: "Return recent AtomFlow draft notes for continuation or rewrite tasks.",
+    parameters: z.object({ limit: z.number().int().min(1).max(6).optional() }),
+    execute: async (input: { limit?: number }, runContext: any) => {
+      const context = runContext?.context as OpenAIWriteAgentContext | undefined;
+      return (context?.recentNotes || []).slice(0, input.limit || 4);
+    }
+  });
+
+  const getEffectiveSkillsTool = tool({
+    name: "getEffectiveSkillsTool",
+    description: "Return baseline writing rules and user-selected style skills active for this run.",
+    parameters: z.object({}),
+    execute: async (_input: Record<string, never>, runContext: any) => {
+      const context = runContext?.context as OpenAIWriteAgentContext | undefined;
+      const skills = context?.agentSkills || [];
+      return {
+        baselineSkills: buildAgentSkillSnapshots(skills.filter(isBaselineSkill)),
+        userSelectedSkills: buildAgentSkillSnapshots(skills.filter(skill => !isBaselineSkill(skill)))
+      };
+    }
+  });
+
+  return [recallCardsTool, listRecentNotesTool, getEffectiveSkillsTool];
+};
+
+const writeAgentInputGuardrail = {
+  name: "write-agent-input-size",
+  runInParallel: false,
+  execute: async ({ input }) => {
+    const text = typeof input === "string" ? input : JSON.stringify(input);
+    return {
+      tripwireTriggered: text.trim().length === 0 || text.length > WRITE_AGENT_MAX_MESSAGE_LENGTH,
+      outputInfo: { length: text.length }
+    };
+  }
+};
+
+const writeAgentOutputGuardrail = {
+  name: "write-agent-source-discipline",
+  execute: async ({ agentOutput }) => {
+    const text = typeof agentOutput === "string" ? agentOutput : JSON.stringify(agentOutput);
+    return {
+      tripwireTriggered: false,
+      outputInfo: {
+        mentionsInsufficientInfo: /不足|没有|未召回|缺少/.test(text),
+        mentionsSource: /来自《|来源|节点/.test(text)
+      }
+    };
+  }
+};
+
+const runOpenAIWriteAgentRuntime = async (
+  pool: pg.Pool,
+  input: {
+    userId: number;
+    threadId?: number;
+    message: string;
+    isCreateArticle: boolean;
+    userState: WriteAgentState;
+    runId?: string;
+    onStep?: (event: { type: string; node?: string; message?: string; data?: unknown }) => void | Promise<void>;
+  }
+): Promise<WriteAgentGraphState> => {
+  const config = getOpenAIWriteAgentConfig();
+  if (!config) throw new Error("OpenAI writing agent is not configured: set OPENAI_API_KEY and OPENAI_MODEL");
+
+  const runId = input.runId || randomUUID();
+  const runStartedAt = Date.now();
+  const runner = createOpenAIWriteAgentRunner(config);
+  const sdkTools = createWriteAgentSdkTools();
+  const trace: WriteAgentGraphTraceRecord[] = [];
+  const withStep = async <T,>(node: string, label: string, fn: () => Promise<{ value: T; summary?: string; meta?: Record<string, unknown> }>) => {
+    const started = Date.now();
+    await input.onStep?.({ type: "step_start", node, message: getWriteAgentNodeLabel(node, "start") });
+    const result = await fn();
+    const traceItem: WriteAgentGraphTraceRecord = {
+      node,
+      durationMs: Date.now() - started,
+      inputSummary: normalizePlainText(input.message).slice(0, 160),
+      outputSummary: result.summary || label,
+      meta: { ...(result.meta || {}), runId },
+      createdAt: new Date().toISOString()
+    };
+    trace.push(traceItem);
+    await input.onStep?.({ type: "step_end", node, message: getWriteAgentNodeLabel(node, "end"), data: traceItem });
+    return result.value;
+  };
+
+  let thread: any;
+  let dbCards: any[] = [];
+  let previousMessages: any[] = [];
+  let mergedState: WriteAgentState = {};
+  let activeCards: any[] = [];
+
+  const threadId = await withStep("hydrate_context", "context hydrated", async () => {
+    thread = input.threadId
+      ? (await pool.query(
+        `SELECT id, title, summary, state, created_at, updated_at
+         FROM write_agent_threads
+         WHERE id = $1 AND user_id = $2`,
+        [input.threadId, input.userId]
+      )).rows[0]
+      : null;
+    if (!thread) {
+      thread = (await pool.query(
+        `INSERT INTO write_agent_threads (user_id, title, state, thread_type)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, title, summary, state, thread_type, created_at, updated_at`,
+        [input.userId, inferThreadTitle(input.message), JSON.stringify({}), "chat"]
+      )).rows[0];
+    }
+    const normalizedThreadId = Number(thread.id);
+    await pool.query(
+      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+       VALUES ($1, 'user', $2, $3)`,
+      [normalizedThreadId, input.message, JSON.stringify({ state: input.userState, action: input.isCreateArticle ? "create_article" : undefined })]
+    );
+    dbCards = await fetchUserSavedCards(pool, input.userId);
+    previousMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
+    const threadState = (thread.state || {}) as WriteAgentState;
+    mergedState = {
+      focusedTopic: input.userState.focusedTopic || threadState.focusedTopic,
+      activatedNodeIds: input.userState.activatedNodeIds || threadState.activatedNodeIds || [],
+      activationSummary: input.userState.activationSummary || threadState.activationSummary || [],
+      selectedStyleSkillId: input.userState.selectedStyleSkillId || threadState.selectedStyleSkillId,
+      selectedSkillIds: input.userState.selectedSkillIds || threadState.selectedSkillIds || [],
+      effectiveSkillIds: Array.isArray(threadState.effectiveSkillIds) ? threadState.effectiveSkillIds : [],
+      writingGoal: input.userState.writingGoal || threadState.writingGoal,
+      pendingChoice: input.userState.pendingChoice || threadState.pendingChoice,
+      selectedCardIds: input.userState.selectedCardIds || threadState.selectedCardIds || [],
+      sourceImageIds: threadState.sourceImageIds || [],
+      lastIntent: threadState.lastIntent,
+      latestOutline: Array.isArray(threadState.latestOutline) ? threadState.latestOutline : [],
+      latestAngle: typeof threadState.latestAngle === "string" ? threadState.latestAngle : undefined,
+      lastGeneratedNoteId: threadState.lastGeneratedNoteId,
+      lastGeneratedNoteTitle: typeof threadState.lastGeneratedNoteTitle === "string" ? threadState.lastGeneratedNoteTitle : undefined
+    };
+    activeCards = toolGetActiveNetwork(dbCards, mergedState.activatedNodeIds || []);
+    return { value: normalizedThreadId, summary: `thread=${normalizedThreadId}; cards=${dbCards.length}` };
+  });
+
+  let agentSkills: WriteAgentSkillRecord[] = [];
+  let styleSkill: WriteAgentSkillRecord | undefined;
+  await withStep("load_effective_skills", "skills loaded", async () => {
+    agentSkills = await resolveWriteAgentSkills(pool, input.userId, mergedState.selectedSkillIds, mergedState.selectedStyleSkillId);
+    styleSkill = agentSkills.find(skill => skill.type === "style")
+      || await resolveWriteStyleSkill(pool, input.userId, mergedState.selectedStyleSkillId);
+    await input.onStep?.({
+      type: "partial_status",
+      node: "load_effective_skills",
+      message: `OpenAI Agents SDK 已加载基础规范，用户增强 Skills ${agentSkills.filter(skill => skill.visibility === "user").length} 个已启用`
+    });
+    return {
+      value: null,
+      summary: `baseline=${agentSkills.filter(isBaselineSkill).length}; user=${agentSkills.filter(skill => skill.visibility === "user").length}`,
+      meta: { sdk: "openai-agents", provider: config.providerLabel, model: config.model }
+    };
+  });
+
+  const { intent, requestedTools } = await withStep("classify_intent", "intent classified locally", async () => {
+    let classified: WriteAgentIntentClassification = classifyWriteAgentIntent(input.message, input.isCreateArticle);
+    if (classified.intent.needsModelRouter) {
+      const rawIntent = await requestAiChatCompletion([
+        {
+          role: "system",
+          content: `你是 AtomFlow 写作助手的轻量路由器。只输出 JSON。
+可选 intent: chat, select_material, outline, draft, revise, continue_note。
+可选 tools: recall_cards, get_active_network, list_recent_notes, generate_outline, generate_draft, revise_note。
+不要把普通闲聊误判为写作任务；但用户提到素材、知识库、来源、文章、草稿、提纲、我的文章时要选择对应工具。`
+        },
+        { role: "user", content: input.message }
+      ], {
+        temperature: 0.1,
+        maxTokens: 260,
+        logLabel: "write_agent_intent_router",
+        disableThinking: true
+      });
+      classified = mergeWriteAgentModelRouterResult(
+        classified,
+        safeJsonParse<{ tools?: unknown; intent?: unknown; reason?: unknown }>(rawIntent)
+      );
+    }
+    return {
+      value: classified,
+      summary: classified.requestedTools.join(",") || "answer",
+      meta: {
+        router: classified.intent.needsModelRouter ? "local_rules_with_model_fallback" : "local_rules",
+        intent: classified.intent.intent,
+        requestedTools: classified.requestedTools,
+        confidence: classified.intent.confidence
+      }
+    };
+  });
+
+  let recalledCards: any[] = [];
+  let recentNotes: any[] = [];
+  await withStep("retrieve_knowledge", "knowledge retrieved", async () => {
+    recalledCards = requestedTools.includes("recall_cards")
+      ? toolRecallCards(`${input.message} ${mergedState.focusedTopic || ""}`, dbCards, activeCards.map(card => card.id))
+      : [];
+    recentNotes = requestedTools.includes("list_recent_notes") || requestedTools.includes("generate_draft")
+      ? await toolListRecentNotes(pool, input.userId, 4)
+      : [];
+    return {
+      value: null,
+      summary: `recalled=${recalledCards.length}`,
+      meta: { requestedTools, activeCards: activeCards.length, recalledCards: recalledCards.length }
+    };
+  });
+
+  const sources = await withStep("enrich_sources", "sources enriched", async () => {
+    const cardsForSources = activeCards.length > 0 ? activeCards.concat(recalledCards) : recalledCards;
+    const built = buildAgentSources(cardsForSources);
+    return { value: built, summary: `sources=${built.cards.length}; images=${built.images.length}` };
+  });
+
+  let choices: WriteAgentChoiceRecord[] = [];
+  await withStep("decide_next", "next actions prepared", async () => {
+    const shouldGenerateDraft = input.isCreateArticle || requestedTools.includes("generate_draft");
+    const shouldGenerateOutline = input.isCreateArticle || requestedTools.includes("generate_outline") || shouldGenerateDraft;
+    const choiceCards = activeCards.length > 0 ? activeCards : recalledCards;
+    choices = buildAgentChoices(choiceCards, styleSkill);
+    mergedState = {
+      ...mergedState,
+      lastIntent: intent.intent,
+      pendingChoice: choiceCards.length > 0 && !shouldGenerateDraft
+        ? {
+          type: "card_selection",
+          prompt: "选择这次要使用的知识卡片，或直接生成提纲/文章。",
+          cardIds: choiceCards.map(card => card.id).filter((id): id is string => typeof id === "string"),
+          styleSkillIds: styleSkill ? [styleSkill.id] : [],
+          createdAt: new Date().toISOString()
+        }
+        : undefined,
+      selectedStyleSkillId: styleSkill?.id,
+      selectedSkillIds: agentSkills.filter(skill => !isBaselineSkill(skill)).map(skill => skill.id),
+      effectiveSkillIds: agentSkills.map(skill => skill.id)
+    };
+    if (shouldGenerateOutline && !requestedTools.includes("generate_outline")) requestedTools.push("generate_outline");
+    return { value: null, summary: `choices=${choices.length}`, meta: { requestedTools } };
+  });
+
+  await withStep("human_selection", "selection synced", async () => {
+    mergedState = {
+      ...mergedState,
+      selectedCardIds: (activeCards.length > 0 ? activeCards : recalledCards)
+        .map(card => card.id)
+        .filter((id): id is string => typeof id === "string")
+    };
+    if ((mergedState.selectedCardIds || []).length > 0) {
+      await input.onStep?.({
+        type: "activation",
+        node: "human_selection",
+        message: "已同步激活知识节点",
+        data: {
+          activatedNodeIds: mergedState.selectedCardIds,
+          activationSummary: mergedState.activationSummary || []
+        }
+      });
+    }
+    return { value: null, summary: `selected=${mergedState.selectedCardIds?.length || 0}` };
+  });
+
+  const sdkContext: OpenAIWriteAgentContext = {
+    pool,
+    userId: input.userId,
+    dbCards,
+    activeCards,
+    recalledCards,
+    recentNotes,
+    agentSkills,
+    styleSkill
+  };
+  const materialAgent = new Agent<OpenAIWriteAgentContext>({
+    name: "MaterialAgent",
+    handoffDescription: "Select and explain relevant AtomFlow knowledge cards for writing tasks.",
+    model: config.model,
+    instructions: "你负责判断召回素材是否足以支撑写作任务。必须明确素材不足，不要伪造来源。",
+    tools: sdkTools,
+    inputGuardrails: [writeAgentInputGuardrail],
+    outputGuardrails: [writeAgentOutputGuardrail]
+  });
+  const outlineAgent = new Agent<OpenAIWriteAgentContext>({
+    name: "OutlineAgent",
+    handoffDescription: "Generate article angles and outlines from AtomFlow knowledge cards.",
+    model: config.model,
+    instructions: WRITING_PLAN_SYSTEM_PROMPT,
+    inputGuardrails: [writeAgentInputGuardrail],
+    outputGuardrails: [writeAgentOutputGuardrail]
+  });
+  const draftAgent = new Agent<OpenAIWriteAgentContext>({
+    name: "DraftAgent",
+    handoffDescription: "Write article drafts from outlines, cards, citations and style skills.",
+    model: config.model,
+    instructions: WRITING_AGENT_SYSTEM_PROMPT,
+    inputGuardrails: [writeAgentInputGuardrail],
+    outputGuardrails: [writeAgentOutputGuardrail]
+  });
+  const coordinatorAgent = new Agent<OpenAIWriteAgentContext>({
+    name: "CoordinatorAgent",
+    handoffDescription: "Coordinate AtomFlow writing tasks and produce final user-facing answers.",
+    model: config.model,
+    instructions: `你是 AtomFlow 的写作助手 Agent。默认基于用户知识库回答，不要频繁反问。
+
+规则：
+1. 先用知识库、线程上下文和激活网络回答。
+2. 回答要短、具体、可执行。
+3. 引用知识节点时，用「来自《文章标题》」或节点编号标注来源。
+4. 如果信息不足，必须明确说「当前素材不足」，再列出下一步。
+5. 不要伪造来源、图片、数据或文章。
+6. 当前风格 Skill：${styleSkill?.name || "默认"}。${styleSkill?.prompt || ""}
+7. 当前适用 Skills：
+${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) || "默认规范"}`,
+    tools: sdkTools,
+    handoffs: [materialAgent, outlineAgent, draftAgent],
+    inputGuardrails: [writeAgentInputGuardrail],
+    outputGuardrails: [writeAgentOutputGuardrail]
+  });
+
+  let generatedOutlineText = "";
+  let generatedDraftText = "";
+  let generatedPlan: WritingPlanResult | null = null;
+  let persistedDraftNote: any = null;
+  let assistantContent = "";
+  const cardsForWriting = sanitizeWritingCards(activeCards.length > 0 ? activeCards : recalledCards);
+  await withStep("generate_answer_or_draft", "generated via OpenAI Agents SDK", async () => {
+    const shouldGenerateDraft = input.isCreateArticle || requestedTools.includes("generate_draft");
+    const shouldGenerateOutline = input.isCreateArticle || requestedTools.includes("generate_outline") || shouldGenerateDraft;
+    if (shouldGenerateOutline) {
+      if (cardsForWriting.length === 0 && input.isCreateArticle) {
+        throw new Error("知识库中没有可用的卡片，请先收藏一些文章并提取知识卡片");
+      }
+      if (cardsForWriting.length > 0) {
+        await input.onStep?.({ type: "partial_status", node: "generate_answer_or_draft", message: shouldGenerateDraft ? "正在规划文章结构" : "正在生成提纲" });
+        const topicForWriting = mergedState.focusedTopic || input.message;
+        const planResult = await runner.run(outlineAgent, buildWritingPlanPrompt(topicForWriting, cardsForWriting, sanitizeWritingCards(recalledCards), styleSkill, agentSkills), {
+          context: sdkContext,
+          maxTurns: 4
+        });
+        generatedPlan = sanitizeWritingPlan(safeJsonParse<WritingPlanResult>(String(planResult.finalOutput || "")), topicForWriting);
+        generatedOutlineText = generatedPlan.outline.map(item => `- ${item.heading}：${item.goal}`).join("\n");
+        const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
+        if (shouldGenerateDraft) {
+          await input.onStep?.({ type: "partial_status", node: "generate_answer_or_draft", message: "正在生成完整文章草稿" });
+          const draftResult = await runner.run(draftAgent, buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards), evidenceMap, styleSkill, agentSkills), {
+            context: sdkContext,
+            maxTurns: 4
+          });
+          generatedDraftText = String(draftResult.finalOutput || "").trim();
+          if (generatedDraftText) {
+            const preparedDraft = prepareAgentDraftForNote(generatedDraftText, generatedPlan.title);
+            await input.onStep?.({ type: "partial_status", node: "persist_memory", message: "正在保存文章与引用链路" });
+            const activationSummaryForNote = (mergedState.activationSummary || []).length > 0
+              ? mergedState.activationSummary || []
+              : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
+            persistedDraftNote = await createAgentDraftNote(pool, input.userId, {
+              title: generatedPlan.title,
+              content: preparedDraft.html,
+              topic: topicForWriting,
+              style: generatedPlan.style,
+              outline: generatedPlan.outline,
+              evidenceMap,
+              activeCards: cardsForWriting,
+              activationSummary: activationSummaryForNote,
+              sourceArticles: buildSourceArticlesFromCards(cardsForWriting, dbCards),
+              styleSkillSnapshot: styleSkill ? buildStyleSkillSnapshot(styleSkill) : undefined,
+              skillSnapshots: buildAgentSkillSnapshots(agentSkills),
+              effectiveSkillSnapshots: {
+                baselineSkills: buildAgentSkillSnapshots(agentSkills.filter(isBaselineSkill)),
+                userSelectedSkills: buildAgentSkillSnapshots(agentSkills.filter(skill => !isBaselineSkill(skill)))
+              }
+            });
+          }
+        }
+      }
+    }
+
+    assistantContent = input.isCreateArticle && persistedDraftNote
+      ? [
+        `已基于当前激活网络创建文章《${persistedDraftNote.title || generatedPlan?.title || "未命名文章"}》。`,
+        "",
+        `这次使用了 ${cardsForWriting.length} 个知识节点，来源文章 ${buildSourceArticlesFromCards(cardsForWriting, dbCards).length} 篇。`,
+        styleSkill ? `写作风格：${styleSkill.name}` : "",
+        generatedPlan?.angle ? `核心判断：${generatedPlan.angle}` : "",
+        "你可以在「我的文章」里继续编辑；知识节点、原文摘录、来源图片和引用映射已经写入文章元信息。"
+      ].filter(Boolean).join("\n")
+      : String((await runner.run(coordinatorAgent, formatOpenAIWriteAgentPrompt({
+        thread,
+        message: input.message,
+        mergedState,
+        activeCards,
+        recalledCards,
+        recentNotes,
+        generatedOutlineText,
+        generatedDraftText,
+        agentSkills,
+        styleSkill
+      }), {
+        context: sdkContext,
+        maxTurns: 6
+      })).finalOutput || "").trim();
+    return { value: null, summary: persistedDraftNote ? `note=${persistedDraftNote.id}` : `answer=${assistantContent.length}`, meta: { sdk: "openai-agents", provider: config.providerLabel, model: config.model } };
+  });
+
+  if (!assistantContent) throw new Error("agent returned empty message");
+
+  let toolPayload: any;
+  let assistantMessageId: number | undefined;
+  let uiBlocks: any[] = [];
+  await withStep("persist_memory", "memory persisted", async () => {
+    const selectedCardIds = (mergedState.selectedCardIds || []).length > 0
+      ? mergedState.selectedCardIds || []
+      : sources.cards.map(card => card.id).filter((id): id is string => typeof id === "string");
+    toolPayload = {
+      runId,
+      requestedTools,
+      intent: intent.intent,
+      reason: intent.reason || "",
+      activeCardIds: activeCards.map(card => card.id),
+      recalledCardIds: recalledCards.map(card => card.id),
+      outline: generatedPlan?.outline || [],
+      draftPreview: (generatedDraftText || "").slice(0, 400),
+      noteId: persistedDraftNote ? Number(persistedDraftNote.id) : undefined,
+      noteTitle: persistedDraftNote?.title,
+      noteSaved: Boolean(persistedDraftNote),
+      noteTopic: mergedState.focusedTopic || input.message,
+      choices,
+      sources,
+      graphTrace: trace,
+      skillSnapshots: buildAgentSkillSnapshots(agentSkills),
+      effectiveSkills: buildAgentSkillSnapshots(agentSkills),
+      effectiveSkillSnapshots: {
+        baselineSkills: buildAgentSkillSnapshots(agentSkills.filter(isBaselineSkill)),
+        userSelectedSkills: buildAgentSkillSnapshots(agentSkills.filter(skill => !isBaselineSkill(skill)))
+      },
+      runtime: "openai-agents-sdk",
+      provider: config.providerLabel,
+      model: config.model
+    };
+    if (requestedTools.length > 0) {
+      await pool.query(
+        `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+         VALUES ($1, 'tool', $2, $3)`,
+        [
+          threadId,
+          [
+            `tools: ${requestedTools.join(", ")}`,
+            generatedOutlineText ? `outline:\n${generatedOutlineText}` : "",
+            generatedDraftText ? `draft:\n${generatedDraftText.slice(0, 600)}` : ""
+          ].filter(Boolean).join("\n\n"),
+          JSON.stringify(toolPayload)
+        ]
+      );
+    }
+    uiBlocks = buildAgentUiBlocks({
+      answer: assistantContent,
+      sources,
+      selectedCardIds,
+      choices,
+      note: persistedDraftNote
+    });
+    const finalPayload = { ...toolPayload, uiBlocks, feedback: "none", sourceCollapsed: true };
+    const assistantMessageRow = (await pool.query(
+      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+       VALUES ($1, 'assistant', $2, $3)
+       RETURNING id`,
+      [threadId, assistantContent, JSON.stringify(finalPayload)]
+    )).rows[0];
+    assistantMessageId = Number(assistantMessageRow.id);
+    finalPayload.messageId = assistantMessageId;
+    toolPayload = finalPayload;
+    const nextState: WriteAgentState = {
+      ...mergedState,
+      activatedNodeIds: selectedCardIds.length > 0 ? selectedCardIds : mergedState.activatedNodeIds || [],
+      selectedCardIds,
+      activationSummary: selectedCardIds.length > 0
+        ? sanitizeWritingCards(sources.cards).slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`)
+        : mergedState.activationSummary || [],
+      sourceImageIds: sources.images.map(image => image.id),
+      latestOutline: generatedPlan?.outline || mergedState.latestOutline || [],
+      latestAngle: generatedPlan?.angle || mergedState.latestAngle,
+      lastGeneratedNoteId: persistedDraftNote ? Number(persistedDraftNote.id) : mergedState.lastGeneratedNoteId,
+      lastGeneratedNoteTitle: persistedDraftNote?.title || mergedState.lastGeneratedNoteTitle,
+      selectedStyleSkillId: styleSkill?.id,
+      selectedSkillIds: agentSkills.filter(skill => !isBaselineSkill(skill)).map(skill => skill.id),
+      effectiveSkillIds: agentSkills.map(skill => skill.id)
+    };
+    const finalMessages = await getRecentThreadMessages(pool, threadId, 14);
+    const summary = summarizeAgentMessages(finalMessages.map(item => ({ role: item.role, content: item.content })));
+    await upsertThreadState(pool, threadId, summary, nextState, thread?.title || inferThreadTitle(input.message));
+    mergedState = nextState;
+    if (selectedCardIds.length > 0) {
+      await input.onStep?.({
+        type: "activation",
+        node: "persist_memory",
+        message: "已同步激活知识节点",
+        data: {
+          activatedNodeIds: selectedCardIds,
+          activationSummary: nextState.activationSummary || []
+        }
+      });
+    }
+    return { value: null, summary: `uiBlocks=${uiBlocks.length}`, meta: { requestedTools, activeCards: activeCards.length, recalledCards: recalledCards.length } };
+  });
+
+  await withStep("respond", "response ready", async () => ({ value: null, summary: `thread=${threadId}` }));
+  await persistAgentGraphEvents(pool, input.userId, threadId, trace, runId);
+  await persistAgentRunEvent(pool, {
+    userId: input.userId,
+    threadId,
+    runId,
+    status: "completed",
+    durationMs: Date.now() - runStartedAt,
+    intent: intent.intent,
+    requestedTools,
+    provider: config.providerLabel,
+    model: config.model,
+    noteId: persistedDraftNote ? Number(persistedDraftNote.id) : undefined
+  });
+
+  return {
+    userId: input.userId,
+    threadId,
+    thread,
+    message: input.message,
+    isCreateArticle: input.isCreateArticle,
+    userState: input.userState,
+    mergedState,
+    previousMessages,
+    dbCards,
+    activeCards,
+    recalledCards,
+    recentNotes,
+    intent,
+    requestedTools,
+    styleSkill,
+    agentSkills,
+    generatedPlan,
+    generatedOutlineText,
+    generatedDraftText,
+    persistedDraftNote,
+    assistantContent,
+    assistantMessageId,
+    toolPayload,
+    sources,
+    choices,
+    uiBlocks,
+    graphTrace: trace
+  } as WriteAgentGraphState;
 };
 
 const SkillCreationGraphAnnotation = Annotation.Root({
@@ -2435,10 +3241,9 @@ const buildNoteSourceArticles = (cards: WritingCardInput[]) => {
 };
 
 // 从写作卡片中提取唯一来源文章列表
-const buildSourceArticlesFromCards = (cardsForWriting: any[], dbCards: any[]) => {
+const buildSourceArticlesFromCards = (cardsForWriting: any[], _dbCards: any[]) => {
   const articleMap = new Map<string, { articleId?: number; articleTitle: string; url?: string; cardIds: string[]; imageUrls?: string[] }>();
-  const allCards = dbCards.length > 0 ? dbCards : cardsForWriting;
-  for (const card of allCards) {
+  for (const card of cardsForWriting) {
     const savedArticleId = card.savedArticleId ?? card.saved_article_id;
     const articleTitle = card.articleTitle ?? card.article_title ?? card.context_title ?? '未知来源';
     const sourceUrl = card.sourceUrl ?? card.article_url;
@@ -2673,13 +3478,14 @@ const WRITING_AGENT_SYSTEM_PROMPT = `你是一位优秀的中文专栏作家。�
 核心原则：
 1. 你拿到的”素材”只是背景知识和灵感来源。你要基于这些素材形成自己的观点，用自己的语言写作。
 2. 绝对不要逐条搬运素材内容。不要出现”某某观点认为””某某数据表明”这种罗列式写法。
-3. 文章要有明确的叙事推进关系：提出问题 → 给出判断 → 展开论证 → 收束结论。
+3. 文章要符合 Scratch 成稿标准：开场抓住具体问题/场景，承接作者核心判断，转入矛盾/代价/反常识，最后收束到结论或行动。
 4. 写法像一个有独立见解的作者在表达自己的思考，而不是在整理别人的观点。
 5. 开头不要套话，不要”在当今时代””众所周知””让我们来看看”。
 6. 如果素材里有冲突观点，要写出冲突和你的判断，而不是抹平它。
 7. 如果素材不足，就写一篇更短但更扎实的文章，不要注水。
 8. 不要 AI 腔，不要假装引用不存在的数据。
 9. 输出必须是纯 Markdown，不要输出解释，不要输出 JSON，不要使用 HTML。
+10. 严禁输出“素材对齐”“观点对齐”“节点映射”“引用映射”“写作思路”“正文草稿”等过程性栏目；这些信息只属于系统 meta，不属于文章。
 
 格式要求：
 - 第一行直接是标题
@@ -2745,6 +3551,30 @@ const getAiChatConfig = (): AiChatConfig | null => {
     baseUrl,
     chatCompletionsUrl: buildOpenAiCompatibleChatCompletionsUrl(baseUrl),
     model: normalizeAiModelName(model),
+  };
+};
+
+type OpenAIWriteAgentConfig = {
+  apiKey: string;
+  model: string;
+  baseURL?: string;
+  providerLabel: "openai" | "mimo-token-plan";
+};
+
+const getOpenAIWriteAgentConfig = (): OpenAIWriteAgentConfig | null => {
+  const openAiApiKey = process.env.OPENAI_API_KEY?.trim();
+  const openAiModel = process.env.OPENAI_MODEL?.trim();
+  if (openAiApiKey && openAiModel && !isPlaceholderAiApiKey(openAiApiKey)) {
+    return { apiKey: openAiApiKey, model: openAiModel, providerLabel: "openai" };
+  }
+
+  const aiConfig = getAiChatConfig();
+  if (!aiConfig) return null;
+  return {
+    apiKey: aiConfig.apiKey,
+    baseURL: aiConfig.baseUrl,
+    model: aiConfig.model,
+    providerLabel: "mimo-token-plan"
   };
 };
 
@@ -4914,7 +5744,12 @@ async function startServer() {
 	  app.get("/api/write/agent/skills", requireAuth, asyncHandler(async (req, res) => {
 	    const type = normalizeAgentSkillType(req.query.type);
 	    const hasTypeFilter = typeof req.query.type === "string" && ["card_storage", "citation", "writing", "style"].includes(req.query.type);
-	    res.json({ skills: await fetchWriteAgentSkills(pool, req.session.userId, hasTypeFilter ? type : undefined) });
+	    const skills = await fetchWriteAgentSkills(pool, req.session.userId, hasTypeFilter ? type : undefined);
+	    res.json({
+	      skills,
+	      systemSkills: skills.filter(skill => skill.visibility === "system"),
+	      userSkills: skills.filter(skill => skill.visibility === "user")
+	    });
 	  }));
 
 	  app.post("/api/write/agent/skills", requireAuth, asyncHandler(async (req, res) => {
@@ -5166,6 +6001,7 @@ async function startServer() {
   };
 
   const buildWriteAgentResponse = (graphState: WriteAgentGraphState) => ({
+    runId: graphState.toolPayload?.runId,
     threadId: Number(graphState.threadId),
     threadState: graphState.mergedState,
     assistant: {
@@ -5195,9 +6031,12 @@ async function startServer() {
   });
 
   app.post("/api/write/agent/chat/stream", requireAuth, asyncHandler(async (req, res) => {
+    const runId = randomUUID();
     const parsed = buildWriteAgentRequest(req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
-    if (!getAiChatConfig()) return res.status(500).json({ error: 'AI service not configured' });
+    if (!getOpenAIWriteAgentConfig()) {
+      return res.status(500).json({ error: 'Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL' });
+    }
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -5210,26 +6049,38 @@ async function startServer() {
     };
 
     try {
-      send('partial_status', { message: '启动写作 Agent' });
-      const graphState = await runWriteAgentGraph(pool, {
+      send('partial_status', { runId, message: '启动写作 Agent' });
+      const graphState = await runOpenAIWriteAgentRuntime(pool, {
         userId: req.session.userId,
         threadId: parsed.threadId,
         message: parsed.normalizedMessage,
         isCreateArticle: parsed.isCreateArticle,
         userState: parsed.graphUserState,
+        runId,
         onStep: async event => {
           send(event.type, {
+            runId,
             node: event.node,
             message: event.message,
             ...(event.data && typeof event.data === 'object' ? event.data as Record<string, unknown> : { data: event.data })
           });
         }
       });
+      logger.info({
+        module: "write-agent-stream",
+        runId,
+        userId: req.session.userId,
+        threadId: graphState.threadId,
+        intent: graphState.intent?.intent,
+        requestedTools: graphState.requestedTools,
+        noteId: graphState.persistedDraftNote ? Number(graphState.persistedDraftNote.id) : undefined
+      }, "Streaming write agent completed");
       send('final', buildWriteAgentResponse(graphState));
       res.end();
     } catch (error) {
-      logger.error({ err: error, module: "write-agent-stream" }, "Streaming write agent failed");
+      logger.error({ err: error, module: "write-agent-stream", runId, userId: req.session.userId }, "Streaming write agent failed");
       send('error', {
+        runId,
         message: error instanceof Error && error.message ? error.message : '写作助手暂时不可用'
       });
       res.end();
@@ -5237,369 +6088,32 @@ async function startServer() {
   }));
 
   app.post("/api/write/agent/chat", requireAuth, asyncHandler(async (req, res) => {
-    const { threadId, message, focusedTopic, activatedNodeIds, activationSummary, action } = req.body || {};
-    const isCreateArticle = action === 'create_article';
-    if (!isCreateArticle && (!message || typeof message !== 'string' || !message.trim())) {
-      return res.status(400).json({ error: 'message is required' });
-    }
-    const normalizedMessage = isCreateArticle
-      ? (typeof message === 'string' && message.trim() ? message.trim() : '请根据当前对话和激活网络创建一篇文章')
-      : message.trim();
-
-    if (!getAiChatConfig()) {
-      return res.status(500).json({ error: 'AI service not configured' });
+    const runId = randomUUID();
+    const parsed = buildWriteAgentRequest(req.body);
+    if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+    if (!getOpenAIWriteAgentConfig()) {
+      return res.status(500).json({ error: 'Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL' });
     }
 
-    const graphUserState: WriteAgentState = {
-      focusedTopic: typeof focusedTopic === 'string' ? focusedTopic : undefined,
-      activatedNodeIds: Array.isArray(activatedNodeIds) ? activatedNodeIds.filter((id): id is string => typeof id === 'string') : undefined,
-      activationSummary: Array.isArray(activationSummary) ? activationSummary.filter((item): item is string => typeof item === 'string') : undefined,
-	      selectedStyleSkillId: typeof req.body?.selectedStyleSkillId === 'string' || typeof req.body?.selectedStyleSkillId === 'number'
-	        ? req.body.selectedStyleSkillId
-	        : undefined,
-	      selectedSkillIds: Array.isArray(req.body?.selectedSkillIds)
-	        ? req.body.selectedSkillIds.filter((id): id is number | string => typeof id === 'string' || typeof id === 'number')
-	        : undefined,
-	      writingGoal: typeof req.body?.writingGoal === 'string' ? req.body.writingGoal : undefined,
-      selectedCardIds: Array.isArray(req.body?.selectedCardIds) ? req.body.selectedCardIds.filter((id): id is string => typeof id === 'string') : undefined
-    };
-
-    const graphState = await runWriteAgentGraph(pool, {
+    const graphState = await runOpenAIWriteAgentRuntime(pool, {
       userId: req.session.userId,
-      threadId: threadId ? Number(threadId) : undefined,
-      message: normalizedMessage,
-      isCreateArticle,
-      userState: graphUserState
+      threadId: parsed.threadId,
+      message: parsed.normalizedMessage,
+      isCreateArticle: parsed.isCreateArticle,
+      userState: parsed.graphUserState,
+      runId
     });
 
-    return res.json({
-      threadId: Number(graphState.threadId),
-      threadState: graphState.mergedState,
-      assistant: {
-        role: 'assistant',
-        content: graphState.assistantContent
-      },
-      assistantMessage: graphState.assistantContent,
-      toolResult: graphState.toolPayload,
-      uiBlocks: graphState.uiBlocks || [],
-      choices: graphState.choices || [],
-      sources: graphState.sources,
-      graphTrace: graphState.graphTrace || [],
-      note: graphState.persistedDraftNote
-        ? {
-          id: Number(graphState.persistedDraftNote.id),
-          title: graphState.persistedDraftNote.title,
-          created_at: graphState.persistedDraftNote.created_at,
-          updated_at: graphState.persistedDraftNote.updated_at
-        }
-        : null,
-      noteCreated: Boolean(graphState.persistedDraftNote),
-      context: {
-        activeCards: graphState.activeCards?.length || 0,
-        recalledCards: graphState.recalledCards?.length || 0
-      }
-    });
-
-    let thread = threadId
-      ? (await pool.query(
-        `SELECT id, title, summary, state, thread_type, created_at, updated_at
-         FROM write_agent_threads
-         WHERE id = $1 AND user_id = $2`,
-        [threadId, req.session.userId]
-      )).rows[0]
-      : null;
-
-    if (!thread) {
-      thread = (await pool.query(
-        `INSERT INTO write_agent_threads (user_id, title, state, thread_type)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, title, summary, state, thread_type, created_at, updated_at`,
-        [req.session.userId, inferThreadTitle(normalizedMessage), JSON.stringify({}), 'chat']
-      )).rows[0];
-    }
-
-    const normalizedThreadId = Number(thread.id);
-    const userState: WriteAgentState = {
-      focusedTopic: typeof focusedTopic === 'string' ? focusedTopic : undefined,
-      activatedNodeIds: Array.isArray(activatedNodeIds) ? activatedNodeIds.filter((id): id is string => typeof id === 'string') : undefined,
-      activationSummary: Array.isArray(activationSummary) ? activationSummary.filter((item): item is string => typeof item === 'string') : undefined
-    };
-
-    await pool.query(
-      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
-       VALUES ($1, 'user', $2, $3)`,
-      [normalizedThreadId, normalizedMessage, JSON.stringify({ state: userState, action: isCreateArticle ? 'create_article' : undefined })]
-    );
-
-    const dbCards = await fetchUserSavedCards(pool, req.session.userId);
-
-    const previousMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
-    const threadState = (thread.state || {}) as WriteAgentState;
-    const mergedState: WriteAgentState = {
-      focusedTopic: userState.focusedTopic || threadState.focusedTopic,
-      activatedNodeIds: userState.activatedNodeIds || threadState.activatedNodeIds || [],
-      activationSummary: userState.activationSummary || threadState.activationSummary || [],
-      latestOutline: Array.isArray(threadState.latestOutline) ? threadState.latestOutline : [],
-      latestAngle: typeof threadState.latestAngle === 'string' ? threadState.latestAngle : undefined,
-      lastGeneratedNoteId: threadState.lastGeneratedNoteId,
-      lastGeneratedNoteTitle: typeof threadState.lastGeneratedNoteTitle === 'string' ? threadState.lastGeneratedNoteTitle : undefined
-    };
-
-    const activeCardRows = toolGetActiveNetwork(dbCards, mergedState.activatedNodeIds || []);
-    const intentPrompt = `你是 AtomFlow 写作助手的路由器。请判断用户这句最新输入最需要哪些工具。
-
-可选工具：
-- recall_cards：当用户在找主题、补素材、想激活节点时
-- get_active_network：当用户在问当前网络、当前节点、围绕当前激活内容展开时
-- list_recent_notes：当用户提到最近文章、之前草稿、继续改写时
-- generate_outline：当用户要提纲、结构、章节安排时
-- generate_draft：当用户明确要生成、写正文、出草稿时
-- just_chat：当用户只是在对话、讨论、闲聊、提问、思考方向时，不需要任何工具
-
-严格输出 JSON：
-{
-  "tools": ["tool_a", "tool_b"],
-  "reason": "一句简短理由"
-}
-
-注意：大部分日常对话应该返回 ["just_chat"]，只有明确涉及上述操作才使用对应工具。`;
-
-    if (!getAiChatConfig()) {
-      return res.status(500).json({ error: 'AI service not configured' });
-    }
-
-    const requestChat = async (messages: AiChatMessage[], temperature: number, maxTokens: number) => {
-      return requestAiChatCompletion(messages, {
-        temperature,
-        maxTokens,
-        timeoutMs: AI_REQUEST_TIMEOUT_MS,
-        logLabel: "write_agent",
-        disableThinking: true
-      });
-    };
-
-    let rawIntent = '';
-    let parsedIntent: { tools?: string[]; reason?: string } | null = null;
-    let requestedTools: string[] = [];
-
-    if (isCreateArticle) {
-      requestedTools = ['recall_cards', 'generate_outline', 'generate_draft'];
-      parsedIntent = { tools: requestedTools, reason: 'user explicitly requested create_article' };
-    } else {
-      rawIntent = await requestChat([
-        { role: 'system', content: intentPrompt },
-        { role: 'user', content: `当前状态：topic=${mergedState.focusedTopic || '无'}; activeNodes=${(mergedState.activatedNodeIds || []).length}; latestMessage=${normalizedMessage}` }
-      ], 0.1, 300);
-      parsedIntent = safeJsonParse<{ tools?: string[]; reason?: string }>(rawIntent);
-      requestedTools = Array.isArray(parsedIntent?.tools)
-        ? parsedIntent!.tools.filter(tool => ['recall_cards', 'get_active_network', 'list_recent_notes', 'generate_outline', 'generate_draft', 'just_chat'].includes(tool))
-        : [];
-      // If just_chat or no real tools, clear the tool list so we skip all tool pipelines
-      if (requestedTools.length === 0 || (requestedTools.length === 1 && requestedTools[0] === 'just_chat')) {
-        requestedTools = [];
-      }
-      if (
-        requestedTools.length === 0 &&
-        /(知识库|素材|节点|卡片|原文|引用|来源|基于|围绕|总结|提炼|写|文章|草稿|选题|观点|证据)/.test(normalizedMessage)
-      ) {
-        requestedTools = ['recall_cards'];
-        parsedIntent = {
-          ...(parsedIntent || {}),
-          tools: requestedTools,
-          reason: 'message refers to knowledge-base material'
-        };
-      }
-    }
-
-    const recalledCards = requestedTools.includes('recall_cards')
-      ? toolRecallCards(`${normalizedMessage} ${mergedState.focusedTopic || ''}`, dbCards, activeCardRows.map(card => card.id))
-      : [];
-
-    const recentNotes = requestedTools.includes('list_recent_notes') || requestedTools.includes('generate_draft')
-      ? await toolListRecentNotes(pool, req.session.userId, 4)
-      : [];
-
-    const systemPrompt = `你是 AtomFlow 的写作助手 Agent。你不是普通闲聊助手，而是帮助用户围绕知识库、激活网络和文章草稿持续推进写作。
-
-你的行为规则：
-1. 先结合线程上下文、当前状态、激活网络，再回答。
-2. 如果用户在讨论写作方向、提纲、段落、改写，优先围绕写作任务推进，不跑题。
-3. 回答要短、具体、可执行，不说空话。
-4. 如果当前激活网络不足以支撑结论，要明确指出还缺什么。
-5. 你可以引用”当前激活节点””补充召回节点””最近文章草稿”，但不要伪造来源。
-6. 如果工具结果里已经包含提纲或草稿，就优先基于它们回答。
-7. 除非用户明确要求长文，否则默认回答简洁。
-8. 当引用知识节点时，用「来自《文章标题》」或节点编号标注来源，不要笼统地说”根据资料”。
-9. 如果已生成文章草稿，在回复中简要说明引用了哪些节点和原文。
-10. 回答和写作都要优先使用“文章背景、卡片语境、原文摘录、引用建议”，不要只看节点摘要。`;
-
-    let generatedOutlineText = '';
-    let generatedDraftText = '';
-    let generatedPlan: WritingPlanResult | null = null;
-    let persistedDraftNote: any = null;
-    const shouldGenerateDraft = isCreateArticle || requestedTools.includes('generate_draft');
-    const shouldGenerateOutline = isCreateArticle || requestedTools.includes('generate_outline') || shouldGenerateDraft;
-    if (shouldGenerateOutline) {
-      const cardsForWriting = sanitizeWritingCards(activeCardRows.length > 0 ? activeCardRows : recalledCards);
-      if (cardsForWriting.length > 0) {
-        const topicForWriting = mergedState.focusedTopic || normalizedMessage;
-        const planRaw = await requestChat([
-          { role: 'system', content: WRITING_PLAN_SYSTEM_PROMPT },
-          { role: 'user', content: buildWritingPlanPrompt(topicForWriting, cardsForWriting, sanitizeWritingCards(recalledCards)) }
-        ], 0.25, 1200);
-        generatedPlan = sanitizeWritingPlan(safeJsonParse<WritingPlanResult>(planRaw), topicForWriting);
-        generatedOutlineText = generatedPlan.outline.map(item => `- ${item.heading}：${item.goal}`).join('\n');
-
-        if (shouldGenerateDraft) {
-          const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
-          generatedDraftText = await requestChat([
-            { role: 'system', content: WRITING_AGENT_SYSTEM_PROMPT },
-            { role: 'user', content: buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards), evidenceMap) }
-          ], 0.38, 1800);
-
-          if (generatedDraftText.trim()) {
-            const activationSummaryForNote = (mergedState.activationSummary || []).length > 0
-              ? (mergedState.activationSummary || [])
-              : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
-            const sourceArticles = buildSourceArticlesFromCards(cardsForWriting, dbCards);
-            persistedDraftNote = await createAgentDraftNote(pool, req.session.userId, {
-              title: generatedPlan.title,
-              content: generatedDraftText.trim(),
-              topic: topicForWriting,
-              style: generatedPlan.style,
-              outline: generatedPlan.outline,
-              evidenceMap,
-              activeCards: cardsForWriting,
-              activationSummary: activationSummaryForNote,
-              sourceArticles
-            });
-          }
-        }
-      } else if (isCreateArticle) {
-        return res.status(400).json({ error: '知识库中没有可用的卡片，请先收藏一些文章并提取知识卡片' });
-      }
-    }
-
-    const toolPayload = {
-      requestedTools,
-      reason: parsedIntent?.reason || '',
-      activeCardIds: activeCardRows.map(card => card.id),
-      recalledCardIds: recalledCards.map(card => card.id),
-      outline: generatedPlan?.outline || [],
-      draftPreview: generatedDraftText.slice(0, 400),
-      noteId: persistedDraftNote ? Number(persistedDraftNote.id) : undefined,
-      noteTitle: persistedDraftNote?.title,
-      noteSaved: Boolean(persistedDraftNote),
-      noteTopic: mergedState.focusedTopic || normalizedMessage
-    };
-
-    if (requestedTools.length > 0) {
-      await pool.query(
-        `INSERT INTO write_agent_messages (thread_id, role, content, meta)
-         VALUES ($1, 'tool', $2, $3)`,
-        [
-          normalizedThreadId,
-          [
-            `tools: ${requestedTools.join(', ')}`,
-            generatedOutlineText ? `outline:\n${generatedOutlineText}` : '',
-            generatedDraftText ? `draft:\n${generatedDraftText.slice(0, 600)}` : ''
-          ].filter(Boolean).join('\n\n'),
-          JSON.stringify(toolPayload)
-        ]
-      );
-    }
-
-    const userContextPrompt = `当前线程摘要：
-${typeof thread.summary === 'string' && thread.summary.trim() ? thread.summary : '暂无摘要'}
-
-当前状态：
-- focusedTopic: ${mergedState.focusedTopic || '无'}
-- activatedNodeIds: ${(mergedState.activatedNodeIds || []).join('、') || '无'}
-- activationSummary: ${(mergedState.activationSummary || []).join(' | ') || '无'}
-
-当前激活节点：
-${activeCardRows.length > 0 ? sanitizeWritingCards(activeCardRows).map((card, index) => formatCardForWriting(card, index)).join('\n\n') : '无'}
-
-补充召回节点：
-${recalledCards.length > 0 ? sanitizeWritingCards(recalledCards).map((card, index) => formatCardForWriting(card, index)).join('\n\n') : '无'}
-
-最近文章草稿：
-${recentNotes.length > 0 ? recentNotes.map((note, index) => `${index + 1}. ${note.title}\n${normalizePlainText(note.content).slice(0, 180)}`).join('\n\n') : '无'}
-
-工具路由：
-- selectedTools: ${requestedTools.join('、') || '无'}
-- toolReason: ${parsedIntent?.reason || '无'}
-
-提纲工具结果：
-${generatedOutlineText || '无'}
-
-正文工具结果：
-${generatedDraftText ? generatedDraftText.slice(0, 5000) : '无'}
-
-用户最新消息：
-${normalizedMessage}`;
-
-    const assistantContent = isCreateArticle && persistedDraftNote
-      ? [
-        `已基于当前激活网络创建文章《${persistedDraftNote.title || generatedPlan?.title || '未命名文章'}》。`,
-        '',
-        `这次使用了 ${activeCardRows.length || sanitizeWritingCards(recalledCards).length} 个知识节点，来源文章 ${buildSourceArticlesFromCards(sanitizeWritingCards(activeCardRows.length > 0 ? activeCardRows : recalledCards), dbCards).length} 篇。`,
-        generatedPlan?.angle ? `核心判断：${generatedPlan.angle}` : '',
-        '你可以在「我的文章」里继续编辑；知识节点、原文摘录和引用映射已经写入文章元信息。'
-      ].filter(Boolean).join('\n')
-      : await requestChat([
-        { role: 'system', content: systemPrompt },
-        ...previousMessages
-          .filter((item): item is typeof item & { role: 'user' | 'assistant' } => item.role === 'user' || item.role === 'assistant')
-          .map(item => ({ role: item.role, content: item.content }))
-          .slice(-10),
-        { role: 'user', content: userContextPrompt }
-      ], 0.55, 1200);
-    if (!assistantContent) {
-      return res.status(500).json({ error: 'agent returned empty message' });
-    }
-
-    await pool.query(
-      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
-       VALUES ($1, 'assistant', $2, $3)`,
-      [normalizedThreadId, assistantContent, JSON.stringify(toolPayload)]
-    );
-
-    const nextState: WriteAgentState = {
-      ...mergedState,
-      latestOutline: generatedPlan?.outline || mergedState.latestOutline || [],
-      latestAngle: generatedPlan?.angle || mergedState.latestAngle,
-      lastGeneratedNoteId: persistedDraftNote ? Number(persistedDraftNote.id) : mergedState.lastGeneratedNoteId,
-      lastGeneratedNoteTitle: persistedDraftNote?.title || mergedState.lastGeneratedNoteTitle
-    };
-
-    const finalMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
-    const summary = summarizeAgentMessages(finalMessages.map(item => ({ role: item.role, content: item.content })));
-    await upsertThreadState(pool, normalizedThreadId, summary, nextState, thread.title || inferThreadTitle(normalizedMessage));
-
-    res.json({
-      threadId: normalizedThreadId,
-      threadState: nextState,
-      assistant: {
-        role: 'assistant',
-        content: assistantContent
-      },
-      assistantMessage: assistantContent,
-      toolResult: toolPayload,
-      note: persistedDraftNote
-        ? {
-          id: Number(persistedDraftNote.id),
-          title: persistedDraftNote.title,
-          created_at: persistedDraftNote.created_at,
-          updated_at: persistedDraftNote.updated_at
-        }
-        : null,
-      noteCreated: Boolean(persistedDraftNote),
-      context: {
-        activeCards: activeCardRows.length,
-        recalledCards: recalledCards.length
-      }
-    });
+    logger.info({
+      module: "write-agent",
+      runId,
+      userId: req.session.userId,
+      threadId: graphState.threadId,
+      intent: graphState.intent?.intent,
+      requestedTools: graphState.requestedTools,
+      noteId: graphState.persistedDraftNote ? Number(graphState.persistedDraftNote.id) : undefined
+    }, "Write agent completed");
+    return res.json(buildWriteAgentResponse(graphState));
   }));
 
   // Vite middleware for development

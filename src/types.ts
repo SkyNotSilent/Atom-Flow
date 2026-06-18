@@ -130,8 +130,10 @@ export interface Article {
 }
 
 export interface WriteAgentToolResult {
+  runId?: string;
   requestedTools?: string[];
   tools?: string[];
+  intent?: string;
   reason?: string;
   activeCardIds?: string[];
   recalledCardIds?: string[];
@@ -145,6 +147,15 @@ export interface WriteAgentToolResult {
   choices?: WriteAgentChoice[];
   sources?: WriteAgentSources;
   graphTrace?: WriteAgentGraphTraceItem[];
+  skillSnapshots?: WriteAgentSkillSnapshot[];
+  effectiveSkills?: WriteAgentSkillSnapshot[];
+  effectiveSkillSnapshots?: {
+    baselineSkills: WriteAgentSkillSnapshot[];
+    userSelectedSkills: WriteAgentSkillSnapshot[];
+  };
+  runtime?: string;
+  provider?: string;
+  model?: string;
 }
 
 export interface WriteAgentThreadState {

@@ -2,14 +2,6 @@ type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 type LogContext = Record<string, unknown>;
 
-declare global {
-  interface ImportMeta {
-    env: {
-      DEV: boolean;
-    };
-  }
-}
-
 const isDevelopment = import.meta.env.DEV;
 
 const normalizeError = (value: unknown): unknown => {
