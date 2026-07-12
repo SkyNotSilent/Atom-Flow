@@ -37,6 +37,8 @@ export const FeedPage: React.FC = () => {
 
   // 源名称到RSS URL的映射
   const SOURCE_RSS_MAP: Record<string, string> = {
+    'AI HOT 精选': 'https://aihot.virxact.com/feed.xml',
+    'AI HOT 全部': 'https://aihot.virxact.com/feed/all.xml',
     '少数派': 'rsshub://sspai/index',
     '36氪': 'rsshub://36kr/hot-list',
     '虎嗅': 'https://www.huxiu.com/rss/0.xml',
@@ -75,7 +77,7 @@ export const FeedPage: React.FC = () => {
       const res = await fetch('/api/sources/retry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: activeSource, input: rssUrl })
+        body: JSON.stringify({ source: activeSource, input: rssUrl, full: true })
       });
       
       if (res.ok) {
@@ -94,7 +96,9 @@ export const FeedPage: React.FC = () => {
   };
 
   const SOURCE_PRIORITY: Record<string, number> = {
-    '36氪': 5,
+    '36氪': 5.5,
+    'AI HOT 精选': 5.0,
+    'AI HOT 全部': 4.9,
     'Lex Fridman': 4.8,
     'Y Combinator': 4.6,
     'Andrej Karpathy': 4.4,

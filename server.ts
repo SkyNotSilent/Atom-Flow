@@ -1,4 +1,7 @@
 import express from "express";
+import compression from "compression";
+import helmet from "helmet";
+import { ipKeyGenerator, rateLimit } from "express-rate-limit";
 import { createServer as createViteServer } from "vite";
 import { MOCK_ARTICLES } from "./src/data/mock.js";
 import { AtomCard, Article, User } from "./src/types.js";
@@ -6,8 +9,12 @@ import multer from "multer";
 import Parser from "rss-parser";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
+import createDOMPurify from "dompurify";
 import { promises as fs } from "fs";
+import { marked } from "marked";
 import path from "path";
+import mammoth from "mammoth";
+import { createRequire } from "module";
 import dotenv from "dotenv";
 import pg from "pg";
 import session from "express-session";
@@ -16,16 +23,37 @@ import bcrypt from "bcryptjs";
 import { Resend } from "resend";
 import nodemailer from "nodemailer";
 import sharp from "sharp";
-import { createServer, type IncomingMessage } from "http";
+import { createServer, ServerResponse, type IncomingMessage } from "http";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { gzipSync, gunzipSync } from "zlib";
-import { randomUUID, createHash } from "crypto";
+import { randomUUID, createHash, createHmac, randomInt } from "crypto";
 import { URL } from "url";
 import pino from "pino";
 import pinoHttp from "pino-http";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
+import { Agent, OpenAIProvider, Runner, setTracingDisabled, tool } from "@openai/agents";
+import { z } from "zod";
+import {
+  classifyWriteAgentIntent,
+  mergeWriteAgentModelRouterResult,
+  type WriteAgentIntentClassification,
+} from "./src/utils/writeAgentIntent.js";
+import {
+  ConcurrencyLimitError,
+  ResponseLimitError,
+  buildAllowedOrigins,
+  createUserConcurrencyGuard,
+  fetchBoundedPublicResource,
+  isAllowedMutationOrigin,
+  isAllowedUploadSignature,
+  readBoundedEnvNumber,
+  readResponseBuffer,
+  validateDocxArchiveBounds,
+  validatePublicHttpUrl,
+} from "./src/server/security.js";
 
 dotenv.config();
+const nodeRequire = createRequire(import.meta.url);
 
 const isProduction = process.env.NODE_ENV === "production";
 const logger = pino({
@@ -52,18 +80,18 @@ const logger = pino({
   },
 });
 
-const formatOtpForLog = (code: string) => {
-  return isProduction ? `${code.slice(0, 2)}****` : code;
-};
-
 const logOtpEvent = (event: "login" | "registration", email: string, code: string) => {
-  const payload = { authEvent: event, email, otp: formatOtpForLog(code) };
   if (isProduction) {
-    logger.info(payload, "Verification code generated");
+    logger.info({ authEvent: event, email }, "Verification code generated");
   } else {
-    logger.debug(payload, "Verification code generated");
+    logger.debug({ authEvent: event, email, otp: code }, "Verification code generated");
   }
 };
+
+const verificationCodeDigest = (email: string, code: string) => createHmac(
+  "sha256",
+  process.env.SESSION_SECRET || "atomflow-dev-secret-change-in-prod",
+).update(`${email}\0${code}`).digest("hex");
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -309,14 +337,14 @@ async function saveArticlesCache(articles: Article[]) {
 const BUILTIN_SOURCE_NAMES = new Set([
   '少数派', '人人都是产品经理', '36氪', '虎嗅', '数字生命卡兹克',
   '新智元', '即刻话题', 'GitHub Blog', 'Sam Altman',
-  '张小珺商业访谈录', 'Lex Fridman', 'Y Combinator', 'Andrej Karpathy'
+  '张小珺商业访谈录', 'Lex Fridman', 'Y Combinator', 'Andrej Karpathy',
+  'AI HOT 精选', 'AI HOT 全部'
 ]);
 
 async function loadUserArticlesAsArticles(userId: number, pool: pg.Pool): Promise<Article[]> {
   const rows = (await pool.query(
-    `SELECT id, source, source_icon, topic, title, excerpt, content, url,
-            audio_url, audio_duration, published_at, time_str, saved,
-            full_fetched, markdown_content
+    `SELECT id, source, source_icon, topic, title, excerpt, url,
+            audio_url, audio_duration, published_at, time_str, saved
      FROM user_articles
      WHERE user_id = $1
      ORDER BY published_at DESC NULLS LAST
@@ -334,15 +362,22 @@ async function loadUserArticlesAsArticles(userId: number, pool: pg.Pool): Promis
     publishedAt: row.published_at ? Number(row.published_at) : undefined,
     title: row.title as string,
     excerpt: row.excerpt as string,
-    content: row.content as string,
-    markdownContent: row.markdown_content ?? undefined,
+    content: "",
     url: row.url ?? undefined,
     audioUrl: row.audio_url ?? undefined,
     audioDuration: row.audio_duration ?? undefined,
-    fullFetched: row.full_fetched as boolean,
+    fullFetched: false,
     cards: []
   }));
 }
+
+const toArticleListItem = (article: Article): Article => ({
+  ...article,
+  content: "",
+  markdownContent: undefined,
+  fullFetched: false,
+  cards: [],
+});
 
 async function applyUserSavedStateToArticles(userId: number, articleList: Article[], pool: pg.Pool): Promise<Article[]> {
   if (articleList.length === 0) return articleList;
@@ -383,7 +418,9 @@ async function applyUserSavedStateToArticles(userId: number, articleList: Articl
 }
 
 const SOURCE_PRIORITY: Record<string, number> = {
-  '36氪': 5,
+  '36氪': 5.5,
+  'AI HOT 精选': 5.0,
+  'AI HOT 全部': 4.9,
   'Lex Fridman': 4.8,
   'Y Combinator': 4.6,
   'Andrej Karpathy': 4.4,
@@ -486,9 +523,21 @@ function stableArticleId(source: string, item: Parser.Item, idOffset: number, in
   return 1_000_000_000_000 + (hash >>> 0);
 }
 
-function normalizeFeedItems(items: Parser.Item[], source: string, defaultTopic: string, idOffset: number, feedIcon?: string) {
-  const maxItems = source === '36氪' || source === '虎嗅' ? 8 : 12;
-  return items.slice(0, maxItems).map((item, index) => {
+function getDefaultFeedLimit(source: string) {
+  return source === '36氪' || source === '虎嗅' ? 8 : 12;
+}
+
+function normalizeFeedItems(
+  items: Parser.Item[],
+  source: string,
+  defaultTopic: string,
+  idOffset: number,
+  feedIcon?: string,
+  options?: { maxItems?: number | null }
+) {
+  const maxItems = options?.maxItems === undefined ? getDefaultFeedLimit(source) : options.maxItems;
+  const normalizedItems = maxItems === null ? items : items.slice(0, maxItems);
+  return normalizedItems.map((item, index) => {
     const rawContent = item['content:encoded'] || item.content || item.contentSnippet || '';
     const formattedContent = source === '即刻话题' ? formatJikeContent(rawContent) : rawContent;
     const excerpt = formattedContent.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').substring(0, 120) + '...';
@@ -829,6 +878,36 @@ type WriteAgentState = {
   lastGeneratedNoteId?: number;
   lastGeneratedNoteTitle?: string;
 };
+
+const WRITE_CANVAS_NODE_KINDS = [
+  "asset_text",
+  "asset_file",
+  "asset_image",
+  "saved_article",
+  "atom_card",
+  "note",
+  "agent",
+  "result",
+] as const;
+
+type WriteCanvasNodeKind = typeof WRITE_CANVAS_NODE_KINDS[number];
+
+type CanvasContextItem = {
+  nodeId: number;
+  kind: WriteCanvasNodeKind;
+  title: string;
+  text: string;
+  imageDataUrl?: string;
+  mimeType?: string;
+  sourceLabel?: string;
+};
+
+const WRITE_CANVAS_MAX_NODES_PER_PROJECT = readBoundedEnvNumber(process.env.CANVAS_MAX_NODES_PER_PROJECT, 500, 50, 5000);
+const WRITE_CANVAS_MAX_MESSAGES_PER_AGENT = readBoundedEnvNumber(process.env.CANVAS_MAX_MESSAGES_PER_AGENT, 200, 20, 1000);
+const WRITE_CANVAS_MAX_PROJECTS_PER_USER = readBoundedEnvNumber(process.env.CANVAS_MAX_PROJECTS_PER_USER, 50, 5, 500);
+const WRITE_CANVAS_MAX_CONTEXT_ITEMS = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_ITEMS, 30, 5, 100);
+const WRITE_CANVAS_MAX_CONTEXT_CHARS = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_CHARS, 60000, 10000, 250000);
+const WRITE_CANVAS_MAX_CONTEXT_IMAGE_BYTES = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_IMAGE_MB, 12, 1, 40) * 1024 * 1024;
 
 type WriteAgentSkillType = "card_storage" | "citation" | "writing" | "style";
 type WriteAgentSkillScenario = "storage" | "citation" | "drafting" | "style";
@@ -1355,9 +1434,10 @@ const WRITING_PLAN_SYSTEM_PROMPT = `你是一位资深内容策划师。你的�
 1. 提纲控制在 3 到 4 个 section，每个 section 要有自己的论点推进，不是按素材分类。
 2. 标题要像专栏作家写的，有锐度，不要空泛模板。
 3. angle 必须是可落地的判断，不是主题复述，不是"从多个角度看XXX"。
-4. outline 的结构应该是：提出问题 → 给出判断 → 展开论证 → 收束结论，而不是按素材类型罗列。
+4. outline 的结构必须符合 Scratch 成稿标准：开场有具体问题或场景，承接作者核心判断，转入矛盾/代价/反常识，再收束到结论或行动。
 5. 素材只是背景知识和灵感来源，文章结构要围绕作者自己的观点展开。
-6. 严格只输出 JSON。`;
+6. 不要出现“素材对齐”“观点对齐”“节点映射”“引用映射”等过程性栏目。
+7. 严格只输出 JSON。`;
 
 const WRITING_POLISH_SYSTEM_PROMPT = `你是中文写作润色 Agent。你的任务是让草稿更像真人写的，而不是改换观点。
 
@@ -1367,10 +1447,66 @@ const WRITING_POLISH_SYSTEM_PROMPT = `你是中文写作润色 Agent。你的任
 3. 让句子更自然、更有推进感，但不要堆修辞。
 4. 输出纯 Markdown，不要解释。`;
 
-const AI_REQUEST_TIMEOUT_MS = 120000;
+const AI_REQUEST_TIMEOUT_MS = readBoundedEnvNumber(process.env.AI_REQUEST_TIMEOUT_MS, 120000, 5000, 300000);
+const WRITE_AGENT_MAX_MESSAGE_LENGTH = 120000;
 const AI_DRAFT_MAX_TOKENS = 2400;
 const AI_POLISH_MAX_TOKENS = 2400;
 const MIMO_MIN_STRUCTURED_OUTPUT_TOKENS = 4096;
+const draftSanitizer = createDOMPurify(new JSDOM("").window as unknown as Parameters<typeof createDOMPurify>[0]);
+
+const DRAFT_META_LINE_PATTERN = /^(?:正文草稿|正文章稿|标题建议|主标题|副标题|核心逻辑|写作思路|写作说明|素材对齐|观点对齐|观点的对齐|引用映射|节点映射|确定性引用映射|使用素材|参考素材|以下是|下面是)[:：\s]/;
+const DRAFT_META_HEADING_PATTERN = /^#{1,6}\s*(?:正文草稿|正文章稿|写作思路|写作说明|素材对齐|观点对齐|观点的对齐|引用映射|节点映射|确定性引用映射)\s*$/;
+
+const cleanGeneratedDraftMarkdown = (raw: string): string => {
+  const normalized = raw
+    .replace(/^```(?:markdown|md)?\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  const lines = normalized.split("\n");
+  const cleanedLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      cleanedLines.push(line);
+      continue;
+    }
+    if (DRAFT_META_LINE_PATTERN.test(trimmed) || DRAFT_META_HEADING_PATTERN.test(trimmed)) {
+      continue;
+    }
+    cleanedLines.push(line);
+  }
+
+  return cleanedLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+};
+
+const stripLeadingTitleHeading = (markdown: string, title: string): string => {
+  const lines = markdown.split("\n");
+  const normalizedTitle = normalizePlainText(title).replace(/^#+\s*/, "").trim();
+  if (!lines.length || !normalizedTitle) return markdown;
+  const firstMeaningfulIndex = lines.findIndex(line => line.trim());
+  if (firstMeaningfulIndex < 0) return markdown;
+  const firstLine = lines[firstMeaningfulIndex].trim();
+  const headingText = firstLine.replace(/^#{1,6}\s*/, "").trim();
+  if (firstLine.startsWith("#") && normalizePlainText(headingText) === normalizedTitle) {
+    return lines.slice(firstMeaningfulIndex + 1).join("\n").trim();
+  }
+  return markdown;
+};
+
+const renderAgentDraftMarkdownToHtml = (markdown: string): string => {
+  const rawHtml = marked.parse(markdown, { async: false, gfm: true, breaks: false }) as string;
+  return draftSanitizer.sanitize(rawHtml);
+};
+
+const prepareAgentDraftForNote = (rawDraft: string, title: string) => {
+  const markdown = stripLeadingTitleHeading(cleanGeneratedDraftMarkdown(rawDraft), title);
+  return {
+    markdown,
+    html: renderAgentDraftMarkdownToHtml(markdown)
+  };
+};
 
 const safeJsonParse = <T>(raw: string): T | null => {
   try {
@@ -1478,15 +1614,16 @@ ${cardLookup}
 补充素材：
 ${extraLookup}
 
-请按以上提纲写出完整 Markdown 正文。要求：
-1. 标题使用「# ${plan.title}」
-2. 二级标题严格对应提纲
-3. 每个二级标题只围绕“确定性引用映射”里分配给该 section 的节点写，不要跨 section 随意挪用节点
-4. 每个 section 至少有一个可追踪依据：优先用原文摘录；没有原文摘录时，用卡片语境或文章背景改写支撑
-5. 如果直接引用原文，必须写成「……」（来自《文章标题》）；不要伪造没有出现在原文摘录里的直接引语
-6. 这是一篇原创文章，不是素材汇编。不要出现“某某卡片提到”“根据资料显示”“从这些观点可以看出”
-7. 文章要有明确的叙事推进：提出问题 → 给出判断 → 展开论证 → 收束结论
-8. 不要改变 section 顺序，不要新增二级标题，不要输出解释`;
+请按以上提纲写出一篇可以直接进入「我的文章」编辑器的完整 Markdown 成稿。要求：
+1. 第一行使用「# ${plan.title}」，后面直接进入正文，不要写任何说明。
+2. 正文必须符合 Scratch 标准：开头抓住具体问题/场景，承接作者核心判断，转入矛盾/代价/反常识，最后收束到结论或行动。
+3. 二级标题严格对应提纲，但标题要像文章小标题，不要像工作流标签。
+4. 每个 section 只围绕“确定性引用映射”里分配给该 section 的节点写，不要跨 section 随意挪用节点。
+5. 每个 section 至少有一个可追踪依据：优先用原文摘录；没有原文摘录时，用卡片语境或文章背景改写支撑。
+6. 如果直接引用原文，必须写成「……」（来自《文章标题》）；不要伪造没有出现在原文摘录里的直接引语。
+7. 这是一篇原创文章，不是素材汇编。不要出现“某某卡片提到”“根据资料显示”“从这些观点可以看出”。
+8. 严禁输出“素材对齐”“观点对齐”“节点映射”“引用映射”“写作思路”“正文草稿”等过程性栏目。
+9. 不要改变 section 顺序，不要新增二级标题，不要输出解释。`;
 };
 
 const buildEvidenceMap = (plan: WritingPlanResult, activeCards: WritingCardInput[]): WritingEvidenceMapItem[] => {
@@ -1566,7 +1703,8 @@ const persistAgentGraphEvents = async (
   pool: pg.Pool,
   userId: number,
   threadId: number,
-  trace: WriteAgentGraphTraceRecord[]
+  trace: WriteAgentGraphTraceRecord[],
+  runId?: string
 ) => {
   for (const item of trace) {
     await pool.query(
@@ -1579,10 +1717,50 @@ const persistAgentGraphEvents = async (
         Math.max(0, Math.round(item.durationMs || 0)),
         item.inputSummary || null,
         item.outputSummary || null,
-        JSON.stringify(item.meta || {})
+        JSON.stringify({ ...(item.meta || {}), ...(runId ? { runId } : {}) })
       ]
     );
   }
+};
+
+const persistAgentRunEvent = async (
+  pool: pg.Pool,
+  input: {
+    userId: number;
+    threadId: number;
+    runId: string;
+    status: "completed" | "error";
+    durationMs: number;
+    intent?: string;
+    requestedTools?: string[];
+    provider?: string;
+    model?: string;
+    noteId?: number;
+    error?: string;
+  }
+) => {
+  await pool.query(
+    `INSERT INTO write_agent_events (thread_id, user_id, node, duration_ms, input_summary, output_summary, meta)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      input.threadId,
+      input.userId,
+      input.status === "completed" ? "run_complete" : "run_error",
+      Math.max(0, Math.round(input.durationMs || 0)),
+      input.intent || null,
+      input.status,
+      JSON.stringify({
+        runId: input.runId,
+        status: input.status,
+        intent: input.intent,
+        requestedTools: input.requestedTools || [],
+        provider: input.provider,
+        model: input.model,
+        noteId: input.noteId,
+        error: input.error
+      })
+    ]
+  );
 };
 
 const fetchUserSavedCards = async (pool: pg.Pool, userId: number) => {
@@ -1614,16 +1792,77 @@ const fetchUserSavedCards = async (pool: pg.Pool, userId: number) => {
   }));
 };
 
+const tokenizeRecallQuery = (topic: string) => {
+  const normalized = (topic || '').trim().toLowerCase();
+  const tokens = normalized
+    .split(/[\s,，。.!?！？、;；:："'“”‘’()（）[\]【】<>《》/\\|+-]+/)
+    .map(token => token.trim())
+    .filter(token => token.length >= 2);
+  const compactChinese = normalized
+    .replace(/[a-z0-9\s,，。.!?！？、;；:："'“”‘’()（）[\]【】<>《》/\\|+-]+/gi, '')
+    .trim();
+  const phrases = [
+    normalized,
+    compactChinese,
+    ...tokens
+  ].filter((token, index, arr) => token.length >= 2 && arr.indexOf(token) === index);
+  return { normalized, tokens, phrases };
+};
+
+const scoreRecallCard = (card: any, query: ReturnType<typeof tokenizeRecallQuery>) => {
+  const title = `${card.articleTitle || ''}`.toLowerCase();
+  const tags = `${(card.tags || []).join(' ')}`.toLowerCase();
+  const content = `${card.content || ''} ${card.summary || ''}`.toLowerCase();
+  const context = `${card.sourceContext || ''} ${card.context || ''} ${card.originalQuote || ''} ${card.citationNote || ''} ${card.sourceExcerpt || ''}`.toLowerCase();
+  const source = `${card.sourceName || ''}`.toLowerCase();
+  let score = 0;
+  const hits: string[] = [];
+  for (const phrase of query.phrases) {
+    if (!phrase) continue;
+    if (title.includes(phrase)) {
+      score += 7;
+      hits.push(`title:${phrase}`);
+    }
+    if (tags.includes(phrase)) {
+      score += 5;
+      hits.push(`tag:${phrase}`);
+    }
+    if (content.includes(phrase)) {
+      score += 4;
+      hits.push(`content:${phrase}`);
+    }
+    if (context.includes(phrase)) {
+      score += 2;
+      hits.push(`context:${phrase}`);
+    }
+    if (source.includes(phrase)) {
+      score += 1;
+      hits.push(`source:${phrase}`);
+    }
+  }
+  const uniqueArticleBoost = card.savedArticleId || card.articleId ? 0.5 : 0;
+  return { score: score + uniqueArticleBoost, hits };
+};
+
 const toolRecallCards = (topic: string, cards: any[], excludeIds: string[] = []) => {
   const normalizedTopic = (topic || '').trim().toLowerCase();
   if (!normalizedTopic) return [];
-  const keywords = normalizedTopic.split(/[\s,，。.!?！？、;；:：]+/).filter(keyword => keyword.length >= 2);
+  const query = tokenizeRecallQuery(normalizedTopic);
   const excludeSet = new Set(excludeIds);
-  return cards.filter(card => {
-    if (excludeSet.has(card.id)) return false;
-    const text = `${card.content} ${card.summary || ''} ${card.sourceContext || ''} ${card.context || ''} ${card.originalQuote || ''} ${card.citationNote || ''} ${(card.tags || []).join(' ')} ${card.articleTitle || ''} ${card.sourceName || ''}`.toLowerCase();
-    return keywords.some(keyword => text.includes(keyword));
-  }).slice(0, 8);
+  return cards
+    .filter(card => !excludeSet.has(card.id))
+    .map(card => {
+      const { score, hits } = scoreRecallCard(card, query);
+      return { card, score, hits };
+    })
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8)
+    .map(item => ({
+      ...item.card,
+      recallScore: item.score,
+      recallHits: item.hits
+    }));
 };
 
 const toolGetActiveNetwork = (cards: any[], activatedNodeIds: string[] = []) => {
@@ -1955,6 +2194,7 @@ const runWriteAgentGraph = async (
             ], 0.38, 1800);
 
             if (generatedDraftText.trim()) {
+              const preparedDraft = prepareAgentDraftForNote(generatedDraftText, generatedPlan.title);
               await input.onStep?.({
                 type: "partial_status",
                 node: "persist_memory",
@@ -1965,10 +2205,10 @@ const runWriteAgentGraph = async (
                 : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
               persistedDraftNote = await createAgentDraftNote(pool, state.userId, {
                 title: generatedPlan.title,
-                content: generatedDraftText.trim(),
-	                topic: topicForWriting,
-	                style: generatedPlan.style,
-	                outline: generatedPlan.outline,
+                content: preparedDraft.html,
+		                topic: topicForWriting,
+		                style: generatedPlan.style,
+		                outline: generatedPlan.outline,
 	                evidenceMap,
                 activeCards: cardsForWriting,
                 activationSummary: activationSummaryForNote,
@@ -2177,6 +2417,642 @@ ${state.message}`;
 
   await persistAgentGraphEvents(pool, input.userId, Number(finalState.threadId), finalState.graphTrace || []);
   return finalState;
+};
+
+type OpenAIWriteAgentContext = {
+  pool: pg.Pool;
+  userId: number;
+  dbCards: any[];
+  activeCards: any[];
+  recalledCards: any[];
+  recentNotes: any[];
+  agentSkills: WriteAgentSkillRecord[];
+  styleSkill?: WriteAgentSkillRecord;
+};
+
+const formatOpenAIWriteAgentPrompt = (input: {
+  thread: any;
+  message: string;
+  mergedState: WriteAgentState;
+  activeCards: any[];
+  recalledCards: any[];
+  recentNotes: any[];
+  generatedOutlineText: string;
+  generatedDraftText: string;
+  agentSkills: WriteAgentSkillRecord[];
+  styleSkill?: WriteAgentSkillRecord;
+}) => `当前线程摘要：
+${typeof input.thread?.summary === "string" && input.thread.summary.trim() ? input.thread.summary : "暂无摘要"}
+
+当前状态：
+- focusedTopic: ${input.mergedState.focusedTopic || "无"}
+- activatedNodeIds: ${(input.mergedState.activatedNodeIds || []).join("、") || "无"}
+- activationSummary: ${(input.mergedState.activationSummary || []).join(" | ") || "无"}
+- styleSkill: ${input.styleSkill?.name || "默认"}
+- skills: ${input.agentSkills.map(skill => `${skill.type}:${skill.name}`).join(" | ") || "默认"}
+
+当前激活节点：
+${input.activeCards.length > 0 ? sanitizeWritingCards(input.activeCards).map((card, index) => formatCardForWriting(card, index)).join("\n\n") : "无"}
+
+补充召回节点：
+${input.recalledCards.length > 0 ? sanitizeWritingCards(input.recalledCards).map((card, index) => formatCardForWriting(card, index)).join("\n\n") : "无"}
+
+最近文章草稿：
+${input.recentNotes.length > 0 ? input.recentNotes.map((note, index) => `${index + 1}. ${note.title}\n${normalizePlainText(note.content).slice(0, 180)}`).join("\n\n") : "无"}
+
+提纲工具结果：
+${input.generatedOutlineText || "无"}
+
+正文工具结果：
+${input.generatedDraftText ? input.generatedDraftText.slice(0, 5000) : "无"}
+
+用户最新消息：
+${input.message}`;
+
+const createOpenAIWriteAgentRunner = (config: OpenAIWriteAgentConfig) => {
+  const tracingDisabled = config.providerLabel !== "openai";
+  setTracingDisabled(tracingDisabled);
+  return new Runner({
+    model: config.model,
+    modelProvider: new OpenAIProvider({
+      apiKey: config.apiKey,
+      baseURL: config.baseURL,
+      useResponses: false,
+      strictFeatureValidation: false
+    }),
+    workflowName: "AtomFlow Write Agent",
+    tracingDisabled,
+    traceIncludeSensitiveData: false
+  });
+};
+
+const createWriteAgentSdkTools = () => {
+  const recallCardsTool = tool({
+    name: "recallCardsTool",
+    description: "Return already-recalled AtomFlow knowledge cards for the current writing request.",
+    parameters: z.object({ reason: z.string().optional() }),
+    execute: async (_input: { reason?: string }, runContext: any) => {
+      const context = runContext?.context as OpenAIWriteAgentContext | undefined;
+      const cards = context?.recalledCards || [];
+      return {
+        cards: cards.slice(0, 8),
+        reason: cards.length > 0 ? "matched local weighted knowledge recall" : "no relevant cards were found",
+        confidence: cards.length >= 3 ? "medium" : cards.length > 0 ? "low" : "none"
+      };
+    }
+  });
+
+  const listRecentNotesTool = tool({
+    name: "listRecentNotesTool",
+    description: "Return recent AtomFlow draft notes for continuation or rewrite tasks.",
+    parameters: z.object({ limit: z.number().int().min(1).max(6).optional() }),
+    execute: async (input: { limit?: number }, runContext: any) => {
+      const context = runContext?.context as OpenAIWriteAgentContext | undefined;
+      return (context?.recentNotes || []).slice(0, input.limit || 4);
+    }
+  });
+
+  const getEffectiveSkillsTool = tool({
+    name: "getEffectiveSkillsTool",
+    description: "Return baseline writing rules and user-selected style skills active for this run.",
+    parameters: z.object({}),
+    execute: async (_input: Record<string, never>, runContext: any) => {
+      const context = runContext?.context as OpenAIWriteAgentContext | undefined;
+      const skills = context?.agentSkills || [];
+      return {
+        baselineSkills: buildAgentSkillSnapshots(skills.filter(isBaselineSkill)),
+        userSelectedSkills: buildAgentSkillSnapshots(skills.filter(skill => !isBaselineSkill(skill)))
+      };
+    }
+  });
+
+  return [recallCardsTool, listRecentNotesTool, getEffectiveSkillsTool];
+};
+
+const writeAgentInputGuardrail = {
+  name: "write-agent-input-size",
+  runInParallel: false,
+  execute: async ({ input }) => {
+    const text = typeof input === "string" ? input : JSON.stringify(input);
+    return {
+      tripwireTriggered: text.trim().length === 0 || text.length > WRITE_AGENT_MAX_MESSAGE_LENGTH,
+      outputInfo: { length: text.length }
+    };
+  }
+};
+
+const writeAgentOutputGuardrail = {
+  name: "write-agent-source-discipline",
+  execute: async ({ agentOutput }) => {
+    const text = typeof agentOutput === "string" ? agentOutput : JSON.stringify(agentOutput);
+    return {
+      tripwireTriggered: false,
+      outputInfo: {
+        mentionsInsufficientInfo: /不足|没有|未召回|缺少/.test(text),
+        mentionsSource: /来自《|来源|节点/.test(text)
+      }
+    };
+  }
+};
+
+const runOpenAIWriteAgentRuntime = async (
+  pool: pg.Pool,
+  input: {
+    userId: number;
+    threadId?: number;
+    message: string;
+    isCreateArticle: boolean;
+    userState: WriteAgentState;
+    runId?: string;
+    onStep?: (event: { type: string; node?: string; message?: string; data?: unknown }) => void | Promise<void>;
+  }
+): Promise<WriteAgentGraphState> => {
+  const config = getOpenAIWriteAgentConfig();
+  if (!config) throw new Error("OpenAI writing agent is not configured: set OPENAI_API_KEY and OPENAI_MODEL");
+
+  const runId = input.runId || randomUUID();
+  const runStartedAt = Date.now();
+  const runner = createOpenAIWriteAgentRunner(config);
+  const sdkTools = createWriteAgentSdkTools();
+  const trace: WriteAgentGraphTraceRecord[] = [];
+  const withStep = async <T,>(node: string, label: string, fn: () => Promise<{ value: T; summary?: string; meta?: Record<string, unknown> }>) => {
+    const started = Date.now();
+    await input.onStep?.({ type: "step_start", node, message: getWriteAgentNodeLabel(node, "start") });
+    const result = await fn();
+    const traceItem: WriteAgentGraphTraceRecord = {
+      node,
+      durationMs: Date.now() - started,
+      inputSummary: normalizePlainText(input.message).slice(0, 160),
+      outputSummary: result.summary || label,
+      meta: { ...(result.meta || {}), runId },
+      createdAt: new Date().toISOString()
+    };
+    trace.push(traceItem);
+    await input.onStep?.({ type: "step_end", node, message: getWriteAgentNodeLabel(node, "end"), data: traceItem });
+    return result.value;
+  };
+
+  let thread: any;
+  let dbCards: any[] = [];
+  let previousMessages: any[] = [];
+  let mergedState: WriteAgentState = {};
+  let activeCards: any[] = [];
+
+  const threadId = await withStep("hydrate_context", "context hydrated", async () => {
+    thread = input.threadId
+      ? (await pool.query(
+        `SELECT id, title, summary, state, created_at, updated_at
+         FROM write_agent_threads
+         WHERE id = $1 AND user_id = $2`,
+        [input.threadId, input.userId]
+      )).rows[0]
+      : null;
+    if (!thread) {
+      thread = (await pool.query(
+        `INSERT INTO write_agent_threads (user_id, title, state, thread_type)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, title, summary, state, thread_type, created_at, updated_at`,
+        [input.userId, inferThreadTitle(input.message), JSON.stringify({}), "chat"]
+      )).rows[0];
+    }
+    const normalizedThreadId = Number(thread.id);
+    await pool.query(
+      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+       VALUES ($1, 'user', $2, $3)`,
+      [normalizedThreadId, input.message, JSON.stringify({ state: input.userState, action: input.isCreateArticle ? "create_article" : undefined })]
+    );
+    dbCards = await fetchUserSavedCards(pool, input.userId);
+    previousMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
+    const threadState = (thread.state || {}) as WriteAgentState;
+    mergedState = {
+      focusedTopic: input.userState.focusedTopic || threadState.focusedTopic,
+      activatedNodeIds: input.userState.activatedNodeIds || threadState.activatedNodeIds || [],
+      activationSummary: input.userState.activationSummary || threadState.activationSummary || [],
+      selectedStyleSkillId: input.userState.selectedStyleSkillId || threadState.selectedStyleSkillId,
+      selectedSkillIds: input.userState.selectedSkillIds || threadState.selectedSkillIds || [],
+      effectiveSkillIds: Array.isArray(threadState.effectiveSkillIds) ? threadState.effectiveSkillIds : [],
+      writingGoal: input.userState.writingGoal || threadState.writingGoal,
+      pendingChoice: input.userState.pendingChoice || threadState.pendingChoice,
+      selectedCardIds: input.userState.selectedCardIds || threadState.selectedCardIds || [],
+      sourceImageIds: threadState.sourceImageIds || [],
+      lastIntent: threadState.lastIntent,
+      latestOutline: Array.isArray(threadState.latestOutline) ? threadState.latestOutline : [],
+      latestAngle: typeof threadState.latestAngle === "string" ? threadState.latestAngle : undefined,
+      lastGeneratedNoteId: threadState.lastGeneratedNoteId,
+      lastGeneratedNoteTitle: typeof threadState.lastGeneratedNoteTitle === "string" ? threadState.lastGeneratedNoteTitle : undefined
+    };
+    activeCards = toolGetActiveNetwork(dbCards, mergedState.activatedNodeIds || []);
+    return { value: normalizedThreadId, summary: `thread=${normalizedThreadId}; cards=${dbCards.length}` };
+  });
+
+  let agentSkills: WriteAgentSkillRecord[] = [];
+  let styleSkill: WriteAgentSkillRecord | undefined;
+  await withStep("load_effective_skills", "skills loaded", async () => {
+    agentSkills = await resolveWriteAgentSkills(pool, input.userId, mergedState.selectedSkillIds, mergedState.selectedStyleSkillId);
+    styleSkill = agentSkills.find(skill => skill.type === "style")
+      || await resolveWriteStyleSkill(pool, input.userId, mergedState.selectedStyleSkillId);
+    await input.onStep?.({
+      type: "partial_status",
+      node: "load_effective_skills",
+      message: `OpenAI Agents SDK 已加载基础规范，用户增强 Skills ${agentSkills.filter(skill => skill.visibility === "user").length} 个已启用`
+    });
+    return {
+      value: null,
+      summary: `baseline=${agentSkills.filter(isBaselineSkill).length}; user=${agentSkills.filter(skill => skill.visibility === "user").length}`,
+      meta: { sdk: "openai-agents", provider: config.providerLabel, model: config.model }
+    };
+  });
+
+  const { intent, requestedTools } = await withStep("classify_intent", "intent classified locally", async () => {
+    let classified: WriteAgentIntentClassification = classifyWriteAgentIntent(input.message, input.isCreateArticle);
+    if (classified.intent.needsModelRouter) {
+      const rawIntent = await requestAiChatCompletion([
+        {
+          role: "system",
+          content: `你是 AtomFlow 写作助手的轻量路由器。只输出 JSON。
+可选 intent: chat, select_material, outline, draft, revise, continue_note。
+可选 tools: recall_cards, get_active_network, list_recent_notes, generate_outline, generate_draft, revise_note。
+不要把普通闲聊误判为写作任务；但用户提到素材、知识库、来源、文章、草稿、提纲、我的文章时要选择对应工具。`
+        },
+        { role: "user", content: input.message }
+      ], {
+        temperature: 0.1,
+        maxTokens: 260,
+        logLabel: "write_agent_intent_router",
+        disableThinking: true
+      });
+      classified = mergeWriteAgentModelRouterResult(
+        classified,
+        safeJsonParse<{ tools?: unknown; intent?: unknown; reason?: unknown }>(rawIntent)
+      );
+    }
+    return {
+      value: classified,
+      summary: classified.requestedTools.join(",") || "answer",
+      meta: {
+        router: classified.intent.needsModelRouter ? "local_rules_with_model_fallback" : "local_rules",
+        intent: classified.intent.intent,
+        requestedTools: classified.requestedTools,
+        confidence: classified.intent.confidence
+      }
+    };
+  });
+
+  let recalledCards: any[] = [];
+  let recentNotes: any[] = [];
+  await withStep("retrieve_knowledge", "knowledge retrieved", async () => {
+    recalledCards = requestedTools.includes("recall_cards")
+      ? toolRecallCards(`${input.message} ${mergedState.focusedTopic || ""}`, dbCards, activeCards.map(card => card.id))
+      : [];
+    recentNotes = requestedTools.includes("list_recent_notes") || requestedTools.includes("generate_draft")
+      ? await toolListRecentNotes(pool, input.userId, 4)
+      : [];
+    return {
+      value: null,
+      summary: `recalled=${recalledCards.length}`,
+      meta: { requestedTools, activeCards: activeCards.length, recalledCards: recalledCards.length }
+    };
+  });
+
+  const sources = await withStep("enrich_sources", "sources enriched", async () => {
+    const cardsForSources = activeCards.length > 0 ? activeCards.concat(recalledCards) : recalledCards;
+    const built = buildAgentSources(cardsForSources);
+    return { value: built, summary: `sources=${built.cards.length}; images=${built.images.length}` };
+  });
+
+  let choices: WriteAgentChoiceRecord[] = [];
+  await withStep("decide_next", "next actions prepared", async () => {
+    const shouldGenerateDraft = input.isCreateArticle || requestedTools.includes("generate_draft");
+    const shouldGenerateOutline = input.isCreateArticle || requestedTools.includes("generate_outline") || shouldGenerateDraft;
+    const choiceCards = activeCards.length > 0 ? activeCards : recalledCards;
+    choices = buildAgentChoices(choiceCards, styleSkill);
+    mergedState = {
+      ...mergedState,
+      lastIntent: intent.intent,
+      pendingChoice: choiceCards.length > 0 && !shouldGenerateDraft
+        ? {
+          type: "card_selection",
+          prompt: "选择这次要使用的知识卡片，或直接生成提纲/文章。",
+          cardIds: choiceCards.map(card => card.id).filter((id): id is string => typeof id === "string"),
+          styleSkillIds: styleSkill ? [styleSkill.id] : [],
+          createdAt: new Date().toISOString()
+        }
+        : undefined,
+      selectedStyleSkillId: styleSkill?.id,
+      selectedSkillIds: agentSkills.filter(skill => !isBaselineSkill(skill)).map(skill => skill.id),
+      effectiveSkillIds: agentSkills.map(skill => skill.id)
+    };
+    if (shouldGenerateOutline && !requestedTools.includes("generate_outline")) requestedTools.push("generate_outline");
+    return { value: null, summary: `choices=${choices.length}`, meta: { requestedTools } };
+  });
+
+  await withStep("human_selection", "selection synced", async () => {
+    mergedState = {
+      ...mergedState,
+      selectedCardIds: (activeCards.length > 0 ? activeCards : recalledCards)
+        .map(card => card.id)
+        .filter((id): id is string => typeof id === "string")
+    };
+    if ((mergedState.selectedCardIds || []).length > 0) {
+      await input.onStep?.({
+        type: "activation",
+        node: "human_selection",
+        message: "已同步激活知识节点",
+        data: {
+          activatedNodeIds: mergedState.selectedCardIds,
+          activationSummary: mergedState.activationSummary || []
+        }
+      });
+    }
+    return { value: null, summary: `selected=${mergedState.selectedCardIds?.length || 0}` };
+  });
+
+  const sdkContext: OpenAIWriteAgentContext = {
+    pool,
+    userId: input.userId,
+    dbCards,
+    activeCards,
+    recalledCards,
+    recentNotes,
+    agentSkills,
+    styleSkill
+  };
+  const materialAgent = new Agent<OpenAIWriteAgentContext>({
+    name: "MaterialAgent",
+    handoffDescription: "Select and explain relevant AtomFlow knowledge cards for writing tasks.",
+    model: config.model,
+    instructions: "你负责判断召回素材是否足以支撑写作任务。必须明确素材不足，不要伪造来源。",
+    tools: sdkTools,
+    inputGuardrails: [writeAgentInputGuardrail],
+    outputGuardrails: [writeAgentOutputGuardrail]
+  });
+  const outlineAgent = new Agent<OpenAIWriteAgentContext>({
+    name: "OutlineAgent",
+    handoffDescription: "Generate article angles and outlines from AtomFlow knowledge cards.",
+    model: config.model,
+    instructions: WRITING_PLAN_SYSTEM_PROMPT,
+    inputGuardrails: [writeAgentInputGuardrail],
+    outputGuardrails: [writeAgentOutputGuardrail]
+  });
+  const draftAgent = new Agent<OpenAIWriteAgentContext>({
+    name: "DraftAgent",
+    handoffDescription: "Write article drafts from outlines, cards, citations and style skills.",
+    model: config.model,
+    instructions: WRITING_AGENT_SYSTEM_PROMPT,
+    inputGuardrails: [writeAgentInputGuardrail],
+    outputGuardrails: [writeAgentOutputGuardrail]
+  });
+  const coordinatorAgent = new Agent<OpenAIWriteAgentContext>({
+    name: "CoordinatorAgent",
+    handoffDescription: "Coordinate AtomFlow writing tasks and produce final user-facing answers.",
+    model: config.model,
+    instructions: `你是 AtomFlow 的写作助手 Agent。默认基于用户知识库回答，不要频繁反问。
+
+规则：
+1. 先用知识库、线程上下文和激活网络回答。
+2. 回答要短、具体、可执行。
+3. 引用知识节点时，用「来自《文章标题》」或节点编号标注来源。
+4. 如果信息不足，必须明确说「当前素材不足」，再列出下一步。
+5. 不要伪造来源、图片、数据或文章。
+6. 当前风格 Skill：${styleSkill?.name || "默认"}。${styleSkill?.prompt || ""}
+7. 当前适用 Skills：
+${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) || "默认规范"}`,
+    tools: sdkTools,
+    handoffs: [materialAgent, outlineAgent, draftAgent],
+    inputGuardrails: [writeAgentInputGuardrail],
+    outputGuardrails: [writeAgentOutputGuardrail]
+  });
+
+  let generatedOutlineText = "";
+  let generatedDraftText = "";
+  let generatedPlan: WritingPlanResult | null = null;
+  let persistedDraftNote: any = null;
+  let assistantContent = "";
+  const cardsForWriting = sanitizeWritingCards(activeCards.length > 0 ? activeCards : recalledCards);
+  await withStep("generate_answer_or_draft", "generated via OpenAI Agents SDK", async () => {
+    const shouldGenerateDraft = input.isCreateArticle || requestedTools.includes("generate_draft");
+    const shouldGenerateOutline = input.isCreateArticle || requestedTools.includes("generate_outline") || shouldGenerateDraft;
+    if (shouldGenerateOutline) {
+      if (cardsForWriting.length === 0 && input.isCreateArticle) {
+        throw new Error("知识库中没有可用的卡片，请先收藏一些文章并提取知识卡片");
+      }
+      if (cardsForWriting.length > 0) {
+        await input.onStep?.({ type: "partial_status", node: "generate_answer_or_draft", message: shouldGenerateDraft ? "正在规划文章结构" : "正在生成提纲" });
+        const topicForWriting = mergedState.focusedTopic || input.message;
+        const planResult = await runner.run(outlineAgent, buildWritingPlanPrompt(topicForWriting, cardsForWriting, sanitizeWritingCards(recalledCards), styleSkill, agentSkills), {
+          context: sdkContext,
+          maxTurns: 4
+        });
+        generatedPlan = sanitizeWritingPlan(safeJsonParse<WritingPlanResult>(String(planResult.finalOutput || "")), topicForWriting);
+        generatedOutlineText = generatedPlan.outline.map(item => `- ${item.heading}：${item.goal}`).join("\n");
+        const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
+        if (shouldGenerateDraft) {
+          await input.onStep?.({ type: "partial_status", node: "generate_answer_or_draft", message: "正在生成完整文章草稿" });
+          const draftResult = await runner.run(draftAgent, buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards), evidenceMap, styleSkill, agentSkills), {
+            context: sdkContext,
+            maxTurns: 4
+          });
+          generatedDraftText = String(draftResult.finalOutput || "").trim();
+          if (generatedDraftText) {
+            const preparedDraft = prepareAgentDraftForNote(generatedDraftText, generatedPlan.title);
+            await input.onStep?.({ type: "partial_status", node: "persist_memory", message: "正在保存文章与引用链路" });
+            const activationSummaryForNote = (mergedState.activationSummary || []).length > 0
+              ? mergedState.activationSummary || []
+              : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
+            persistedDraftNote = await createAgentDraftNote(pool, input.userId, {
+              title: generatedPlan.title,
+              content: preparedDraft.html,
+              topic: topicForWriting,
+              style: generatedPlan.style,
+              outline: generatedPlan.outline,
+              evidenceMap,
+              activeCards: cardsForWriting,
+              activationSummary: activationSummaryForNote,
+              sourceArticles: buildSourceArticlesFromCards(cardsForWriting, dbCards),
+              styleSkillSnapshot: styleSkill ? buildStyleSkillSnapshot(styleSkill) : undefined,
+              skillSnapshots: buildAgentSkillSnapshots(agentSkills),
+              effectiveSkillSnapshots: {
+                baselineSkills: buildAgentSkillSnapshots(agentSkills.filter(isBaselineSkill)),
+                userSelectedSkills: buildAgentSkillSnapshots(agentSkills.filter(skill => !isBaselineSkill(skill)))
+              }
+            });
+          }
+        }
+      }
+    }
+
+    assistantContent = input.isCreateArticle && persistedDraftNote
+      ? [
+        `已基于当前激活网络创建文章《${persistedDraftNote.title || generatedPlan?.title || "未命名文章"}》。`,
+        "",
+        `这次使用了 ${cardsForWriting.length} 个知识节点，来源文章 ${buildSourceArticlesFromCards(cardsForWriting, dbCards).length} 篇。`,
+        styleSkill ? `写作风格：${styleSkill.name}` : "",
+        generatedPlan?.angle ? `核心判断：${generatedPlan.angle}` : "",
+        "你可以在「我的文章」里继续编辑；知识节点、原文摘录、来源图片和引用映射已经写入文章元信息。"
+      ].filter(Boolean).join("\n")
+      : String((await runner.run(coordinatorAgent, formatOpenAIWriteAgentPrompt({
+        thread,
+        message: input.message,
+        mergedState,
+        activeCards,
+        recalledCards,
+        recentNotes,
+        generatedOutlineText,
+        generatedDraftText,
+        agentSkills,
+        styleSkill
+      }), {
+        context: sdkContext,
+        maxTurns: 6
+      })).finalOutput || "").trim();
+    return { value: null, summary: persistedDraftNote ? `note=${persistedDraftNote.id}` : `answer=${assistantContent.length}`, meta: { sdk: "openai-agents", provider: config.providerLabel, model: config.model } };
+  });
+
+  if (!assistantContent) throw new Error("agent returned empty message");
+
+  let toolPayload: any;
+  let assistantMessageId: number | undefined;
+  let uiBlocks: any[] = [];
+  await withStep("persist_memory", "memory persisted", async () => {
+    const selectedCardIds = (mergedState.selectedCardIds || []).length > 0
+      ? mergedState.selectedCardIds || []
+      : sources.cards.map(card => card.id).filter((id): id is string => typeof id === "string");
+    toolPayload = {
+      runId,
+      requestedTools,
+      intent: intent.intent,
+      reason: intent.reason || "",
+      activeCardIds: activeCards.map(card => card.id),
+      recalledCardIds: recalledCards.map(card => card.id),
+      outline: generatedPlan?.outline || [],
+      draftPreview: (generatedDraftText || "").slice(0, 400),
+      noteId: persistedDraftNote ? Number(persistedDraftNote.id) : undefined,
+      noteTitle: persistedDraftNote?.title,
+      noteSaved: Boolean(persistedDraftNote),
+      noteTopic: mergedState.focusedTopic || input.message,
+      choices,
+      sources,
+      graphTrace: trace,
+      skillSnapshots: buildAgentSkillSnapshots(agentSkills),
+      effectiveSkills: buildAgentSkillSnapshots(agentSkills),
+      effectiveSkillSnapshots: {
+        baselineSkills: buildAgentSkillSnapshots(agentSkills.filter(isBaselineSkill)),
+        userSelectedSkills: buildAgentSkillSnapshots(agentSkills.filter(skill => !isBaselineSkill(skill)))
+      },
+      runtime: "openai-agents-sdk",
+      provider: config.providerLabel,
+      model: config.model
+    };
+    if (requestedTools.length > 0) {
+      await pool.query(
+        `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+         VALUES ($1, 'tool', $2, $3)`,
+        [
+          threadId,
+          [
+            `tools: ${requestedTools.join(", ")}`,
+            generatedOutlineText ? `outline:\n${generatedOutlineText}` : "",
+            generatedDraftText ? `draft:\n${generatedDraftText.slice(0, 600)}` : ""
+          ].filter(Boolean).join("\n\n"),
+          JSON.stringify(toolPayload)
+        ]
+      );
+    }
+    uiBlocks = buildAgentUiBlocks({
+      answer: assistantContent,
+      sources,
+      selectedCardIds,
+      choices,
+      note: persistedDraftNote
+    });
+    const finalPayload = { ...toolPayload, uiBlocks, feedback: "none", sourceCollapsed: true };
+    const assistantMessageRow = (await pool.query(
+      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
+       VALUES ($1, 'assistant', $2, $3)
+       RETURNING id`,
+      [threadId, assistantContent, JSON.stringify(finalPayload)]
+    )).rows[0];
+    assistantMessageId = Number(assistantMessageRow.id);
+    finalPayload.messageId = assistantMessageId;
+    toolPayload = finalPayload;
+    const nextState: WriteAgentState = {
+      ...mergedState,
+      activatedNodeIds: selectedCardIds.length > 0 ? selectedCardIds : mergedState.activatedNodeIds || [],
+      selectedCardIds,
+      activationSummary: selectedCardIds.length > 0
+        ? sanitizeWritingCards(sources.cards).slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`)
+        : mergedState.activationSummary || [],
+      sourceImageIds: sources.images.map(image => image.id),
+      latestOutline: generatedPlan?.outline || mergedState.latestOutline || [],
+      latestAngle: generatedPlan?.angle || mergedState.latestAngle,
+      lastGeneratedNoteId: persistedDraftNote ? Number(persistedDraftNote.id) : mergedState.lastGeneratedNoteId,
+      lastGeneratedNoteTitle: persistedDraftNote?.title || mergedState.lastGeneratedNoteTitle,
+      selectedStyleSkillId: styleSkill?.id,
+      selectedSkillIds: agentSkills.filter(skill => !isBaselineSkill(skill)).map(skill => skill.id),
+      effectiveSkillIds: agentSkills.map(skill => skill.id)
+    };
+    const finalMessages = await getRecentThreadMessages(pool, threadId, 14);
+    const summary = summarizeAgentMessages(finalMessages.map(item => ({ role: item.role, content: item.content })));
+    await upsertThreadState(pool, threadId, summary, nextState, thread?.title || inferThreadTitle(input.message));
+    mergedState = nextState;
+    if (selectedCardIds.length > 0) {
+      await input.onStep?.({
+        type: "activation",
+        node: "persist_memory",
+        message: "已同步激活知识节点",
+        data: {
+          activatedNodeIds: selectedCardIds,
+          activationSummary: nextState.activationSummary || []
+        }
+      });
+    }
+    return { value: null, summary: `uiBlocks=${uiBlocks.length}`, meta: { requestedTools, activeCards: activeCards.length, recalledCards: recalledCards.length } };
+  });
+
+  await withStep("respond", "response ready", async () => ({ value: null, summary: `thread=${threadId}` }));
+  await persistAgentGraphEvents(pool, input.userId, threadId, trace, runId);
+  await persistAgentRunEvent(pool, {
+    userId: input.userId,
+    threadId,
+    runId,
+    status: "completed",
+    durationMs: Date.now() - runStartedAt,
+    intent: intent.intent,
+    requestedTools,
+    provider: config.providerLabel,
+    model: config.model,
+    noteId: persistedDraftNote ? Number(persistedDraftNote.id) : undefined
+  });
+
+  return {
+    userId: input.userId,
+    threadId,
+    thread,
+    message: input.message,
+    isCreateArticle: input.isCreateArticle,
+    userState: input.userState,
+    mergedState,
+    previousMessages,
+    dbCards,
+    activeCards,
+    recalledCards,
+    recentNotes,
+    intent,
+    requestedTools,
+    styleSkill,
+    agentSkills,
+    generatedPlan,
+    generatedOutlineText,
+    generatedDraftText,
+    persistedDraftNote,
+    assistantContent,
+    assistantMessageId,
+    toolPayload,
+    sources,
+    choices,
+    uiBlocks,
+    graphTrace: trace
+  } as WriteAgentGraphState;
 };
 
 const SkillCreationGraphAnnotation = Annotation.Root({
@@ -2420,10 +3296,9 @@ const buildNoteSourceArticles = (cards: WritingCardInput[]) => {
 };
 
 // 从写作卡片中提取唯一来源文章列表
-const buildSourceArticlesFromCards = (cardsForWriting: any[], dbCards: any[]) => {
+const buildSourceArticlesFromCards = (cardsForWriting: any[], _dbCards: any[]) => {
   const articleMap = new Map<string, { articleId?: number; articleTitle: string; url?: string; cardIds: string[]; imageUrls?: string[] }>();
-  const allCards = dbCards.length > 0 ? dbCards : cardsForWriting;
-  for (const card of allCards) {
+  for (const card of cardsForWriting) {
     const savedArticleId = card.savedArticleId ?? card.saved_article_id;
     const articleTitle = card.articleTitle ?? card.article_title ?? card.context_title ?? '未知来源';
     const sourceUrl = card.sourceUrl ?? card.article_url;
@@ -2658,13 +3533,14 @@ const WRITING_AGENT_SYSTEM_PROMPT = `你是一位优秀的中文专栏作家。�
 核心原则：
 1. 你拿到的”素材”只是背景知识和灵感来源。你要基于这些素材形成自己的观点，用自己的语言写作。
 2. 绝对不要逐条搬运素材内容。不要出现”某某观点认为””某某数据表明”这种罗列式写法。
-3. 文章要有明确的叙事推进关系：提出问题 → 给出判断 → 展开论证 → 收束结论。
+3. 文章要符合 Scratch 成稿标准：开场抓住具体问题/场景，承接作者核心判断，转入矛盾/代价/反常识，最后收束到结论或行动。
 4. 写法像一个有独立见解的作者在表达自己的思考，而不是在整理别人的观点。
 5. 开头不要套话，不要”在当今时代””众所周知””让我们来看看”。
 6. 如果素材里有冲突观点，要写出冲突和你的判断，而不是抹平它。
 7. 如果素材不足，就写一篇更短但更扎实的文章，不要注水。
 8. 不要 AI 腔，不要假装引用不存在的数据。
 9. 输出必须是纯 Markdown，不要输出解释，不要输出 JSON，不要使用 HTML。
+10. 严禁输出“素材对齐”“观点对齐”“节点映射”“引用映射”“写作思路”“正文草稿”等过程性栏目；这些信息只属于系统 meta，不属于文章。
 
 格式要求：
 - 第一行直接是标题
@@ -2733,6 +3609,30 @@ const getAiChatConfig = (): AiChatConfig | null => {
   };
 };
 
+type OpenAIWriteAgentConfig = {
+  apiKey: string;
+  model: string;
+  baseURL?: string;
+  providerLabel: "openai" | "mimo-token-plan";
+};
+
+const getOpenAIWriteAgentConfig = (): OpenAIWriteAgentConfig | null => {
+  const openAiApiKey = process.env.OPENAI_API_KEY?.trim();
+  const openAiModel = process.env.OPENAI_MODEL?.trim();
+  if (openAiApiKey && openAiModel && !isPlaceholderAiApiKey(openAiApiKey)) {
+    return { apiKey: openAiApiKey, model: openAiModel, providerLabel: "openai" };
+  }
+
+  const aiConfig = getAiChatConfig();
+  if (!aiConfig) return null;
+  return {
+    apiKey: aiConfig.apiKey,
+    baseURL: aiConfig.baseUrl,
+    model: aiConfig.model,
+    providerLabel: "mimo-token-plan"
+  };
+};
+
 const isAiFallbackDisabled = () => process.env.DISABLE_AI_FALLBACK === "true";
 
 const requestAiChatCompletion = async (
@@ -2751,9 +3651,7 @@ const requestAiChatCompletion = async (
   }
 
   const controller = new AbortController();
-  const timeout = options.timeoutMs
-    ? setTimeout(() => controller.abort(), options.timeoutMs)
-    : null;
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? AI_REQUEST_TIMEOUT_MS);
 
   try {
     const maxTokens = getEffectiveAiMaxTokens(config.model, options.maxTokens, options.disableThinking);
@@ -2791,8 +3689,471 @@ const requestAiChatCompletion = async (
     };
     return (data.choices?.[0]?.message?.content || "").trim();
   } finally {
-    if (timeout) clearTimeout(timeout);
+    clearTimeout(timeout);
   }
+};
+
+const normalizeCanvasNodeKind = (value: unknown): WriteCanvasNodeKind | null => {
+  return typeof value === "string" && (WRITE_CANVAS_NODE_KINDS as readonly string[]).includes(value)
+    ? value as WriteCanvasNodeKind
+    : null;
+};
+
+const clampNumber = (value: unknown, fallback: number, min: number, max: number) => {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+};
+
+const normalizeJsonObject = (value: unknown) => (
+  isPlainRecord(value) ? value : {}
+);
+
+const getDefaultCanvasAgentConfig = () => {
+  const config = getOpenAIWriteAgentConfig();
+  return {
+    name: "写作 Agent",
+    model: config?.model || process.env.AI_MODEL || process.env.OPENAI_MODEL || "mimo-v2.5-pro",
+    systemPrompt: "你是 AtomFlow 魔法写作画布里的写作 Agent。只基于用户连接到你的上下文回答；如果上下文不足，明确说明缺口。",
+    temperature: 0.55,
+    topP: 1,
+    maxTokens: 1200
+  };
+};
+
+const mapCanvasProjectRow = (row: any) => ({
+  id: Number(row.id),
+  name: row.name as string,
+  viewport: row.viewport || {},
+  createdAt: row.createdAt || row.created_at,
+  updatedAt: row.updatedAt || row.updated_at,
+  lastOpenedAt: row.lastOpenedAt || row.last_opened_at
+});
+
+const mapCanvasAssetRow = (row: any) => row ? ({
+  id: Number(row.id),
+  type: row.type as "text" | "file" | "image",
+  title: row.title as string,
+  contentText: row.contentText ?? row.content_text ?? "",
+  extractedText: row.extractedText ?? row.extracted_text ?? "",
+  fileName: row.fileName ?? row.file_name ?? undefined,
+  mimeType: row.mimeType ?? row.mime_type ?? undefined,
+  dataUrl: row.dataUrl ?? row.data_url ?? undefined,
+  meta: row.meta || {},
+  createdAt: row.createdAt || row.created_at
+}) : null;
+
+const mapCanvasAgentRow = (row: any) => row ? ({
+  id: Number(row.id),
+  projectId: Number(row.projectId ?? row.project_id),
+  templateId: row.templateId ?? row.template_id ? Number(row.templateId ?? row.template_id) : null,
+  name: row.name as string,
+  model: row.model as string,
+  systemPrompt: row.systemPrompt ?? row.system_prompt ?? "",
+  temperature: Number(row.temperature ?? 0.55),
+  topP: Number(row.topP ?? row.top_p ?? 1),
+  maxTokens: Number(row.maxTokens ?? row.max_tokens ?? 1200),
+  createdAt: row.createdAt || row.created_at,
+  updatedAt: row.updatedAt || row.updated_at
+}) : null;
+
+const mapCanvasNodeRow = (row: any) => ({
+  id: Number(row.id),
+  projectId: Number(row.projectId ?? row.project_id),
+  kind: row.kind as WriteCanvasNodeKind,
+  title: row.title as string,
+  summary: row.summary || "",
+  refId: row.refId ?? row.ref_id ?? null,
+  asset: mapCanvasAssetRow(row.asset || null),
+  agent: mapCanvasAgentRow(row.agent || null),
+  meta: row.meta || {},
+  x: Number(row.x),
+  y: Number(row.y),
+  width: Number(row.width),
+  height: Number(row.height),
+  createdAt: row.createdAt || row.created_at,
+  updatedAt: row.updatedAt || row.updated_at
+});
+
+const mapCanvasEdgeRow = (row: any) => ({
+  id: Number(row.id),
+  projectId: Number(row.projectId ?? row.project_id),
+  sourceNodeId: Number(row.sourceNodeId ?? row.source_node_id),
+  targetNodeId: Number(row.targetNodeId ?? row.target_node_id),
+  relation: "context" as const,
+  createdAt: row.createdAt || row.created_at
+});
+
+const mapAgentTemplateRow = (row: any) => ({
+  id: Number(row.id),
+  name: row.name as string,
+  model: row.model as string,
+  systemPrompt: row.systemPrompt ?? row.system_prompt ?? "",
+  temperature: Number(row.temperature ?? 0.55),
+  topP: Number(row.topP ?? row.top_p ?? 1),
+  maxTokens: Number(row.maxTokens ?? row.max_tokens ?? 1200),
+  createdAt: row.createdAt || row.created_at,
+  updatedAt: row.updatedAt || row.updated_at
+});
+
+const mapCanvasMessageRow = (row: any) => ({
+  id: Number(row.id),
+  agentId: Number(row.agentId ?? row.agent_id),
+  role: row.role as "user" | "assistant",
+  content: row.content as string,
+  meta: row.meta || {},
+  createdAt: row.createdAt || row.created_at
+});
+
+const extractCanvasFileText = async (file: Express.Multer.File) => {
+  const mime = file.mimetype || "";
+  const ext = path.extname(file.originalname || "").toLowerCase();
+  if (mime.startsWith("text/") || [".txt", ".md", ".markdown", ".csv"].includes(ext)) {
+    return file.buffer.toString("utf8").slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH);
+  }
+  if (mime === "application/pdf" || ext === ".pdf") {
+    const pdfParse = nodeRequire("pdf-parse/lib/pdf-parse.js") as (buffer: Buffer) => Promise<{ text?: string }>;
+    const parsed = await pdfParse(file.buffer);
+    return normalizePlainText(parsed.text || "").slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH);
+  }
+  if (
+    mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    ext === ".docx"
+  ) {
+    const parsed = await mammoth.extractRawText({ buffer: file.buffer });
+    return normalizePlainText(parsed.value || "").slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH);
+  }
+  return "";
+};
+
+const lockCanvasUser = async (client: pg.PoolClient, userId: number) => {
+  const user = (await client.query(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, [userId])).rows[0];
+  if (!user) throw new Error("Canvas user no longer exists");
+};
+
+const getCanvasStoredBytes = async (client: pg.PoolClient, userId: number) => Number((await client.query(
+  `SELECT COALESCE(SUM(
+     octet_length(COALESCE(data_url, '')) +
+     octet_length(COALESCE(content_text, '')) +
+     octet_length(COALESCE(extracted_text, ''))
+   ), 0) AS bytes
+   FROM write_canvas_assets
+   WHERE user_id = $1`,
+  [userId],
+)).rows[0]?.bytes || 0);
+
+const ensureCanvasProject = async (pool: pg.Pool, userId: number) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await lockCanvasUser(client, userId);
+    const existing = (await client.query(
+      `SELECT id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"
+       FROM write_canvas_projects
+       WHERE user_id = $1
+       ORDER BY last_opened_at DESC
+       LIMIT 1`,
+      [userId]
+    )).rows[0];
+    if (existing) {
+      await client.query("COMMIT");
+      return mapCanvasProjectRow(existing);
+    }
+
+    const created = (await client.query(
+      `INSERT INTO write_canvas_projects (user_id, name)
+       VALUES ($1, '我的魔法写作项目')
+       RETURNING id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+      [userId]
+    )).rows[0];
+    await client.query("COMMIT");
+    return mapCanvasProjectRow(created);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId: number) => {
+  const projectRow = (await pool.query(
+    `UPDATE write_canvas_projects
+     SET last_opened_at = NOW()
+     WHERE id = $1 AND user_id = $2
+     RETURNING id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+    [projectId, userId]
+  )).rows[0];
+  if (!projectRow) return null;
+
+  const nodeRows = (await pool.query(
+    `SELECT n.id, n.project_id AS "projectId", n.kind, n.title, n.summary, n.ref_id AS "refId",
+            n.meta, n.x, n.y, n.width, n.height, n.created_at AS "createdAt", n.updated_at AS "updatedAt",
+            CASE WHEN a.id IS NULL THEN NULL ELSE jsonb_build_object(
+              'id', a.id, 'type', a.type, 'title', a.title,
+              'contentText', a.content_text, 'extractedText', a.extracted_text,
+              'fileName', a.file_name, 'mimeType', a.mime_type,
+              'dataUrl', a.data_url, 'meta', a.meta, 'createdAt', a.created_at
+            ) END AS asset,
+            CASE WHEN ai.id IS NULL THEN NULL ELSE jsonb_build_object(
+              'id', ai.id, 'projectId', ai.project_id, 'templateId', ai.template_id,
+              'name', ai.name, 'model', ai.model, 'systemPrompt', ai.system_prompt,
+              'temperature', ai.temperature, 'topP', ai.top_p, 'maxTokens', ai.max_tokens,
+              'createdAt', ai.created_at, 'updatedAt', ai.updated_at
+            ) END AS agent
+     FROM write_canvas_nodes n
+     LEFT JOIN write_canvas_assets a ON a.id = n.asset_id AND a.user_id = n.user_id
+     LEFT JOIN write_agent_instances ai ON ai.id = n.agent_id AND ai.user_id = n.user_id
+     WHERE n.user_id = $1 AND n.project_id = $2
+     ORDER BY n.created_at ASC`,
+    [userId, projectId]
+  )).rows.map(mapCanvasNodeRow);
+
+  const edgeRows = (await pool.query(
+    `SELECT id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+            target_node_id AS "targetNodeId", relation, created_at AS "createdAt"
+     FROM write_canvas_edges
+     WHERE user_id = $1 AND project_id = $2
+     ORDER BY created_at ASC`,
+    [userId, projectId]
+  )).rows.map(mapCanvasEdgeRow);
+
+  const agentIds = nodeRows.map(node => node.agent?.id).filter((id): id is number => typeof id === "number");
+  const messages: Record<number, ReturnType<typeof mapCanvasMessageRow>[]> = {};
+  if (agentIds.length > 0) {
+    const messageRows = (await pool.query(
+      `SELECT id, agent_id AS "agentId", role, content, meta, created_at AS "createdAt"
+       FROM (
+         SELECT id, agent_id, role, content, meta, created_at,
+                ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY created_at DESC, id DESC) AS message_rank
+         FROM write_canvas_agent_messages
+         WHERE user_id = $1 AND agent_id = ANY($2::bigint[])
+       ) ranked
+       WHERE message_rank <= $3
+       ORDER BY "agentId", "createdAt" ASC`,
+      [userId, agentIds, WRITE_CANVAS_MAX_MESSAGES_PER_AGENT]
+    )).rows.map(mapCanvasMessageRow);
+    for (const message of messageRows) {
+      if (!messages[message.agentId]) messages[message.agentId] = [];
+      messages[message.agentId].push(message);
+    }
+  }
+
+  return {
+    project: mapCanvasProjectRow(projectRow),
+    nodes: nodeRows,
+    edges: edgeRows,
+    messages
+  };
+};
+
+const getCanvasAgentNode = async (pool: pg.Pool, userId: number, agentId: number) => {
+  return (await pool.query(
+    `SELECT n.id AS node_id, n.project_id, ai.*
+     FROM write_agent_instances ai
+     JOIN write_canvas_nodes n ON n.agent_id = ai.id AND n.user_id = ai.user_id
+     WHERE ai.id = $1 AND ai.user_id = $2 AND n.kind = 'agent'`,
+    [agentId, userId]
+  )).rows[0];
+};
+
+const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNodeId: number, projectId: number): Promise<CanvasContextItem[]> => {
+  const sourceRows = (await pool.query(
+    `SELECT n.id, n.kind, n.title, n.summary, n.ref_id, n.meta,
+            a.id AS asset_id, a.type AS asset_type, a.title AS asset_title, a.content_text,
+            a.extracted_text, a.file_name, a.mime_type, a.data_url
+     FROM write_canvas_edges e
+     JOIN write_canvas_nodes n ON n.id = e.source_node_id AND n.user_id = e.user_id
+     LEFT JOIN write_canvas_assets a ON a.id = n.asset_id AND a.user_id = n.user_id
+     WHERE e.user_id = $1 AND e.project_id = $2 AND e.target_node_id = $3 AND e.relation = 'context'
+     ORDER BY e.created_at ASC
+     LIMIT $4`,
+    [userId, projectId, agentNodeId, WRITE_CANVAS_MAX_CONTEXT_ITEMS]
+  )).rows;
+
+  const items: CanvasContextItem[] = [];
+  for (const row of sourceRows) {
+    const kind = normalizeCanvasNodeKind(row.kind);
+    if (!kind) continue;
+    if (["asset_text", "asset_file", "asset_image", "result"].includes(kind)) {
+      const text = normalizePlainText([
+        row.content_text,
+        row.extracted_text,
+        row.summary,
+        row.meta?.note,
+      ].filter(Boolean).join("\n")).slice(0, 12000);
+      items.push({
+        nodeId: Number(row.id),
+        kind,
+        title: row.title || row.asset_title || row.file_name || "资料",
+        text,
+        imageDataUrl: kind === "asset_image" ? row.data_url || undefined : undefined,
+        mimeType: row.mime_type || undefined,
+        sourceLabel: row.file_name || undefined
+      });
+      continue;
+    }
+    if (kind === "saved_article" && row.ref_id) {
+      const article = (await pool.query(
+        `SELECT id, title, source, url, excerpt, content, citation_context, image_urls
+         FROM saved_articles
+         WHERE id = $1 AND user_id = $2`,
+        [Number(row.ref_id), userId]
+      )).rows[0];
+      if (article) {
+        items.push({
+          nodeId: Number(row.id),
+          kind,
+          title: article.title,
+          text: normalizePlainText([article.citation_context, article.excerpt, article.content].filter(Boolean).join("\n")).slice(0, 12000),
+          sourceLabel: article.source || article.url || undefined
+        });
+      }
+      continue;
+    }
+    if (kind === "atom_card" && row.ref_id) {
+      const card = (await pool.query(
+        `SELECT sc.id, sc.type, sc.content, sc.summary, sc.original_quote, sc.context,
+                sc.citation_note, sc.tags, sc.article_title, sa.source, sa.url
+         FROM saved_cards sc
+         LEFT JOIN saved_articles sa ON sa.id = sc.saved_article_id AND sa.user_id = sc.user_id
+         WHERE sc.id = $1 AND sc.user_id = $2`,
+        [row.ref_id, userId]
+      )).rows[0];
+      if (card) {
+        items.push({
+          nodeId: Number(row.id),
+          kind,
+          title: `${card.type} · ${card.article_title || row.title || "原子卡"}`,
+          text: normalizePlainText([
+            `[${card.type}] ${card.content}`,
+            card.summary,
+            card.context,
+            card.original_quote ? `原文摘录：${card.original_quote}` : "",
+            card.citation_note ? `引用建议：${card.citation_note}` : "",
+            card.tags ? `tags：${(typeof card.tags === "string" ? JSON.parse(card.tags) : card.tags).join("、")}` : "",
+          ].filter(Boolean).join("\n")).slice(0, 6000),
+          sourceLabel: card.source || card.url || undefined
+        });
+      }
+      continue;
+    }
+    if (kind === "note" && row.ref_id) {
+      const note = (await pool.query(
+        `SELECT id, title, content, tags
+         FROM notes
+         WHERE id = $1 AND user_id = $2`,
+        [Number(row.ref_id), userId]
+      )).rows[0];
+      if (note) {
+        items.push({
+          nodeId: Number(row.id),
+          kind,
+          title: note.title || row.title || "文章草稿",
+          text: normalizePlainText(note.content || "").slice(0, 12000),
+          sourceLabel: "我的文章"
+        });
+      }
+    }
+  }
+  let remainingChars = WRITE_CANVAS_MAX_CONTEXT_CHARS;
+  return items.flatMap(item => {
+    if (remainingChars <= 0 && !item.imageDataUrl) return [];
+    const text = item.text.slice(0, Math.max(0, remainingChars));
+    remainingChars -= text.length;
+    return [{ ...item, text }];
+  });
+};
+
+const canvasModelSupportsImages = (model: string) => {
+  const normalized = model.toLowerCase();
+  return /(vision|vl|gpt-4o|gpt-4\.1|gpt-5|o3|o4|gemini|claude-3|mimo-vl)/.test(normalized);
+};
+
+const requestCanvasAgentCompletion = async (input: {
+  model: string;
+  systemPrompt: string;
+  message: string;
+  contexts: CanvasContextItem[];
+  previousMessages: Array<{ role: "user" | "assistant"; content: string }>;
+  temperature: number;
+  topP: number;
+  maxTokens: number;
+  signal?: AbortSignal;
+}) => {
+  const config = getOpenAIWriteAgentConfig();
+  if (!config) {
+    throw new Error("Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL");
+  }
+  const model = normalizeAiModelName(input.model || config.model);
+  const chatCompletionsUrl = config.providerLabel === "openai"
+    ? "https://api.openai.com/v1/chat/completions"
+    : buildOpenAiCompatibleChatCompletionsUrl(config.baseURL || "");
+  const contextText = input.contexts.length
+    ? input.contexts.map((item, index) => [
+      `#${index + 1} ${item.title}`,
+      `类型：${item.kind}`,
+      item.sourceLabel ? `来源：${item.sourceLabel}` : "",
+      item.text || "(无可读文本)",
+    ].filter(Boolean).join("\n")).join("\n\n---\n\n")
+    : "无连接上下文。";
+
+  const supportsImages = canvasModelSupportsImages(model);
+  const imageParts: Array<{ type: "image_url"; image_url: { url: string } }> = [];
+  if (supportsImages) {
+    let imageBytes = 0;
+    for (const item of input.contexts) {
+      if (!item.imageDataUrl || imageParts.length >= 4) continue;
+      const estimatedBytes = Math.ceil(item.imageDataUrl.length * 0.75);
+      if (imageBytes + estimatedBytes > WRITE_CANVAS_MAX_CONTEXT_IMAGE_BYTES) continue;
+      imageBytes += estimatedBytes;
+      imageParts.push({ type: "image_url", image_url: { url: item.imageDataUrl } });
+    }
+  }
+  const userContent = [
+    `用户最新消息：${input.message}`,
+    "",
+    "以下是本次画布连线授权的上下文。不要使用未连接的资料；如果上下文不足，直接说明缺口。",
+    "",
+    contextText
+  ].join("\n");
+  const messages: any[] = [
+    { role: "system", content: input.systemPrompt || getDefaultCanvasAgentConfig().systemPrompt },
+    ...input.previousMessages.slice(-8).map(message => ({ role: message.role, content: message.content })),
+    imageParts.length > 0
+      ? { role: "user", content: [{ type: "text", text: userContent }, ...imageParts] }
+      : { role: "user", content: userContent }
+  ];
+
+  const response = await fetch(chatCompletionsUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${config.apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: clampNumber(input.temperature, 0.55, 0, 2),
+      top_p: clampNumber(input.topP, 1, 0.01, 1),
+      max_tokens: Math.round(clampNumber(input.maxTokens, 1200, 128, 8000)),
+    }),
+    signal: input.signal
+      ? AbortSignal.any([input.signal, AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS)])
+      : AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    const responseBody = await response.text();
+    logger.error({ module: "canvas-agent", status: response.status, responseBody: responseBody.slice(0, 1000) }, "Canvas agent request failed");
+    throw new Error(`AI request failed ${response.status}: ${responseBody}`);
+  }
+  const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  return {
+    content: (data.choices?.[0]?.message?.content || "").trim(),
+    model,
+    provider: config.providerLabel,
+    usedImages: imageParts.length
+  };
 };
 
 type ExtractedKnowledge = {
@@ -3004,6 +4365,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       parseWithRetry([
           'rsshub://youtube/user/@AndrejKarpathy',
           'https://www.youtube.com/feeds/videos.xml?channel_id=UCYO_jab_esuFRV4b17AJtAw'
+        ], 20000, 2),
+      parseWithRetry([
+          'https://aihot.virxact.com/feed.xml'
         ], 20000, 2)
     ]);
     const sspaiArticles = results[0].status === 'fulfilled'
@@ -3045,6 +4409,9 @@ async function fetchRSSFeeds(): Promise<Article[]> {
     const karpathyArticles = results[12].status === 'fulfilled'
       ? normalizeFeedItems(results[12].value.items, 'Andrej Karpathy', 'YouTube', 12000, extractFeedIcon(results[12].value))
       : [];
+    const aiHotSelectedArticles = results[13].status === 'fulfilled'
+      ? normalizeFeedItems(results[13].value.items, 'AI HOT 精选', 'AI 资讯', 13000, extractFeedIcon(results[13].value))
+      : [];
     logger.info({
       module: "rss",
       counts: {
@@ -3060,7 +4427,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
         xyzfm: xyzfmArticles.length,
         lex: lexArticles.length,
         yc: ycArticles.length,
-        karpathy: karpathyArticles.length
+        karpathy: karpathyArticles.length,
+        aiHotSelected: aiHotSelectedArticles.length
       }
     }, "RSS feed counts");
     const feedNames = [
@@ -3077,6 +4445,7 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       'Lex Fridman',
       'Y Combinator',
       'Andrej Karpathy',
+      'AI HOT 精选',
     ];
     results.forEach((result, index) => {
       if (result.status === 'rejected') {
@@ -3096,7 +4465,8 @@ async function fetchRSSFeeds(): Promise<Article[]> {
       ...xyzfmArticles,
       ...lexArticles,
       ...ycArticles,
-      ...karpathyArticles
+      ...karpathyArticles,
+      ...aiHotSelectedArticles
     ];
     const ordered = rankArticles(merged);
     return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
@@ -3109,19 +4479,37 @@ async function fetchRSSFeeds(): Promise<Article[]> {
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 1000);
+  app.set("trust proxy", 1);
+  app.disable("x-powered-by");
+
+  const dbPoolMax = readBoundedEnvNumber(process.env.DB_POOL_MAX, 10, 2, 50);
+  const dbConnectionTimeoutMs = readBoundedEnvNumber(process.env.DB_CONNECTION_TIMEOUT_MS, 5000, 1000, 30000);
+  const dbIdleTimeoutMs = readBoundedEnvNumber(process.env.DB_IDLE_TIMEOUT_MS, 30000, 5000, 120000);
+  const dbStatementTimeoutMs = readBoundedEnvNumber(process.env.DB_STATEMENT_TIMEOUT_MS, 30000, 1000, 120000);
+  if (isProduction && !process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL environment variable must be set in production");
+  }
 
   // --- Database init (PostgreSQL) ---
   // Note: rejectUnauthorized: false is required for Railway's self-signed PG certs.
   // If migrating to another platform (Supabase, Neon, etc.), review this setting.
   let pool: pg.Pool | null = null;
   let dbAvailable = false;
+  let schemaReady = false;
   try {
     const _pool = new pg.Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: process.env.NODE_ENV === 'production'
         ? { rejectUnauthorized: false }
         : false,
-      max: 10,
+      max: dbPoolMax,
+      connectionTimeoutMillis: dbConnectionTimeoutMs,
+      idleTimeoutMillis: dbIdleTimeoutMs,
+      statement_timeout: dbStatementTimeoutMs,
+      query_timeout: dbStatementTimeoutMs + 1000,
+    });
+    _pool.on("error", error => {
+      logger.error({ err: error, module: "db" }, "Unexpected PostgreSQL pool error");
     });
     // Test connection
     await _pool.query('SELECT 1');
@@ -3129,6 +4517,7 @@ async function startServer() {
     dbAvailable = true;
     logger.info({ module: "db" }, "Database connected successfully");
   } catch (err) {
+    if (isProduction) throw err;
     logger.warn({ err, module: "db" }, "Database unavailable; server will start without auth/persistence features");
   }
 
@@ -3292,7 +4681,6 @@ async function startServer() {
   await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS content_hash TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_articles_user ON saved_articles(user_id, saved_at DESC)`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_articles_unique ON saved_articles(user_id, url) WHERE url IS NOT NULL`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_articles_content_hash ON saved_articles(user_id, content_hash) WHERE content_hash IS NOT NULL`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS write_agent_events (
@@ -3327,6 +4715,120 @@ async function startServer() {
 	  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_style_skills_user ON write_style_skills(user_id, updated_at DESC)`);
 	  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_style_skills_user_type ON write_style_skills(user_id, type, updated_at DESC)`);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_canvas_projects (
+      id             BIGSERIAL PRIMARY KEY,
+      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name           TEXT NOT NULL DEFAULT '新的魔法写作项目',
+      viewport       JSONB NOT NULL DEFAULT '{}'::jsonb,
+      last_opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_projects_user ON write_canvas_projects(user_id, last_opened_at DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_canvas_assets (
+      id             BIGSERIAL PRIMARY KEY,
+      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      project_id     BIGINT REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
+      type           TEXT NOT NULL CHECK (type IN ('text','file','image')),
+      title          TEXT NOT NULL DEFAULT '',
+      content_text   TEXT NOT NULL DEFAULT '',
+      extracted_text TEXT NOT NULL DEFAULT '',
+      file_name      TEXT,
+      mime_type      TEXT,
+      data_url       TEXT,
+      meta           JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_assets_user ON write_canvas_assets(user_id, created_at DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_agent_templates (
+      id            BIGSERIAL PRIMARY KEY,
+      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name          TEXT NOT NULL,
+      model         TEXT NOT NULL,
+      system_prompt TEXT NOT NULL DEFAULT '',
+      temperature   REAL NOT NULL DEFAULT 0.55,
+      top_p         REAL NOT NULL DEFAULT 1,
+      max_tokens    INTEGER NOT NULL DEFAULT 1200,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_templates_user ON write_agent_templates(user_id, updated_at DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_agent_instances (
+      id            BIGSERIAL PRIMARY KEY,
+      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      project_id    BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
+      template_id   BIGINT REFERENCES write_agent_templates(id) ON DELETE SET NULL,
+      name          TEXT NOT NULL DEFAULT '写作 Agent',
+      model         TEXT NOT NULL,
+      system_prompt TEXT NOT NULL DEFAULT '',
+      temperature   REAL NOT NULL DEFAULT 0.55,
+      top_p         REAL NOT NULL DEFAULT 1,
+      max_tokens    INTEGER NOT NULL DEFAULT 1200,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_instances_project ON write_agent_instances(project_id, updated_at DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_canvas_nodes (
+      id          BIGSERIAL PRIMARY KEY,
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      project_id  BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
+      kind        TEXT NOT NULL CHECK (kind IN ('asset_text','asset_file','asset_image','saved_article','atom_card','note','agent','result')),
+      title       TEXT NOT NULL DEFAULT '',
+      summary     TEXT NOT NULL DEFAULT '',
+      ref_id      TEXT,
+      asset_id    BIGINT REFERENCES write_canvas_assets(id) ON DELETE SET NULL,
+      agent_id    BIGINT REFERENCES write_agent_instances(id) ON DELETE CASCADE,
+      meta        JSONB NOT NULL DEFAULT '{}'::jsonb,
+      x           REAL NOT NULL DEFAULT 0,
+      y           REAL NOT NULL DEFAULT 0,
+      width       REAL NOT NULL DEFAULT 280,
+      height      REAL NOT NULL DEFAULT 180,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_nodes_project ON write_canvas_nodes(project_id, updated_at DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_canvas_edges (
+      id             BIGSERIAL PRIMARY KEY,
+      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      project_id     BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
+      source_node_id BIGINT NOT NULL REFERENCES write_canvas_nodes(id) ON DELETE CASCADE,
+      target_node_id BIGINT NOT NULL REFERENCES write_canvas_nodes(id) ON DELETE CASCADE,
+      relation       TEXT NOT NULL DEFAULT 'context' CHECK (relation IN ('context')),
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (project_id, source_node_id, target_node_id, relation)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_edges_target ON write_canvas_edges(project_id, target_node_id)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_canvas_agent_messages (
+      id         BIGSERIAL PRIMARY KEY,
+      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      agent_id   BIGINT NOT NULL REFERENCES write_agent_instances(id) ON DELETE CASCADE,
+      role       TEXT NOT NULL CHECK (role IN ('user','assistant')),
+      content    TEXT NOT NULL DEFAULT '',
+      meta       JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_messages_agent ON write_canvas_agent_messages(agent_id, created_at ASC)`);
+
   // --- saved_cards: add origin and saved_article_id columns ---
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'manual'`);
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS saved_article_id BIGINT REFERENCES saved_articles(id) ON DELETE SET NULL`);
@@ -3337,6 +4839,91 @@ async function startServer() {
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS evidence_role TEXT`);
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS raw_card_meta JSONB NOT NULL DEFAULT '{}'::jsonb`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_saved_article ON saved_cards(saved_article_id)`);
+  const contentHashIndexIsUnique = Boolean((await pool.query(
+    `SELECT i.indisunique AS "isUnique"
+     FROM pg_class c
+     JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.relname = 'idx_saved_articles_content_hash_unique_v2' AND pg_table_is_visible(c.oid)`,
+  )).rows[0]?.isUnique);
+  if (!contentHashIndexIsUnique) {
+    await pool.query(`
+      WITH ranked AS (
+        SELECT *, FIRST_VALUE(id) OVER (
+          PARTITION BY user_id, content_hash ORDER BY saved_at DESC, id DESC
+        ) AS keep_id
+        FROM saved_articles
+        WHERE content_hash IS NOT NULL
+      ), merged AS (
+        SELECT keep_id,
+               (array_agg(NULLIF(content, '') ORDER BY length(content) DESC, saved_at DESC)
+                 FILTER (WHERE content <> ''))[1] AS content,
+               (array_agg(NULLIF(excerpt, '') ORDER BY length(excerpt) DESC, saved_at DESC)
+                 FILTER (WHERE excerpt <> ''))[1] AS excerpt,
+               (array_agg(NULLIF(citation_context, '') ORDER BY length(citation_context) DESC, saved_at DESC)
+                 FILTER (WHERE citation_context IS NOT NULL AND citation_context <> ''))[1] AS citation_context,
+               (array_agg(image_urls ORDER BY jsonb_array_length(image_urls) DESC, saved_at DESC)
+                 FILTER (WHERE jsonb_typeof(image_urls) = 'array' AND jsonb_array_length(image_urls) > 0))[1] AS image_urls,
+               (array_agg(source_icon ORDER BY saved_at DESC)
+                 FILTER (WHERE source_icon IS NOT NULL))[1] AS source_icon,
+               MAX(published_at) AS published_at
+        FROM ranked
+        GROUP BY keep_id
+        HAVING COUNT(*) > 1
+      )
+      UPDATE saved_articles keep
+      SET content = COALESCE(merged.content, keep.content),
+          excerpt = COALESCE(merged.excerpt, keep.excerpt),
+          citation_context = COALESCE(merged.citation_context, keep.citation_context),
+          image_urls = COALESCE(merged.image_urls, keep.image_urls),
+          source_icon = COALESCE(keep.source_icon, merged.source_icon),
+          published_at = COALESCE(keep.published_at, merged.published_at)
+      FROM merged
+      WHERE keep.id = merged.keep_id
+    `);
+    await pool.query(`
+      WITH duplicates AS (
+        SELECT id, user_id, FIRST_VALUE(id) OVER (
+          PARTITION BY user_id, content_hash ORDER BY saved_at DESC, id DESC
+        ) AS keep_id
+        FROM saved_articles
+        WHERE content_hash IS NOT NULL
+      )
+      UPDATE saved_cards sc
+      SET saved_article_id = duplicates.keep_id
+      FROM duplicates
+      WHERE sc.saved_article_id = duplicates.id AND duplicates.id <> duplicates.keep_id
+    `);
+    await pool.query(`
+      WITH duplicates AS (
+        SELECT id, user_id, FIRST_VALUE(id) OVER (
+          PARTITION BY user_id, content_hash ORDER BY saved_at DESC, id DESC
+        ) AS keep_id
+        FROM saved_articles
+        WHERE content_hash IS NOT NULL
+      )
+      UPDATE write_canvas_nodes n
+      SET ref_id = duplicates.keep_id::text, updated_at = NOW()
+      FROM duplicates
+      WHERE n.kind = 'saved_article'
+        AND n.user_id = duplicates.user_id
+        AND n.ref_id = duplicates.id::text
+        AND duplicates.id <> duplicates.keep_id
+    `);
+    await pool.query(`
+      WITH duplicates AS (
+        SELECT id, FIRST_VALUE(id) OVER (
+          PARTITION BY user_id, content_hash ORDER BY saved_at DESC, id DESC
+        ) AS keep_id
+        FROM saved_articles
+        WHERE content_hash IS NOT NULL
+      )
+      DELETE FROM saved_articles sa
+      USING duplicates
+      WHERE sa.id = duplicates.id AND duplicates.id <> duplicates.keep_id
+    `);
+    await pool.query(`DROP INDEX IF EXISTS idx_saved_articles_content_hash`);
+    await pool.query(`CREATE UNIQUE INDEX idx_saved_articles_content_hash_unique_v2 ON saved_articles(user_id, content_hash) WHERE content_hash IS NOT NULL`);
+  }
 
   // --- card_relations: knowledge graph (reserved for future use) ---
   await pool.query(`
@@ -3364,7 +4951,9 @@ async function startServer() {
 
   // Backfill: set default nickname for existing users who don't have one
   await pool.query("UPDATE users SET nickname = split_part(email, '@', 1) WHERE nickname IS NULL");
+  schemaReady = true;
   } catch (err) {
+    if (isProduction) throw err;
     logger.error({ err, module: "db" }, "Database schema migration failed; some features may be unavailable");
   }
   } // end if (pool)
@@ -3381,16 +4970,170 @@ async function startServer() {
 
   // Avatar upload setup (memory storage → compress → base64 data URL stored in DB)
   const AVATAR_MAX_BYTES = 2 * 1024 * 1024; // 2MB threshold for compression
+  const avatarUploadMaxBytes = readBoundedEnvNumber(process.env.AVATAR_UPLOAD_MAX_MB, 5, 1, 10) * 1024 * 1024;
+  const canvasUploadMaxBytes = readBoundedEnvNumber(process.env.CANVAS_UPLOAD_MAX_MB, 10, 1, 20) * 1024 * 1024;
+  const canvasUserStorageMaxBytes = readBoundedEnvNumber(process.env.CANVAS_USER_STORAGE_MAX_MB, 100, 20, 2048) * 1024 * 1024;
   const avatarUpload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 }, // accept up to 10MB, compress if > 2MB
+    limits: { fileSize: avatarUploadMaxBytes, files: 1, fields: 5, parts: 6, fieldNameSize: 100, fieldSize: 16 * 1024 },
     fileFilter: (_req, file, cb) => {
       const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
       cb(null, allowed.includes(file.mimetype));
     }
   });
+  const canvasAssetUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: canvasUploadMaxBytes, files: 1, fields: 10, parts: 11, fieldNameSize: 100, fieldSize: 64 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      const allowed = [
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp"
+      ];
+      cb(null, allowed.includes(file.mimetype));
+    }
+  });
 
-  app.use(express.json());
+  const apiLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.API_RATE_LIMIT, 300, 30, 3000),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "api",
+    skip: req => req.path === "/health",
+    message: { error: "请求过于频繁，请稍后再试" },
+  });
+  const requestIpKey = (req: express.Request) => ipKeyGenerator(req.ip || req.socket.remoteAddress || "unknown");
+  const normalizedEmailKey = (req: express.Request) => {
+    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase().slice(0, 320) : "";
+    return email ? `email:${email}` : `ip:${requestIpKey(req)}`;
+  };
+  const authenticatedUserKey = (req: express.Request) => req.session?.userId
+    ? `user:${req.session.userId}`
+    : `ip:${requestIpKey(req)}`;
+  const passwordLoginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.AUTH_LOGIN_RATE_LIMIT, 10, 3, 100),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "password-login-ip",
+    keyGenerator: requestIpKey,
+    skipSuccessfulRequests: true,
+    message: { error: "登录尝试过多，请稍后再试" },
+  });
+  const passwordEmailLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.AUTH_LOGIN_RATE_LIMIT, 10, 3, 100),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "password-login-email",
+    keyGenerator: normalizedEmailKey,
+    skipSuccessfulRequests: true,
+    message: { error: "该账号登录尝试过多，请稍后再试" },
+  });
+  const verificationSendLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.AUTH_CODE_IP_RATE_LIMIT, 5, 2, 100),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "verification-send-ip",
+    keyGenerator: requestIpKey,
+    message: { error: "验证码发送请求过多，请稍后再试" },
+  });
+  const verificationEmailLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.AUTH_CODE_EMAIL_RATE_LIMIT, 3, 1, 20),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "verification-send-email",
+    keyGenerator: normalizedEmailKey,
+    message: { error: "该邮箱验证码发送过多，请稍后再试" },
+  });
+  const verificationCheckLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.AUTH_VERIFY_RATE_LIMIT, 10, 3, 100),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "verification-check",
+    keyGenerator: normalizedEmailKey,
+    skipSuccessfulRequests: true,
+    message: { error: "验证码尝试过多，请稍后再试" },
+  });
+  const paidOperationLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.PAID_OPERATION_RATE_LIMIT, 20, 2, 500),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "paid-operation",
+    keyGenerator: authenticatedUserKey,
+    message: { error: "AI 或翻译请求过于频繁，请稍后再试" },
+  });
+  const remoteFetchLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.REMOTE_FETCH_RATE_LIMIT, 30, 3, 300),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "remote-fetch",
+    keyGenerator: authenticatedUserKey,
+    message: { error: "远程抓取请求过于频繁，请稍后再试" },
+  });
+  const uploadLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.UPLOAD_RATE_LIMIT, 20, 2, 200),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "upload",
+    keyGenerator: authenticatedUserKey,
+    message: { error: "上传过于频繁，请稍后再试" },
+  });
+  const clientLogLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 30,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "client-log",
+    keyGenerator: requestIpKey,
+    message: { error: "日志请求过于频繁" },
+  });
+  const remoteRssMaxBytes = readBoundedEnvNumber(process.env.REMOTE_RSS_MAX_MB, 5, 1, 10) * 1024 * 1024;
+  const remoteRssMaxItems = readBoundedEnvNumber(process.env.REMOTE_RSS_MAX_ITEMS, 500, 20, 1000);
+
+  app.use(helmet({
+    contentSecurityPolicy: isProduction ? {
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        connectSrc: ["'self'", "wss:"],
+        fontSrc: ["'self'", "data:"],
+        frameAncestors: ["'none'"],
+        frameSrc: ["'none'"],
+        imgSrc: ["'self'", "data:", "blob:", "https:"],
+        mediaSrc: ["'self'", "blob:", "data:", "https:"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        workerSrc: ["'self'", "blob:"],
+      },
+    } : false,
+    crossOriginEmbedderPolicy: false,
+    strictTransportSecurity: isProduction ? undefined : false,
+  }));
+  app.use(compression({
+    threshold: 1024,
+    filter: (req, res) => {
+      if (req.path.endsWith("/stream") || req.get("accept")?.includes("text/event-stream")) return false;
+      return compression.filter(req, res);
+    },
+  }));
+  const jsonBodyLimitKb = readBoundedEnvNumber(process.env.JSON_BODY_LIMIT_KB, 256, 64, 1024);
+  app.use(express.json({ limit: `${jsonBodyLimitKb}kb`, strict: true }));
+  app.use(express.urlencoded({ extended: false, limit: "64kb", parameterLimit: 50 }));
   app.use(pinoHttp({
     logger,
     autoLogging: {
@@ -3405,7 +5148,7 @@ async function startServer() {
     customErrorMessage: (req, res, err) => `${req.method} ${req.url} ${res.statusCode} ${err.message}`,
   }));
 
-  app.post("/api/log", (req, res) => {
+  app.post("/api/log", clientLogLimiter, (req, res) => {
     const { level, message, context } = req.body || {};
     if (level !== "error" && level !== "warn") {
       return res.status(400).json({ error: "unsupported log level" });
@@ -3425,38 +5168,210 @@ async function startServer() {
   });
 
   // --- Session middleware (PostgreSQL) ---
-  if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
-    throw new Error('SESSION_SECRET environment variable must be set in production');
+  const sessionSecret = process.env.SESSION_SECRET || "atomflow-dev-secret-change-in-prod";
+  if (isProduction && sessionSecret.length < 32) {
+    throw new Error("SESSION_SECRET must contain at least 32 characters in production");
   }
-  app.set('trust proxy', 1);
-  if (pool) {
-    const PgSession = connectPgSimple(session);
-    app.use(session({
-      store: new PgSession({ pool, createTableIfMissing: true }),
-      secret: process.env.SESSION_SECRET || 'atomflow-dev-secret-change-in-prod',
-      resave: false,
-      saveUninitialized: false,
-      cookie: {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: 7 * 24 * 60 * 60 * 1000
+  const PgSession = connectPgSimple(session);
+  const sessionMiddleware = session({
+    name: "atomflow.sid",
+    store: pool ? new PgSession({ pool, createTableIfMissing: true }) : undefined,
+    secret: sessionSecret,
+    proxy: isProduction,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    },
+  });
+  app.use(sessionMiddleware);
+  app.use("/api", apiLimiter);
+
+  const appUrl = process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : undefined);
+  const allowedOrigins = buildAllowedOrigins(appUrl, process.env.ALLOWED_ORIGINS);
+  if (isProduction && allowedOrigins.size === 0) {
+    throw new Error("APP_URL or RAILWAY_PUBLIC_DOMAIN must be configured in production");
+  }
+  const mutationOriginGuard: express.RequestHandler = (req, res, next) => {
+    if (!isProduction || isAllowedMutationOrigin({
+      method: req.method,
+      path: req.path,
+      origin: req.get("origin") || undefined,
+      referer: req.get("referer") || undefined,
+      isAuthenticated: Boolean(req.session.userId),
+    }, allowedOrigins)) {
+      next();
+      return;
+    }
+    res.status(403).json({ error: "请求来源不受信任" });
+  };
+  app.use("/api", mutationOriginGuard);
+
+  const paidConcurrencyGuard = createUserConcurrencyGuard(
+    readBoundedEnvNumber(process.env.PAID_OPERATION_CONCURRENCY, 2, 1, 10),
+  );
+  const paidGlobalConcurrencyGuard = createUserConcurrencyGuard(
+    readBoundedEnvNumber(process.env.PAID_OPERATION_GLOBAL_CONCURRENCY, 8, 2, 100),
+  );
+  const paidOperationLeaseMs = readBoundedEnvNumber(process.env.PAID_OPERATION_LEASE_MS, 180000, 30000, 600000);
+  const uploadConcurrencyGuard = createUserConcurrencyGuard(
+    readBoundedEnvNumber(process.env.CANVAS_UPLOAD_GLOBAL_CONCURRENCY, 4, 1, 20),
+  );
+  const articleSaveConcurrencyGuard = createUserConcurrencyGuard(1);
+  const canvasAgentConcurrencyGuard = createUserConcurrencyGuard(1);
+  const paidConcurrencyMiddleware: express.RequestHandler = (req, res, next) => {
+    let releaseGlobal: (() => void) | undefined;
+    let releaseUser: (() => void) | undefined;
+    try {
+      releaseGlobal = paidGlobalConcurrencyGuard.acquire("global");
+      releaseUser = paidConcurrencyGuard.acquire(authenticatedUserKey(req));
+    } catch (error) {
+      releaseGlobal?.();
+      if (error instanceof ConcurrencyLimitError) {
+        res.setHeader("Retry-After", "5");
+        res.status(429).json({ error: "已有任务正在运行，请等待完成后再试" });
+        return;
       }
-    }));
-  } else {
-    app.use(session({
-      secret: process.env.SESSION_SECRET || 'atomflow-dev-secret-change-in-prod',
-      resave: false,
-      saveUninitialized: false,
-      cookie: { httpOnly: true, secure: false, sameSite: 'lax', maxAge: 7 * 24 * 60 * 60 * 1000 }
-    }));
-  }
+      next(error);
+      return;
+    }
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      releaseUser?.();
+      releaseGlobal?.();
+    };
+    res.locals.releasePaidConcurrency = release;
+    res.once("finish", release);
+    res.once("close", () => {
+      if (res.writableFinished) {
+        release();
+        return;
+      }
+      const leaseTimer = setTimeout(release, paidOperationLeaseMs);
+      leaseTimer.unref();
+    });
+    next();
+  };
+  const canvasAgentConcurrencyMiddleware: express.RequestHandler = (req, res, next) => {
+    const agentId = Number(req.params.id);
+    if (!Number.isSafeInteger(agentId) || agentId <= 0) {
+      res.status(400).json({ error: "invalid agent id" });
+      return;
+    }
+    let release: () => void;
+    try {
+      release = canvasAgentConcurrencyGuard.acquire(`${authenticatedUserKey(req)}:${agentId}`);
+    } catch (error) {
+      if (error instanceof ConcurrencyLimitError) {
+        res.setHeader("Retry-After", "5");
+        res.status(429).json({ error: "这个 Agent 正在生成，请等待完成后再试" });
+        return;
+      }
+      next(error);
+      return;
+    }
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      release();
+    };
+    res.locals.releaseCanvasAgentConcurrency = releaseOnce;
+    res.once("finish", releaseOnce);
+    res.once("close", () => {
+      if (res.writableFinished) {
+        releaseOnce();
+        return;
+      }
+      const leaseTimer = setTimeout(releaseOnce, paidOperationLeaseMs);
+      leaseTimer.unref();
+    });
+    next();
+  };
+  const uploadConcurrencyMiddleware: express.RequestHandler = (_req, res, next) => {
+    let release: () => void;
+    try {
+      release = uploadConcurrencyGuard.acquire("global");
+    } catch (error) {
+      if (error instanceof ConcurrencyLimitError) {
+        res.setHeader("Retry-After", "5");
+        res.status(429).json({ error: "上传处理繁忙，请稍后再试" });
+        return;
+      }
+      next(error);
+      return;
+    }
+    res.once("finish", release);
+    res.once("close", release);
+    next();
+  };
+  const articleSaveConcurrencyMiddleware: express.RequestHandler = (req, res, next) => {
+    const articleId = Number(req.params.id);
+    if (!Number.isSafeInteger(articleId) || articleId <= 0) {
+      res.status(400).json({ error: "invalid article id" });
+      return;
+    }
+    let release: () => void;
+    try {
+      release = articleSaveConcurrencyGuard.acquire(authenticatedUserKey(req));
+    } catch (error) {
+      if (error instanceof ConcurrencyLimitError) {
+        res.setHeader("Retry-After", "5");
+        res.status(429).json({ error: "这篇文章正在保存，请等待完成后再试" });
+        return;
+      }
+      next(error);
+      return;
+    }
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      release();
+    };
+    res.once("finish", releaseOnce);
+    res.once("close", () => {
+      if (res.writableFinished) {
+        releaseOnce();
+        return;
+      }
+      const leaseTimer = setTimeout(releaseOnce, paidOperationLeaseMs);
+      leaseTimer.unref();
+    });
+    next();
+  };
+
+  const establishAuthenticatedSession = (req: express.Request, userId: number, email: string) => new Promise<void>((resolve, reject) => {
+    req.session.regenerate(error => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      req.session.userId = userId;
+      req.session.email = email;
+      resolve();
+    });
+  });
+
+  app.get("/api/health", asyncHandler(async (_req, res) => {
+    if (!pool || !schemaReady) return res.status(503).json({ status: "unhealthy", database: pool ? "schema-unavailable" : "unavailable" });
+    await pool.query("SELECT 1 FROM users LIMIT 0");
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ status: "ok", database: "connected" });
+  }));
 
   // In-memory database for prototype
   let articles: Article[] = [];
   const cachedArticles = await loadArticlesCache();
   if (cachedArticles.length > 0) {
     articles = cachedArticles;
+  } else {
+    articles = [...MOCK_ARTICLES];
   }
 
   // Load RSS feeds on startup
@@ -3479,20 +5394,16 @@ async function startServer() {
       logger.error({ err: error, module: "rss" }, "Failed to refresh feeds, keeping existing data");
     }
   };
-  // 如果有缓存数据，不阻塞启动，后台异步刷新
-  if (articles.length > 0) {
-    logger.info({ module: "rss", articleCount: articles.length }, "Using cached articles, refreshing in background");
-    refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds in background"));
-  } else {
-    await refreshFeeds();
-  }
-  setInterval(() => {
+  logger.info({ module: "rss", articleCount: articles.length }, "Using cached or fallback articles, refreshing in background");
+  refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds in background"));
+  const feedRefreshTimer = setInterval(() => {
     refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds"));
   }, 10 * 60 * 1000);
+  feedRefreshTimer.unref();
 
   // --- Auth Routes ---
 
-  app.post("/api/auth/send-code", asyncHandler(async (req, res) => {
+  app.post("/api/auth/send-code", verificationSendLimiter, verificationEmailLimiter, asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: '请输入有效的邮箱地址' });
@@ -3509,9 +5420,9 @@ async function startServer() {
       return res.status(429).json({ error: '发送过于频繁，请 60 秒后再试' });
     }
 
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const code = randomInt(100000, 1000000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-    await pool.query('INSERT INTO verification_codes (email, code, expires_at) VALUES ($1, $2, $3)', [email, code, expiresAt]);
+    await pool.query('INSERT INTO verification_codes (email, code, expires_at) VALUES ($1, $2, $3)', [email, verificationCodeDigest(email, code), expiresAt]);
 
     logOtpEvent("login", email, code);
 
@@ -3547,7 +5458,7 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/auth/verify", asyncHandler(async (req, res) => {
+  app.post("/api/auth/verify", verificationCheckLimiter, asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     const code = (req.body?.code || '').trim();
     if (!email || !code) {
@@ -3555,14 +5466,19 @@ async function startServer() {
     }
 
     const record = (await pool.query(
-      'SELECT id FROM verification_codes WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW()',
-      [email, code]
+      `UPDATE verification_codes
+       SET used = TRUE
+       WHERE id = (
+         SELECT id FROM verification_codes
+         WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW() AND password_hash IS NULL
+         ORDER BY created_at DESC LIMIT 1
+       ) AND used = FALSE
+       RETURNING id`,
+      [email, verificationCodeDigest(email, code)]
     )).rows[0];
     if (!record) {
       return res.status(400).json({ error: '验证码无效或已过期' });
     }
-
-    await pool.query('UPDATE verification_codes SET used = TRUE WHERE id = $1', [record.id]);
 
     let user = (await pool.query('SELECT id, email, nickname, avatar_url, password_hash FROM users WHERE email = $1', [email])).rows[0];
     if (!user) {
@@ -3571,8 +5487,7 @@ async function startServer() {
       user = { id: result.rows[0].id, email, nickname, avatar_url: null, password_hash: null };
     }
 
-    req.session.userId = user.id as number;
-    req.session.email = user.email as string;
+    await establishAuthenticatedSession(req, Number(user.id), String(user.email));
     return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url, has_password: Boolean(user.password_hash) } });
   }));
 
@@ -3590,13 +5505,13 @@ async function startServer() {
   app.post("/api/auth/logout", (req, res) => {
     req.session.destroy((err) => {
       if (err) return res.status(500).json({ error: '登出失败' });
-      res.clearCookie('connect.sid');
+      res.clearCookie("atomflow.sid", { httpOnly: true, secure: isProduction, sameSite: "lax" });
       return res.json({ success: true });
     });
   });
 
   // --- Password Registration ---
-  app.post("/api/auth/register", asyncHandler(async (req, res) => {
+  app.post("/api/auth/register", verificationSendLimiter, verificationEmailLimiter, asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     const password = req.body?.password || '';
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -3623,11 +5538,11 @@ async function startServer() {
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const code = randomInt(100000, 1000000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
     await pool.query(
       'INSERT INTO verification_codes (email, code, expires_at, password_hash) VALUES ($1, $2, $3, $4)',
-      [email, code, expiresAt, passwordHash]
+      [email, verificationCodeDigest(email, code), expiresAt, passwordHash]
     );
 
     logOtpEvent("registration", email, code);
@@ -3664,7 +5579,7 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/auth/register/verify", asyncHandler(async (req, res) => {
+  app.post("/api/auth/register/verify", verificationCheckLimiter, asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     const code = (req.body?.code || '').trim();
     if (!email || !code) {
@@ -3672,14 +5587,19 @@ async function startServer() {
     }
 
     const record = (await pool.query(
-      'SELECT id, password_hash FROM verification_codes WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW() AND password_hash IS NOT NULL',
-      [email, code]
+      `UPDATE verification_codes
+       SET used = TRUE
+       WHERE id = (
+         SELECT id FROM verification_codes
+         WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW() AND password_hash IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1
+       ) AND used = FALSE
+       RETURNING id, password_hash`,
+      [email, verificationCodeDigest(email, code)]
     )).rows[0];
     if (!record) {
       return res.status(400).json({ error: '验证码无效或已过期' });
     }
-
-    await pool.query('UPDATE verification_codes SET used = TRUE WHERE id = $1', [record.id]);
 
     const existing = (await pool.query('SELECT id FROM users WHERE email = $1', [email])).rows[0];
     if (existing) {
@@ -3693,12 +5613,11 @@ async function startServer() {
     );
     const user = { id: result.rows[0].id, email, nickname, avatar_url: null, has_password: true };
 
-    req.session.userId = user.id;
-    req.session.email = user.email;
+    await establishAuthenticatedSession(req, Number(user.id), String(user.email));
     return res.json({ success: true, user });
   }));
 
-  app.post("/api/auth/login-password", asyncHandler(async (req, res) => {
+  app.post("/api/auth/login-password", passwordLoginLimiter, passwordEmailLimiter, asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     const password = req.body?.password || '';
     if (!email || !password) {
@@ -3715,8 +5634,7 @@ async function startServer() {
       return res.status(401).json({ error: '邮箱或密码错误' });
     }
 
-    req.session.userId = user.id;
-    req.session.email = user.email;
+    await establishAuthenticatedSession(req, Number(user.id), String(user.email));
     return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url, has_password: true } });
   }));
 
@@ -3740,7 +5658,7 @@ async function startServer() {
   }));
 
   // --- Reset password (forgot password: verify code + set new password, no auth) ---
-  app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
+  app.post("/api/auth/reset-password", verificationCheckLimiter, asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     const code = (req.body?.code || '').trim();
     const password = req.body?.password || '';
@@ -3752,14 +5670,19 @@ async function startServer() {
     }
 
     const record = (await pool.query(
-      'SELECT id FROM verification_codes WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW() AND password_hash IS NULL',
-      [email, code]
+      `UPDATE verification_codes
+       SET used = TRUE
+       WHERE id = (
+         SELECT id FROM verification_codes
+         WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW() AND password_hash IS NULL
+         ORDER BY created_at DESC LIMIT 1
+       ) AND used = FALSE
+       RETURNING id`,
+      [email, verificationCodeDigest(email, code)]
     )).rows[0];
     if (!record) {
       return res.status(400).json({ error: '验证码无效或已过期' });
     }
-
-    await pool.query('UPDATE verification_codes SET used = TRUE WHERE id = $1', [record.id]);
 
     const user = (await pool.query('SELECT id FROM users WHERE email = $1', [email])).rows[0];
     if (!user) {
@@ -3770,8 +5693,7 @@ async function startServer() {
     await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, user.id]);
 
     // Auto login after reset
-    req.session.userId = user.id;
-    req.session.email = email;
+    await establishAuthenticatedSession(req, Number(user.id), email);
     const updated = (await pool.query('SELECT id, email, nickname, avatar_url, password_hash FROM users WHERE id = $1', [user.id])).rows[0];
     return res.json({ success: true, user: { id: updated.id, email: updated.email, nickname: updated.nickname, avatar_url: updated.avatar_url, has_password: true } });
   }));
@@ -3793,7 +5715,10 @@ async function startServer() {
 
   app.post("/api/auth/avatar", requireAuth, avatarUpload.single('avatar'), asyncHandler(async (req: any, res) => {
     if (!req.file) {
-      return res.status(400).json({ error: '请上传有效的图片文件（JPG/PNG/GIF/WebP，最大10MB）' });
+      return res.status(400).json({ error: '请上传有效的图片文件（JPG/PNG/GIF/WebP）' });
+    }
+    if (!isAllowedUploadSignature(req.file.buffer, req.file.mimetype, req.file.originalname)) {
+      return res.status(400).json({ error: "图片内容与文件类型不匹配" });
     }
 
     let buffer: Buffer = req.file.buffer;
@@ -3845,7 +5770,7 @@ async function startServer() {
   // --- Notes routes ---
   app.get("/api/notes", requireAuth, asyncHandler(async (req, res) => {
     const rows = (await pool.query(
-      'SELECT id, title, content, tags, meta, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC',
+      'SELECT id, title, content, tags, meta, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 500',
       [req.session.userId]
     )).rows;
     return res.json(rows);
@@ -3888,44 +5813,45 @@ async function startServer() {
   // Get all articles (global + user's private articles when logged in)
   app.get("/api/articles", asyncHandler(async (req, res) => {
     if (!req.session.userId) {
-      return res.json(articles);
+      return res.json(articles.map(toArticleListItem));
     }
     const userArticles = await loadUserArticlesAsArticles(req.session.userId, pool);
     if (userArticles.length === 0) {
-      return res.json(await applyUserSavedStateToArticles(req.session.userId, articles, pool));
+      const withSavedState = await applyUserSavedStateToArticles(req.session.userId, articles, pool);
+      return res.json(withSavedState.map(toArticleListItem));
     }
     // Deduplicate: skip user articles whose URL already exists in global store
     const globalUrls = new Set(articles.filter(a => a.url).map(a => a.url as string));
     const uniqueUserArticles = userArticles.filter(a => !a.url || !globalUrls.has(a.url));
     const rankedArticles = rankArticles([...articles, ...uniqueUserArticles]);
-    return res.json(await applyUserSavedStateToArticles(req.session.userId, rankedArticles, pool));
+    const withSavedState = await applyUserSavedStateToArticles(req.session.userId, rankedArticles, pool);
+    return res.json(withSavedState.map(toArticleListItem));
   }));
 
-  app.post("/api/sources/fetch", asyncHandler(async (req, res) => {
+  app.post("/api/sources/fetch", requireAuth, remoteFetchLimiter, asyncHandler(async (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
+    const fullFeed = req.body?.full === true;
     if (!source || !input) {
       return res.status(400).json({ error: "source and input are required" });
     }
     const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
     const userId = req.session.userId;
+    if (isBuiltin) return res.status(403).json({ error: "内置订阅源由服务器定时刷新" });
     try {
-      const parsed = await parseWithRetry([input], 15000, 2);
+      await validatePublicHttpUrl(input);
+      const resource = await fetchBoundedPublicResource(input, {
+        timeoutMs: 15000,
+        maxBytes: remoteRssMaxBytes,
+        maxRedirects: 3,
+        headers: { "User-Agent": "AtomFlow/1.0 RSS Reader", "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" },
+      });
+      if (resource.status < 200 || resource.status >= 300) throw new Error(`RSS source returned ${resource.status}`);
+      const parsed = await parser.parseString(resource.body.toString("utf8"));
       const feedIcon = extractFeedIcon(parsed);
-      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon);
-
-      // Anonymous user OR fetching a built-in source → global in-memory store
-      if (!userId || isBuiltin) {
-        const combined = [...fetched, ...articles];
-        const dedup = new Map<string, Article>();
-        for (const article of combined) {
-          const key = article.url ? `url:${article.url}` : `st:${article.source}:${article.title}`;
-          if (!dedup.has(key)) dedup.set(key, article);
-        }
-        articles = rankArticles(Array.from(dedup.values()));
-        await saveArticlesCache(articles);
-        return res.json({ success: true, added: fetched.length });
-      }
+      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon, {
+        maxItems: fullFeed ? remoteRssMaxItems : undefined
+      });
 
       // Logged-in user + custom source → persist to DB
       const subResult = await pool.query(
@@ -3964,30 +5890,30 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/sources/retry", asyncHandler(async (req, res) => {
+  app.post("/api/sources/retry", requireAuth, remoteFetchLimiter, asyncHandler(async (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
+    const fullFeed = req.body?.full === true;
     if (!source || !input) {
       return res.status(400).json({ error: "source and input are required" });
     }
     const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
     const userId = req.session.userId;
+    if (isBuiltin) return res.status(403).json({ error: "内置订阅源由服务器定时刷新" });
     try {
-      const parsed = await parseWithRetry([input], 60000, 1);
+      await validatePublicHttpUrl(input);
+      const resource = await fetchBoundedPublicResource(input, {
+        timeoutMs: 30000,
+        maxBytes: remoteRssMaxBytes,
+        maxRedirects: 3,
+        headers: { "User-Agent": "AtomFlow/1.0 RSS Reader", "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" },
+      });
+      if (resource.status < 200 || resource.status >= 300) throw new Error(`RSS source returned ${resource.status}`);
+      const parsed = await parser.parseString(resource.body.toString("utf8"));
       const feedIcon = extractFeedIcon(parsed);
-      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon);
-
-      if (!userId || isBuiltin) {
-        const combined = [...fetched, ...articles];
-        const dedup = new Map<string, Article>();
-        for (const article of combined) {
-          const key = article.url ? `url:${article.url}` : `st:${article.source}:${article.title}`;
-          if (!dedup.has(key)) dedup.set(key, article);
-        }
-        articles = rankArticles(Array.from(dedup.values()));
-        await saveArticlesCache(articles);
-        return res.json({ success: true, added: fetched.length });
-      }
+      const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon, {
+        maxItems: fullFeed ? remoteRssMaxItems : undefined
+      });
 
       // Logged-in user + custom source → persist to DB
       const subResult = await pool.query(
@@ -4027,83 +5953,42 @@ async function startServer() {
     }
   }));
 
-  app.delete("/api/sources/:source", asyncHandler(async (req, res) => {
+  app.delete("/api/sources/:source", requireAuth, asyncHandler(async (req, res) => {
     const source = decodeURIComponent(req.params.source || '').trim();
     if (!source) return res.status(400).json({ error: "source is required" });
     const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
-    const userId = req.session.userId;
-
-    let removed = 0;
-    // For built-in sources (or anonymous), remove from global in-memory store
-    if (isBuiltin || !userId) {
-      const before = articles.length;
-      articles = articles.filter(article => article.source !== source);
-      await saveArticlesCache(articles);
-      removed = before - articles.length;
-    }
-    // For logged-in users with custom sources, delete from DB (user_articles cascade)
-    if (userId && !isBuiltin) {
-      const result = await pool.query(
-        'DELETE FROM user_subscriptions WHERE user_id = $1 AND name = $2',
-        [userId, source]
-      );
-      removed += result.rowCount ?? 0;
-    }
+    if (isBuiltin) return res.status(403).json({ error: "内置订阅源不能通过用户接口删除" });
+    const result = await pool.query(
+      'DELETE FROM user_subscriptions WHERE user_id = $1 AND name = $2',
+      [req.session.userId, source]
+    );
+    const removed = result.rowCount ?? 0;
     return res.json({ success: true, removed });
   }));
 
-  app.patch("/api/sources/rename", asyncHandler(async (req, res) => {
+  app.patch("/api/sources/rename", requireAuth, asyncHandler(async (req, res) => {
     const from = typeof req.body?.from === 'string' ? req.body.from.trim() : '';
     const to = typeof req.body?.to === 'string' ? req.body.to.trim() : '';
     if (!from || !to) return res.status(400).json({ error: "from and to are required" });
     if (from === to) return res.json({ success: true, renamed: 0 });
-    let renamed = 0;
-    articles = articles.map(article => {
-      if (article.source !== from) return article;
-      renamed += 1;
-      return { ...article, source: to };
-    });
-    await saveArticlesCache(articles);
-    // For logged-in users with custom sources, also rename in DB
-    const userId = req.session.userId;
-    if (userId && !BUILTIN_SOURCE_NAMES.has(from)) {
-      await pool.query(
-        `UPDATE user_subscriptions SET name = $1, updated_at = NOW() WHERE user_id = $2 AND name = $3`,
-        [to, userId, from]
-      );
-      await pool.query(
-        `UPDATE user_articles SET source = $1 WHERE user_id = $2 AND source = $3`,
-        [to, userId, from]
-      );
+    if (BUILTIN_SOURCE_NAMES.has(from) || BUILTIN_SOURCE_NAMES.has(to)) {
+      return res.status(403).json({ error: "内置订阅源不能通过用户接口重命名" });
     }
+    const userId = req.session.userId;
+    const result = await pool.query(
+      `UPDATE user_subscriptions SET name = $1, updated_at = NOW() WHERE user_id = $2 AND name = $3`,
+      [to, userId, from]
+    );
+    await pool.query(
+      `UPDATE user_articles SET source = $1 WHERE user_id = $2 AND source = $3`,
+      [to, userId, from]
+    );
+    const renamed = result.rowCount ?? 0;
     return res.json({ success: true, renamed });
   }));
 
-  app.post("/api/articles/refresh-cache", (req, res) => {
-    const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
-    const titleIncludes = typeof req.body?.titleIncludes === 'string' ? req.body.titleIncludes.trim() : '';
-    const urlIncludes = typeof req.body?.urlIncludes === 'string' ? req.body.urlIncludes.trim() : '';
-    let refreshed = 0;
-    articles = articles.map(article => {
-      const bySource = source ? article.source === source : true;
-      const byTitle = titleIncludes ? article.title.includes(titleIncludes) : true;
-      const byUrl = urlIncludes ? Boolean(article.url && article.url.includes(urlIncludes)) : true;
-      if (!(bySource && byTitle && byUrl)) {
-        return article;
-      }
-      refreshed += 1;
-      return {
-        ...article,
-        fullFetched: false,
-        markdownContent: undefined,
-        readabilityUsed: undefined
-      };
-    });
-    res.json({ success: true, refreshed, total: articles.length });
-  });
-
   // Save an article (mark as saved and extract cards)
-  app.post("/api/articles/:id/save", requireAuth, asyncHandler(async (req, res) => {
+  app.post("/api/articles/:id/save", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, articleSaveConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
     let article = articles.find(a => a.id === articleId);
     let isUserArticle = false;
@@ -4250,6 +6135,13 @@ async function startServer() {
             const insertResult = await client.query(
               `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, citation_context, image_urls, published_at, content_hash)
                VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               ON CONFLICT (user_id, content_hash) WHERE content_hash IS NOT NULL
+               DO UPDATE SET title = EXCLUDED.title,
+                             content = EXCLUDED.content,
+                             excerpt = EXCLUDED.excerpt,
+                             source_icon = EXCLUDED.source_icon,
+                             citation_context = EXCLUDED.citation_context,
+                             image_urls = EXCLUDED.image_urls
                RETURNING id`,
               [
                 req.session.userId, article.title,
@@ -4265,8 +6157,15 @@ async function startServer() {
           }
         }
 
-        for (const card of newCards) {
-          await client.query(
+        const cardsAlreadyStored = savedArticleId
+          ? (await client.query(
+              `SELECT id FROM saved_cards WHERE user_id = $1 AND saved_article_id = $2 LIMIT 1`,
+              [req.session.userId, savedArticleId],
+            )).rows[0]
+          : null;
+        if (!cardsAlreadyStored) {
+          for (const card of newCards) {
+            await client.query(
             `INSERT INTO saved_cards (
                id, user_id, type, content, summary, original_quote, context,
                citation_note, evidence_role, tags, article_title, article_id,
@@ -4287,7 +6186,8 @@ async function startServer() {
                  userSelectedSkills: buildAgentSkillSnapshots(extractionSkills.filter(skill => !isBaselineSkill(skill)))
                }
              })]
-          );
+            );
+          }
         }
         await client.query('COMMIT');
       } catch (err) {
@@ -4363,7 +6263,7 @@ async function startServer() {
   }));
 
   // Image proxy to bypass CSP and hotlink protection
-  app.get("/api/image-proxy", asyncHandler(async (req, res) => {
+  app.get("/api/image-proxy", remoteFetchLimiter, asyncHandler(async (req, res) => {
     const imageUrl = req.query.url as string;
     const referer = (req.query.referer as string) || '';
     if (!imageUrl) {
@@ -4385,6 +6285,14 @@ async function startServer() {
     if (!isAllowedHost) {
       return res.status(403).send("Host not allowed");
     }
+    const imageProxyMaxBytes = readBoundedEnvNumber(process.env.IMAGE_PROXY_MAX_MB, 8, 1, 16) * 1024 * 1024;
+    const imageProxyTimeoutMs = readBoundedEnvNumber(process.env.IMAGE_PROXY_TIMEOUT_MS, 8000, 1000, 20000);
+    const assertAllowedImageHost = (url: URL) => {
+      const candidateHost = url.hostname.toLowerCase();
+      if (!ALLOWED_IMAGE_HOST_SUFFIXES.some(suffix => candidateHost === suffix || candidateHost.endsWith(`.${suffix}`))) {
+        throw new Error("Image host not allowed");
+      }
+    };
     try {
       let refererHeader = parsedUrl.origin;
       if (referer) {
@@ -4397,35 +6305,36 @@ async function startServer() {
           refererHeader = parsedUrl.origin;
         }
       }
-      const response = await fetch(parsedUrl.toString(), {
+      const resource = await fetchBoundedPublicResource(parsedUrl.toString(), {
+        timeoutMs: imageProxyTimeoutMs,
+        maxBytes: imageProxyMaxBytes,
+        maxRedirects: 2,
+        validateUrl: assertAllowedImageHost,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Referer': refererHeader
-        }
+          'Referer': refererHeader,
+          'Accept': 'image/avif,image/webp,image/apng,image/png,image/jpeg,image/gif,image/*;q=0.8'
+        },
       });
-      
-      if (!response.ok) {
-        throw new Error(`Failed to fetch image: ${response.statusText}`);
+      if (resource.status < 200 || resource.status >= 300) throw new Error(`Image source returned ${resource.status}`);
+      const contentType = (resource.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      if (!/^image\/(?:png|jpe?g|gif|webp|avif|x-icon|vnd\.microsoft\.icon)$/.test(contentType)) {
+        return res.status(415).send("Remote content is not a supported image");
       }
-      
-      const contentType = response.headers.get('content-type');
-      if (contentType) {
-        res.setHeader('Content-Type', contentType);
-      }
-      
+      res.setHeader('Content-Type', contentType);
       res.setHeader('Cache-Control', 'public, max-age=31536000');
-      
-      const arrayBuffer = await response.arrayBuffer();
-      res.send(Buffer.from(arrayBuffer));
+      res.send(resource.body);
     } catch (error) {
       logger.error({ err: error, module: "image-proxy", imageUrl }, "Image proxy error");
-      res.status(500).send("Failed to load image");
+      if (error instanceof ResponseLimitError) return res.status(413).send("Remote image is too large");
+      if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) return res.status(504).send("Remote image timed out");
+      res.status(502).send("Failed to load image");
     }
   }));
 
   // Favicon proxy for RSS source icons. Unlike article images, source icons can
   // come from arbitrary subscription domains, so keep the response small.
-  app.get("/api/favicon-proxy", asyncHandler(async (req, res) => {
+  app.get("/api/favicon-proxy", remoteFetchLimiter, asyncHandler(async (req, res) => {
     const targetUrl = req.query.url as string;
     if (!targetUrl) {
       return res.status(400).send("Missing url parameter");
@@ -4439,21 +6348,7 @@ async function startServer() {
     if (!["http:", "https:"].includes(parsedUrl.protocol)) {
       return res.status(400).send("Invalid url protocol");
     }
-    const hostname = parsedUrl.hostname.toLowerCase();
-    const blockedHostname =
-      hostname === "localhost" ||
-      hostname.endsWith(".local") ||
-      hostname === "0.0.0.0" ||
-      hostname === "127.0.0.1" ||
-      hostname === "::1" ||
-      /^10\./.test(hostname) ||
-      /^192\.168\./.test(hostname) ||
-      /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname);
-    if (blockedHostname) {
-      return res.status(400).send("Invalid url hostname");
-    }
-
-    const hasImageFileExtension = /\.(?:ico|png|jpe?g|gif|webp|svg|avif)$/i.test(parsedUrl.pathname);
+    const hasImageFileExtension = /\.(?:ico|png|jpe?g|gif|webp|avif)$/i.test(parsedUrl.pathname);
     const fallbackUrls = hasImageFileExtension ? [] : [
       `${parsedUrl.origin}/favicon.ico`,
       `${parsedUrl.origin}/favicon.png`,
@@ -4467,28 +6362,21 @@ async function startServer() {
 
     for (const faviconUrl of faviconUrls) {
       try {
-        const response = await fetch(faviconUrl, {
+        const resource = await fetchBoundedPublicResource(faviconUrl, {
+          timeoutMs: 3000,
+          maxBytes: 1024 * 1024,
+          maxRedirects: 2,
           headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
-          },
-          signal: AbortSignal.timeout(2500)
+            'Accept': 'image/avif,image/webp,image/apng,image/png,image/jpeg,image/gif,image/x-icon,image/*;q=0.8'
+          }
         });
-        if (!response.ok) continue;
-
-        const contentType = response.headers.get('content-type') || '';
-        const contentLength = Number(response.headers.get('content-length') || 0);
-        const isImage = contentType.includes('image/') || contentType.includes('icon') || hasImageFileExtension;
-        if (!isImage || contentLength > 1024 * 1024) continue;
-
-        const arrayBuffer = await response.arrayBuffer();
-        if (arrayBuffer.byteLength > 1024 * 1024) continue;
-
-        if (contentType) {
-          res.setHeader('Content-Type', contentType);
-        }
+        if (resource.status < 200 || resource.status >= 300) continue;
+        const contentType = (resource.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        if (!/^image\/(?:png|jpe?g|gif|webp|avif|x-icon|vnd\.microsoft\.icon)$/.test(contentType)) continue;
+        res.setHeader('Content-Type', contentType);
         res.setHeader('Cache-Control', 'public, max-age=604800');
-        res.send(Buffer.from(arrayBuffer));
+        res.send(resource.body);
         return;
       } catch (error) {
         logger.debug({ err: error, module: "favicon-proxy", faviconUrl }, "Favicon candidate failed");
@@ -4531,7 +6419,8 @@ async function startServer() {
        FROM saved_cards sc
        LEFT JOIN saved_articles sa ON sa.id = sc.saved_article_id AND sa.user_id = sc.user_id
        WHERE sc.user_id = $1
-       ORDER BY sc.created_at DESC`,
+       ORDER BY sc.created_at DESC
+       LIMIT 500`,
       [req.session.userId]
     )).rows;
     res.json(rows.map(row => ({ ...row, sourceImages: normalizeJsonStringArray(row.sourceImages) })));
@@ -4539,6 +6428,12 @@ async function startServer() {
 
   // Add a new manual card
   app.post("/api/cards", requireAuth, asyncHandler(async (req, res) => {
+    const requestedSavedArticleId = req.body?.savedArticleId === undefined || req.body?.savedArticleId === null
+      ? null
+      : Number(req.body.savedArticleId);
+    if (requestedSavedArticleId !== null && (!Number.isSafeInteger(requestedSavedArticleId) || requestedSavedArticleId <= 0)) {
+      return res.status(400).json({ error: "无效的文章来源" });
+    }
     const newCard: AtomCard = {
       ...req.body,
       id: randomUUID(),
@@ -4547,22 +6442,27 @@ async function startServer() {
     if (!VALID_CARD_TYPES.has(newCard.type)) {
       return res.status(400).json({ error: '无效的卡片类型' });
     }
-    await pool.query(
+    const result = await pool.query(
       `INSERT INTO saved_cards (
          id, user_id, type, content, summary, original_quote, context,
          citation_note, evidence_role, tags, article_title, article_id,
          origin, saved_article_id, raw_card_meta
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+       WHERE $14::bigint IS NULL OR EXISTS (
+         SELECT 1 FROM saved_articles WHERE id = $14 AND user_id = $2
+       )
+       RETURNING id`,
       [
         newCard.id, req.session.userId, newCard.type, newCard.content,
         newCard.summary || null, newCard.originalQuote || null, newCard.context || null,
         newCard.citationNote || null, newCard.evidenceRole || null,
         JSON.stringify(newCard.tags || []), newCard.articleTitle, newCard.articleId || null,
-        req.body.origin || 'manual', req.body.savedArticleId || null,
+        req.body.origin || 'manual', requestedSavedArticleId,
         JSON.stringify({ createdBy: 'manual', createdAt: new Date().toISOString() })
       ]
     );
+    if (result.rowCount === 0) return res.status(404).json({ error: "文章来源不存在" });
     res.json(newCard);
   }));
 
@@ -4625,7 +6525,7 @@ async function startServer() {
               citation_context AS "citationContext",
               image_urls AS "sourceImages",
               published_at AS "publishedAt", saved_at AS "savedAt"
-       FROM saved_articles WHERE user_id = $1 ORDER BY saved_at DESC`,
+       FROM saved_articles WHERE user_id = $1 ORDER BY saved_at DESC LIMIT 500`,
       [req.session.userId]
     )).rows;
     res.json(rows.map(row => ({ ...row, sourceImages: normalizeJsonStringArray(row.sourceImages) })));
@@ -4647,8 +6547,26 @@ async function startServer() {
 
   // Translate article content (Baidu Translate API)
   // Supports both single string (content) and array of strings (segments) for paragraph-level translation
-  app.post("/api/translate", requireAuth, asyncHandler(async (req, res) => {
+  app.post("/api/translate", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const { content, segments, targetLang = 'zh' } = req.body;
+    const maxTranslationSegments = 50;
+    const maxTranslationCharacters = 50_000;
+
+    if (segments !== undefined && (!Array.isArray(segments) || segments.some(segment => typeof segment !== "string"))) {
+      return res.status(400).json({ error: "segments must be an array of strings" });
+    }
+    if (Array.isArray(segments) && segments.length > maxTranslationSegments) {
+      return res.status(413).json({ error: `最多支持 ${maxTranslationSegments} 个翻译段落` });
+    }
+    const translationCharacters = Array.isArray(segments)
+      ? segments.reduce((total, segment) => total + segment.length, 0)
+      : typeof content === "string" ? content.length : 0;
+    if (translationCharacters > maxTranslationCharacters) {
+      return res.status(413).json({ error: `单次翻译内容不能超过 ${maxTranslationCharacters} 个字符` });
+    }
+    if (!Array.isArray(segments) && content !== undefined && typeof content !== "string") {
+      return res.status(400).json({ error: "content must be a string" });
+    }
 
     const appid = process.env.BAIDU_TRANSLATE_APPID;
     const key = process.env.BAIDU_TRANSLATE_KEY;
@@ -4693,7 +6611,9 @@ async function startServer() {
       const salt = Date.now().toString() + Math.random();
       const sign = crypto.createHash('md5').update(appid + text + salt + key).digest('hex');
       const params = new URLSearchParams({ q: text, from: 'auto', to: toLang, appid, salt, sign });
-      const response = await fetch(`https://fanyi-api.baidu.com/api/trans/vip/translate?${params}`);
+      const response = await fetch(`https://fanyi-api.baidu.com/api/trans/vip/translate?${params}`, {
+        signal: AbortSignal.timeout(15_000),
+      });
       const data = await response.json() as any;
       if (data.error_code) throw new Error(`百度翻译错误 ${data.error_code}: ${data.error_msg}`);
       return (data.trans_result as Array<{ dst: string }>).map(r => r.dst).join('\n');
@@ -4795,6 +6715,790 @@ async function startServer() {
     res.json({ cards: matched.length >= 2 ? matched : cardRows.slice(0, 10) });
   }));
 
+  app.get("/api/write/canvas/projects", requireAuth, asyncHandler(async (req, res) => {
+    await ensureCanvasProject(pool, req.session.userId);
+    const rows = (await pool.query(
+      `SELECT id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"
+       FROM write_canvas_projects
+       WHERE user_id = $1
+       ORDER BY last_opened_at DESC
+       LIMIT $2`,
+      [req.session.userId, WRITE_CANVAS_MAX_PROJECTS_PER_USER]
+    )).rows.map(mapCanvasProjectRow);
+    res.json({ projects: rows });
+  }));
+
+  app.post("/api/write/canvas/projects", requireAuth, asyncHandler(async (req, res) => {
+    const name = typeof req.body?.name === "string" && req.body.name.trim()
+      ? req.body.name.trim().slice(0, 80)
+      : "新的魔法写作项目";
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const row = (await client.query(
+        `INSERT INTO write_canvas_projects (user_id, name)
+         SELECT $1, $2
+         WHERE (SELECT COUNT(*) FROM write_canvas_projects WHERE user_id = $1) < $3
+         RETURNING id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+        [req.session.userId, name, WRITE_CANVAS_MAX_PROJECTS_PER_USER]
+      )).rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "画布项目数量已达到上限" });
+      }
+      await client.query("COMMIT");
+      res.json({ project: mapCanvasProjectRow(row) });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.get("/api/write/canvas/projects/:id", requireAuth, asyncHandler(async (req, res) => {
+    const projectId = Number(req.params.id);
+    if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
+    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, projectId);
+    if (!detail) return res.status(404).json({ error: "project not found" });
+    res.json(detail);
+  }));
+
+  app.put("/api/write/canvas/projects/:id", requireAuth, asyncHandler(async (req, res) => {
+    const projectId = Number(req.params.id);
+    if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
+    const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 80) : null;
+    const viewport = isPlainRecord(req.body?.viewport) ? req.body.viewport : null;
+    const row = (await pool.query(
+      `UPDATE write_canvas_projects
+       SET name = COALESCE($1, name),
+           viewport = COALESCE($2, viewport),
+           updated_at = NOW(),
+           last_opened_at = NOW()
+       WHERE id = $3 AND user_id = $4
+       RETURNING id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+      [name || null, viewport ? JSON.stringify(viewport) : null, projectId, req.session.userId]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: "project not found" });
+    res.json({ project: mapCanvasProjectRow(row) });
+  }));
+
+  app.delete("/api/write/canvas/projects/:id", requireAuth, asyncHandler(async (req, res) => {
+    const projectId = Number(req.params.id);
+    if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const result = await client.query(
+        `DELETE FROM write_canvas_projects WHERE id = $1 AND user_id = $2`,
+        [projectId, req.session.userId]
+      );
+      if (result.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const remaining = (await client.query(
+        `SELECT id FROM write_canvas_projects WHERE user_id = $1 LIMIT 1`,
+        [req.session.userId]
+      )).rows[0];
+      if (!remaining) {
+        await client.query(
+          `INSERT INTO write_canvas_projects (user_id, name) VALUES ($1, '我的魔法写作项目')`,
+          [req.session.userId]
+        );
+      }
+      await client.query("COMMIT");
+      res.json({ success: true });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.post("/api/write/canvas/projects/:id/nodes", requireAuth, asyncHandler(async (req, res) => {
+    const projectId = Number(req.params.id);
+    const kind = normalizeCanvasNodeKind(req.body?.kind);
+    if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
+    if (!kind) return res.status(400).json({ error: "invalid node kind" });
+    const x = clampNumber(req.body?.x, 120, -100000, 100000);
+    const y = clampNumber(req.body?.y, 120, -100000, 100000);
+    const width = clampNumber(req.body?.width, kind === "agent" ? 360 : 280, 160, 1200);
+    const height = clampNumber(req.body?.height, kind === "agent" ? 260 : 180, 120, 1000);
+    const meta = normalizeJsonObject(req.body?.meta);
+    let title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 120) : "";
+    let summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 500) : "";
+    let refId: string | null = typeof req.body?.refId === "string" || typeof req.body?.refId === "number" ? String(req.body.refId) : null;
+    const hasAssetId = req.body?.assetId !== undefined && req.body?.assetId !== null && req.body?.assetId !== "";
+    const requestedAssetId = hasAssetId ? Number(req.body.assetId) : null;
+    let assetId: number | null = null;
+    let agentId: number | null = null;
+
+    if (hasAssetId && kind !== "asset_file" && kind !== "asset_image") {
+      return res.status(400).json({ error: "assetId is only valid for uploaded file or image nodes" });
+    }
+    if ((kind === "asset_file" || kind === "asset_image") && (!Number.isSafeInteger(requestedAssetId) || Number(requestedAssetId) <= 0)) {
+      return res.status(400).json({ error: "assetId is required for uploaded file or image nodes" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const fail = async (status: number, error: string) => {
+        await client.query("ROLLBACK");
+        return res.status(status).json({ error });
+      };
+      await lockCanvasUser(client, req.session.userId);
+      const project = (await client.query(
+        `SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [projectId, req.session.userId]
+      )).rows[0];
+      if (!project) return await fail(404, "project not found");
+      const nodeCount = Number((await client.query(
+        `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
+        [projectId, req.session.userId],
+      )).rows[0]?.count || 0);
+      if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) return await fail(413, "项目节点数量已达到上限");
+
+      if (kind === "agent") {
+      const defaults = getDefaultCanvasAgentConfig();
+      const templateId = Number.isFinite(Number(req.body?.templateId)) ? Number(req.body.templateId) : null;
+      const template = templateId
+        ? (await client.query(`SELECT * FROM write_agent_templates WHERE id = $1 AND user_id = $2`, [templateId, req.session.userId])).rows[0]
+        : null;
+      if (templateId && !template) return await fail(404, "template not found");
+      const agentName = title || template?.name || defaults.name;
+      const row = (await client.query(
+        `INSERT INTO write_agent_instances
+           (user_id, project_id, template_id, name, model, system_prompt, temperature, top_p, max_tokens)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id`,
+        [
+          req.session.userId,
+          projectId,
+          template?.id || null,
+          agentName,
+          req.body?.model || template?.model || defaults.model,
+          req.body?.systemPrompt || template?.system_prompt || defaults.systemPrompt,
+          clampNumber(req.body?.temperature ?? template?.temperature, defaults.temperature, 0, 2),
+          clampNumber(req.body?.topP ?? template?.top_p, defaults.topP, 0.01, 1),
+          Math.round(clampNumber(req.body?.maxTokens ?? template?.max_tokens, defaults.maxTokens, 128, 8000))
+        ]
+      )).rows[0];
+      agentId = Number(row.id);
+      refId = String(agentId);
+      title = agentName;
+      summary = summary || "连接资料后发送消息，只会使用已连接上下文。";
+      } else if (kind === "asset_text" || kind === "result") {
+      const content = typeof req.body?.content === "string" ? req.body.content.slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH) : "";
+      title = title || (kind === "result" ? "Agent 输出" : "粘贴文本");
+      const newAssetBytes = Buffer.byteLength(content, "utf8") * 2;
+      const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
+      if (storedBytes + newAssetBytes > canvasUserStorageMaxBytes) {
+        return await fail(413, "画布资料存储额度已用完，请删除旧资料后重试");
+      }
+      const asset = (await client.query(
+        `INSERT INTO write_canvas_assets (user_id, project_id, type, title, content_text, extracted_text, meta)
+         VALUES ($1, $2, 'text', $3, $4, $4, $5)
+         RETURNING id`,
+        [req.session.userId, projectId, title, content, JSON.stringify(meta)]
+      )).rows[0];
+      assetId = Number(asset.id);
+      summary = summary || normalizePlainText(content).slice(0, 180);
+      } else if (kind === "asset_file" || kind === "asset_image") {
+      assetId = Number(requestedAssetId);
+      const asset = (await client.query(
+        `SELECT id, title, extracted_text FROM write_canvas_assets
+         WHERE id = $1 AND user_id = $2 AND project_id = $3
+         FOR SHARE`,
+        [assetId, req.session.userId, projectId]
+      )).rows[0];
+      if (!asset) return await fail(404, "asset not found");
+      title = title || asset.title || "上传资料";
+      summary = summary || normalizePlainText(asset.extracted_text || "").slice(0, 180);
+      } else if (["saved_article", "atom_card", "note"].includes(kind)) {
+      const referenceId = Number(refId);
+      if (!Number.isSafeInteger(referenceId) || referenceId <= 0) return await fail(400, "valid refId is required");
+      const table = kind === "saved_article" ? "saved_articles" : kind === "atom_card" ? "saved_cards" : "notes";
+      const reference = (await client.query(
+        `SELECT id FROM ${table} WHERE id = $1 AND user_id = $2`,
+        [referenceId, req.session.userId]
+      )).rows[0];
+      if (!reference) return await fail(404, "referenced item not found");
+      refId = String(referenceId);
+      }
+
+      const nodeRow = (await client.query(
+      `INSERT INTO write_canvas_nodes
+         (user_id, project_id, kind, title, summary, ref_id, asset_id, agent_id, meta, x, y, width, height)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       RETURNING id`,
+      [
+        req.session.userId,
+        projectId,
+        kind,
+        title || "未命名节点",
+        summary,
+        refId,
+        assetId,
+        agentId,
+        JSON.stringify(meta),
+        x,
+        y,
+        width,
+        height
+      ]
+      )).rows[0];
+      await client.query("COMMIT");
+    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, projectId);
+    const node = detail?.nodes.find(item => item.id === Number(nodeRow.id));
+    res.json({ node });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.put("/api/write/canvas/nodes/:id", requireAuth, asyncHandler(async (req, res) => {
+    const nodeId = Number(req.params.id);
+    if (!Number.isFinite(nodeId)) return res.status(400).json({ error: "invalid node id" });
+    const current = (await pool.query(
+      `SELECT id, project_id, agent_id FROM write_canvas_nodes WHERE id = $1 AND user_id = $2`,
+      [nodeId, req.session.userId]
+    )).rows[0];
+    if (!current) return res.status(404).json({ error: "node not found" });
+    const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 120) : null;
+    const summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 500) : null;
+    const meta = isPlainRecord(req.body?.meta) ? req.body.meta : null;
+    await pool.query(
+      `UPDATE write_canvas_nodes
+       SET title = COALESCE($1, title),
+           summary = COALESCE($2, summary),
+           meta = COALESCE($3, meta),
+           x = COALESCE($4, x),
+           y = COALESCE($5, y),
+           width = COALESCE($6, width),
+           height = COALESCE($7, height),
+           updated_at = NOW()
+       WHERE id = $8 AND user_id = $9`,
+      [
+        title,
+        summary,
+        meta ? JSON.stringify(meta) : null,
+        req.body?.x === undefined ? null : clampNumber(req.body.x, 0, -100000, 100000),
+        req.body?.y === undefined ? null : clampNumber(req.body.y, 0, -100000, 100000),
+        req.body?.width === undefined ? null : clampNumber(req.body.width, 280, 160, 1200),
+        req.body?.height === undefined ? null : clampNumber(req.body.height, 180, 120, 1000),
+        nodeId,
+        req.session.userId
+      ]
+    );
+    if (current.agent_id) {
+      const defaults = getDefaultCanvasAgentConfig();
+      await pool.query(
+        `UPDATE write_agent_instances
+         SET name = COALESCE($1, name),
+             model = COALESCE($2, model),
+             system_prompt = COALESCE($3, system_prompt),
+             temperature = COALESCE($4, temperature),
+             top_p = COALESCE($5, top_p),
+             max_tokens = COALESCE($6, max_tokens),
+             updated_at = NOW()
+         WHERE id = $7 AND user_id = $8`,
+        [
+          title,
+          typeof req.body?.model === "string" && req.body.model.trim() ? normalizeAiModelName(req.body.model.trim()) : null,
+          typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : null,
+          req.body?.temperature === undefined ? null : clampNumber(req.body.temperature, defaults.temperature, 0, 2),
+          req.body?.topP === undefined ? null : clampNumber(req.body.topP, defaults.topP, 0.01, 1),
+          req.body?.maxTokens === undefined ? null : Math.round(clampNumber(req.body.maxTokens, defaults.maxTokens, 128, 8000)),
+          current.agent_id,
+          req.session.userId
+        ]
+      );
+    }
+    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, Number(current.project_id));
+    const node = detail?.nodes.find(item => item.id === nodeId);
+    res.json({ node });
+  }));
+
+  app.delete("/api/write/canvas/nodes/:id", requireAuth, asyncHandler(async (req, res) => {
+    const nodeId = Number(req.params.id);
+    if (!Number.isFinite(nodeId)) return res.status(400).json({ error: "invalid node id" });
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const current = (await client.query(
+        `SELECT id, agent_id, asset_id
+         FROM write_canvas_nodes
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [nodeId, req.session.userId]
+      )).rows[0];
+      if (!current) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "node not found" });
+      }
+      if (current.asset_id) {
+        await client.query(
+          `SELECT id FROM write_canvas_assets WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+          [current.asset_id, req.session.userId]
+        );
+      }
+
+      await client.query(
+        `DELETE FROM write_canvas_nodes WHERE id = $1 AND user_id = $2`,
+        [nodeId, req.session.userId]
+      );
+      if (current.agent_id) {
+        await client.query(
+          `DELETE FROM write_agent_instances ai
+           WHERE ai.id = $1 AND ai.user_id = $2
+             AND NOT EXISTS (
+               SELECT 1 FROM write_canvas_nodes n
+               WHERE n.agent_id = ai.id AND n.user_id = ai.user_id
+             )`,
+          [current.agent_id, req.session.userId]
+        );
+      }
+      if (current.asset_id) {
+        await client.query(
+          `DELETE FROM write_canvas_assets a
+           WHERE a.id = $1 AND a.user_id = $2
+             AND NOT EXISTS (
+               SELECT 1 FROM write_canvas_nodes n
+               WHERE n.asset_id = a.id AND n.user_id = a.user_id
+             )`,
+          [current.asset_id, req.session.userId]
+        );
+      }
+      await client.query("COMMIT");
+      res.json({ success: true });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.post("/api/write/canvas/edges", requireAuth, asyncHandler(async (req, res) => {
+    const projectId = Number(req.body?.projectId);
+    const sourceNodeId = Number(req.body?.sourceNodeId);
+    const targetNodeId = Number(req.body?.targetNodeId);
+    if (![projectId, sourceNodeId, targetNodeId].every(Number.isFinite)) {
+      return res.status(400).json({ error: "projectId, sourceNodeId and targetNodeId are required" });
+    }
+    if (sourceNodeId === targetNodeId) return res.status(400).json({ error: "cannot connect node to itself" });
+    const nodes = (await pool.query(
+      `SELECT id, kind FROM write_canvas_nodes
+       WHERE user_id = $1 AND project_id = $2 AND id = ANY($3::bigint[])`,
+      [req.session.userId, projectId, [sourceNodeId, targetNodeId]]
+    )).rows;
+    if (nodes.length !== 2) return res.status(404).json({ error: "nodes not found" });
+    const target = nodes.find(node => Number(node.id) === targetNodeId);
+    if (target?.kind !== "agent") return res.status(400).json({ error: "target node must be an agent" });
+    const row = (await pool.query(
+      `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+       VALUES ($1, $2, $3, $4, 'context')
+       ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO UPDATE SET relation = EXCLUDED.relation
+       RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                 target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+      [req.session.userId, projectId, sourceNodeId, targetNodeId]
+    )).rows[0];
+    res.json({ edge: mapCanvasEdgeRow(row) });
+  }));
+
+  app.delete("/api/write/canvas/edges", requireAuth, asyncHandler(async (req, res) => {
+    const edgeId = Number(req.body?.id || req.query.id);
+    const projectId = Number(req.body?.projectId);
+    const sourceNodeId = Number(req.body?.sourceNodeId);
+    const targetNodeId = Number(req.body?.targetNodeId);
+    let result: pg.QueryResult;
+    if (Number.isFinite(edgeId)) {
+      result = await pool.query(`DELETE FROM write_canvas_edges WHERE id = $1 AND user_id = $2`, [edgeId, req.session.userId]);
+    } else if ([projectId, sourceNodeId, targetNodeId].every(Number.isFinite)) {
+      result = await pool.query(
+        `DELETE FROM write_canvas_edges
+         WHERE user_id = $1 AND project_id = $2 AND source_node_id = $3 AND target_node_id = $4`,
+        [req.session.userId, projectId, sourceNodeId, targetNodeId]
+      );
+    } else {
+      return res.status(400).json({ error: "edge id or edge endpoints are required" });
+    }
+    res.json({ success: result.rowCount > 0 });
+  }));
+
+  app.post("/api/write/canvas/assets/upload", requireAuth, uploadLimiter, uploadConcurrencyMiddleware, canvasAssetUpload.single("file"), asyncHandler(async (req, res) => {
+    const projectId = Number(req.body?.projectId);
+    if (!Number.isFinite(projectId)) return res.status(400).json({ error: "projectId is required" });
+    if (!req.file) return res.status(400).json({ error: "file is required" });
+    if (!isAllowedUploadSignature(req.file.buffer, req.file.mimetype, req.file.originalname)) {
+      return res.status(400).json({ error: "文件内容与声明类型不匹配" });
+    }
+    if (
+      req.file.mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" &&
+      !(await validateDocxArchiveBounds(req.file.buffer).catch(() => false))
+    ) {
+      return res.status(400).json({ error: "Word 文件结构无效或解压后内容过大" });
+    }
+    const project = (await pool.query(`SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2`, [projectId, req.session.userId])).rows[0];
+    if (!project) return res.status(404).json({ error: "project not found" });
+    const isImage = req.file.mimetype.startsWith("image/");
+    const extractedText = isImage ? "" : await extractCanvasFileText(req.file).catch(error => {
+      logger.warn({ err: error, module: "canvas-upload", fileName: req.file?.originalname }, "Canvas file text extraction failed");
+      return "";
+    });
+    const title = (typeof req.body?.title === "string" && req.body.title.trim())
+      ? req.body.title.trim().slice(0, 120)
+      : req.file.originalname || "上传资料";
+    const dataUrl = isImage ? `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}` : null;
+    const assetType = isImage ? "image" : "file";
+    const client = await pool.connect();
+    let nodeId: number;
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const lockedProject = (await client.query(
+        `SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [projectId, req.session.userId]
+      )).rows[0];
+      if (!lockedProject) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const nodeCount = Number((await client.query(
+        `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
+        [projectId, req.session.userId],
+      )).rows[0]?.count || 0);
+      if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目节点数量已达到上限" });
+      }
+      const newAssetBytes = Buffer.byteLength(dataUrl || "", "utf8") + Buffer.byteLength(extractedText, "utf8");
+      const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
+      if (storedBytes + newAssetBytes > canvasUserStorageMaxBytes) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "画布资料存储额度已用完，请删除旧资料后重试" });
+      }
+      const assetRow = (await client.query(
+        `INSERT INTO write_canvas_assets
+           (user_id, project_id, type, title, content_text, extracted_text, file_name, mime_type, data_url, meta)
+         VALUES ($1, $2, $3, $4, '', $5, $6, $7, $8, $9)
+         RETURNING id`,
+        [
+          req.session.userId,
+          projectId,
+          assetType,
+          title,
+          extractedText,
+          req.file.originalname,
+          req.file.mimetype,
+          dataUrl,
+          JSON.stringify({ size: req.file.size })
+        ]
+      )).rows[0];
+      const nodeKind = isImage ? "asset_image" : "asset_file";
+      const nodeResponse = await client.query(
+        `INSERT INTO write_canvas_nodes
+           (user_id, project_id, kind, title, summary, asset_id, meta, x, y, width, height)
+         VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, $7, $8, $9, $10)
+         RETURNING id`,
+        [
+          req.session.userId,
+          projectId,
+          nodeKind,
+          title,
+          isImage ? "图片资料" : normalizePlainText(extractedText).slice(0, 180),
+          Number(assetRow.id),
+          clampNumber(req.body?.x, 180, -100000, 100000),
+          clampNumber(req.body?.y, 180, -100000, 100000),
+          isImage ? 280 : 300,
+          isImage ? 220 : 190
+        ]
+      );
+      nodeId = Number(nodeResponse.rows[0].id);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, projectId);
+    const node = detail?.nodes.find(item => item.id === nodeId);
+    res.json({ node });
+  }));
+
+  app.get("/api/write/agent/templates", requireAuth, asyncHandler(async (req, res) => {
+    const rows = (await pool.query(
+      `SELECT id, name, model, system_prompt AS "systemPrompt", temperature, top_p AS "topP",
+              max_tokens AS "maxTokens", created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM write_agent_templates
+       WHERE user_id = $1
+       ORDER BY updated_at DESC
+       LIMIT 100`,
+      [req.session.userId]
+    )).rows.map(mapAgentTemplateRow);
+    res.json({ templates: rows });
+  }));
+
+  app.post("/api/write/agent/templates", requireAuth, asyncHandler(async (req, res) => {
+    const defaults = getDefaultCanvasAgentConfig();
+    const name = typeof req.body?.name === "string" && req.body.name.trim() ? req.body.name.trim().slice(0, 60) : "写作 Agent 模板";
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const row = (await client.query(
+        `INSERT INTO write_agent_templates (user_id, name, model, system_prompt, temperature, top_p, max_tokens)
+         SELECT $1, $2, $3, $4, $5, $6, $7
+         WHERE (SELECT COUNT(*) FROM write_agent_templates WHERE user_id = $1) < 100
+         RETURNING id, name, model, system_prompt AS "systemPrompt", temperature, top_p AS "topP",
+                   max_tokens AS "maxTokens", created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [
+          req.session.userId,
+          name,
+          typeof req.body?.model === "string" && req.body.model.trim() ? normalizeAiModelName(req.body.model.trim()) : defaults.model,
+          typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : defaults.systemPrompt,
+          clampNumber(req.body?.temperature, defaults.temperature, 0, 2),
+          clampNumber(req.body?.topP, defaults.topP, 0.01, 1),
+          Math.round(clampNumber(req.body?.maxTokens, defaults.maxTokens, 128, 8000))
+        ]
+      )).rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "Agent 模板数量已达到上限" });
+      }
+      await client.query("COMMIT");
+      res.json({ template: mapAgentTemplateRow(row) });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.post("/api/write/canvas/agents/:id/chat/stream", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, canvasAgentConcurrencyMiddleware, asyncHandler(async (req, res) => {
+    const agentId = Number(req.params.id);
+    if (!Number.isFinite(agentId)) return res.status(400).json({ error: "invalid agent id" });
+    const message = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH) : "";
+    if (!message) return res.status(400).json({ error: "message is required" });
+    const agentRow = await getCanvasAgentNode(pool, req.session.userId, agentId);
+    if (!agentRow) return res.status(404).json({ error: "agent not found" });
+    if (!getOpenAIWriteAgentConfig()) {
+      return res.status(500).json({ error: "Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL" });
+    }
+
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
+    const send = (type: string, data: unknown) => {
+      res.write(`event: ${type}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    const runId = randomUUID();
+    const requestAbortController = new AbortController();
+    res.once("close", () => {
+      if (!res.writableFinished) requestAbortController.abort(new Error("Client disconnected"));
+    });
+    try {
+      send("partial_status", { runId, message: "读取画布连线上下文" });
+      const contexts = await resolveCanvasContextItems(pool, req.session.userId, Number(agentRow.node_id), Number(agentRow.project_id));
+      const previousMessages = (await pool.query(
+        `SELECT role, content
+         FROM write_canvas_agent_messages
+         WHERE user_id = $1 AND agent_id = $2
+         ORDER BY created_at DESC
+         LIMIT 10`,
+        [req.session.userId, agentId]
+      )).rows.reverse().filter(row => row.role === "user" || row.role === "assistant");
+      await pool.query(
+        `INSERT INTO write_canvas_agent_messages (user_id, agent_id, role, content, meta)
+         VALUES ($1, $2, 'user', $3, $4)`,
+        [req.session.userId, agentId, message, JSON.stringify({ runId })]
+      );
+      send("partial_status", { runId, message: `已连接 ${contexts.length} 个上下文节点` });
+      const completion = await requestCanvasAgentCompletion({
+        model: agentRow.model,
+        systemPrompt: agentRow.system_prompt,
+        message,
+        contexts,
+        previousMessages,
+        temperature: Number(agentRow.temperature),
+        topP: Number(agentRow.top_p),
+        maxTokens: Number(agentRow.max_tokens),
+        signal: requestAbortController.signal,
+      });
+      const assistantRow = (await pool.query(
+        `INSERT INTO write_canvas_agent_messages (user_id, agent_id, role, content, meta)
+         VALUES ($1, $2, 'assistant', $3, $4)
+         RETURNING id, agent_id AS "agentId", role, content, meta, created_at AS "createdAt"`,
+        [
+          req.session.userId,
+          agentId,
+          completion.content,
+          JSON.stringify({
+            runId,
+            model: completion.model,
+            provider: completion.provider,
+            contextNodeIds: contexts.map(item => item.nodeId),
+            usedImages: completion.usedImages
+          })
+        ]
+      )).rows[0];
+      await pool.query(
+        `DELETE FROM write_canvas_agent_messages
+         WHERE user_id = $1 AND agent_id = $2 AND id IN (
+           SELECT id FROM write_canvas_agent_messages
+           WHERE user_id = $1 AND agent_id = $2
+           ORDER BY created_at DESC, id DESC
+           OFFSET $3
+         )`,
+        [req.session.userId, agentId, WRITE_CANVAS_MAX_MESSAGES_PER_AGENT],
+      );
+      send("final", {
+        runId,
+        message: mapCanvasMessageRow(assistantRow),
+        context: {
+          nodes: contexts.map(item => ({ nodeId: item.nodeId, kind: item.kind, title: item.title })),
+          usedImages: completion.usedImages
+        }
+      });
+      res.end();
+    } catch (error) {
+      logger.error({ err: error, module: "canvas-agent", runId, agentId, userId: req.session.userId }, "Canvas agent failed");
+      if (!res.destroyed && !res.writableEnded) {
+        send("error", {
+          runId,
+          message: error instanceof Error && error.message ? error.message : "画布 Agent 暂时不可用"
+        });
+        res.end();
+      }
+    } finally {
+      if (typeof res.locals.releaseCanvasAgentConcurrency === "function") res.locals.releaseCanvasAgentConcurrency();
+      if (typeof res.locals.releasePaidConcurrency === "function") res.locals.releasePaidConcurrency();
+    }
+  }));
+
+  app.post("/api/write/canvas/agents/:id/save-result", requireAuth, asyncHandler(async (req, res) => {
+    const agentId = Number(req.params.id);
+    if (!Number.isFinite(agentId)) return res.status(400).json({ error: "invalid agent id" });
+    const agentRow = await getCanvasAgentNode(pool, req.session.userId, agentId);
+    if (!agentRow) return res.status(404).json({ error: "agent not found" });
+    let content = typeof req.body?.content === "string" ? req.body.content.trim() : "";
+    const messageId = Number(req.body?.messageId);
+    if (!content && Number.isFinite(messageId)) {
+      const messageRow = (await pool.query(
+        `SELECT content FROM write_canvas_agent_messages
+         WHERE id = $1 AND agent_id = $2 AND user_id = $3 AND role = 'assistant'`,
+        [messageId, agentId, req.session.userId]
+      )).rows[0];
+      content = messageRow?.content || "";
+    }
+    if (!content) return res.status(400).json({ error: "content or messageId is required" });
+    content = content.slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH);
+    const title = typeof req.body?.title === "string" && req.body.title.trim()
+      ? req.body.title.trim().slice(0, 120)
+      : "Agent 输出";
+    const client = await pool.connect();
+    let nodeId: number;
+    let edgeRow: Record<string, unknown>;
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const lockedProject = (await client.query(
+        `SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [Number(agentRow.project_id), req.session.userId],
+      )).rows[0];
+      if (!lockedProject) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const lockedAgent = (await client.query(
+        `SELECT n.id AS node_id, n.project_id
+         FROM write_agent_instances ai
+         JOIN write_canvas_nodes n ON n.agent_id = ai.id AND n.user_id = ai.user_id
+         WHERE ai.id = $1 AND ai.user_id = $2 AND n.kind = 'agent'
+         FOR SHARE OF ai, n`,
+        [agentId, req.session.userId]
+      )).rows[0];
+      if (!lockedAgent) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "agent not found" });
+      }
+      const nodeCount = Number((await client.query(
+        `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
+        [lockedAgent.project_id, req.session.userId],
+      )).rows[0]?.count || 0);
+      if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目节点数量已达到上限" });
+      }
+      const newAssetBytes = Buffer.byteLength(content, "utf8") * 2;
+      const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
+      if (storedBytes + newAssetBytes > canvasUserStorageMaxBytes) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "画布资料存储额度已用完，请删除旧资料后重试" });
+      }
+      const assetRow = (await client.query(
+        `INSERT INTO write_canvas_assets (user_id, project_id, type, title, content_text, extracted_text, meta)
+         VALUES ($1, $2, 'text', $3, $4, $4, $5)
+         RETURNING id`,
+        [req.session.userId, lockedAgent.project_id, title, content, JSON.stringify({ sourceAgentId: agentId, messageId: Number.isFinite(messageId) ? messageId : null })]
+      )).rows[0];
+      const nodeRow = (await client.query(
+        `INSERT INTO write_canvas_nodes
+           (user_id, project_id, kind, title, summary, asset_id, meta, x, y, width, height)
+         SELECT $1, n.project_id, 'result', $2, $3, $4, $5, n.x + 420, n.y + 40, 320, 220
+         FROM write_canvas_nodes n
+         WHERE n.id = $6 AND n.user_id = $1
+         RETURNING id`,
+        [
+          req.session.userId,
+          title,
+          normalizePlainText(content).slice(0, 180),
+          Number(assetRow.id),
+          JSON.stringify({ sourceAgentId: agentId, messageId: Number.isFinite(messageId) ? messageId : null }),
+          Number(lockedAgent.node_id)
+        ]
+      )).rows[0];
+      if (!nodeRow) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "agent node not found" });
+      }
+      nodeId = Number(nodeRow.id);
+      edgeRow = (await client.query(
+        `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+         VALUES ($1, $2, $3, $4, 'context')
+         ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO UPDATE SET relation = EXCLUDED.relation
+         RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                   target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+        [req.session.userId, lockedAgent.project_id, nodeId, Number(lockedAgent.node_id)]
+      )).rows[0];
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, Number(agentRow.project_id));
+    res.json({
+      node: detail?.nodes.find(item => item.id === nodeId),
+      edge: mapCanvasEdgeRow(edgeRow)
+    });
+  }));
+
   app.get("/api/write/agent/threads", requireAuth, asyncHandler(async (req, res) => {
     const threadType = req.query.type === 'skill' ? 'skill' : 'chat';
     const rows = (await pool.query(
@@ -4884,7 +7588,12 @@ async function startServer() {
 	  app.get("/api/write/agent/skills", requireAuth, asyncHandler(async (req, res) => {
 	    const type = normalizeAgentSkillType(req.query.type);
 	    const hasTypeFilter = typeof req.query.type === "string" && ["card_storage", "citation", "writing", "style"].includes(req.query.type);
-	    res.json({ skills: await fetchWriteAgentSkills(pool, req.session.userId, hasTypeFilter ? type : undefined) });
+	    const skills = await fetchWriteAgentSkills(pool, req.session.userId, hasTypeFilter ? type : undefined);
+	    res.json({
+	      skills,
+	      systemSkills: skills.filter(skill => skill.visibility === "system"),
+	      userSkills: skills.filter(skill => skill.visibility === "user")
+	    });
 	  }));
 
 	  app.post("/api/write/agent/skills", requireAuth, asyncHandler(async (req, res) => {
@@ -4982,7 +7691,7 @@ async function startServer() {
 	    res.json({ success: true });
 	  }));
 
-	  app.post("/api/write/agent/skills/generate", requireAuth, asyncHandler(async (req, res) => {
+	  app.post("/api/write/agent/skills/generate", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
 	    const { userInput, sampleText } = req.body;
 
 	    if (!userInput || typeof userInput !== "string" || userInput.trim().length < 5) {
@@ -5136,6 +7845,7 @@ async function startServer() {
   };
 
   const buildWriteAgentResponse = (graphState: WriteAgentGraphState) => ({
+    runId: graphState.toolPayload?.runId,
     threadId: Number(graphState.threadId),
     threadState: graphState.mergedState,
     assistant: {
@@ -5164,10 +7874,13 @@ async function startServer() {
     }
   });
 
-  app.post("/api/write/agent/chat/stream", requireAuth, asyncHandler(async (req, res) => {
+  app.post("/api/write/agent/chat/stream", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+    const runId = randomUUID();
     const parsed = buildWriteAgentRequest(req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
-    if (!getAiChatConfig()) return res.status(500).json({ error: 'AI service not configured' });
+    if (!getOpenAIWriteAgentConfig()) {
+      return res.status(500).json({ error: 'Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL' });
+    }
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -5180,396 +7893,71 @@ async function startServer() {
     };
 
     try {
-      send('partial_status', { message: '启动写作 Agent' });
-      const graphState = await runWriteAgentGraph(pool, {
+      send('partial_status', { runId, message: '启动写作 Agent' });
+      const graphState = await runOpenAIWriteAgentRuntime(pool, {
         userId: req.session.userId,
         threadId: parsed.threadId,
         message: parsed.normalizedMessage,
         isCreateArticle: parsed.isCreateArticle,
         userState: parsed.graphUserState,
+        runId,
         onStep: async event => {
           send(event.type, {
+            runId,
             node: event.node,
             message: event.message,
             ...(event.data && typeof event.data === 'object' ? event.data as Record<string, unknown> : { data: event.data })
           });
         }
       });
+      logger.info({
+        module: "write-agent-stream",
+        runId,
+        userId: req.session.userId,
+        threadId: graphState.threadId,
+        intent: graphState.intent?.intent,
+        requestedTools: graphState.requestedTools,
+        noteId: graphState.persistedDraftNote ? Number(graphState.persistedDraftNote.id) : undefined
+      }, "Streaming write agent completed");
       send('final', buildWriteAgentResponse(graphState));
       res.end();
     } catch (error) {
-      logger.error({ err: error, module: "write-agent-stream" }, "Streaming write agent failed");
+      logger.error({ err: error, module: "write-agent-stream", runId, userId: req.session.userId }, "Streaming write agent failed");
       send('error', {
+        runId,
         message: error instanceof Error && error.message ? error.message : '写作助手暂时不可用'
       });
       res.end();
     }
   }));
 
-  app.post("/api/write/agent/chat", requireAuth, asyncHandler(async (req, res) => {
-    const { threadId, message, focusedTopic, activatedNodeIds, activationSummary, action } = req.body || {};
-    const isCreateArticle = action === 'create_article';
-    if (!isCreateArticle && (!message || typeof message !== 'string' || !message.trim())) {
-      return res.status(400).json({ error: 'message is required' });
-    }
-    const normalizedMessage = isCreateArticle
-      ? (typeof message === 'string' && message.trim() ? message.trim() : '请根据当前对话和激活网络创建一篇文章')
-      : message.trim();
-
-    if (!getAiChatConfig()) {
-      return res.status(500).json({ error: 'AI service not configured' });
+  app.post("/api/write/agent/chat", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+    const runId = randomUUID();
+    const parsed = buildWriteAgentRequest(req.body);
+    if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+    if (!getOpenAIWriteAgentConfig()) {
+      return res.status(500).json({ error: 'Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL' });
     }
 
-    const graphUserState: WriteAgentState = {
-      focusedTopic: typeof focusedTopic === 'string' ? focusedTopic : undefined,
-      activatedNodeIds: Array.isArray(activatedNodeIds) ? activatedNodeIds.filter((id): id is string => typeof id === 'string') : undefined,
-      activationSummary: Array.isArray(activationSummary) ? activationSummary.filter((item): item is string => typeof item === 'string') : undefined,
-	      selectedStyleSkillId: typeof req.body?.selectedStyleSkillId === 'string' || typeof req.body?.selectedStyleSkillId === 'number'
-	        ? req.body.selectedStyleSkillId
-	        : undefined,
-	      selectedSkillIds: Array.isArray(req.body?.selectedSkillIds)
-	        ? req.body.selectedSkillIds.filter((id): id is number | string => typeof id === 'string' || typeof id === 'number')
-	        : undefined,
-	      writingGoal: typeof req.body?.writingGoal === 'string' ? req.body.writingGoal : undefined,
-      selectedCardIds: Array.isArray(req.body?.selectedCardIds) ? req.body.selectedCardIds.filter((id): id is string => typeof id === 'string') : undefined
-    };
-
-    const graphState = await runWriteAgentGraph(pool, {
+    const graphState = await runOpenAIWriteAgentRuntime(pool, {
       userId: req.session.userId,
-      threadId: threadId ? Number(threadId) : undefined,
-      message: normalizedMessage,
-      isCreateArticle,
-      userState: graphUserState
+      threadId: parsed.threadId,
+      message: parsed.normalizedMessage,
+      isCreateArticle: parsed.isCreateArticle,
+      userState: parsed.graphUserState,
+      runId
     });
 
-    return res.json({
-      threadId: Number(graphState.threadId),
-      threadState: graphState.mergedState,
-      assistant: {
-        role: 'assistant',
-        content: graphState.assistantContent
-      },
-      assistantMessage: graphState.assistantContent,
-      toolResult: graphState.toolPayload,
-      uiBlocks: graphState.uiBlocks || [],
-      choices: graphState.choices || [],
-      sources: graphState.sources,
-      graphTrace: graphState.graphTrace || [],
-      note: graphState.persistedDraftNote
-        ? {
-          id: Number(graphState.persistedDraftNote.id),
-          title: graphState.persistedDraftNote.title,
-          created_at: graphState.persistedDraftNote.created_at,
-          updated_at: graphState.persistedDraftNote.updated_at
-        }
-        : null,
-      noteCreated: Boolean(graphState.persistedDraftNote),
-      context: {
-        activeCards: graphState.activeCards?.length || 0,
-        recalledCards: graphState.recalledCards?.length || 0
-      }
-    });
-
-    let thread = threadId
-      ? (await pool.query(
-        `SELECT id, title, summary, state, thread_type, created_at, updated_at
-         FROM write_agent_threads
-         WHERE id = $1 AND user_id = $2`,
-        [threadId, req.session.userId]
-      )).rows[0]
-      : null;
-
-    if (!thread) {
-      thread = (await pool.query(
-        `INSERT INTO write_agent_threads (user_id, title, state, thread_type)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, title, summary, state, thread_type, created_at, updated_at`,
-        [req.session.userId, inferThreadTitle(normalizedMessage), JSON.stringify({}), 'chat']
-      )).rows[0];
-    }
-
-    const normalizedThreadId = Number(thread.id);
-    const userState: WriteAgentState = {
-      focusedTopic: typeof focusedTopic === 'string' ? focusedTopic : undefined,
-      activatedNodeIds: Array.isArray(activatedNodeIds) ? activatedNodeIds.filter((id): id is string => typeof id === 'string') : undefined,
-      activationSummary: Array.isArray(activationSummary) ? activationSummary.filter((item): item is string => typeof item === 'string') : undefined
-    };
-
-    await pool.query(
-      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
-       VALUES ($1, 'user', $2, $3)`,
-      [normalizedThreadId, normalizedMessage, JSON.stringify({ state: userState, action: isCreateArticle ? 'create_article' : undefined })]
-    );
-
-    const dbCards = await fetchUserSavedCards(pool, req.session.userId);
-
-    const previousMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
-    const threadState = (thread.state || {}) as WriteAgentState;
-    const mergedState: WriteAgentState = {
-      focusedTopic: userState.focusedTopic || threadState.focusedTopic,
-      activatedNodeIds: userState.activatedNodeIds || threadState.activatedNodeIds || [],
-      activationSummary: userState.activationSummary || threadState.activationSummary || [],
-      latestOutline: Array.isArray(threadState.latestOutline) ? threadState.latestOutline : [],
-      latestAngle: typeof threadState.latestAngle === 'string' ? threadState.latestAngle : undefined,
-      lastGeneratedNoteId: threadState.lastGeneratedNoteId,
-      lastGeneratedNoteTitle: typeof threadState.lastGeneratedNoteTitle === 'string' ? threadState.lastGeneratedNoteTitle : undefined
-    };
-
-    const activeCardRows = toolGetActiveNetwork(dbCards, mergedState.activatedNodeIds || []);
-    const intentPrompt = `你是 AtomFlow 写作助手的路由器。请判断用户这句最新输入最需要哪些工具。
-
-可选工具：
-- recall_cards：当用户在找主题、补素材、想激活节点时
-- get_active_network：当用户在问当前网络、当前节点、围绕当前激活内容展开时
-- list_recent_notes：当用户提到最近文章、之前草稿、继续改写时
-- generate_outline：当用户要提纲、结构、章节安排时
-- generate_draft：当用户明确要生成、写正文、出草稿时
-- just_chat：当用户只是在对话、讨论、闲聊、提问、思考方向时，不需要任何工具
-
-严格输出 JSON：
-{
-  "tools": ["tool_a", "tool_b"],
-  "reason": "一句简短理由"
-}
-
-注意：大部分日常对话应该返回 ["just_chat"]，只有明确涉及上述操作才使用对应工具。`;
-
-    if (!getAiChatConfig()) {
-      return res.status(500).json({ error: 'AI service not configured' });
-    }
-
-    const requestChat = async (messages: AiChatMessage[], temperature: number, maxTokens: number) => {
-      return requestAiChatCompletion(messages, {
-        temperature,
-        maxTokens,
-        timeoutMs: AI_REQUEST_TIMEOUT_MS,
-        logLabel: "write_agent",
-        disableThinking: true
-      });
-    };
-
-    let rawIntent = '';
-    let parsedIntent: { tools?: string[]; reason?: string } | null = null;
-    let requestedTools: string[] = [];
-
-    if (isCreateArticle) {
-      requestedTools = ['recall_cards', 'generate_outline', 'generate_draft'];
-      parsedIntent = { tools: requestedTools, reason: 'user explicitly requested create_article' };
-    } else {
-      rawIntent = await requestChat([
-        { role: 'system', content: intentPrompt },
-        { role: 'user', content: `当前状态：topic=${mergedState.focusedTopic || '无'}; activeNodes=${(mergedState.activatedNodeIds || []).length}; latestMessage=${normalizedMessage}` }
-      ], 0.1, 300);
-      parsedIntent = safeJsonParse<{ tools?: string[]; reason?: string }>(rawIntent);
-      requestedTools = Array.isArray(parsedIntent?.tools)
-        ? parsedIntent!.tools.filter(tool => ['recall_cards', 'get_active_network', 'list_recent_notes', 'generate_outline', 'generate_draft', 'just_chat'].includes(tool))
-        : [];
-      // If just_chat or no real tools, clear the tool list so we skip all tool pipelines
-      if (requestedTools.length === 0 || (requestedTools.length === 1 && requestedTools[0] === 'just_chat')) {
-        requestedTools = [];
-      }
-      if (
-        requestedTools.length === 0 &&
-        /(知识库|素材|节点|卡片|原文|引用|来源|基于|围绕|总结|提炼|写|文章|草稿|选题|观点|证据)/.test(normalizedMessage)
-      ) {
-        requestedTools = ['recall_cards'];
-        parsedIntent = {
-          ...(parsedIntent || {}),
-          tools: requestedTools,
-          reason: 'message refers to knowledge-base material'
-        };
-      }
-    }
-
-    const recalledCards = requestedTools.includes('recall_cards')
-      ? toolRecallCards(`${normalizedMessage} ${mergedState.focusedTopic || ''}`, dbCards, activeCardRows.map(card => card.id))
-      : [];
-
-    const recentNotes = requestedTools.includes('list_recent_notes') || requestedTools.includes('generate_draft')
-      ? await toolListRecentNotes(pool, req.session.userId, 4)
-      : [];
-
-    const systemPrompt = `你是 AtomFlow 的写作助手 Agent。你不是普通闲聊助手，而是帮助用户围绕知识库、激活网络和文章草稿持续推进写作。
-
-你的行为规则：
-1. 先结合线程上下文、当前状态、激活网络，再回答。
-2. 如果用户在讨论写作方向、提纲、段落、改写，优先围绕写作任务推进，不跑题。
-3. 回答要短、具体、可执行，不说空话。
-4. 如果当前激活网络不足以支撑结论，要明确指出还缺什么。
-5. 你可以引用”当前激活节点””补充召回节点””最近文章草稿”，但不要伪造来源。
-6. 如果工具结果里已经包含提纲或草稿，就优先基于它们回答。
-7. 除非用户明确要求长文，否则默认回答简洁。
-8. 当引用知识节点时，用「来自《文章标题》」或节点编号标注来源，不要笼统地说”根据资料”。
-9. 如果已生成文章草稿，在回复中简要说明引用了哪些节点和原文。
-10. 回答和写作都要优先使用“文章背景、卡片语境、原文摘录、引用建议”，不要只看节点摘要。`;
-
-    let generatedOutlineText = '';
-    let generatedDraftText = '';
-    let generatedPlan: WritingPlanResult | null = null;
-    let persistedDraftNote: any = null;
-    const shouldGenerateDraft = isCreateArticle || requestedTools.includes('generate_draft');
-    const shouldGenerateOutline = isCreateArticle || requestedTools.includes('generate_outline') || shouldGenerateDraft;
-    if (shouldGenerateOutline) {
-      const cardsForWriting = sanitizeWritingCards(activeCardRows.length > 0 ? activeCardRows : recalledCards);
-      if (cardsForWriting.length > 0) {
-        const topicForWriting = mergedState.focusedTopic || normalizedMessage;
-        const planRaw = await requestChat([
-          { role: 'system', content: WRITING_PLAN_SYSTEM_PROMPT },
-          { role: 'user', content: buildWritingPlanPrompt(topicForWriting, cardsForWriting, sanitizeWritingCards(recalledCards)) }
-        ], 0.25, 1200);
-        generatedPlan = sanitizeWritingPlan(safeJsonParse<WritingPlanResult>(planRaw), topicForWriting);
-        generatedOutlineText = generatedPlan.outline.map(item => `- ${item.heading}：${item.goal}`).join('\n');
-
-        if (shouldGenerateDraft) {
-          const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
-          generatedDraftText = await requestChat([
-            { role: 'system', content: WRITING_AGENT_SYSTEM_PROMPT },
-            { role: 'user', content: buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards), evidenceMap) }
-          ], 0.38, 1800);
-
-          if (generatedDraftText.trim()) {
-            const activationSummaryForNote = (mergedState.activationSummary || []).length > 0
-              ? (mergedState.activationSummary || [])
-              : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
-            const sourceArticles = buildSourceArticlesFromCards(cardsForWriting, dbCards);
-            persistedDraftNote = await createAgentDraftNote(pool, req.session.userId, {
-              title: generatedPlan.title,
-              content: generatedDraftText.trim(),
-              topic: topicForWriting,
-              style: generatedPlan.style,
-              outline: generatedPlan.outline,
-              evidenceMap,
-              activeCards: cardsForWriting,
-              activationSummary: activationSummaryForNote,
-              sourceArticles
-            });
-          }
-        }
-      } else if (isCreateArticle) {
-        return res.status(400).json({ error: '知识库中没有可用的卡片，请先收藏一些文章并提取知识卡片' });
-      }
-    }
-
-    const toolPayload = {
-      requestedTools,
-      reason: parsedIntent?.reason || '',
-      activeCardIds: activeCardRows.map(card => card.id),
-      recalledCardIds: recalledCards.map(card => card.id),
-      outline: generatedPlan?.outline || [],
-      draftPreview: generatedDraftText.slice(0, 400),
-      noteId: persistedDraftNote ? Number(persistedDraftNote.id) : undefined,
-      noteTitle: persistedDraftNote?.title,
-      noteSaved: Boolean(persistedDraftNote),
-      noteTopic: mergedState.focusedTopic || normalizedMessage
-    };
-
-    if (requestedTools.length > 0) {
-      await pool.query(
-        `INSERT INTO write_agent_messages (thread_id, role, content, meta)
-         VALUES ($1, 'tool', $2, $3)`,
-        [
-          normalizedThreadId,
-          [
-            `tools: ${requestedTools.join(', ')}`,
-            generatedOutlineText ? `outline:\n${generatedOutlineText}` : '',
-            generatedDraftText ? `draft:\n${generatedDraftText.slice(0, 600)}` : ''
-          ].filter(Boolean).join('\n\n'),
-          JSON.stringify(toolPayload)
-        ]
-      );
-    }
-
-    const userContextPrompt = `当前线程摘要：
-${typeof thread.summary === 'string' && thread.summary.trim() ? thread.summary : '暂无摘要'}
-
-当前状态：
-- focusedTopic: ${mergedState.focusedTopic || '无'}
-- activatedNodeIds: ${(mergedState.activatedNodeIds || []).join('、') || '无'}
-- activationSummary: ${(mergedState.activationSummary || []).join(' | ') || '无'}
-
-当前激活节点：
-${activeCardRows.length > 0 ? sanitizeWritingCards(activeCardRows).map((card, index) => formatCardForWriting(card, index)).join('\n\n') : '无'}
-
-补充召回节点：
-${recalledCards.length > 0 ? sanitizeWritingCards(recalledCards).map((card, index) => formatCardForWriting(card, index)).join('\n\n') : '无'}
-
-最近文章草稿：
-${recentNotes.length > 0 ? recentNotes.map((note, index) => `${index + 1}. ${note.title}\n${normalizePlainText(note.content).slice(0, 180)}`).join('\n\n') : '无'}
-
-工具路由：
-- selectedTools: ${requestedTools.join('、') || '无'}
-- toolReason: ${parsedIntent?.reason || '无'}
-
-提纲工具结果：
-${generatedOutlineText || '无'}
-
-正文工具结果：
-${generatedDraftText ? generatedDraftText.slice(0, 5000) : '无'}
-
-用户最新消息：
-${normalizedMessage}`;
-
-    const assistantContent = isCreateArticle && persistedDraftNote
-      ? [
-        `已基于当前激活网络创建文章《${persistedDraftNote.title || generatedPlan?.title || '未命名文章'}》。`,
-        '',
-        `这次使用了 ${activeCardRows.length || sanitizeWritingCards(recalledCards).length} 个知识节点，来源文章 ${buildSourceArticlesFromCards(sanitizeWritingCards(activeCardRows.length > 0 ? activeCardRows : recalledCards), dbCards).length} 篇。`,
-        generatedPlan?.angle ? `核心判断：${generatedPlan.angle}` : '',
-        '你可以在「我的文章」里继续编辑；知识节点、原文摘录和引用映射已经写入文章元信息。'
-      ].filter(Boolean).join('\n')
-      : await requestChat([
-        { role: 'system', content: systemPrompt },
-        ...previousMessages
-          .filter((item): item is typeof item & { role: 'user' | 'assistant' } => item.role === 'user' || item.role === 'assistant')
-          .map(item => ({ role: item.role, content: item.content }))
-          .slice(-10),
-        { role: 'user', content: userContextPrompt }
-      ], 0.55, 1200);
-    if (!assistantContent) {
-      return res.status(500).json({ error: 'agent returned empty message' });
-    }
-
-    await pool.query(
-      `INSERT INTO write_agent_messages (thread_id, role, content, meta)
-       VALUES ($1, 'assistant', $2, $3)`,
-      [normalizedThreadId, assistantContent, JSON.stringify(toolPayload)]
-    );
-
-    const nextState: WriteAgentState = {
-      ...mergedState,
-      latestOutline: generatedPlan?.outline || mergedState.latestOutline || [],
-      latestAngle: generatedPlan?.angle || mergedState.latestAngle,
-      lastGeneratedNoteId: persistedDraftNote ? Number(persistedDraftNote.id) : mergedState.lastGeneratedNoteId,
-      lastGeneratedNoteTitle: persistedDraftNote?.title || mergedState.lastGeneratedNoteTitle
-    };
-
-    const finalMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
-    const summary = summarizeAgentMessages(finalMessages.map(item => ({ role: item.role, content: item.content })));
-    await upsertThreadState(pool, normalizedThreadId, summary, nextState, thread.title || inferThreadTitle(normalizedMessage));
-
-    res.json({
-      threadId: normalizedThreadId,
-      threadState: nextState,
-      assistant: {
-        role: 'assistant',
-        content: assistantContent
-      },
-      assistantMessage: assistantContent,
-      toolResult: toolPayload,
-      note: persistedDraftNote
-        ? {
-          id: Number(persistedDraftNote.id),
-          title: persistedDraftNote.title,
-          created_at: persistedDraftNote.created_at,
-          updated_at: persistedDraftNote.updated_at
-        }
-        : null,
-      noteCreated: Boolean(persistedDraftNote),
-      context: {
-        activeCards: activeCardRows.length,
-        recalledCards: recalledCards.length
-      }
-    });
+    logger.info({
+      module: "write-agent",
+      runId,
+      userId: req.session.userId,
+      threadId: graphState.threadId,
+      intent: graphState.intent?.intent,
+      requestedTools: graphState.requestedTools,
+      noteId: graphState.persistedDraftNote ? Number(graphState.persistedDraftNote.id) : undefined
+    }, "Write agent completed");
+    return res.json(buildWriteAgentResponse(graphState));
   }));
 
   // Vite middleware for development
@@ -5586,6 +7974,22 @@ ${normalizedMessage}`;
   app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (res.headersSent) {
       next(err);
+      return;
+    }
+    if (err instanceof multer.MulterError) {
+      const payloadTooLarge = err.code === "LIMIT_FILE_SIZE" || err.code === "LIMIT_FIELD_VALUE";
+      res.status(payloadTooLarge ? 413 : 400).json({
+        error: payloadTooLarge ? "上传内容超过大小限制" : "上传请求格式不合法",
+      });
+      return;
+    }
+    const errorRecord = isPlainRecord(err) ? err : {};
+    if (errorRecord.type === "entity.too.large") {
+      res.status(413).json({ error: "请求内容超过大小限制" });
+      return;
+    }
+    if (err instanceof SyntaxError && errorRecord.type === "entity.parse.failed") {
+      res.status(400).json({ error: "JSON 请求格式不合法" });
       return;
     }
     logger.error({
@@ -5680,12 +8084,96 @@ ${normalizedMessage}`;
     return null;
   }
 
-  const wss = new WebSocketServer({ server: httpServer, path: "/api/asr" });
+  const asrMaxFrameBytes = readBoundedEnvNumber(process.env.ASR_MAX_FRAME_KB, 256, 32, 1024) * 1024;
+  const asrMaxPendingBytes = readBoundedEnvNumber(process.env.ASR_MAX_PENDING_MB, 2, 1, 8) * 1024 * 1024;
+  const asrMaxSessionMs = readBoundedEnvNumber(process.env.ASR_MAX_SESSION_SECONDS, 600, 30, 1800) * 1000;
+  const asrMaxConnectionsPerUser = readBoundedEnvNumber(process.env.ASR_MAX_CONNECTIONS_PER_USER, 2, 1, 5);
+  const asrMaxGlobalConnections = readBoundedEnvNumber(process.env.ASR_MAX_GLOBAL_CONNECTIONS, 20, 2, 200);
+  const asrMaxSessionAudioBytes = readBoundedEnvNumber(process.env.ASR_MAX_SESSION_AUDIO_MB, 25, 5, 200) * 1024 * 1024;
+  const asrMaxBytesPerSecond = readBoundedEnvNumber(process.env.ASR_MAX_BYTES_PER_SECOND, 1024 * 1024, 64 * 1024, 4 * 1024 * 1024);
+  const asrMaxUpstreamBufferedBytes = readBoundedEnvNumber(process.env.ASR_MAX_UPSTREAM_BUFFER_MB, 1, 1, 8) * 1024 * 1024;
+  const asrConnectionsByUser = new Map<number, number>();
+  let asrGlobalConnections = 0;
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: asrMaxFrameBytes,
+    perMessageDeflate: false,
+  });
 
-  wss.on("connection", (clientWs) => {
+  const rejectUpgrade = (socket: import("node:stream").Duplex, status: 401 | 403 | 404 | 429, message: string) => {
+    socket.write(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    socket.destroy();
+  };
+
+  httpServer.on("upgrade", (upgradeRequest, socket, head) => {
+    let pathname = "";
+    try {
+      pathname = new URL(upgradeRequest.url || "/", "http://localhost").pathname;
+    } catch {
+      socket.destroy();
+      return;
+    }
+    if (pathname !== "/api/asr") {
+      if (isProduction) rejectUpgrade(socket, 404, "Not Found");
+      return;
+    }
+
+    const origin = upgradeRequest.headers.origin;
+    if (isProduction) {
+      try {
+        if (!origin || !allowedOrigins.has(new URL(origin).origin)) {
+          rejectUpgrade(socket, 403, "Forbidden");
+          return;
+        }
+      } catch {
+        rejectUpgrade(socket, 403, "Forbidden");
+        return;
+      }
+    }
+
+    const upgradeResponse = new ServerResponse(upgradeRequest);
+    sessionMiddleware(upgradeRequest as express.Request, upgradeResponse as unknown as express.Response, () => {
+      const userId = (upgradeRequest as express.Request).session?.userId;
+      if (!userId) {
+        rejectUpgrade(socket, 401, "Unauthorized");
+        return;
+      }
+      if ((asrConnectionsByUser.get(userId) || 0) >= asrMaxConnectionsPerUser) {
+        rejectUpgrade(socket, 429, "Too Many Requests");
+        return;
+      }
+      if (asrGlobalConnections >= asrMaxGlobalConnections) {
+        rejectUpgrade(socket, 429, "Too Many Requests");
+        return;
+      }
+      wss.handleUpgrade(upgradeRequest, socket, head, clientWs => {
+        wss.emit("connection", clientWs, upgradeRequest);
+      });
+    });
+  });
+
+  wss.on("connection", (clientWs, request) => {
+    const userId = (request as express.Request).session?.userId;
+    if (!userId) {
+      clientWs.close(1008, "Authentication required");
+      return;
+    }
+    asrConnectionsByUser.set(userId, (asrConnectionsByUser.get(userId) || 0) + 1);
+    asrGlobalConnections += 1;
+    let connectionReleased = false;
+    const releaseConnection = () => {
+      if (connectionReleased) return;
+      connectionReleased = true;
+      const remaining = (asrConnectionsByUser.get(userId) || 1) - 1;
+      if (remaining <= 0) asrConnectionsByUser.delete(userId);
+      else asrConnectionsByUser.set(userId, remaining);
+      asrGlobalConnections = Math.max(0, asrGlobalConnections - 1);
+    };
+
     if (!ASR_APPID || !ASR_TOKEN) {
       clientWs.send(JSON.stringify({ error: "ASR credentials not configured" }));
-      clientWs.close();
+      clientWs.close(1011, "ASR unavailable");
+      releaseConnection();
       return;
     }
 
@@ -5693,14 +8181,39 @@ ${normalizedMessage}`;
     let upstreamWs: WsWebSocket | null = null;
     let upstreamReady = false;
     const pendingAudio: Buffer[] = [];
+    let pendingAudioBytes = 0;
+    let totalAudioBytes = 0;
+    let rateWindowStartedAt = Date.now();
+    let rateWindowBytes = 0;
+    const safeClientSend = (payload: unknown) => {
+      if (clientWs.readyState === WsWebSocket.OPEN) clientWs.send(JSON.stringify(payload));
+    };
+    const closeUpstream = () => {
+      if (!upstreamWs) return;
+      try {
+        if (upstreamWs.readyState === WsWebSocket.OPEN) upstreamWs.send(buildAudioRequest(Buffer.alloc(0), true));
+        if (upstreamWs.readyState === WsWebSocket.OPEN || upstreamWs.readyState === WsWebSocket.CONNECTING) upstreamWs.close();
+      } catch {
+        upstreamWs.terminate();
+      }
+      upstreamWs = null;
+      upstreamReady = false;
+    };
+    const asrSessionTimeout = setTimeout(() => {
+      safeClientSend({ error: "ASR session reached its maximum duration" });
+      clientWs.close(1000, "Session limit reached");
+      closeUpstream();
+    }, asrMaxSessionMs);
 
     const upstream = new WsWebSocket(ASR_WS_URL, {
       headers: { Authorization: `Bearer; ${ASR_TOKEN}` },
+      handshakeTimeout: 10000,
+      maxPayload: asrMaxFrameBytes,
+      perMessageDeflate: false,
     });
+    upstreamWs = upstream;
 
     upstream.on("open", () => {
-      upstreamWs = upstream;
-      // Send full client request
       upstream.send(buildFullClientRequest(reqid));
     });
 
@@ -5712,65 +8225,130 @@ ${normalizedMessage}`;
       if (parsed.code === 1000) {
         if (!upstreamReady) {
           upstreamReady = true;
-          // Flush pending audio
-          for (const chunk of pendingAudio) {
-            upstream.send(buildAudioRequest(chunk, false));
-          }
+          for (const chunk of pendingAudio) upstream.send(buildAudioRequest(chunk, false));
           pendingAudio.length = 0;
+          pendingAudioBytes = 0;
         }
-        // Send transcript to client
-        if (parsed.text !== undefined) {
-          clientWs.send(JSON.stringify({ text: parsed.text, utterances: parsed.utterances }));
-        }
+        if (parsed.text !== undefined) safeClientSend({ text: parsed.text, utterances: parsed.utterances });
       } else {
-        clientWs.send(JSON.stringify({ error: `ASR error code: ${parsed.code}` }));
+        safeClientSend({ error: `ASR error code: ${parsed.code}` });
       }
     });
 
     upstream.on("error", (err) => {
-      logger.error({ err, module: "asr" }, "ASR upstream error");
-      clientWs.send(JSON.stringify({ error: "ASR connection error" }));
+      logger.error({ err, module: "asr", userId }, "ASR upstream error");
+      safeClientSend({ error: "ASR connection error" });
     });
 
-    upstream.on("close", () => {
+    upstream.on("close", (code) => {
+      const wasCurrentUpstream = upstreamWs === upstream;
       upstreamWs = null;
       upstreamReady = false;
+      if (wasCurrentUpstream && clientWs.readyState === WsWebSocket.OPEN) {
+        if (code !== 1000) safeClientSend({ error: "ASR upstream connection closed" });
+        clientWs.close(code === 1000 ? 1000 : 1011, code === 1000 ? "ASR session ended" : "ASR upstream unavailable");
+      }
     });
 
-    clientWs.on("message", (rawData) => {
+    clientWs.on("message", (rawData, isBinary) => {
       const data = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData as ArrayBuffer);
-
-      // Check if it's a text control message
-      if (typeof rawData === "string") {
+      if (!isBinary) {
         try {
-          const msg = JSON.parse(rawData);
-          if (msg.type === "stop") {
-            // Send last audio packet (empty)
-            if (upstreamWs && upstreamWs.readyState === WsWebSocket.OPEN) {
-              upstreamWs.send(buildAudioRequest(Buffer.alloc(0), true));
-            }
+          const message = JSON.parse(data.toString("utf8"));
+          if (message.type === "stop") {
+            if (upstreamWs?.readyState === WsWebSocket.OPEN) upstreamWs.send(buildAudioRequest(Buffer.alloc(0), true));
             return;
           }
-        } catch { /* not JSON, treat as binary */ }
+          clientWs.close(1003, "Unsupported control message");
+          return;
+        } catch {
+          clientWs.close(1003, "Invalid control message");
+          return;
+        }
       }
 
-      // Binary audio data
-      if (upstreamReady && upstreamWs && upstreamWs.readyState === WsWebSocket.OPEN) {
+      const now = Date.now();
+      if (now - rateWindowStartedAt >= 1000) {
+        rateWindowStartedAt = now;
+        rateWindowBytes = 0;
+      }
+      rateWindowBytes += data.byteLength;
+      totalAudioBytes += data.byteLength;
+      if (rateWindowBytes > asrMaxBytesPerSecond) {
+        safeClientSend({ error: "ASR audio rate limit exceeded" });
+        clientWs.close(1008, "Audio rate limit exceeded");
+        closeUpstream();
+        return;
+      }
+      if (totalAudioBytes > asrMaxSessionAudioBytes) {
+        safeClientSend({ error: "ASR session audio limit exceeded" });
+        clientWs.close(1009, "Session audio limit exceeded");
+        closeUpstream();
+        return;
+      }
+
+      if (upstreamReady && upstreamWs?.readyState === WsWebSocket.OPEN) {
+        if (upstreamWs.bufferedAmount > asrMaxUpstreamBufferedBytes) {
+          safeClientSend({ error: "ASR upstream queue limit exceeded" });
+          clientWs.close(1013, "ASR upstream is busy");
+          closeUpstream();
+          return;
+        }
         upstreamWs.send(buildAudioRequest(data, false));
-      } else {
-        pendingAudio.push(data);
+        return;
       }
+      if (pendingAudioBytes + data.byteLength > asrMaxPendingBytes) {
+        safeClientSend({ error: "ASR pending audio limit exceeded" });
+        clientWs.close(1009, "Pending audio limit exceeded");
+        closeUpstream();
+        return;
+      }
+      pendingAudio.push(data);
+      pendingAudioBytes += data.byteLength;
     });
 
-    clientWs.on("close", () => {
-      if (upstreamWs && upstreamWs.readyState === WsWebSocket.OPEN) {
-        try {
-          upstreamWs.send(buildAudioRequest(Buffer.alloc(0), true));
-        } catch { /* ignore */ }
-        upstreamWs.close();
+    const cleanup = () => {
+      clearTimeout(asrSessionTimeout);
+      pendingAudio.length = 0;
+      pendingAudioBytes = 0;
+      closeUpstream();
+      releaseConnection();
+    };
+    clientWs.once("close", cleanup);
+    clientWs.once("error", cleanup);
+  });
+
+  let shuttingDown = false;
+  const shutdown = (signal: "SIGTERM" | "SIGINT") => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info({ module: "server", signal }, "Graceful shutdown started");
+    clearInterval(feedRefreshTimer);
+    for (const client of wss.clients) client.close(1012, "Server restarting");
+
+    const forceExitTimer = setTimeout(() => {
+      logger.error({ module: "server", signal }, "Graceful shutdown timed out");
+      httpServer.closeAllConnections();
+      process.exit(1);
+    }, 15000);
+    forceExitTimer.unref();
+
+    httpServer.close(async error => {
+      try {
+        await pool?.end();
+      } catch (poolError) {
+        logger.error({ err: poolError, module: "db" }, "Failed to close PostgreSQL pool");
+        error ||= poolError instanceof Error ? poolError : new Error("Failed to close PostgreSQL pool");
+      } finally {
+        clearTimeout(forceExitTimer);
+        if (error) logger.error({ err: error, module: "server" }, "Graceful shutdown completed with errors");
+        else logger.info({ module: "server" }, "Graceful shutdown completed");
+        process.exit(error ? 1 : 0);
       }
     });
-  });
+  };
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => shutdown("SIGINT"));
 
   httpServer.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {

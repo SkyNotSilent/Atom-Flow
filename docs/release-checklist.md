@@ -15,7 +15,7 @@
 ## 3. 文档更新
 - 更新 `CHANGELOG.md`
 - 更新 `README.md` 的版本亮点
-- 如有流程变更，更新 `docs/README_INTERNAL.md`
+- 如有流程变更，更新公开架构和部署文档
 
 ## 4. Git 操作
 - 创建发布分支（如需）：`release/vX.Y.Z`

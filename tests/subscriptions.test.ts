@@ -3,22 +3,31 @@
  *
  * Prerequisites:
  *   - Server running at http://localhost:1000
- *   - A test user account already created (set TEST_EMAIL / TEST_PASSWORD env vars,
- *     or defaults below are used)
+ *   - A test user account configured through TEST_EMAIL / TEST_PASSWORD
  *
  * Run:
  *   npx tsx tests/subscriptions.test.ts
  */
 
+import { lookup } from 'node:dns/promises';
+
 const BASE = process.env.API_BASE ?? 'http://localhost:1000';
-const EMAIL = process.env.TEST_EMAIL ?? 'test@example.com';
-const PASSWORD = process.env.TEST_PASSWORD ?? 'test123456';
+const EMAIL = process.env.TEST_EMAIL?.trim();
+const PASSWORD = process.env.TEST_PASSWORD;
+if (!EMAIL || !PASSWORD) throw new Error('Set TEST_EMAIL and TEST_PASSWORD before running subscription integration tests');
 
 // A real public RSS feed for testing (no RSSHub required)
 const TEST_SOURCE_NAME = '__test_atomflow_sub__';
 const TEST_RSS_URL = 'https://github.blog/feed/';
 
 let cookie = '';
+let remoteFetchSkipReason = '';
+
+class SkippedTest extends Error {}
+
+function skipIfRemoteFetchUnavailable() {
+  if (remoteFetchSkipReason) throw new SkippedTest(remoteFetchSkipReason);
+}
 
 async function req(
   method: string,
@@ -50,7 +59,7 @@ function assert(condition: boolean, msg: string) {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 async function testLogin() {
-  const r = await req('POST', '/api/auth/login', { email: EMAIL, password: PASSWORD });
+  const r = await req('POST', '/api/auth/login-password', { email: EMAIL, password: PASSWORD });
   assert(r.status === 200, `login should return 200, got ${r.status}`);
   assert((r.body as any)?.user?.email === EMAIL, 'login response should contain user');
   console.log('  ✓ login');
@@ -74,12 +83,21 @@ async function testAddCustomSubscription() {
     input: TEST_RSS_URL,
     color: '#123456'
   });
+  if (r.status === 502) {
+    const hostname = new URL(TEST_RSS_URL).hostname;
+    const addresses = await lookup(hostname, { all: true, verbatim: true });
+    if (addresses.length > 0 && addresses.every(({ address }) => /^198\.(18|19)\./.test(address))) {
+      remoteFetchSkipReason = '本机网络把公网 DNS 映射到 198.18.0.0/15，安全 SSRF 规则按预期拒绝了测试源';
+      throw new SkippedTest(remoteFetchSkipReason);
+    }
+  }
   assert(r.status === 200, `POST /api/sources/fetch should return 200, got ${r.status}: ${JSON.stringify(r.body)}`);
   assert((r.body as any)?.success === true, 'fetch response should have success:true');
   console.log(`  ✓ POST /api/sources/fetch (added ${(r.body as any).added} articles)`);
 }
 
 async function testSubscriptionPersisted() {
+  skipIfRemoteFetchUnavailable();
   const r = await req('GET', '/api/subscriptions');
   assert(r.status === 200, `GET /api/subscriptions should return 200, got ${r.status}`);
   const subs = r.body as any[];
@@ -91,6 +109,7 @@ async function testSubscriptionPersisted() {
 }
 
 async function testArticlesIncludeUserSource() {
+  skipIfRemoteFetchUnavailable();
   const r = await req('GET', '/api/articles');
   assert(r.status === 200, `GET /api/articles should return 200, got ${r.status}`);
   const articles = r.body as any[];
@@ -100,6 +119,7 @@ async function testArticlesIncludeUserSource() {
 }
 
 async function testRenameSubscription() {
+  skipIfRemoteFetchUnavailable();
   const newName = TEST_SOURCE_NAME + '_renamed';
   const r = await req('PATCH', '/api/sources/rename', { from: TEST_SOURCE_NAME, to: newName });
   assert(r.status === 200, `PATCH /api/sources/rename should return 200, got ${r.status}: ${JSON.stringify(r.body)}`);
@@ -167,6 +187,7 @@ async function run() {
 
   let passed = 0;
   let failed = 0;
+  let skipped = 0;
 
   console.log('\n=== Subscription Persistence Tests ===\n');
 
@@ -176,13 +197,18 @@ async function run() {
       await fn();
       passed++;
     } catch (err: any) {
+      if (err instanceof SkippedTest) {
+        console.log(`  - SKIP: ${err.message}`);
+        skipped++;
+        continue;
+      }
       console.error(`  ✗ ${err.message}`);
       failed++;
     }
   }
 
   console.log(`\n${'─'.repeat(40)}`);
-  console.log(`Results: ${passed} passed, ${failed} failed`);
+  console.log(`Results: ${passed} passed, ${skipped} skipped, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }
 

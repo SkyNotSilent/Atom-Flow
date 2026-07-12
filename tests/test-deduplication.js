@@ -30,10 +30,12 @@ function generateContentHash(title, source, excerpt) {
 
 async function testDeduplication() {
   console.log('=== Testing Knowledge Base Deduplication ===\n');
+  const testEmail = process.env.TEST_EMAIL?.trim();
+  if (!testEmail) throw new Error('Set TEST_EMAIL before running the deduplication integration test');
 
   try {
     // Get test user
-    const userResult = await pool.query('SELECT id FROM users WHERE email = $1', ['test@atomflow.local']);
+    const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [testEmail]);
     if (userResult.rows.length === 0) {
       console.log('❌ Test user not found');
       return;

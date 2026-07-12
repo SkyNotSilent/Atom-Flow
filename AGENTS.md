@@ -13,10 +13,10 @@ AtomFlow 是一个前后端一体化的知识工作台，把内容消费流程�
 - Frontend: React 18 + Vite + TypeScript + Tailwind (class-based)
 - Backend: Express (same process as frontend dev server) + RSS Parser + Readability + JSDOM
 - Database: PostgreSQL (via `pg` pool, no ORM); optional pgvector for future semantic search
-- AI: OpenAI-compatible API (MiMo Token Plan) for card extraction and writing Chat assistant
+- AI: OpenAI-compatible API (MiMo Token Plan) for card extraction and default writing Agent model; OpenAI Agents SDK for writing Agent runtime
 - Auth: express-session + bcrypt
 - Email: Resend API / Gmail SMTP
-- Runtime: Node.js 18+
+- Runtime: Node.js 22+
 - Deployment: Railway (Nixpacks) + GitHub auto-deploy
 
 ## Key Paths
@@ -84,6 +84,8 @@ AtomFlow 是一个前后端一体化的知识工作台，把内容消费流程�
 | `AI_API_KEY` | Yes | OpenAI-compatible API key for card extraction |
 | `AI_BASE_URL` | Yes | API base URL (e.g. https://token-plan-sgp.xiaomimimo.com/v1) |
 | `AI_MODEL` | Yes | Model name (e.g. mimo-v2.5-pro) |
+| `OPENAI_API_KEY` | Optional | Official OpenAI API key override for the writing Agent runtime |
+| `OPENAI_MODEL` | Optional | Official OpenAI model override for the writing Agent runtime |
 | `DISABLE_AI_FALLBACK` | Optional | Set `true` to fail saves when AI extraction fails, used to verify real AI atomization |
 | `RESEND_API_KEY` | Optional | Resend email API |
 | `SMTP_USER` / `SMTP_PASS` | Optional | Gmail SMTP (alternative to Resend) |
@@ -104,6 +106,9 @@ AI_API_KEY=...
 AI_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
 AI_MODEL=mimo-v2.5-pro
 NODE_ENV=production
+APP_URL=https://your-domain.example
+ALLOWED_ORIGINS=https://your-domain.example
+VITE_TLDRAW_LICENSE_KEY=...
 ```
 
 - Optional Railway variables:
@@ -120,14 +125,31 @@ VOLCENGINE_ASR_TOKEN=...
 VOLCENGINE_ASR_CLUSTER=volcengine_streaming_common
 ```
 
-## AI Extraction And Chat
+## Production Security And Scale
 
-Knowledge atomization and the writing Chat assistant must use the same OpenAI-compatible configuration:
+- Production deploys use GitHub auto-deploy to Railway. Merge only after the GitHub checks pass, and **Wait for CI** before treating a change as deployable.
+- Set `SESSION_SECRET` to a minimum of 32 random characters in production. Never use the example value or commit secrets.
+- Set `APP_URL` to the canonical public HTTPS URL and configure `ALLOWED_ORIGINS` to the exact browser origins that may call the app.
+- Railway must use `healthcheckPath: /api/health` with an explicit `healthcheckTimeout`; a deployment is not healthy until that check passes.
+- `VITE_TLDRAW_LICENSE_KEY` is a production build variable. Without it, the magic-writing canvas is intentionally disabled.
+- Local and in-memory limits are development safeguards only. They do not provide shared enforcement across Railway replicas and must not be treated as production-grade rate limiting or coordination.
+- Keep Railway at one web replica until global RSS state, rate limits and job coordination move to shared storage. Public launch gates: Cloudflare/WAF, Redis, object storage, a background queue, monitoring/alerting and verified database backups. Add 2+ replicas only after those shared-state migrations and a load test.
+
+## AI Extraction And Writing Agent
+
+Knowledge atomization uses the OpenAI-compatible MiMo Token Plan configuration:
 
 ```env
 AI_API_KEY
 AI_BASE_URL
 AI_MODEL
+```
+
+The writing Agent runtime uses the OpenAI Agents SDK. By default it reuses the MiMo OpenAI-compatible configuration above through `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL`. To force official OpenAI instead, set:
+
+```env
+OPENAI_API_KEY
+OPENAI_MODEL
 ```
 
 The backend calls:
@@ -147,22 +169,12 @@ DISABLE_AI_FALLBACK=true
 
 When enabled, AI extraction failure makes `/api/articles/:id/save` return `502` instead of creating rule-based fallback cards. Use this for local debugging or temporary staging checks; do not enable in production unless saves should fail when the AI provider is unavailable.
 
-## Local Test Account
+## Local Integration Test Account
 
-专用测试账号（直接账号密码登录，无需 OTP 验证）：
-
-```text
-邮箱: test@atomflow.local
-昵称: 测试用户
-密码: test123456
-```
-
-**使用场景**：本地开发测试、快速登录验证功能
-
-**登录方式**：
-- 使用 `/api/auth/login-password` 接口
-- 直接输入邮箱和密码即可登录
-- 不需要发送验证码或 OTP 流程
+- Real API tests read `TEST_EMAIL` and `TEST_PASSWORD` from the local shell or an uncommitted environment file.
+- Never commit, document, or add fallback values for test-account credentials.
+- The account must exist only in the intended local or isolated test database, never as a shared production backdoor.
+- Local application URL remains `http://localhost:1000`.
 
 ## Save To Knowledge Flow
 

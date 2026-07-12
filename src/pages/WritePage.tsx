@@ -14,10 +14,12 @@ import {
 import { cn } from '../components/Nav';
 import { AlertCircle, Check, CheckCircle2, ChevronDown, Copy, Edit3, FileText, Image as ImageIcon, Loader2, MoreHorizontal, Palette, Plus, RotateCcw, Tag, ThumbsDown, ThumbsUp, Trash2, Volume2, Wand2, X, ZoomIn, ZoomOut } from 'lucide-react';
 import { NotesPanel } from '../components/NotesPanel';
+import { MagicWritingCanvas } from './MagicWritingCanvas';
 import { AtomFlowGalaxyIcon } from '../components/AtomFlowGalaxyIcon';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { prepareAgentDraftForNote } from '../utils/agentDraftExport';
+import { getWriteAgentRunPhase, parseWriteAgentSseChunk } from '../utils/writeAgentRun';
 
 type GraphArticle = {
   id: string;
@@ -1389,30 +1391,33 @@ export const WritePage: React.FC = () => {
     let finalPayload: any = null;
 
     const handleEvent = async (raw: string) => {
-      const eventLine = raw.split('\n').find(line => line.startsWith('event:'));
-      const dataLines = raw.split('\n').filter(line => line.startsWith('data:'));
-      if (!eventLine || dataLines.length === 0) return;
-      const event = eventLine.replace(/^event:\s*/, '').trim();
-      const payloadText = dataLines.map(line => line.replace(/^data:\s*/, '')).join('\n');
-      const payload = payloadText ? JSON.parse(payloadText) : {};
+      const parsed = parseWriteAgentSseChunk(raw);
+      if (!parsed) return;
+      const { event, payload } = parsed;
 
       if (event === 'partial_status') {
-        setAgentRunState(prev => prev ? { ...prev, message: payload.message || prev.message } : prev);
+        setAgentRunState(prev => prev ? { ...prev, message: `正在思考 · ${getWriteAgentRunPhase(String(payload.node || ''), String(payload.message || ''))}` } : prev);
         return;
       }
       if (event === 'step_start') {
-        upsertAgentRunStep(payload.node || 'agent', {
-          label: getAgentStepCopy(payload.node || 'agent'),
+        const node = String(payload.node || 'agent');
+        const phase = getWriteAgentRunPhase(node, String(payload.message || ''));
+        upsertAgentRunStep(node, {
+          label: phase,
           status: 'running'
         });
+        setAgentRunState(prev => prev ? { ...prev, message: `正在思考 · ${phase}` } : prev);
         return;
       }
       if (event === 'step_end') {
-        upsertAgentRunStep(payload.node || 'agent', {
-          label: getAgentStepCopy(payload.node || 'agent'),
+        const node = String(payload.node || 'agent');
+        const phase = getWriteAgentRunPhase(node, String(payload.message || ''));
+        upsertAgentRunStep(node, {
+          label: phase,
           status: 'done',
-          durationMs: payload.durationMs
+          durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : undefined
         });
+        setAgentRunState(prev => prev ? { ...prev, message: `正在思考 · ${phase}` } : prev);
         return;
       }
       if (event === 'activation') {
@@ -1432,7 +1437,7 @@ export const WritePage: React.FC = () => {
         return;
       }
       if (event === 'error') {
-        throw new Error(payload.message || '写作助手暂时不可用');
+        throw new Error(typeof payload.message === 'string' ? payload.message : '写作助手暂时不可用');
       }
     };
 
@@ -2235,24 +2240,17 @@ export const WritePage: React.FC = () => {
 
   const renderAgentRunPanel = () => {
     if (!agentRun) return null;
-    const doneCount = agentRun.steps.filter(step => step.status === 'done').length;
     const isError = agentRun.status === 'error';
     return (
       <div className="self-start w-full max-w-[94%] text-[12px] text-text3">
-        <button
-          onClick={() => setAgentRunState(prev => prev ? { ...prev, collapsed: !prev.collapsed } : prev)}
-          className="inline-flex items-center gap-2 rounded-full px-1 py-1 text-text3 transition-colors hover:text-text-main"
-        >
+        <div className="inline-flex items-center gap-2 rounded-full px-1 py-1 text-text3">
           {isError ? (
             <AlertCircle size={13} className="text-[#C75050]" />
           ) : (
             <Loader2 size={13} className="animate-spin text-text3" />
           )}
           <span>{isError ? '思考中断' : agentRun.message || '正在思考'}</span>
-          {doneCount > 0 ? <span>· {doneCount} 步</span> : null}
-          <ChevronDown size={12} className={cn('transition-transform', agentRun.collapsed ? '-rotate-90' : '')} />
-        </button>
-        {!agentRun.collapsed ? renderRunSteps(agentRun) : null}
+        </div>
       </div>
     );
   };
@@ -2261,18 +2259,12 @@ export const WritePage: React.FC = () => {
     const run = message.meta?.run as AgentRunState | undefined;
     if (!run) return null;
     const doneCount = run.steps.filter(step => step.status === 'done').length;
-    const isExpanded = run.collapsed === false;
     return (
       <div className="mt-2 text-[11px] text-text3">
-        <button
-          onClick={() => updateAssistantMessageMeta(message.id, { run: { ...run, collapsed: !run.collapsed } })}
-          className="inline-flex items-center gap-1.5 rounded-full px-1 py-1 text-text3 transition-colors hover:text-text-main"
-        >
+        <div className="inline-flex items-center gap-1.5 rounded-full px-1 py-1 text-text3">
           <span>{run.status === 'error' ? '思考中断' : '已完成思考'}</span>
           <span>· {doneCount} 步</span>
-          <ChevronDown size={12} className={cn('transition-transform', !isExpanded ? '-rotate-90' : '')} />
-        </button>
-        {isExpanded ? renderRunSteps(run) : null}
+        </div>
       </div>
     );
   };
@@ -2863,6 +2855,7 @@ export const WritePage: React.FC = () => {
     return renderSkillsWorkspace();
   }
 
+  if (import.meta.env.VITE_LEGACY_WRITE_WORKSPACE === 'true') {
 	  return (
     <div className="flex h-full min-h-0 gap-4 bg-bg">
       <div id="page-write" className="flex h-full min-h-0 flex-1 flex-col overflow-hidden rounded-[30px] border border-[#E7DAC0] bg-[#FBF7EF] shadow-[0_20px_48px_rgba(150,120,78,0.1)]">
@@ -3351,4 +3344,7 @@ export const WritePage: React.FC = () => {
       {renderAssistantAside()}
     </div>
   );
+  }
+
+  return <MagicWritingCanvas />;
 };

@@ -11,5 +11,7 @@ export const OFFICIAL_SOURCE_ICON_URLS: Record<string, string> = {
   'Andrej Karpathy': '/source-icons/youtube.png',
   '数字生命卡兹克': '/source-icons/bestblogs.ico',
   '新智元': '/source-icons/xzy.png',
-  'GitHub Blog': '/source-icons/github.svg'
+  'GitHub Blog': '/source-icons/github.svg',
+  'AI HOT 精选': 'https://aihot.virxact.com/icon.png',
+  'AI HOT 全部': 'https://aihot.virxact.com/icon.png'
 };

@@ -5,15 +5,16 @@
  *
  * Prerequisites:
  *   - Server running at http://localhost:1000
- *   - A test user account (set TEST_EMAIL / TEST_PASSWORD env vars, or defaults below)
+ *   - A test user account configured through TEST_EMAIL / TEST_PASSWORD
  *
  * Run:
  *   npx tsx tests/save-to-knowledge.test.ts
  */
 
 const BASE = process.env.API_BASE ?? 'http://localhost:1000';
-const EMAIL = process.env.TEST_EMAIL ?? 'test@atomflow.local';
-const PASSWORD = process.env.TEST_PASSWORD ?? 'test123456';
+const EMAIL = process.env.TEST_EMAIL?.trim();
+const PASSWORD = process.env.TEST_PASSWORD;
+if (!EMAIL || !PASSWORD) throw new Error('Set TEST_EMAIL and TEST_PASSWORD before running save-to-knowledge integration tests');
 
 let cookie = '';
 
