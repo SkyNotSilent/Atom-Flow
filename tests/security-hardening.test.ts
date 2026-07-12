@@ -237,6 +237,7 @@ assert.match(securitySource, /requestPinnedPublicResource/, "Remote fetches must
 assert.match(securitySource, /lookup,[\s\S]{0,100}servername: parsed\.hostname/, "Pinned HTTP requests must preserve TLS hostname validation");
 
 const railway = readFileSync(path.join(root, "railway.json"), "utf8");
+const railwayConfig = JSON.parse(railway) as { deploy?: { drainingSeconds?: unknown } };
 const dockerfile = readFileSync(path.join(root, "Dockerfile"), "utf8");
 const nixpacks = readFileSync(path.join(root, "nixpacks.toml"), "utf8");
 const envExample = readFileSync(path.join(root, ".env.example"), "utf8");
@@ -245,7 +246,7 @@ const claudeDoc = readFileSync(path.join(root, "CLAUDE.md"), "utf8");
 const deploymentDoc = readFileSync(path.join(root, "DEPLOYMENT.md"), "utf8");
 assert.match(railway, /"healthcheckPath"\s*:\s*"\/api\/health"/, "Railway must gate deployments on health");
 assert.match(railway, /"healthcheckTimeout"\s*:/, "Railway healthcheck timeout must be explicit");
-assert.match(railway, /"drainingSeconds"\s*:\s*"20"/, "Railway must preserve enough time for graceful shutdown");
+assert.equal(railwayConfig.deploy?.drainingSeconds, 20, "Railway must preserve enough time for graceful shutdown");
 assert.match(dockerfile, /FROM node:22-alpine/, "Docker runtime must match the documented Node.js 22 requirement");
 assert.match(dockerfile, /ENV NODE_ENV=production/, "Docker production mode must be explicit");
 assert.match(dockerfile, /npm ci --include=dev/, "Docker build must install the Vite and tsx toolchain");
