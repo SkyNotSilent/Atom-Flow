@@ -8,5 +8,17 @@ coverage/
 !.env.example
 .cache/
 .claude/settings.local.json
+.claude/worktrees/
+.playwright-mcp/
+docs/superpowers/
+docs/write-agent-skills-redesign.md
+docs/README_INTERNAL.md
+output/
+IMPLEMENTATION_SUMMARY.md
+TEST_REPORT.md
+TEST_SKILL_GENERATION.md
+THREAD_IMPROVEMENTS.md
+plan-check.sh
+test-thread-improvements.sh
 tmp_*.json
 articles.json

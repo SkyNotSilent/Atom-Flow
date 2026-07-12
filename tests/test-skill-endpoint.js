@@ -77,7 +77,7 @@ const testEndpoint = async () => {
   console.log('   - Authentication required: ✅');
   console.log('\n💡 To test full functionality:');
   console.log(`   1. Open browser: ${baseUrl}`);
-  console.log('   2. Login with test@atomflow.local');
+  console.log('   2. Login with the account configured in TEST_EMAIL');
   console.log('   3. Go to Write page → Skills 助手');
   console.log('   4. Enter: "像产品经理面试复盘，必须讲机制和取舍"');
   console.log('   5. Verify AI generates a proper skill draft');

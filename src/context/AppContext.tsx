@@ -105,7 +105,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [selectedStyleSkillId, setSelectedStyleSkillId] = useState<number | string>('system-columnist');
   const [selectedSkillIds, setSelectedSkillIds] = useState<Array<number | string>>(['system-card-storage', 'system-citation', 'system-writing', 'system-columnist']);
   const syncTimerRef = useRef<number | null>(null);
-  const quickOpenMode = true;
+  const quickOpenMode = false;
   const forceRefetchInTesting = false;
   const saveStages = ['提取全文', '识别要点', '原子化拆分', '提炼入库'];
 

@@ -21,8 +21,9 @@ assert.match(types, /effectiveSkillSnapshots\?:/, "WriteAgentToolResult should t
 
 if (process.env.RUN_REAL_WRITE_AGENT_TESTS === "true") {
   const base = process.env.API_BASE || "http://localhost:1000";
-  const email = process.env.TEST_EMAIL || "test@atomflow.local";
-  const password = process.env.TEST_PASSWORD || "test123456";
+  const email = process.env.TEST_EMAIL?.trim();
+  const password = process.env.TEST_PASSWORD;
+  assert.ok(email && password, "set TEST_EMAIL and TEST_PASSWORD for real write Agent tests");
   let cookie = "";
 
   const request = async (method: string, route: string, body?: unknown) => {

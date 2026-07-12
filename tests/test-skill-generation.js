@@ -5,6 +5,8 @@
 
 const testSkillGeneration = async () => {
   const baseUrl = process.env.API_BASE || 'http://localhost:1000';
+  const testEmail = process.env.TEST_EMAIL?.trim();
+  if (!testEmail) throw new Error('Set TEST_EMAIL before running the skill generation integration test');
 
   console.log('🧪 Testing AI-powered skill generation...\n');
 
@@ -13,7 +15,7 @@ const testSkillGeneration = async () => {
   const loginRes = await fetch(`${baseUrl}/api/auth/request-code`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: 'test@atomflow.local' })
+    body: JSON.stringify({ email: testEmail })
   });
 
   if (!loginRes.ok) {

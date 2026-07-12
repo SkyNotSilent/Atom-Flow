@@ -106,6 +106,9 @@ AI_API_KEY=...
 AI_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
 AI_MODEL=mimo-v2.5-pro
 NODE_ENV=production
+APP_URL=https://your-domain.example
+ALLOWED_ORIGINS=https://your-domain.example
+VITE_TLDRAW_LICENSE_KEY=...
 ```
 
 - Optional Railway variables:
@@ -121,6 +124,16 @@ VOLCENGINE_ASR_APPID=...
 VOLCENGINE_ASR_TOKEN=...
 VOLCENGINE_ASR_CLUSTER=volcengine_streaming_common
 ```
+
+## Production Security And Scale
+
+- Production deploys use GitHub auto-deploy to Railway. Merge only after the GitHub checks pass, and **Wait for CI** before treating a change as deployable.
+- Set `SESSION_SECRET` to a minimum of 32 random characters in production. Never use the example value or commit secrets.
+- Set `APP_URL` to the canonical public HTTPS URL and configure `ALLOWED_ORIGINS` to the exact browser origins that may call the app.
+- Railway must use `healthcheckPath: /api/health` with an explicit `healthcheckTimeout`; a deployment is not healthy until that check passes.
+- `VITE_TLDRAW_LICENSE_KEY` is a production build variable. Without it, the magic-writing canvas is intentionally disabled.
+- Local and in-memory limits are development safeguards only. They do not provide shared enforcement across Railway replicas and must not be treated as production-grade rate limiting or coordination.
+- Keep Railway at one web replica until global RSS state, rate limits and job coordination move to shared storage. Public launch gates: Cloudflare/WAF, Redis, object storage, a background queue, monitoring/alerting and verified database backups. Add 2+ replicas only after those shared-state migrations and a load test.
 
 ## AI Extraction And Writing Agent
 
@@ -156,26 +169,12 @@ DISABLE_AI_FALLBACK=true
 
 When enabled, AI extraction failure makes `/api/articles/:id/save` return `502` instead of creating rule-based fallback cards. Use this for local debugging or temporary staging checks; do not enable in production unless saves should fail when the AI provider is unavailable.
 
-## Local Test Account
+## Local Integration Test Account
 
-专用测试账号（直接账号密码登录，无需 OTP 验证）：
-
-```text
-邮箱: test@atomflow.local
-昵称: 测试用户
-密码: test123456
-```
-
-**使用场景**：本地开发测试、快速登录验证功能
-
-**Agent 启动提示规则**：
-- 每次启动或打开本地项目后，必须主动告知用户本地访问地址和测试账号信息。
-- 提示内容必须包含：`http://localhost:1000`、邮箱 `test@atomflow.local`、密码 `test123456`。
-
-**登录方式**：
-- 使用 `/api/auth/login-password` 接口
-- 直接输入邮箱和密码即可登录
-- 不需要发送验证码或 OTP 流程
+- Real API tests read `TEST_EMAIL` and `TEST_PASSWORD` from the local shell or an uncommitted environment file.
+- Never commit, document, or add fallback values for test-account credentials.
+- The account must exist only in the intended local or isolated test database, never as a shared production backdoor.
+- Local application URL remains `http://localhost:1000`.
 
 ## Save To Knowledge Flow
 

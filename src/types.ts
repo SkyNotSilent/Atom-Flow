@@ -212,6 +212,107 @@ export interface WriteAgentMessage {
   created_at?: string;
 }
 
+export type WriteCanvasNodeKind =
+  | 'asset_text'
+  | 'asset_file'
+  | 'asset_image'
+  | 'saved_article'
+  | 'atom_card'
+  | 'note'
+  | 'agent'
+  | 'result';
+
+export interface WriteCanvasProject {
+  id: number;
+  name: string;
+  viewport?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  lastOpenedAt: string;
+}
+
+export interface WriteCanvasAsset {
+  id: number;
+  type: 'text' | 'file' | 'image';
+  title: string;
+  contentText?: string;
+  extractedText?: string;
+  fileName?: string;
+  mimeType?: string;
+  dataUrl?: string;
+  meta?: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface WriteAgentTemplate {
+  id: number;
+  name: string;
+  model: string;
+  systemPrompt: string;
+  temperature: number;
+  topP: number;
+  maxTokens: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WriteAgentInstance {
+  id: number;
+  projectId: number;
+  templateId?: number | null;
+  name: string;
+  model: string;
+  systemPrompt: string;
+  temperature: number;
+  topP: number;
+  maxTokens: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WriteCanvasNode {
+  id: number;
+  projectId: number;
+  kind: WriteCanvasNodeKind;
+  title: string;
+  summary?: string;
+  refId?: string | number | null;
+  asset?: WriteCanvasAsset | null;
+  agent?: WriteAgentInstance | null;
+  meta?: Record<string, unknown>;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WriteCanvasEdge {
+  id: number;
+  projectId: number;
+  sourceNodeId: number;
+  targetNodeId: number;
+  relation: 'context';
+  createdAt: string;
+}
+
+export interface WriteCanvasMessage {
+  id: number;
+  agentId: number;
+  role: 'user' | 'assistant';
+  content: string;
+  meta?: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface WriteCanvasProjectDetail {
+  project: WriteCanvasProject;
+  nodes: WriteCanvasNode[];
+  edges: WriteCanvasEdge[];
+  messages: Record<number, WriteCanvasMessage[]>;
+}
+
 export type WriteAgentSkillType = 'card_storage' | 'citation' | 'writing' | 'style';
 export type WriteAgentSkillScenario = 'storage' | 'citation' | 'drafting' | 'style';
 

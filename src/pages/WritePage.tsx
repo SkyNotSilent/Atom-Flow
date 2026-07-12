@@ -14,6 +14,7 @@ import {
 import { cn } from '../components/Nav';
 import { AlertCircle, Check, CheckCircle2, ChevronDown, Copy, Edit3, FileText, Image as ImageIcon, Loader2, MoreHorizontal, Palette, Plus, RotateCcw, Tag, ThumbsDown, ThumbsUp, Trash2, Volume2, Wand2, X, ZoomIn, ZoomOut } from 'lucide-react';
 import { NotesPanel } from '../components/NotesPanel';
+import { MagicWritingCanvas } from './MagicWritingCanvas';
 import { AtomFlowGalaxyIcon } from '../components/AtomFlowGalaxyIcon';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -2854,6 +2855,7 @@ export const WritePage: React.FC = () => {
     return renderSkillsWorkspace();
   }
 
+  if (import.meta.env.VITE_LEGACY_WRITE_WORKSPACE === 'true') {
 	  return (
     <div className="flex h-full min-h-0 gap-4 bg-bg">
       <div id="page-write" className="flex h-full min-h-0 flex-1 flex-col overflow-hidden rounded-[30px] border border-[#E7DAC0] bg-[#FBF7EF] shadow-[0_20px_48px_rgba(150,120,78,0.1)]">
@@ -3342,4 +3344,7 @@ export const WritePage: React.FC = () => {
       {renderAssistantAside()}
     </div>
   );
+  }
+
+  return <MagicWritingCanvas />;
 };

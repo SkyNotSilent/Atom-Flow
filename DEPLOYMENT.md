@@ -10,13 +10,13 @@ AtomFlow 是一个全栈应用，包含：
 
 ## 部署方案
 
-### 方案1：Railway（推荐，免费额度）
+### 方案1：Railway（推荐）
 
 1. 访问 [Railway.app](https://railway.app)
-2. 连接你的 GitHub 仓库
-3. Railway 会自动检测 `railway.json` 配置
-4. 点击 Deploy
-5. 部署完成后，Railway 会提供一个公网URL
+2. 连接 GitHub 仓库，启用 GitHub 自动部署到 Railway
+3. Railway 会自动读取 `railway.json`，并使用 `npm start` 启动服务
+4. 每次合并前 **Wait for CI**，确认 GitHub CI 全部通过后再触发部署
+5. 确认 `/api/health` 健康检查通过，部署完成后再绑定公网 URL
 
 ### 方案2：Render（免费）
 
@@ -26,14 +26,14 @@ AtomFlow 是一个全栈应用，包含：
 4. Render 会自动检测 `render.yaml` 配置
 5. 或手动配置：
    - Build Command: `npm install && npm run build`
-   - Start Command: `npm run dev`
+   - Start Command: `npm start`
 6. 点击 Create Web Service
 
 ### 方案3：Docker 部署（VPS/云服务器）
 
 ```bash
 # 构建镜像
-docker build -t atomflow .
+docker build --build-arg VITE_TLDRAW_LICENSE_KEY="$VITE_TLDRAW_LICENSE_KEY" -t atomflow .
 
 # 运行容器（本地默认端口 1000；云平台通常注入 PORT）
 docker run -d -p 1000:1000 --name atomflow atomflow
@@ -54,12 +54,12 @@ npm run build
 
 # 4. 使用 PM2 运行（推荐）
 npm install -g pm2
-pm2 start npm --name "atomflow" -- run dev
+pm2 start npm --name "atomflow" -- start
 pm2 save
 pm2 startup
 
 # 或直接运行
-npm run dev
+npm start
 ```
 
 ## 环境变量配置
@@ -73,12 +73,15 @@ SESSION_SECRET=your-random-secret-string
 AI_API_KEY=your-mimo-token-plan-api-key
 AI_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
 AI_MODEL=mimo-v2.5-pro
+NODE_ENV=production
+APP_URL=https://your-domain.example
+ALLOWED_ORIGINS=https://your-domain.example
+VITE_TLDRAW_LICENSE_KEY=your-production-tldraw-license-key
 ```
 
 ### 可选
 ```env
 PORT=1000
-NODE_ENV=production
 RSSHUB_BASE=https://rsshub.app
 RESEND_API_KEY=your-resend-key
 SMTP_USER=your-gmail@gmail.com
@@ -88,6 +91,14 @@ BAIDU_TRANSLATE_KEY=your-key
 ```
 
 > **注意**：Railway 会自动注入 `DATABASE_URL`（添加 PostgreSQL 插件后）。其他变量需要在 Railway Variables 面板手动添加。
+
+### 发布前检查
+
+- **Wait for CI**：GitHub checks 全部通过后再合并和部署。
+- `SESSION_SECRET` 使用至少 32 个随机字符，`APP_URL` 使用正式 HTTPS 地址；`VITE_TLDRAW_LICENSE_KEY` 必须在构建阶段存在。
+- Railway 的 `/api/health` 健康检查通过，且 `healthcheckTimeout` 已显式配置。
+- 当前全局 RSS 和限流仍有单进程状态，Railway 先保持 1 个 Web 副本。公开发布前完成 Cloudflare/WAF、Redis、对象存储、后台队列、监控告警和数据库备份；共享状态迁移并压测后再扩到 2 个以上副本。
+- 本地或单进程内存限流只适合开发验证，不能替代多副本生产环境的共享限流和协调。
 
 ## 验证部署
 

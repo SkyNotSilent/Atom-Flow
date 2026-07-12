@@ -9,11 +9,12 @@ import { Nav } from "./components/Nav";
 import { Toast } from "./components/Toast";
 import { FeedPage } from "./pages/FeedPage";
 import { KnowledgePage } from "./pages/KnowledgePage";
-import { WritePage } from "./pages/WritePage";
 import { DiscoverPage } from "./pages/DiscoverPage";
 import { ReaderPane } from "./components/ReaderModal";
 import { LoginModal } from "./components/LoginModal";
 import { ProfileModal } from "./components/ProfileModal";
+
+const WritePage = React.lazy(() => import("./pages/WritePage").then(module => ({ default: module.WritePage })));
 
 class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
   state = { hasError: false };
@@ -201,11 +202,15 @@ function AppContent() {
           <div className="flex h-full min-h-0 flex-col bg-bg">
             {isMobile ? (
               <div className="min-h-0 flex-1 p-4">
-                <WritePage />
+                <React.Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-text3">加载中...</div>}>
+                  <WritePage />
+                </React.Suspense>
               </div>
             ) : (
               <div className="min-h-0 flex-1 p-4">
-                <WritePage />
+                <React.Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-text3">加载中...</div>}>
+                  <WritePage />
+                </React.Suspense>
               </div>
             )}
           </div>

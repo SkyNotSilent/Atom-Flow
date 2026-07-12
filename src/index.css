@@ -1,6 +1,22 @@
 @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&family=Inter:wght@400;500;600&display=swap');
 @import "tailwindcss";
 
+.canvas-field {
+  width: 100%;
+  border: 1px solid #dcdad4;
+  border-radius: 6px;
+  background: #fff;
+  padding: 8px 10px;
+  color: #30343a;
+  font-size: 12px;
+  outline: none;
+}
+
+.canvas-field:focus {
+  border-color: #78a5eb;
+  box-shadow: 0 0 0 2px #dceaff;
+}
+
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-serif: "Noto Serif SC", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;

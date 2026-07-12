@@ -61,10 +61,17 @@ const checks: Check[] = [
     run: () => assertNoConsoleCalls("server.ts"),
   },
   {
-    name: "OTP codes are masked for production logs",
+    name: "OTP codes are omitted from production logs",
     run: () => {
       const server = readFileSync(serverPath, "utf-8");
-      assert(/formatOtpForLog/.test(server), "server.ts should use formatOtpForLog");
+      assert(
+        /if \(isProduction\) \{\s*logger\.info\(\{ authEvent: event, email \}/.test(server),
+        "production OTP logs should omit the code",
+      );
+      assert(
+        /else \{\s*logger\.debug\(\{ authEvent: event, email, otp: code \}/.test(server),
+        "development OTP logs may include the code for local debugging",
+      );
       assert(/logOtpEvent\(["']login["'],\s*email,\s*code\)/.test(server), "login OTP logs should use logOtpEvent");
       assert(/logOtpEvent\(["']registration["'],\s*email,\s*code\)/.test(server), "registration OTP logs should use logOtpEvent");
       assert(!/console\.log\(`\[AUTH\][^`]*\$\{code\}`\)/.test(server), "OTP log messages should not interpolate full code");
