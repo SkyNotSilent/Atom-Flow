@@ -13,6 +13,25 @@ const canvasUi = [
   existsSync(addDrawerPath) ? readFileSync(addDrawerPath, "utf-8") : "",
   existsSync(inspectorPath) ? readFileSync(inspectorPath, "utf-8") : "",
 ].join("\n");
+const routeSegment = (start: string, end: string) => {
+  const startIndex = server.indexOf(start);
+  const endIndex = server.indexOf(end, startIndex);
+  assert.notEqual(startIndex, -1, `missing route start: ${start}`);
+  assert.notEqual(endIndex, -1, `missing route end: ${end}`);
+  return server.slice(startIndex, endIndex);
+};
+const genericNodeCreateRoute = routeSegment(
+  'app.post("/api/write/canvas/projects/:id/nodes"',
+  'app.put("/api/write/canvas/nodes/:id"',
+);
+const genericNodeUpdateRoute = routeSegment(
+  'app.put("/api/write/canvas/nodes/:id"',
+  'app.delete("/api/write/canvas/nodes/:id"',
+);
+const documentUpdateRoute = routeSegment(
+  'app.put("/api/write/canvas/documents/:id"',
+  'app.get("/api/write/canvas/documents/:id/versions"',
+);
 
 assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_projects/, "canvas projects table must exist");
 assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_nodes/, "canvas nodes table must exist");
@@ -59,6 +78,19 @@ assert.match(server, /target\?\.kind !== "agent" \|\| source\?\.kind === "agent"
 assert.match(server, /write_canvas_document_versions[\s\S]*snapshot/, "document updates must create immutable snapshots");
 assert.match(server, /write_canvas_documents t WHERE user_id = \$1/, "document content must be included in export preflight");
 assert.match(server, /write_canvas_document_sections t WHERE user_id = \$1/, "document sections must be included in export preflight");
+assert.match(genericNodeCreateRoute, /documentId is managed by document APIs/, "generic node creation must reject documentId");
+assert.doesNotMatch(genericNodeCreateRoute, /document_id/, "generic node creation must not attach documents");
+assert.match(genericNodeUpdateRoute, /documentId is managed by document APIs/, "generic node updates must reject documentId");
+assert.doesNotMatch(genericNodeUpdateRoute, /document_id\s*=/, "generic node updates must preserve document links");
+assert.match(server, /const getCanvasDocumentUpdateAdditionalBytes =/, "document update quota must use a dedicated delta helper");
+assert.match(
+  server,
+  /getCanvasDocumentSnapshotBytes\(nextDocument, nextSections\)[\s\S]*Math\.max\(0, getCanvasDocumentMutableBytes\(nextDocument, nextSections\) - getCanvasDocumentMutableBytes\(currentDocument, currentSections\)\)/,
+  "document updates must charge a new snapshot plus only positive mutable growth",
+);
+assert.match(documentUpdateRoute, /const additionalBytes = getCanvasDocumentUpdateAdditionalBytes\(/, "document PUT must calculate its quota from the update delta");
+assert.match(documentUpdateRoute, /storedBytes \+ additionalBytes > canvasUserStorageMaxBytes/, "document PUT must apply the delta to stored bytes");
+assert.doesNotMatch(documentUpdateRoute, /storedBytes \+ getCanvasDocumentBytes\(/, "document PUT must not charge the full replacement size");
 
 assert.match(canvas, /<Tldraw/, "magic writing canvas must render tldraw");
 assert.match(canvas, /shapeUtils=\{shapeUtils\}/, "tldraw must register AtomFlow custom shapes");

@@ -4245,11 +4245,23 @@ const normalizeCanvasDocumentSections = (value: unknown): CanvasDocumentSectionI
   return sections;
 };
 
-const getCanvasDocumentBytes = (document: { title: string; summary: string; scenario: string; status: string }, sections: CanvasDocumentSectionInput[]) => {
-  const snapshot = JSON.stringify({ ...document, sections });
-  return Buffer.byteLength(document.title + document.summary + document.scenario + snapshot, "utf8")
+const getCanvasDocumentMutableBytes = (document: { title: string; summary: string; scenario: string }, sections: CanvasDocumentSectionInput[]) =>
+  Buffer.byteLength(document.title + document.summary + document.scenario, "utf8")
     + sections.reduce((total, section) => total + Buffer.byteLength(section.key + section.heading + section.body + JSON.stringify(section.meta), "utf8"), 0);
-};
+
+const getCanvasDocumentSnapshotBytes = (document: { title: string; summary: string; scenario: string; status: string }, sections: CanvasDocumentSectionInput[]) =>
+  Buffer.byteLength(JSON.stringify({ ...document, sections }), "utf8");
+
+const getCanvasDocumentBytes = (document: { title: string; summary: string; scenario: string; status: string }, sections: CanvasDocumentSectionInput[]) =>
+  getCanvasDocumentMutableBytes(document, sections) + getCanvasDocumentSnapshotBytes(document, sections);
+
+const getCanvasDocumentUpdateAdditionalBytes = (
+  currentDocument: { title: string; summary: string; scenario: string; status: string },
+  currentSections: CanvasDocumentSectionInput[],
+  nextDocument: { title: string; summary: string; scenario: string; status: string },
+  nextSections: CanvasDocumentSectionInput[],
+) => getCanvasDocumentSnapshotBytes(nextDocument, nextSections)
+  + Math.max(0, getCanvasDocumentMutableBytes(nextDocument, nextSections) - getCanvasDocumentMutableBytes(currentDocument, currentSections));
 
 const writeCanvasDocumentSnapshot = async (
   client: pg.PoolClient,
@@ -7710,6 +7722,7 @@ async function startServer() {
     const kind = normalizeCanvasNodeKind(req.body?.kind);
     if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
     if (!kind) return res.status(400).json({ error: "invalid node kind" });
+    if (req.body?.documentId !== undefined) return res.status(400).json({ error: "documentId is managed by document APIs" });
     const role = req.body?.role === undefined ? getCanvasNodeRole(kind) : normalizeCanvasNodeRole(req.body.role);
     const origin = req.body?.origin === undefined ? getCanvasNodeOrigin(kind) : normalizeCanvasNodeOrigin(req.body.origin);
     const status = req.body?.status === undefined ? getCanvasNodeStatus(kind) : normalizeCanvasNodeStatus(req.body.status);
@@ -7717,9 +7730,6 @@ async function startServer() {
     const contentType = typeof req.body?.contentType === "string" && req.body.contentType.trim()
       ? req.body.contentType.trim().slice(0, 80) : getCanvasContentType(kind);
     const businessRef = typeof req.body?.businessRef === "string" ? req.body.businessRef.trim().slice(0, 500) : null;
-    const hasDocumentId = req.body?.documentId !== undefined && req.body?.documentId !== null && req.body?.documentId !== "";
-    const documentId = hasDocumentId ? Number(req.body.documentId) : null;
-    if (hasDocumentId && (!Number.isSafeInteger(documentId) || Number(documentId) <= 0)) return res.status(400).json({ error: "invalid documentId" });
     const x = clampNumber(req.body?.x, 120, -100000, 100000);
     const y = clampNumber(req.body?.y, 120, -100000, 100000);
     const width = clampNumber(req.body?.width, kind === "agent" ? 360 : 280, 160, 1200);
@@ -7758,14 +7768,6 @@ async function startServer() {
         [projectId, req.session.userId],
       )).rows[0]?.count || 0);
       if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) return await fail(413, "项目节点数量已达到上限");
-      if (documentId) {
-        const document = (await client.query(
-          `SELECT id FROM write_canvas_documents WHERE id = $1 AND user_id = $2 AND project_id = $3 FOR SHARE`,
-          [documentId, req.session.userId, projectId],
-        )).rows[0];
-        if (!document) return await fail(404, "document not found");
-      }
-
       if (kind === "agent") {
       const defaults = getDefaultCanvasAgentConfig();
       const templateId = Number.isFinite(Number(req.body?.templateId)) ? Number(req.body.templateId) : null;
@@ -7838,8 +7840,8 @@ async function startServer() {
 
       const nodeRow = (await client.query(
       `INSERT INTO write_canvas_nodes
-         (user_id, project_id, kind, node_role, content_type, origin, status, business_ref, document_id, title, summary, ref_id, asset_id, agent_id, meta, x, y, width, height)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+         (user_id, project_id, kind, node_role, content_type, origin, status, business_ref, title, summary, ref_id, asset_id, agent_id, meta, x, y, width, height)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
        RETURNING id`,
       [
         req.session.userId,
@@ -7850,7 +7852,6 @@ async function startServer() {
         origin,
         status,
         businessRef,
-        documentId,
         title || "未命名节点",
         summary,
         refId,
@@ -7886,6 +7887,7 @@ async function startServer() {
     if (current.document_id && (req.body?.title !== undefined || req.body?.summary !== undefined || req.body?.status !== undefined)) {
       return res.status(400).json({ error: "document title, summary and status must be updated through the document API" });
     }
+    if (req.body?.documentId !== undefined) return res.status(400).json({ error: "documentId is managed by document APIs" });
     const requestedAgentModel = current.agent_id && typeof req.body?.model === "string" && req.body.model.trim()
       ? resolveAllowedCanvasAgentModel(req.body.model, req.body.model)
       : null;
@@ -7903,18 +7905,6 @@ async function startServer() {
     }
     const contentType = typeof req.body?.contentType === "string" ? req.body.contentType.trim().slice(0, 80) : null;
     const businessRef = typeof req.body?.businessRef === "string" ? req.body.businessRef.trim().slice(0, 500) : null;
-    const hasDocumentId = req.body?.documentId !== undefined;
-    const documentId = req.body?.documentId === null || req.body?.documentId === "" ? null : Number(req.body?.documentId);
-    if (hasDocumentId && documentId !== null && (!Number.isSafeInteger(documentId) || documentId <= 0)) {
-      return res.status(400).json({ error: "invalid documentId" });
-    }
-    if (hasDocumentId && documentId) {
-      const document = (await pool.query(
-        `SELECT id FROM write_canvas_documents WHERE id = $1 AND user_id = $2 AND project_id = $3`,
-        [documentId, req.session.userId, current.project_id],
-      )).rows[0];
-      if (!document) return res.status(404).json({ error: "document not found" });
-    }
     await pool.query(
       `UPDATE write_canvas_nodes
        SET title = COALESCE($1, title),
@@ -7929,9 +7919,8 @@ async function startServer() {
            origin = COALESCE($10, origin),
            status = COALESCE($11, status),
            business_ref = COALESCE($12, business_ref),
-           document_id = CASE WHEN $13 THEN $14 ELSE document_id END,
            updated_at = NOW()
-       WHERE id = $15 AND user_id = $16`,
+       WHERE id = $13 AND user_id = $14`,
       [
         title,
         summary,
@@ -7945,8 +7934,6 @@ async function startServer() {
         origin,
         status,
         businessRef,
-        hasDocumentId,
-        documentId,
         nodeId,
         req.session.userId
       ]
@@ -8202,7 +8189,13 @@ async function startServer() {
       }
       const documentValues = { title, summary, scenario, status };
       const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
-      if (storedBytes + getCanvasDocumentBytes(documentValues, sections) > canvasUserStorageMaxBytes) {
+      const additionalBytes = getCanvasDocumentUpdateAdditionalBytes(
+        { title: current.title, summary: current.summary, scenario: current.scenario, status: current.status },
+        existingSections,
+        documentValues,
+        sections,
+      );
+      if (storedBytes + additionalBytes > canvasUserStorageMaxBytes) {
         await client.query("ROLLBACK");
         return res.status(413).json({ error: "画布资料存储额度已用完，请删除旧资料后重试" });
       }
