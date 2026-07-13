@@ -50,6 +50,13 @@ assert.match(
 assert.match(server, /finishCanvasAgentBatch/, "Batch and group terminal state should be finalized by one transactional helper");
 assert.match(server, /WRITE_CANVAS_AGENT_BATCH_STALE_MS/, "Stale running batches need bounded recovery");
 assert.match(server, /FOR UPDATE[\s\S]{0,1200}已有批次正在运行/, "A row lock must reject a second active batch for the same group");
+assert.match(server, /current_batch_id\s+BIGINT/, "Agent groups need a persisted current-batch lease");
+assert.match(server, /assertCurrentCanvasAgentBatchLease/, "Output persistence must validate the current batch lease");
+assert.match(
+  server,
+  /status = CASE[\s\S]{0,500}status = 'completed'[\s\S]{0,300}THEN 'partial'[\s\S]{0,100}ELSE 'failed'/,
+  "Stale recovery must preserve partial success",
+);
 
 const quickActionRoute = routeSegment(
   'app.post("/api/write/canvas/nodes/:id/actions/stream"',
@@ -65,7 +72,20 @@ const groupBatchHistoryRoute = routeSegment(
 );
 assertOrdered(quickActionRoute, 'res.once("close"', "resolveCanvasOwnedNodeContext", "Quick action cancellation must be registered before context resolution");
 assertOrdered(groupBatchRoute, 'res.once("close"', "resolveCanvasOwnedNodeContext", "Batch cancellation must be registered before context resolution");
+assert.match(quickActionRoute, /requestAbortController\.signal\.aborted\s*\?\s*"cancelled"\s*:\s*"failed"/, "Aborted quick actions must persist cancelled rather than failed");
 assert.match(groupBatchRoute, /requestAbortController\.signal\.throwIfAborted\(\)[\s\S]{0,500}requestCanvasAgentCompletion/, "Batch must check cancellation immediately before provider calls");
+assert.match(groupBatchRoute, /assertCurrentCanvasAgentBatchLease[\s\S]{0,600}createCanvasGeneratedNodes/, "Superseded batches must be rejected before output nodes are created");
+assert.match(groupBatchRoute, /current_batch_id\s*=\s*\$1/, "Batch creation must acquire the group lease");
+assert.match(
+  server,
+  /assertCurrentCanvasAgentBatchLease[\s\S]{0,1200}b\.status = 'running'[\s\S]{0,300}g\.current_batch_id = b\.id/,
+  "The lease guard must lock the running batch selected by the group",
+);
+assert.match(
+  server,
+  /finishCanvasAgentBatch[\s\S]{0,1600}assertCurrentCanvasAgentBatchLease[\s\S]{0,1200}current_batch_id = NULL/,
+  "Terminal batch and group updates must use the same lease CAS",
+);
 
 assert.match(
   server,
@@ -85,5 +105,19 @@ assert.match(server, /app\.get\("\/api\/write\/canvas\/agent-groups\/:id\/batche
 assert.match(groupBatchHistoryRoute, /write_canvas_agent_runs WHERE group_id = \$1 AND user_id = \$2/, "Group history runs must be tenant-scoped");
 assert.match(groupBatchHistoryRoute, /res\.json\(\{ batches, runs \}\)/, "Group history must restore batch member outcomes");
 assert.match(server, /requireCanvasCompletionContent/, "Empty provider responses must fail before persistence");
+
+const legacyConstraintMigration = routeSegment(
+  'await runSchemaTransaction(async client => {',
+  'ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS node_role TEXT',
+);
+const canonicalGroupNodeMigration = routeSegment(
+  'ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS node_role TEXT',
+  'CREATE TABLE IF NOT EXISTS write_canvas_documents',
+);
+assert.match(server, /runSchemaTransaction[\s\S]{0,700}BEGIN[\s\S]{0,500}COMMIT[\s\S]{0,500}ROLLBACK/, "Schema transaction helper must commit or roll back on one client");
+assert.match(legacyConstraintMigration, /runSchemaTransaction\(async client =>/, "Legacy FK drops and replacements must be one transaction");
+assert.match(legacyConstraintMigration, /DROP CONSTRAINT IF EXISTS[\s\S]{0,3500}ADD CONSTRAINT/, "Replacement constraints must be installed with their legacy drops");
+assert.match(canonicalGroupNodeMigration, /runSchemaTransaction\(async client =>/, "Canonical group-node backfill must be transactional");
+assert.match(canonicalGroupNodeMigration, /CREATE UNIQUE INDEX[\s\S]{0,300}agent_group[\s\S]{0,1800}ON CONFLICT/, "Canonical group nodes need an idempotent unique business reference");
 
 console.log("PASS: canvas quick AI and Agent group API contracts");

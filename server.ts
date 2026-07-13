@@ -4029,6 +4029,7 @@ const isCanvasExtractionAction = (action: WriteCanvasQuickAction) => action.star
 
 class CanvasInputLimitError extends Error {}
 class CanvasStorageLimitError extends Error {}
+class CanvasAgentBatchLeaseLostError extends Error {}
 
 const getCanvasAggregateContextChars = (
   contexts: CanvasContextItem[],
@@ -5184,6 +5185,16 @@ async function startServer() {
   let schemaLockReleased = false;
   try {
   await schemaLockClient.query(`SELECT pg_advisory_lock(hashtext('atomflow-schema-migration'))`);
+  const runSchemaTransaction = async (operation: (client: pg.PoolClient) => Promise<void>) => {
+    await schemaLockClient.query("BEGIN");
+    try {
+      await operation(schemaLockClient);
+      await schemaLockClient.query("COMMIT");
+    } catch (error) {
+      await schemaLockClient.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  };
   try {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -5521,6 +5532,7 @@ async function startServer() {
       user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       project_id      BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
       node_id         BIGINT,
+      current_batch_id BIGINT,
       name            TEXT NOT NULL,
       shared_prompt   TEXT NOT NULL DEFAULT '',
       status          TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('ready','running','completed','partial','failed','cancelled')),
@@ -5603,16 +5615,29 @@ async function startServer() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_runs_user ON write_canvas_agent_runs(user_id, project_id, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_runs_batch ON write_canvas_agent_runs(batch_id, created_at ASC) WHERE batch_id IS NOT NULL`);
 
-  await pool.query(`ALTER TABLE write_canvas_agent_groups ADD COLUMN IF NOT EXISTS node_id BIGINT`);
-  await pool.query(`ALTER TABLE write_canvas_agent_group_members ADD COLUMN IF NOT EXISTS project_id BIGINT`);
-  await pool.query(`
+  await runSchemaTransaction(async client => {
+  await client.query(`ALTER TABLE write_canvas_agent_groups ADD COLUMN IF NOT EXISTS node_id BIGINT`);
+  await client.query(`ALTER TABLE write_canvas_agent_groups ADD COLUMN IF NOT EXISTS current_batch_id BIGINT`);
+  await client.query(`
+    UPDATE write_canvas_agent_groups g
+    SET current_batch_id = active.id
+    FROM (
+      SELECT DISTINCT ON (group_id, user_id) id, group_id, user_id
+      FROM write_canvas_agent_batches
+      WHERE status = 'running'
+      ORDER BY group_id, user_id, started_at DESC NULLS LAST, id DESC
+    ) active
+    WHERE g.id = active.group_id AND g.user_id = active.user_id AND g.current_batch_id IS NULL
+  `);
+  await client.query(`ALTER TABLE write_canvas_agent_group_members ADD COLUMN IF NOT EXISTS project_id BIGINT`);
+  await client.query(`
     UPDATE write_canvas_agent_group_members m
     SET project_id = g.project_id
     FROM write_canvas_agent_groups g
     WHERE m.group_id = g.id AND m.user_id = g.user_id AND m.project_id IS NULL
   `);
-  await pool.query(`ALTER TABLE write_canvas_agent_group_members ALTER COLUMN project_id SET NOT NULL`);
-  await pool.query(`
+  await client.query(`ALTER TABLE write_canvas_agent_group_members ALTER COLUMN project_id SET NOT NULL`);
+  await client.query(`
     ALTER TABLE write_canvas_agent_groups DROP CONSTRAINT IF EXISTS write_canvas_agent_groups_status_check;
     ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_status_check CHECK (status IN ('ready','running','completed','partial','failed','cancelled'));
     ALTER TABLE write_canvas_agent_batches DROP CONSTRAINT IF EXISTS write_canvas_agent_batches_status_check;
@@ -5623,7 +5648,7 @@ async function startServer() {
     ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_batch_id_fkey;
     ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_source_node_id_fkey;
   `);
-  await pool.query(`
+  await client.query(`
     DO $$ BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_projects_tenant_key') THEN
         ALTER TABLE write_canvas_projects ADD CONSTRAINT write_canvas_projects_tenant_key UNIQUE (id, user_id);
@@ -5666,6 +5691,7 @@ async function startServer() {
       END IF;
     END $$
   `);
+  });
 
   await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS node_role TEXT`);
   await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS content_type TEXT`);
@@ -5692,15 +5718,40 @@ async function startServer() {
   await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN content_type SET NOT NULL`);
   await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN origin SET NOT NULL`);
   await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN status SET NOT NULL`);
-  await pool.query(`
+  await runSchemaTransaction(async client => {
+  await client.query(`
+    WITH ranked AS (
+      SELECT n.id,
+             ROW_NUMBER() OVER (
+               PARTITION BY n.user_id, n.project_id, n.content_type, n.business_ref
+               ORDER BY CASE WHEN g.node_id = n.id THEN 0 ELSE 1 END, n.id
+             ) AS duplicate_rank
+      FROM write_canvas_nodes n
+      LEFT JOIN write_canvas_agent_groups g
+        ON g.user_id = n.user_id AND g.project_id = n.project_id AND g.id::text = n.business_ref
+      WHERE n.content_type = 'agent_group' AND n.business_ref IS NOT NULL
+    )
+    DELETE FROM write_canvas_nodes n
+    USING ranked
+    WHERE n.id = ranked.id AND ranked.duplicate_rank > 1
+  `);
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_agent_group_business_ref_unique
+    ON write_canvas_nodes(user_id, project_id, content_type, business_ref)
+    WHERE content_type = 'agent_group' AND business_ref IS NOT NULL
+  `);
+  await client.query(`
     INSERT INTO write_canvas_nodes
       (user_id, project_id, kind, node_role, content_type, origin, status, business_ref, title, summary, meta, x, y, width, height)
     SELECT g.user_id, g.project_id, 'result', 'task', 'agent_group', 'manual', 'ready', g.id::text,
            g.name, LEFT(g.shared_prompt, 500), jsonb_build_object('groupId', g.id), 360, 180, 340, 220
     FROM write_canvas_agent_groups g
     WHERE g.node_id IS NULL
+    ON CONFLICT (user_id, project_id, content_type, business_ref)
+      WHERE content_type = 'agent_group' AND business_ref IS NOT NULL
+      DO NOTHING
   `);
-  await pool.query(`
+  await client.query(`
     UPDATE write_canvas_agent_groups g
     SET node_id = n.id
     FROM write_canvas_nodes n
@@ -5708,14 +5759,15 @@ async function startServer() {
       AND n.user_id = g.user_id AND n.project_id = g.project_id
       AND n.content_type = 'agent_group' AND n.business_ref = g.id::text
   `);
-  await pool.query(`ALTER TABLE write_canvas_agent_groups ALTER COLUMN node_id SET NOT NULL`);
-  await pool.query(`
+  await client.query(`ALTER TABLE write_canvas_agent_groups ALTER COLUMN node_id SET NOT NULL`);
+  await client.query(`
     DO $$ BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_groups_node_owner_fkey') THEN
         ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_node_owner_fkey FOREIGN KEY (node_id, user_id, project_id) REFERENCES write_canvas_nodes(id, user_id, project_id) ON DELETE CASCADE;
       END IF;
     END $$
   `);
+  });
   await pool.query(`
     CREATE TABLE IF NOT EXISTS write_canvas_documents (
       id                 BIGSERIAL PRIMARY KEY,
@@ -6760,6 +6812,55 @@ async function startServer() {
     )).rows[0] || null;
   };
 
+  const assertCurrentCanvasAgentBatchLease = async (
+    client: pg.PoolClient,
+    userId: number,
+    groupId: number,
+    batchId: number,
+  ) => {
+    const lease = (await client.query(
+      `SELECT b.id
+       FROM write_canvas_agent_batches b
+       JOIN write_canvas_agent_groups g
+         ON g.id = b.group_id AND g.user_id = b.user_id AND g.project_id = b.project_id
+       WHERE b.id = $1 AND b.group_id = $2 AND b.user_id = $3
+         AND b.status = 'running' AND g.current_batch_id = b.id
+       FOR UPDATE OF b, g`,
+      [batchId, groupId, userId],
+    )).rows[0];
+    if (!lease) throw new CanvasAgentBatchLeaseLostError("Agent batch was superseded by a newer run");
+  };
+
+  const failCanvasAgentRunIfLeaseCurrent = async (input: {
+    userId: number;
+    groupId: number;
+    batchId: number;
+    runId: number;
+    status: "failed" | "cancelled";
+    error: string;
+  }) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, input.userId);
+      await assertCurrentCanvasAgentBatchLease(client, input.userId, input.groupId, input.batchId);
+      const result = await client.query(
+        `UPDATE write_canvas_agent_runs
+         SET status = $1, error = $2, completed_at = NOW(), updated_at = NOW()
+         WHERE id = $3 AND batch_id = $4 AND user_id = $5 AND status IN ('queued','running')`,
+        [input.status, input.error, input.runId, input.batchId, input.userId],
+      );
+      await client.query("COMMIT");
+      return result.rowCount === 1;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (error instanceof CanvasAgentBatchLeaseLostError) return false;
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
   const finishCanvasAgentBatch = async (input: {
     userId: number;
     batchId: number;
@@ -6772,28 +6873,27 @@ async function startServer() {
     try {
       await client.query("BEGIN");
       await lockCanvasUser(client, input.userId);
-      const owned = (await client.query(
-        `SELECT b.id
-         FROM write_canvas_agent_batches b
-         JOIN write_canvas_agent_groups g ON g.id = b.group_id AND g.user_id = b.user_id AND g.project_id = b.project_id
-         WHERE b.id = $1 AND b.group_id = $2 AND b.user_id = $3
-         FOR UPDATE OF b, g`,
-        [input.batchId, input.groupId, input.userId],
-      )).rows[0];
-      if (!owned) throw new Error("batch not found");
-      await client.query(
+      await assertCurrentCanvasAgentBatchLease(client, input.userId, input.groupId, input.batchId);
+      const batchResult = await client.query(
         `UPDATE write_canvas_agent_batches
          SET status = $1, output = $2::jsonb, error = $3, completed_at = NOW(), updated_at = NOW()
-         WHERE id = $4 AND group_id = $5 AND user_id = $6`,
+         WHERE id = $4 AND group_id = $5 AND user_id = $6 AND status = 'running'`,
         [input.status, JSON.stringify(input.output), input.error, input.batchId, input.groupId, input.userId],
       );
-      await client.query(
-        `UPDATE write_canvas_agent_groups SET status = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`,
-        [input.status, input.groupId, input.userId],
+      const groupResult = await client.query(
+        `UPDATE write_canvas_agent_groups
+         SET status = $1, current_batch_id = NULL, updated_at = NOW()
+         WHERE id = $2 AND user_id = $3 AND current_batch_id = $4`,
+        [input.status, input.groupId, input.userId, input.batchId],
       );
+      if (batchResult.rowCount !== 1 || groupResult.rowCount !== 1) {
+        throw new CanvasAgentBatchLeaseLostError("Agent batch lease changed during finalization");
+      }
       await client.query("COMMIT");
+      return true;
     } catch (error) {
-      await client.query("ROLLBACK");
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (error instanceof CanvasAgentBatchLeaseLostError) return false;
       throw error;
     } finally {
       client.release();
@@ -9142,7 +9242,13 @@ async function startServer() {
       res.end();
     } catch (error) {
       const message = error instanceof Error ? error.message : "画布 AI 操作失败";
-      await pool.query(`UPDATE write_canvas_agent_runs SET status = 'failed', error = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2 AND user_id = $3`, [message.slice(0, 2000), runId, req.session.userId]);
+      const runStatus = requestAbortController.signal.aborted ? "cancelled" : "failed";
+      await pool.query(
+        `UPDATE write_canvas_agent_runs
+         SET status = $1, error = $2, completed_at = NOW(), updated_at = NOW()
+         WHERE id = $3 AND user_id = $4 AND status IN ('queued','running')`,
+        [runStatus, message.slice(0, 2000), runId, req.session.userId],
+      );
       if (!res.destroyed && !res.writableEnded) { send("error", { runId, message }); res.end(); }
     } finally {
       if (typeof res.locals.releasePaidConcurrency === "function") res.locals.releasePaidConcurrency();
@@ -9202,15 +9308,15 @@ async function startServer() {
       await client.query("BEGIN");
       await lockCanvasUser(client, req.session.userId);
       const lockedGroup = (await client.query(
-        `SELECT id, project_id, node_id FROM write_canvas_agent_groups WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        `SELECT id, project_id, node_id, current_batch_id FROM write_canvas_agent_groups WHERE id = $1 AND user_id = $2 FOR UPDATE`,
         [groupId, req.session.userId],
       )).rows[0];
       if (!lockedGroup) { await client.query("ROLLBACK"); return res.status(404).json({ error: "group not found" }); }
       const activeBatch = (await client.query(
         `SELECT id, started_at FROM write_canvas_agent_batches
          WHERE group_id = $1 AND user_id = $2 AND status = 'running'
-         ORDER BY started_at DESC LIMIT 1 FOR UPDATE`,
-        [groupId, req.session.userId],
+         ORDER BY (id = $3) DESC NULLS LAST, started_at DESC NULLS LAST, id DESC LIMIT 1 FOR UPDATE`,
+        [groupId, req.session.userId, lockedGroup.current_batch_id],
       )).rows[0];
       if (activeBatch && Date.now() - new Date(activeBatch.started_at).getTime() <= WRITE_CANVAS_AGENT_BATCH_STALE_MS) {
         await client.query("ROLLBACK");
@@ -9219,7 +9325,14 @@ async function startServer() {
       if (activeBatch) {
         const staleError = "运行超时，已由后续请求恢复";
         await client.query(
-          `UPDATE write_canvas_agent_batches SET status = 'failed', error = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2 AND user_id = $3`,
+          `UPDATE write_canvas_agent_batches
+           SET status = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM write_canvas_agent_runs
+               WHERE batch_id = $2 AND user_id = $3 AND status = 'completed'
+             ) THEN 'partial' ELSE 'failed' END,
+             error = $1, completed_at = NOW(), updated_at = NOW()
+           WHERE id = $2 AND user_id = $3 AND status = 'running'`,
           [staleError, Number(activeBatch.id), req.session.userId],
         );
         await client.query(
@@ -9250,7 +9363,10 @@ async function startServer() {
           [req.session.userId, Number(group.project_id), contextNodeId, Number(group.node_id)],
         );
       }
-      await client.query(`UPDATE write_canvas_agent_groups SET status = 'running', updated_at = NOW() WHERE id = $1 AND user_id = $2`, [groupId, req.session.userId]);
+      await client.query(
+        `UPDATE write_canvas_agent_groups SET status = 'running', current_batch_id = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`,
+        [batchId, groupId, req.session.userId],
+      );
       for (const member of members) {
         const run = (await client.query(
           `INSERT INTO write_canvas_agent_runs (user_id, project_id, group_id, group_member_id, batch_id, action, context_snapshot, config_snapshot)
@@ -9275,7 +9391,18 @@ async function startServer() {
     const memberRuns = runs.slice(0, WRITE_CANVAS_MAX_AGENT_GROUP_MEMBERS).map(async ({ id: runId, member }, index) => {
       send("member_start", { batchId, runId, memberId: Number(member.id), name: member.name });
       try {
-        await pool.query(`UPDATE write_canvas_agent_runs SET status = 'running', started_at = NOW(), updated_at = NOW() WHERE id = $1 AND user_id = $2`, [runId, req.session.userId]);
+        const startedRun = await pool.query(
+          `UPDATE write_canvas_agent_runs r
+           SET status = 'running', started_at = NOW(), updated_at = NOW()
+           FROM write_canvas_agent_batches b
+           JOIN write_canvas_agent_groups g
+             ON g.id = b.group_id AND g.user_id = b.user_id AND g.project_id = b.project_id
+           WHERE r.id = $1 AND r.batch_id = $2 AND r.user_id = $3 AND r.status = 'queued'
+             AND b.id = r.batch_id AND b.status = 'running' AND g.current_batch_id = b.id
+           RETURNING r.id`,
+          [runId, batchId, req.session.userId],
+        );
+        if (startedRun.rowCount !== 1) throw new CanvasAgentBatchLeaseLostError("Agent batch was superseded before provider execution");
         requestAbortController.signal.throwIfAborted();
         const estimatedInputTokens = estimatedInputTokensByMember.get(Number(member.id)) || 0;
         const reservation = await reserveDailyAiBudget(req.session.userId, Number(member.max_tokens), estimatedInputTokens);
@@ -9287,9 +9414,16 @@ async function startServer() {
         try {
           await outputClient.query("BEGIN");
           await lockCanvasUser(outputClient, req.session.userId);
+          await assertCurrentCanvasAgentBatchLease(outputClient, req.session.userId, groupId, batchId);
           const lineage = { sourceNodeId: Number(group.node_id), relation: "generated" as const };
           outputNodeIds = await createCanvasGeneratedNodes(outputClient, req.session.userId, Number(group.project_id), lineage.sourceNodeId, [{ title: `${member.name} 输出`, content: completion.content, role: "insight", origin: "generated", status: "pending_review", relation: lineage.relation, x: Number(group.node_x) + 400 + index * 360, y: Number(group.node_y), meta: { batchId, runId, groupId, memberId: Number(member.id) } }], Buffer.byteLength(completion.content, "utf8"));
-          await outputClient.query(`UPDATE write_canvas_agent_runs SET status = 'completed', output = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2 AND user_id = $3`, [completion.content, runId, req.session.userId]);
+          const completedRun = await outputClient.query(
+            `UPDATE write_canvas_agent_runs
+             SET status = 'completed', output = $1, completed_at = NOW(), updated_at = NOW()
+             WHERE id = $2 AND batch_id = $3 AND user_id = $4 AND status = 'running'`,
+            [completion.content, runId, batchId, req.session.userId],
+          );
+          if (completedRun.rowCount !== 1) throw new CanvasAgentBatchLeaseLostError("Agent run was superseded before output persistence");
           await outputClient.query("COMMIT");
         } catch (error) {
           await outputClient.query("ROLLBACK");
@@ -9302,7 +9436,7 @@ async function startServer() {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Agent 执行失败";
         const runStatus = requestAbortController.signal.aborted ? "cancelled" : "failed";
-        await pool.query(`UPDATE write_canvas_agent_runs SET status = $1, error = $2, completed_at = NOW(), updated_at = NOW() WHERE id = $3 AND user_id = $4`, [runStatus, errorMessage.slice(0, 2000), runId, req.session.userId]);
+        await failCanvasAgentRunIfLeaseCurrent({ userId: req.session.userId, groupId, batchId, runId, status: runStatus, error: errorMessage.slice(0, 2000) });
         if (!res.destroyed && !res.writableEnded) send("member_error", { batchId, runId, memberId: Number(member.id), message: errorMessage });
         throw error;
       }
@@ -9317,7 +9451,11 @@ async function startServer() {
           ? "partial"
           : successes.length > 0 ? "completed" : "failed";
       const persistedRuns = successes.map(({ output: _output, ...result }) => result);
-      await finishCanvasAgentBatch({ userId: req.session.userId, batchId, groupId, status, output: { runs: persistedRuns }, error: failures.join("; ").slice(0, 4000) || null });
+      const finalized = await finishCanvasAgentBatch({ userId: req.session.userId, batchId, groupId, status, output: { runs: persistedRuns }, error: failures.join("; ").slice(0, 4000) || null });
+      if (!finalized) {
+        if (!res.destroyed && !res.writableEnded) { send("error", { batchId, message: "批次已被新的运行替代" }); res.end(); }
+        return;
+      }
       if (!res.destroyed && !res.writableEnded) { send("final", { batchId, status, successes, failures }); res.end(); }
     } finally {
       if (typeof res.locals.releasePaidConcurrency === "function") res.locals.releasePaidConcurrency();
