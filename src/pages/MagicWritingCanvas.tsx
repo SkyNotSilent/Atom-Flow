@@ -13,10 +13,7 @@ import {
 } from 'tldraw';
 import 'tldraw/tldraw.css';
 import {
-  Bot,
   ChevronDown,
-  FileText,
-  Image as ImageIcon,
   Pencil,
   Plus,
   Trash2,
@@ -24,6 +21,8 @@ import {
 import { useAppContext } from '../context/AppContext';
 import { CanvasAddDrawer } from '../components/write-canvas/CanvasAddDrawer';
 import { CanvasInspector, type AgentDraft } from '../components/write-canvas/CanvasInspector';
+import { CanvasNodeCard } from '../components/write-canvas/CanvasNodeCard';
+import type { CanvasNodeAction } from '../components/write-canvas/CanvasNodeAddMenu';
 import type {
   AtomCard,
   Note,
@@ -48,6 +47,8 @@ type AtomFlowShape = {
     h: number;
     nodeId: string;
     kind: WriteCanvasNodeKind;
+    role: string;
+    status: string;
     title: string;
     summary: string;
   };
@@ -71,6 +72,8 @@ class AtomFlowNodeShapeUtil extends BaseBoxShapeUtil<any> {
     h: T.number,
     nodeId: T.string,
     kind: T.string,
+    role: T.string,
+    status: T.string,
     title: T.string,
     summary: T.string,
   };
@@ -81,40 +84,21 @@ class AtomFlowNodeShapeUtil extends BaseBoxShapeUtil<any> {
       h: 180,
       nodeId: '',
       kind: 'asset_text',
+      role: 'material',
+      status: 'ready',
       title: '未命名节点',
       summary: '',
     };
   }
 
   override component(shape: AtomFlowShape) {
-    const tone = getNodeTone(shape.props.kind as WriteCanvasNodeKind);
+    const nodeId = Number(shape.props.nodeId);
     return (
       <HTMLContainer id={shape.id} style={{ width: shape.props.w, height: shape.props.h, pointerEvents: 'all' }}>
-        <button
-          type="button"
-          onPointerDown={() => {
-            window.dispatchEvent(new CustomEvent('atomflow-canvas-select', { detail: { nodeId: Number(shape.props.nodeId) } }));
-          }}
-          className="h-full w-full overflow-hidden rounded-[8px] border bg-white text-left shadow-[0_12px_30px_rgba(36,43,53,0.13)] transition-[box-shadow,border-color] hover:shadow-[0_16px_38px_rgba(36,43,53,0.18)]"
-          style={{ borderColor: tone.border }}
-        >
-          <div className="flex h-full flex-col">
-            <div className="flex items-center gap-2 border-b px-3 py-2.5" style={{ borderColor: tone.border, background: tone.bg }}>
-              <span className="flex h-7 w-7 items-center justify-center rounded-[5px] bg-white/80" style={{ color: tone.text }}>
-                {shape.props.kind === 'agent' ? <Bot size={15} /> : shape.props.kind === 'asset_image' ? <ImageIcon size={15} /> : <FileText size={15} />}
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-[12px] font-semibold text-[#252A31]">{shape.props.title}</div>
-                <div className="mt-0.5 text-[10px]" style={{ color: tone.text }}>{getNodeKindLabel(shape.props.kind as WriteCanvasNodeKind)}</div>
-              </div>
-            </div>
-            <div className="min-h-0 flex-1 px-3 py-2.5">
-              <div className="line-clamp-6 whitespace-pre-wrap text-[11px] leading-5 text-[#666C74]">
-                {shape.props.summary || (shape.props.kind === 'agent' ? '连接资料后开始对话。' : '暂无摘要')}
-              </div>
-            </div>
-          </div>
-        </button>
+        <CanvasNodeCard
+          node={{ id: Number.isFinite(nodeId) ? nodeId : 0, kind: shape.props.kind, role: shape.props.role, status: shape.props.status, title: shape.props.title, summary: shape.props.summary }}
+          onSelect={nodeId => window.dispatchEvent(new CustomEvent('atomflow-canvas-select', { detail: { nodeId } }))}
+        />
       </HTMLContainer>
     );
   }
@@ -127,25 +111,6 @@ class AtomFlowNodeShapeUtil extends BaseBoxShapeUtil<any> {
 }
 
 const shapeUtils = [AtomFlowNodeShapeUtil];
-
-const getNodeKindLabel = (kind: WriteCanvasNodeKind) => ({
-  asset_text: '粘贴文本',
-  asset_file: '上传文件',
-  asset_image: '图片资料',
-  saved_article: '收藏文章',
-  atom_card: '原子卡',
-  note: '文章草稿',
-  agent: 'Agent',
-  result: '输出结果',
-}[kind]);
-
-const getNodeTone = (kind: WriteCanvasNodeKind) => {
-  if (kind === 'agent') return { bg: '#EAF2FF', border: '#AFC9F5', text: '#225DAA' };
-  if (kind === 'result') return { bg: '#F4EEFF', border: '#D5C5F1', text: '#6A4C96' };
-  if (kind === 'asset_image') return { bg: '#EAF7F1', border: '#B9DFCE', text: '#2C7455' };
-  if (kind === 'atom_card') return { bg: '#FFF5E5', border: '#EACF9F', text: '#8C5D20' };
-  return { bg: '#F7F5F0', border: '#D7D3CA', text: '#676057' };
-};
 
 const shapeIdForNode = (nodeId: number) => createShapeId(`atomflow-node-${nodeId}`);
 const shapeIdForEdge = (edgeId: number) => createShapeId(`atomflow-edge-${edgeId}`);
@@ -201,6 +166,9 @@ export const MagicWritingCanvas: React.FC = () => {
   const [agentInput, setAgentInput] = useState('');
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [aiDecomposeNodeId, setAiDecomposeNodeId] = useState<number | null>(null);
+  const [aiDecomposeAgentId, setAiDecomposeAgentId] = useState<number | null>(null);
+  const [aiDecomposePrompt, setAiDecomposePrompt] = useState('请将这个节点拆解为可继续展开的创作要点。');
   const editorRef = useRef<Editor | null>(null);
   const detailRef = useRef<WriteCanvasProjectDetail | null>(null);
   const activePanelRef = useRef<ActivePanel>(null);
@@ -375,6 +343,8 @@ export const MagicWritingCanvas: React.FC = () => {
             h: node.height,
             nodeId: String(node.id),
             kind: node.kind,
+            role: node.role || 'material',
+            status: node.status || 'ready',
             title: node.title,
             summary: node.summary || '',
           };
@@ -552,6 +522,7 @@ export const MagicWritingCanvas: React.FC = () => {
       const edgeId = Number(shape.meta.atomflowEdgeId);
       const edge = currentDetail.edges.find(item => item.id === edgeId);
       if (!edge || pendingCanonicalEdgeIdsRef.current.has(edgeId)) continue;
+      if (edge.relation !== 'context') continue;
       const bindings = getArrowBindings(editor, shape as TLArrowShape);
       const sourceNodeId = bindings.start ? nodeIdFromShape(editor.getShape(bindings.start.toId)) : null;
       const targetNodeId = bindings.end ? nodeIdFromShape(editor.getShape(bindings.end.toId)) : null;
@@ -676,6 +647,152 @@ export const MagicWritingCanvas: React.FC = () => {
     return node;
   }, [finishNodeAddition, loadProjectDetail, showToast]);
 
+  const createStructureEdge = useCallback(async (sourceNodeId: number, targetNodeId: number) => {
+    const projectId = currentProjectIdRef.current;
+    if (!projectId) return false;
+    const response = await fetch('/api/write/canvas/edges', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId, sourceNodeId, targetNodeId, relation: 'structure' }),
+    });
+    if (!response.ok) {
+      showToast('结构连接创建失败');
+      return false;
+    }
+    await loadProjectDetail(projectId);
+    return true;
+  }, [loadProjectDetail, showToast]);
+
+  const createInsightBranch = useCallback(async (parent: WriteCanvasNode) => {
+    const currentDetail = detailRef.current;
+    const childCount = currentDetail?.edges.filter(edge => edge.relation === 'structure' && edge.sourceNodeId === parent.id).length || 0;
+    const node = await createNode({
+      kind: 'asset_text',
+      role: 'insight',
+      origin: 'manual',
+      status: 'editing',
+      title: `子节点：${parent.title}`,
+      content: '',
+      x: parent.x + 380,
+      y: parent.y + childCount * 220,
+      width: 300,
+      height: 180,
+    }, { open: false });
+    if (!node) return;
+    await createStructureEdge(parent.id, node.id);
+    selectNode(node.id);
+  }, [createNode, createStructureEdge, selectNode]);
+
+  const createDocumentFromNode = useCallback(async (source: WriteCanvasNode) => {
+    const projectId = currentProjectIdRef.current;
+    if (!projectId) return;
+    const response = await fetch(`/api/write/canvas/projects/${projectId}/documents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: `${source.title}作品`,
+        summary: source.summary || '',
+        scenario: 'canvas',
+        status: 'editing',
+        sections: [{ key: 'opening', heading: '开场', body: '', level: 1, meta: {} }],
+        x: source.x + 380,
+        y: source.y,
+        width: 420,
+        height: 320,
+      }),
+    });
+    if (!response.ok) return showToast('创建作品失败');
+    const payload = await response.json() as { document?: { id?: number; nodeId?: number } };
+    await loadProjectDetail(projectId);
+    const documentId = Number(payload.document?.id);
+    const nodeId = Number(payload.document?.nodeId) || detailRef.current?.nodes.find(node => node.document?.id === documentId)?.id;
+    if (Number.isFinite(nodeId)) selectNode(nodeId);
+  }, [loadProjectDetail, selectNode, showToast]);
+
+  const runAgentMessage = async (agentNode: WriteCanvasNode, message: string) => {
+    if (!agentNode.agent || !message.trim()) return;
+    setIsAgentRunning(true);
+    try {
+      const response = await fetch(`/api/write/canvas/agents/${agentNode.agent.id}/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: message.trim() }),
+      });
+      if (!response.ok || !response.body) throw new Error('Agent 请求失败');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const boundary = buffer.lastIndexOf('\n\n');
+        if (boundary < 0) continue;
+        const events = parseSseEvents(buffer.slice(0, boundary + 2));
+        buffer = buffer.slice(boundary + 2);
+        const error = events.find(event => event.event === 'error');
+        if (error) throw new Error(String(error.payload.message || 'Agent 暂时不可用'));
+        if (events.some(event => event.event === 'final') && currentProjectIdRef.current) {
+          await loadProjectDetail(currentProjectIdRef.current);
+        }
+      }
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Agent 暂时不可用');
+    } finally {
+      setIsAgentRunning(false);
+    }
+  };
+
+  const submitAiDecomposition = async () => {
+    const currentDetail = detailRef.current;
+    const source = currentDetail?.nodes.find(node => node.id === aiDecomposeNodeId);
+    const agent = currentDetail?.nodes.find(node => node.id === aiDecomposeAgentId && node.kind === 'agent');
+    if (!source || !agent) return showToast('请选择可用的 Agent');
+    const hasContext = currentDetail?.edges.some(edge => edge.relation === 'context' && edge.sourceNodeId === source.id && edge.targetNodeId === agent.id);
+    if (!hasContext) {
+      const connected = await connectNodes(source.id, agent.id, { quiet: true });
+      if (!connected) return;
+    }
+    setAiDecomposeNodeId(null);
+    await runAgentMessage(agent, aiDecomposePrompt);
+  };
+
+  useEffect(() => {
+    const actionHandler = (event: Event) => {
+      const detail = (event as CustomEvent<{ nodeId?: number; action?: CanvasNodeAction }>).detail;
+      const node = detailRef.current?.nodes.find(item => item.id === Number(detail?.nodeId));
+      if (!node || !detail?.action) return;
+      if (detail.action === 'new-child') void createInsightBranch(node);
+      if (detail.action === 'create-document') void createDocumentFromNode(node);
+      if (detail.action === 'ai-decompose') {
+        const firstAgent = detailRef.current?.nodes.find(item => item.kind === 'agent') || null;
+        setAiDecomposeNodeId(node.id);
+        setAiDecomposeAgentId(firstAgent?.id || null);
+      }
+    };
+    const keyHandler = (event: KeyboardEvent) => {
+      const isTab = event.key === 'Tab';
+      const isEnter = event.key === 'Enter';
+      if (!isTab && !isEnter) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest('input, textarea, select, button, [contenteditable="true"]')) return;
+      const selected = detailRef.current?.nodes.find(node => node.id === selectedNodeId);
+      if (!selected) return;
+      event.preventDefault();
+      const incomingStructure = detailRef.current?.edges.find(edge => edge.relation === 'structure' && edge.targetNodeId === selected.id);
+      const parent = isEnter && incomingStructure
+        ? detailRef.current?.nodes.find(node => node.id === incomingStructure.sourceNodeId) || selected
+        : selected;
+      void createInsightBranch(parent);
+    };
+    window.addEventListener('atomflow-canvas-node-action', actionHandler);
+    window.addEventListener('keydown', keyHandler);
+    return () => {
+      window.removeEventListener('atomflow-canvas-node-action', actionHandler);
+      window.removeEventListener('keydown', keyHandler);
+    };
+  }, [createDocumentFromNode, createInsightBranch, selectedNodeId]);
+
   const createProject = () => loginAndDo(async () => {
     const response = await fetch('/api/write/canvas/projects', {
       method: 'POST',
@@ -792,6 +909,17 @@ export const MagicWritingCanvas: React.FC = () => {
     if (!response.ok || !projectId) return showToast('Agent 更新失败');
     await loadProjectDetail(projectId);
     showToast('Agent 设置已保存');
+  };
+
+  const updateCanvasNode = async (node: WriteCanvasNode, data: Record<string, unknown>) => {
+    const response = await fetch(`/api/write/canvas/nodes/${node.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const projectId = currentProjectIdRef.current;
+    if (!response.ok || !projectId) return showToast('节点更新失败');
+    await loadProjectDetail(projectId);
   };
 
   const saveTemplate = async (draft: AgentDraft) => {
@@ -955,6 +1083,32 @@ export const MagicWritingCanvas: React.FC = () => {
         />
       ) : null}
 
+      {aiDecomposeNodeId ? (
+        <div className="absolute inset-0 z-[90] flex items-end bg-[#20242A]/20 p-0 md:items-start md:justify-end md:bg-transparent md:p-4" onPointerDown={event => event.stopPropagation()}>
+          <div className="h-full w-full overflow-y-auto border border-[#D8D7D2] bg-[#FCFCFA] p-4 shadow-[0_24px_72px_rgba(29,32,38,0.18)] md:h-auto md:w-[360px] md:rounded-[8px]">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-[14px] font-semibold text-[#20242A]">AI 拆解</h2>
+                <p className="mt-1 text-[11px] leading-5 text-[#747980]">请求会发送给选中的 Agent，并只使用已连接的画布资料。</p>
+              </div>
+              <button type="button" aria-label="关闭 AI 拆解" onClick={() => setAiDecomposeNodeId(null)} className="text-[11px] text-[#777C83] hover:text-[#20242A]">关闭</button>
+            </div>
+            <label className="mt-4 block text-[10px] font-medium text-[#6D7178]">Agent
+              <select value={aiDecomposeAgentId || ''} onChange={event => setAiDecomposeAgentId(Number(event.target.value) || null)} className="canvas-field mt-1.5">
+                <option value="">选择 Agent</option>
+                {agentNodes.map(agent => <option key={agent.id} value={agent.id}>{agent.title}</option>)}
+              </select>
+            </label>
+            <label className="mt-3 block text-[10px] font-medium text-[#6D7178]">拆解指令
+              <textarea value={aiDecomposePrompt} onChange={event => setAiDecomposePrompt(event.target.value)} className="canvas-field mt-1.5 h-28 resize-none leading-5" />
+            </label>
+            <button type="button" disabled={!aiDecomposeAgentId || !aiDecomposePrompt.trim() || isAgentRunning} onClick={() => void submitAiDecomposition()} className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-[6px] bg-[#1F6FEB] px-3 py-2 text-[11px] font-medium text-white hover:bg-[#195FC9] disabled:opacity-50">
+              {isAgentRunning ? '请求中…' : '交给 Agent'}
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {activePanel === 'inspector' && selectedNode ? (
         <CanvasInspector
           node={selectedNode}
@@ -972,6 +1126,8 @@ export const MagicWritingCanvas: React.FC = () => {
           onSaveMessage={message => void saveMessageToCanvas(message)}
           onOpenAddContext={agentNodeId => openAddDrawer(agentNodeId)}
           onConnectToAgent={(sourceNodeId, agentNodeId) => void connectNodes(sourceNodeId, agentNodeId)}
+          onUpdateNode={(node, data) => void updateCanvasNode(node, data)}
+          onDocumentSaved={() => { if (currentProjectIdRef.current) void loadProjectDetail(currentProjectIdRef.current); }}
           onDeleteNode={node => void deleteSelectedNode(node)}
         />
       ) : null}

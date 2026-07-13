@@ -14,6 +14,7 @@ import {
   X,
 } from 'lucide-react';
 import type { WriteCanvasEdge, WriteCanvasMessage, WriteCanvasNode } from '../../types';
+import { CanvasDocumentEditor } from './CanvasDocumentEditor';
 
 type InspectorTab = 'chat' | 'context' | 'settings';
 
@@ -42,6 +43,8 @@ type CanvasInspectorProps = {
   onSaveMessage: (message: WriteCanvasMessage) => void;
   onOpenAddContext: (agentNodeId: number) => void;
   onConnectToAgent: (sourceNodeId: number, agentNodeId: number) => void;
+  onUpdateNode: (node: WriteCanvasNode, data: Record<string, unknown>) => void;
+  onDocumentSaved: () => void;
   onDeleteNode: (node: WriteCanvasNode) => void;
 };
 
@@ -72,6 +75,8 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
   onSaveMessage,
   onOpenAddContext,
   onConnectToAgent,
+  onUpdateNode,
+  onDocumentSaved,
   onDeleteNode,
 }) => {
   const [tab, setTab] = useState<InspectorTab>('chat');
@@ -108,7 +113,7 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
             {node.kind === 'agent' ? <Bot size={18} /> : <FileText size={18} />}
           </div>
           <div className="min-w-0 flex-1">
-            <div className="text-[10px] font-medium uppercase text-[#83878E]">{nodeKindLabel[node.kind]}</div>
+            <div className="text-[10px] font-medium uppercase text-[#83878E]">{node.role || nodeKindLabel[node.kind]} · {node.status || 'ready'}</div>
             <h2 className="mt-0.5 truncate text-[15px] font-semibold text-[#20242A]">{node.title}</h2>
           </div>
           <button type="button" onClick={onClose} aria-label="关闭节点详情" className="flex h-8 w-8 items-center justify-center rounded-[6px] text-[#777B82] hover:bg-[#EEEDE9] hover:text-[#20242A]">
@@ -118,7 +123,9 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
         {node.summary ? <p className="mt-3 line-clamp-3 text-[11px] leading-5 text-[#71757C]">{node.summary}</p> : null}
       </header>
 
-      {node.kind === 'agent' && node.agent ? (
+      {node.role === 'document' ? (
+        <CanvasDocumentEditor node={node} onSaved={onDocumentSaved} />
+      ) : node.kind === 'agent' && node.agent ? (
         <>
           <nav className="grid grid-cols-3 border-b border-[#E7E6E1] bg-[#F5F4F1] p-1" aria-label="Agent Inspector">
             <InspectorTabButton active={tab === 'chat'} icon={<MessageSquare size={13} />} onClick={() => setTab('chat')}>对话</InspectorTabButton>
@@ -218,6 +225,30 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
             <div className="whitespace-pre-wrap rounded-[7px] border border-[#E2E0DB] bg-white p-3 text-[12px] leading-6 text-[#4F545B]">
               {node.asset?.extractedText || node.asset?.contentText || node.summary || '这个节点没有可预览文本。'}
             </div>
+
+            <section className="mt-5">
+              <h3 className="text-[12px] font-semibold text-[#30343A]">节点状态</h3>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <label className="text-[10px] font-medium text-[#6D7178]">角色
+                  <select value={node.role || 'material'} onChange={event => onUpdateNode(node, { role: event.target.value })} className="canvas-field mt-1">
+                    <option value="material">资料</option>
+                    <option value="insight">洞察</option>
+                    <option value="task">任务</option>
+                    <option value="group">分组</option>
+                  </select>
+                </label>
+                <label className="text-[10px] font-medium text-[#6D7178]">状态
+                  <select value={node.status || 'ready'} onChange={event => onUpdateNode(node, { status: event.target.value })} className="canvas-field mt-1">
+                    <option value="ready">就绪</option>
+                    <option value="editing">编辑中</option>
+                    <option value="pending_review">待审核</option>
+                    <option value="adopted">已采纳</option>
+                    <option value="rejected">已拒绝</option>
+                    <option value="completed">已完成</option>
+                  </select>
+                </label>
+              </div>
+            </section>
 
             <section className="mt-5">
               <h3 className="text-[12px] font-semibold text-[#30343A]">连接到 Agent</h3>
