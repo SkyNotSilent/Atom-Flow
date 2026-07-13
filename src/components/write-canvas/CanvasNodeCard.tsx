@@ -7,6 +7,7 @@ type CanvasNodeCardNode = {
   kind?: string | null;
   role?: string | null;
   status?: string | null;
+  contentType?: string | null;
   title?: string | null;
   summary?: string | null;
 };
@@ -67,15 +68,7 @@ export const CanvasNodeCard: React.FC<CanvasNodeCardProps> = ({ node, onSelect }
 
   return (
     <div
-      role="button"
-      tabIndex={0}
       onPointerDown={() => onSelect(node.id)}
-      onKeyDown={event => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          onSelect(node.id);
-        }
-      }}
       className="relative h-full w-full overflow-hidden rounded-[8px] border bg-white text-left shadow-[0_12px_30px_rgba(36,43,53,0.13)] transition-[box-shadow,border-color] hover:shadow-[0_16px_38px_rgba(36,43,53,0.18)]"
       style={{ borderColor: tone.border }}
     >
@@ -99,7 +92,7 @@ export const CanvasNodeCard: React.FC<CanvasNodeCardProps> = ({ node, onSelect }
           </div>
         </div>
       </div>
-      <CanvasNodeAddMenu nodeId={node.id} />
+      <CanvasNodeAddMenu nodeId={node.id} isAgentGroup={node.contentType === 'agent_group'} />
     </div>
   );
 };

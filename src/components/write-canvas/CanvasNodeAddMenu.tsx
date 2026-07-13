@@ -1,17 +1,18 @@
 import React, { useState } from 'react';
-import { FilePlus2, Plus, Sparkles } from 'lucide-react';
+import { FilePlus2, Play, Plus, Sparkles } from 'lucide-react';
 
-export type CanvasNodeAction = 'new-child' | 'ai-decompose' | 'create-document';
+export type CanvasNodeAction = 'new-child' | 'ai-decompose' | 'create-document' | 'run-agent-group';
 
 type CanvasNodeAddMenuProps = {
   nodeId: number;
+  isAgentGroup?: boolean;
 };
 
 const stopCanvasInteraction = (event: React.SyntheticEvent) => {
   event.stopPropagation();
 };
 
-export const CanvasNodeAddMenu: React.FC<CanvasNodeAddMenuProps> = ({ nodeId }) => {
+export const CanvasNodeAddMenu: React.FC<CanvasNodeAddMenuProps> = ({ nodeId, isAgentGroup = false }) => {
   const [isOpen, setIsOpen] = useState(false);
 
   const dispatchAction = (action: CanvasNodeAction) => {
@@ -32,6 +33,7 @@ export const CanvasNodeAddMenu: React.FC<CanvasNodeAddMenuProps> = ({ nodeId }) 
           <ActionButton icon={<Plus size={12} />} onClick={() => dispatchAction('new-child')}>新建子节点</ActionButton>
           <ActionButton icon={<Sparkles size={12} />} onClick={() => dispatchAction('ai-decompose')}>AI 拆解</ActionButton>
           <ActionButton icon={<FilePlus2 size={12} />} onClick={() => dispatchAction('create-document')}>创建作品</ActionButton>
+          {isAgentGroup ? <ActionButton icon={<Play size={12} />} onClick={() => dispatchAction('run-agent-group')}>运行任务</ActionButton> : null}
         </div>
       ) : null}
       <button

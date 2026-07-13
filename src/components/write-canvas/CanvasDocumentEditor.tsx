@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { EditorContent, useEditor } from '@tiptap/react';
 import { StarterKit } from '@tiptap/starter-kit';
-import { Bold, ChevronDown, ChevronUp, GripVertical, Heading2, Italic, Plus, Save, Trash2 } from 'lucide-react';
+import { Bold, ChevronDown, ChevronUp, Download, FileCode2, GripVertical, Heading2, Italic, Plus, Save, Trash2 } from 'lucide-react';
 import type { WriteCanvasDocument, WriteCanvasDocumentSection, WriteCanvasNode } from '../../types';
+import { CANVAS_DOCUMENT_SCENARIOS, createScenarioSections, downloadCanvasDocument } from '../../utils/canvasDocumentExport';
 
 type CanvasDocumentEditorProps = {
   node: WriteCanvasNode;
@@ -166,6 +167,15 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
     setActiveSectionKey(section.key);
   };
 
+  const applyScenario = () => {
+    if (!document) return;
+    const hasWrittenContent = document.sections.some(section => section.heading.trim() || section.body.replace(/<[^>]+>/g, '').trim());
+    if (hasWrittenContent && !window.confirm('套用场景结构会替换当前大纲与正文，是否继续？')) return;
+    const sections = createScenarioSections(document.scenario);
+    setDocument({ ...document, sections });
+    setActiveSectionKey(sections[0]?.key || null);
+  };
+
   const save = async () => {
     if (!document || isSaving) return;
     setIsSaving(true);
@@ -207,6 +217,14 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
         <label className="block text-[10px] font-medium text-[#6D7178]">摘要
           <textarea value={document.summary} onChange={event => updateDocument({ summary: event.target.value })} className="canvas-field mt-1.5 h-20 resize-none leading-5" />
         </label>
+        <div className="grid grid-cols-[1fr_auto] items-end gap-2">
+          <label className="block text-[10px] font-medium text-[#6D7178]">创作场景
+            <select value={document.scenario || 'custom-longform'} onChange={event => updateDocument({ scenario: event.target.value })} className="canvas-field mt-1.5">
+              {CANVAS_DOCUMENT_SCENARIOS.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <button type="button" onClick={applyScenario} className="mb-px h-[34px] rounded-[6px] border border-[#C9D7E9] bg-white px-2.5 text-[10px] font-medium text-[#185ABD] hover:bg-[#EEF4FC]">套用结构</button>
+        </div>
         <label className="block text-[10px] font-medium text-[#6D7178]">状态
           <select value={document.status} onChange={event => updateDocument({ status: event.target.value as WriteCanvasDocument['status'] })} className="canvas-field mt-1.5">
             {documentStatuses.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
@@ -245,7 +263,11 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
       ) : null}
 
       {error ? <p className="mt-3 text-[11px] text-[#B34439]">{error}</p> : null}
-      <button type="button" disabled={isSaving} onClick={() => void save()} className="mt-5 inline-flex w-full items-center justify-center gap-1.5 rounded-[6px] bg-[#1F6FEB] px-3 py-2 text-[11px] font-medium text-white hover:bg-[#195FC9] disabled:opacity-50"><Save size={13} />{isSaving ? '保存中…' : '保存作品'}</button>
+      <div className="mt-5 grid grid-cols-[1fr_auto_auto] gap-2">
+        <button type="button" disabled={isSaving} onClick={() => void save()} className="inline-flex items-center justify-center gap-1.5 rounded-[6px] bg-[#1F6FEB] px-3 py-2 text-[11px] font-medium text-white hover:bg-[#195FC9] disabled:opacity-50"><Save size={13} />{isSaving ? '保存中…' : '保存作品'}</button>
+        <button type="button" title="导出 Markdown" aria-label="导出 Markdown" onClick={() => downloadCanvasDocument(document, 'markdown')} className="flex h-8 w-8 items-center justify-center rounded-[6px] border border-[#DCDAD4] bg-white text-[#59616A] hover:border-[#9ABCF0] hover:text-[#185ABD]"><Download size={14} /></button>
+        <button type="button" title="导出 HTML" aria-label="导出 HTML" onClick={() => downloadCanvasDocument(document, 'html')} className="flex h-8 w-8 items-center justify-center rounded-[6px] border border-[#DCDAD4] bg-white text-[#59616A] hover:border-[#9ABCF0] hover:text-[#185ABD]"><FileCode2 size={14} /></button>
+      </div>
     </div>
   );
 };

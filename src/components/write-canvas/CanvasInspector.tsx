@@ -45,6 +45,7 @@ type CanvasInspectorProps = {
   onConnectToAgent: (sourceNodeId: number, agentNodeId: number) => void;
   onUpdateNode: (node: WriteCanvasNode, data: Record<string, unknown>) => void;
   onDocumentSaved: () => void;
+  onOpenAgentGroup: (groupId: number) => void;
   onDeleteNode: (node: WriteCanvasNode) => void;
 };
 
@@ -77,6 +78,7 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
   onConnectToAgent,
   onUpdateNode,
   onDocumentSaved,
+  onOpenAgentGroup,
   onDeleteNode,
 }) => {
   const [tab, setTab] = useState<InspectorTab>('chat');
@@ -221,6 +223,11 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
       ) : (
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
+            {node.contentType === 'agent_group' && Number.isFinite(Number(node.businessRef)) ? (
+              <button type="button" onClick={() => onOpenAgentGroup(Number(node.businessRef))} className="mb-4 inline-flex w-full items-center justify-center gap-2 rounded-[6px] bg-[#1F6FEB] px-3 py-2 text-[11px] font-medium text-white hover:bg-[#195FC9]">
+                <Bot size={14} /> 配置或运行 Agent 组
+              </button>
+            ) : null}
             {node.asset?.dataUrl ? <img src={node.asset.dataUrl} alt={node.title} className="mb-3 max-h-56 w-full rounded-[7px] border border-[#E2E0DB] bg-white object-contain" /> : null}
             <div className="whitespace-pre-wrap rounded-[7px] border border-[#E2E0DB] bg-white p-3 text-[12px] leading-6 text-[#4F545B]">
               {node.asset?.extractedText || node.asset?.contentText || node.summary || '这个节点没有可预览文本。'}
