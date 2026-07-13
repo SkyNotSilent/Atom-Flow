@@ -8940,7 +8940,11 @@ async function startServer() {
       `SELECT * FROM write_canvas_agent_batches WHERE group_id = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT 100`,
       [groupId, req.session.userId],
     )).rows.map(mapCanvasAgentBatchRow);
-    return res.json({ batches });
+    const runs = (await pool.query(
+      `SELECT * FROM write_canvas_agent_runs WHERE group_id = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT 300`,
+      [groupId, req.session.userId],
+    )).rows.map(mapCanvasAgentRunRow);
+    return res.json({ batches, runs });
   }));
 
   app.get("/api/write/canvas/projects/:projectId/agent-groups", requireAuth, asyncHandler(async (req, res) => {

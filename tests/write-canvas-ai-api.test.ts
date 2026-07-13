@@ -59,6 +59,10 @@ const groupBatchRoute = routeSegment(
   'app.post("/api/write/canvas/agent-groups/:id/batches/stream"',
   'app.post("/api/write/canvas/agents/:id/chat/stream"',
 );
+const groupBatchHistoryRoute = routeSegment(
+  'app.get("/api/write/canvas/agent-groups/:id/batches"',
+  'app.get("/api/write/canvas/projects/:projectId/agent-groups"',
+);
 assertOrdered(quickActionRoute, 'res.once("close"', "resolveCanvasOwnedNodeContext", "Quick action cancellation must be registered before context resolution");
 assertOrdered(groupBatchRoute, 'res.once("close"', "resolveCanvasOwnedNodeContext", "Batch cancellation must be registered before context resolution");
 assert.match(groupBatchRoute, /requestAbortController\.signal\.throwIfAborted\(\)[\s\S]{0,500}requestCanvasAgentCompletion/, "Batch must check cancellation immediately before provider calls");
@@ -78,6 +82,8 @@ assert.match(groupBatchRoute, /sourceNodeId:\s*Number\(group\.node_id\)/, "Gener
 
 assert.match(server, /app\.get\("\/api\/write\/canvas\/projects\/:projectId\/runs", requireAuth/, "Project run history must be discoverable");
 assert.match(server, /app\.get\("\/api\/write\/canvas\/agent-groups\/:id\/batches", requireAuth/, "Group batch history must be discoverable");
+assert.match(groupBatchHistoryRoute, /write_canvas_agent_runs WHERE group_id = \$1 AND user_id = \$2/, "Group history runs must be tenant-scoped");
+assert.match(groupBatchHistoryRoute, /res\.json\(\{ batches, runs \}\)/, "Group history must restore batch member outcomes");
 assert.match(server, /requireCanvasCompletionContent/, "Empty provider responses must fail before persistence");
 
 console.log("PASS: canvas quick AI and Agent group API contracts");
