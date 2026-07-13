@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bot,
   Check,
@@ -15,8 +15,11 @@ import {
 } from 'lucide-react';
 import type {
   WriteAgentTemplate,
+  WriteCanvasAgentBatch,
   WriteCanvasAgentGroup,
   WriteCanvasAgentGroupMember,
+  WriteCanvasAgentRun,
+  WriteCanvasEdge,
   WriteCanvasNode,
 } from '../../types';
 
@@ -24,6 +27,7 @@ type CanvasAgentGroupPanelProps = {
   projectId: number;
   initialGroupId?: number | null;
   nodes: WriteCanvasNode[];
+  edges?: WriteCanvasEdge[];
   templates: WriteAgentTemplate[];
   onClose: () => void;
   onGroupCreated: (group: WriteCanvasAgentGroup) => void | Promise<void>;
@@ -50,6 +54,15 @@ type MemberRunState = {
 
 type SseEvent = { type: string; data: Record<string, unknown> };
 
+type AgentGroupBatchHistory = WriteCanvasAgentBatch & {
+  runs: WriteCanvasAgentRun[];
+};
+
+type AgentGroupBatchHistoryPayload = {
+  batches?: Array<WriteCanvasAgentBatch & { runs?: WriteCanvasAgentRun[] }>;
+  runs?: WriteCanvasAgentRun[];
+};
+
 const fallbackMember = {
   model: '',
   systemPrompt: '',
@@ -64,6 +77,59 @@ const nodeRoleLabels: Record<WriteCanvasNode['role'], string> = {
   task: '任务',
   document: '作品',
   group: '分组',
+};
+
+const batchStatusLabels: Record<WriteCanvasAgentBatch['status'], string> = {
+  queued: '等待中',
+  running: '生成中',
+  completed: '已完成',
+  partial: '部分完成',
+  failed: '失败',
+  cancelled: '已取消',
+};
+
+const runStatusLabels: Record<WriteCanvasAgentRun['status'], string> = {
+  queued: '等待中',
+  running: '生成中',
+  completed: '成功',
+  failed: '失败',
+  cancelled: '已取消',
+};
+
+export const getAgentGroupContextNodes = (nodes: WriteCanvasNode[]) => nodes.filter(node => (
+  node.kind !== 'agent'
+  && node.role !== 'task'
+  && node.role !== 'group'
+  && node.contentType !== 'agent_group'
+  && node.status !== 'rejected'
+));
+
+export const getAgentGroupContextIds = (
+  edges: WriteCanvasEdge[],
+  group: WriteCanvasAgentGroup,
+  contextNodes: WriteCanvasNode[],
+) => {
+  const allowedNodeIds = new Set(contextNodes.map(node => node.id));
+  return Array.from(new Set(edges
+    .filter(edge => edge.relation === 'context' && edge.targetNodeId === group.nodeId && allowedNodeIds.has(edge.sourceNodeId))
+    .map(edge => edge.sourceNodeId)))
+    .slice(0, 30);
+};
+
+export const normalizeAgentGroupBatchHistory = (
+  payload: AgentGroupBatchHistoryPayload,
+): AgentGroupBatchHistory[] => {
+  const batches = Array.isArray(payload.batches) ? payload.batches : [];
+  const siblingRuns = Array.isArray(payload.runs) ? payload.runs : [];
+  return batches.map(batch => {
+    const embeddedRuns = Array.isArray(batch.runs) ? batch.runs : [];
+    return {
+      ...batch,
+      runs: embeddedRuns.length > 0
+        ? embeddedRuns
+        : siblingRuns.filter(run => run.batchId === batch.id),
+    };
+  });
 };
 
 const createMemberDraft = (template?: WriteAgentTemplate, index = 0): MemberDraft => ({
@@ -131,6 +197,7 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
   projectId,
   initialGroupId = null,
   nodes,
+  edges,
   templates,
   onClose,
   onGroupCreated,
@@ -151,6 +218,9 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
   const [isRunning, setIsRunning] = useState(false);
   const [runStates, setRunStates] = useState<Record<number, MemberRunState>>({});
   const [runError, setRunError] = useState('');
+  const [batchHistory, setBatchHistory] = useState<AgentGroupBatchHistory[]>([]);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
   const runAbortRef = useRef<AbortController | null>(null);
 
   const selectedGroup = useMemo(
@@ -158,8 +228,12 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
     [groups, selectedGroupId],
   );
   const contextNodes = useMemo(
-    () => nodes.filter(node => node.role !== 'group' && node.contentType !== 'agent_group' && node.status !== 'rejected'),
+    () => getAgentGroupContextNodes(nodes),
     [nodes],
+  );
+  const canonicalContextIds = useMemo(
+    () => selectedGroup && edges ? getAgentGroupContextIds(edges, selectedGroup, contextNodes) : [],
+    [contextNodes, edges, selectedGroup],
   );
 
   const loadGroups = async (signal?: AbortSignal) => {
@@ -192,14 +266,64 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
 
   useEffect(() => () => runAbortRef.current?.abort(), []);
 
+  const applyPersistedRuns = useCallback((group: WriteCanvasAgentGroup, history: AgentGroupBatchHistory[]) => {
+    const latestRuns = history[0]?.runs || [];
+    setRunStates(Object.fromEntries(group.members.map(member => {
+      const run = latestRuns.find(item => item.groupMemberId === member.id);
+      if (!run) return [member.id, { status: 'idle' } satisfies MemberRunState];
+      if (run.status === 'completed') {
+        return [member.id, { status: 'completed', output: run.output || '' } satisfies MemberRunState];
+      }
+      if (run.status === 'running') return [member.id, { status: 'running' } satisfies MemberRunState];
+      if (run.status === 'failed' || run.status === 'cancelled') {
+        return [member.id, {
+          status: 'failed',
+          error: run.error || (run.status === 'cancelled' ? '运行已取消' : '生成失败'),
+        } satisfies MemberRunState];
+      }
+      return [member.id, { status: 'idle' } satisfies MemberRunState];
+    })));
+  }, []);
+
+  const loadBatchHistory = useCallback(async (group: WriteCanvasAgentGroup, signal?: AbortSignal) => {
+    setIsHistoryLoading(true);
+    setHistoryError('');
+    try {
+      const response = await fetch(`/api/write/canvas/agent-groups/${group.id}/batches`, { signal });
+      if (!response.ok) throw new Error(await getResponseError(response, '运行历史加载失败'));
+      const payload = await response.json() as AgentGroupBatchHistoryPayload;
+      const history = normalizeAgentGroupBatchHistory(payload);
+      setBatchHistory(history);
+      applyPersistedRuns(group, history);
+      if (edges === undefined) {
+        const allowedNodeIds = new Set(contextNodes.map(node => node.id));
+        setSelectedContextIds((history[0]?.contextNodeIds || []).filter(id => allowedNodeIds.has(id)).slice(0, 30));
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      setHistoryError(error instanceof Error ? error.message : '运行历史加载失败');
+    } finally {
+      if (!signal?.aborted) setIsHistoryLoading(false);
+    }
+  }, [applyPersistedRuns, contextNodes, edges]);
+
   useEffect(() => {
     if (!selectedGroup) {
       setRunStates({});
+      setBatchHistory([]);
+      setSelectedContextIds([]);
       return;
     }
     setRunStates(Object.fromEntries(selectedGroup.members.map(member => [member.id, { status: 'idle' }])));
     setRunError('');
-  }, [selectedGroup?.id]);
+    const controller = new AbortController();
+    void loadBatchHistory(selectedGroup, controller.signal);
+    return () => controller.abort();
+  }, [loadBatchHistory, selectedGroup]);
+
+  useEffect(() => {
+    if (edges !== undefined) setSelectedContextIds(canonicalContextIds);
+  }, [canonicalContextIds, edges]);
 
   const updateMember = (key: string, patch: Partial<MemberDraft>) => {
     setMembers(current => current.map(member => member.key === key ? { ...member, ...patch } : member));
@@ -252,15 +376,21 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
       });
       if (!response.ok) throw new Error(await getResponseError(response, 'Agent 组创建失败'));
       const payload = await response.json() as { group?: WriteCanvasAgentGroup };
-      if (!payload.group) throw new Error('Agent 组创建结果无效');
+      if (!payload.group || !Number.isSafeInteger(payload.group.nodeId) || payload.group.nodeId <= 0) {
+        throw new Error('Agent 组创建结果缺少画布节点');
+      }
       setGroups(current => [payload.group!, ...current.filter(group => group.id !== payload.group!.id)]);
       setSelectedGroupId(payload.group.id);
       setMode('run');
       setName('');
       setSharedPrompt('');
       setMembers([createMemberDraft(templates[0], 0)]);
-      await onGroupCreated(payload.group);
       onToast('Agent 组已创建');
+      try {
+        await onGroupCreated(payload.group);
+      } catch {
+        onToast('Agent 组已创建，但画布刷新失败，请重新打开项目');
+      }
     } catch (error) {
       onToast(error instanceof Error ? error.message : 'Agent 组创建失败');
     } finally {
@@ -325,8 +455,12 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
         if (type === 'final') {
           receivedFinal = true;
           const failures = Array.isArray(data.failures) ? data.failures.length : 0;
+          const finalStatus = typeof data.status === 'string' ? data.status : failures > 0 ? 'partial' : 'completed';
+          await loadBatchHistory(selectedGroup);
           if (outputNodeIds.size > 0) await onResults([...outputNodeIds]);
-          onToast(failures > 0 ? `批量生成完成，${failures} 个成员失败` : '批量生成完成');
+          if (finalStatus === 'failed') onToast('批量生成失败');
+          else if (finalStatus === 'cancelled') onToast('批量生成已取消');
+          else onToast(failures > 0 || finalStatus === 'partial' ? `批量生成部分完成，${failures} 个成员失败` : '批量生成完成');
         }
       });
       if (!receivedFinal) throw new Error('Agent 组运行连接提前结束');
@@ -398,11 +532,15 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
             isRunning={isRunning}
             runStates={runStates}
             runError={runError}
+            batchHistory={batchHistory}
+            isHistoryLoading={isHistoryLoading}
+            historyError={historyError}
             onSelectGroup={setSelectedGroupId}
             onToggleContext={toggleContext}
             onMessageChange={setMessage}
             onCreate={() => setMode('create')}
             onRetry={() => void loadGroups()}
+            onRetryHistory={() => selectedGroup && void loadBatchHistory(selectedGroup)}
             onRun={() => void runGroup()}
             onCancel={() => runAbortRef.current?.abort()}
           />
@@ -525,11 +663,15 @@ type RunGroupViewProps = {
   isRunning: boolean;
   runStates: Record<number, MemberRunState>;
   runError: string;
+  batchHistory: AgentGroupBatchHistory[];
+  isHistoryLoading: boolean;
+  historyError: string;
   onSelectGroup: (id: number) => void;
   onToggleContext: (id: number) => void;
   onMessageChange: (value: string) => void;
   onCreate: () => void;
   onRetry: () => void;
+  onRetryHistory: () => void;
   onRun: () => void;
   onCancel: () => void;
 };
@@ -545,11 +687,15 @@ const RunGroupView: React.FC<RunGroupViewProps> = ({
   isRunning,
   runStates,
   runError,
+  batchHistory,
+  isHistoryLoading,
+  historyError,
   onSelectGroup,
   onToggleContext,
   onMessageChange,
   onCreate,
   onRetry,
+  onRetryHistory,
   onRun,
   onCancel,
 }) => {
@@ -620,6 +766,30 @@ const RunGroupView: React.FC<RunGroupViewProps> = ({
               </div>
               {runError && <p role="alert" className="mt-3 flex items-start gap-1.5 text-[10px] leading-4 text-[#B34439]"><CircleAlert size={12} className="mt-0.5 shrink-0" />{runError}</p>}
             </section>
+
+            <section className="border-t border-[#E7E6E1] py-4">
+              <div className="mb-2 flex items-center justify-between">
+                <h3 className="text-[11px] font-semibold text-[#3B4047]">最近运行</h3>
+                {historyError && (
+                  <button type="button" onClick={onRetryHistory} className="inline-flex items-center gap-1 text-[10px] text-[#5F646B] hover:text-[#20242A]">
+                    <RefreshCw size={11} /> 重试
+                  </button>
+                )}
+              </div>
+              {isHistoryLoading ? (
+                <p className="flex items-center gap-1.5 py-3 text-[10px] text-[#8A8E95]"><LoaderCircle size={12} className="animate-spin" />加载历史</p>
+              ) : historyError ? (
+                <p role="alert" className="py-2 text-[10px] leading-4 text-[#B34439]">{historyError}</p>
+              ) : batchHistory.length === 0 ? (
+                <p className="py-3 text-[10px] text-[#92969D]">暂无运行记录</p>
+              ) : (
+                <div className="divide-y divide-[#E7E6E1] border-y border-[#E7E6E1]">
+                  {batchHistory.slice(0, 5).map(batch => (
+                    <BatchHistoryRow key={batch.id} batch={batch} members={selectedGroup.members} />
+                  ))}
+                </div>
+              )}
+            </section>
           </>
         )}
       </div>
@@ -640,6 +810,36 @@ const RunGroupView: React.FC<RunGroupViewProps> = ({
     </>
   );
 };
+
+const BatchHistoryRow: React.FC<{
+  batch: AgentGroupBatchHistory;
+  members: WriteCanvasAgentGroupMember[];
+}> = ({ batch, members }) => (
+  <article className="py-3">
+    <div className="flex items-center gap-2">
+      <span className={`rounded-[4px] px-1.5 py-0.5 text-[9px] font-medium ${batch.status === 'completed' ? 'bg-[#E7F5EC] text-[#267A47]' : batch.status === 'partial' ? 'bg-[#FFF3D9] text-[#946200]' : batch.status === 'running' || batch.status === 'queued' ? 'bg-[#E7F0FF] text-[#1F6FEB]' : 'bg-[#FCECEA] text-[#B34439]'}`}>
+        {batchStatusLabels[batch.status]}
+      </span>
+      <time className="ml-auto text-[9px] text-[#92969D]" dateTime={batch.createdAt}>
+        {new Date(batch.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
+      </time>
+    </div>
+    <p className="mt-2 line-clamp-2 text-[10px] leading-4 text-[#555A61]">{batch.message || '未记录任务内容'}</p>
+    {batch.runs.length > 0 && (
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {batch.runs.map(run => {
+          const memberName = members.find(member => member.id === run.groupMemberId)?.name || `Agent ${run.groupMemberId || ''}`.trim();
+          return (
+            <span key={run.id} title={run.error || run.output || ''} className={`rounded-[4px] border px-1.5 py-1 text-[9px] ${run.status === 'completed' ? 'border-[#C9E6D3] text-[#267A47]' : run.status === 'running' || run.status === 'queued' ? 'border-[#C9D9F2] text-[#1F6FEB]' : 'border-[#EACBC7] text-[#B34439]'}`}>
+              {memberName} · {runStatusLabels[run.status]}
+            </span>
+          );
+        })}
+      </div>
+    )}
+    {batch.error && <p className="mt-2 line-clamp-2 text-[9px] leading-4 text-[#B34439]">{batch.error}</p>}
+  </article>
+);
 
 const NumberField: React.FC<{ label: string; value: number; min: number; max: number; step: number; onChange: (value: number) => void }> = ({ label, value, min, max, step, onChange }) => (
   <label className="block text-[10px] text-[#6D7178]">{label}

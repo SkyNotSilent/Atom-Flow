@@ -31,6 +31,16 @@ assert.match(page, /event\.key === 'Tab'|event\.key === "Tab"/, "Tab must create
 assert.match(page, /event\.key === 'Enter'|event\.key === "Enter"/, "Enter must create a sibling branch outside editors");
 assert.match(page, /\[role="button"\]/, "Global branch shortcuts must ignore interactive role targets");
 assert.match(page, /if \(!linked\)[\s\S]{0,300}method: 'DELETE'/, "Failed structure links must roll back their orphan child node");
+assert.match(page, /let receivedFinal = false/, "Quick AI must distinguish a terminal final event from a truncated stream");
+assert.match(page, /if \(!receivedFinal\)[\s\S]{0,120}throw new Error/, "Quick AI must reject streams that close before the final event");
+assert.match(page, /quickActionAbortControllerRef/, "Quick AI must keep an AbortController for explicit cancellation");
+assert.match(page, /signal:\s*abortController\.signal/, "Quick AI requests must be wired to the cancellation signal");
+assert.match(page, /取消生成/, "Quick AI must expose an explicit cancel action while running");
+assert.match(page, /setActivePanel\(null\)[\s\S]{0,220}setAiDecomposeNodeId\(node\.id\)/, "Opening Quick AI must close other canvas overlays");
+assert.match(page, /pendingNodeGeometryRef/, "User geometry edits must be tracked before the debounce expires");
+assert.match(page, /mergePendingNodeGeometry/, "Server detail reloads must preserve optimistic local geometry");
+assert.match(page, /flushPendingNodeGeometry/, "Pending node geometry must be flushable before project changes");
+assert.match(page, /selectedIds\.length !== 1[\s\S]{0,220}setSelectedNodeId\(null\)/, "Multi-selection and arrow selection must clear stale business selection");
 assert.match(inspector, /node\.role === 'document'|node\.role === "document"/, "Inspector must route document nodes to the document editor");
 assert.match(editor, /useEditor\(/, "Document editing must use Tiptap");
 assert.match(editor, /sections/, "Document editor must keep ordered outline sections and bodies together");
