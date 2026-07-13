@@ -984,6 +984,16 @@ const WRITE_CANVAS_NODE_KINDS = [
 
 type WriteCanvasNodeKind = typeof WRITE_CANVAS_NODE_KINDS[number];
 
+const WRITE_CANVAS_NODE_ROLES = ["material", "insight", "task", "document", "group"] as const;
+const WRITE_CANVAS_NODE_ORIGINS = ["existing", "extracted", "manual", "generated"] as const;
+const WRITE_CANVAS_NODE_STATUSES = ["parsing", "ready", "running", "pending_review", "adopted", "rejected", "editing", "completed", "failed"] as const;
+const WRITE_CANVAS_EDGE_RELATIONS = ["context", "derived_from", "generated", "structure"] as const;
+
+type WriteCanvasNodeRole = typeof WRITE_CANVAS_NODE_ROLES[number];
+type WriteCanvasNodeOrigin = typeof WRITE_CANVAS_NODE_ORIGINS[number];
+type WriteCanvasNodeStatus = typeof WRITE_CANVAS_NODE_STATUSES[number];
+type WriteCanvasEdgeRelation = typeof WRITE_CANVAS_EDGE_RELATIONS[number];
+
 type CanvasContextItem = {
   nodeId: number;
   kind: WriteCanvasNodeKind;
@@ -3818,6 +3828,51 @@ const normalizeCanvasNodeKind = (value: unknown): WriteCanvasNodeKind | null => 
     : null;
 };
 
+const normalizeCanvasNodeRole = (value: unknown): WriteCanvasNodeRole | null => (
+  typeof value === "string" && (WRITE_CANVAS_NODE_ROLES as readonly string[]).includes(value)
+    ? value as WriteCanvasNodeRole
+    : null
+);
+
+const normalizeCanvasNodeOrigin = (value: unknown): WriteCanvasNodeOrigin | null => (
+  typeof value === "string" && (WRITE_CANVAS_NODE_ORIGINS as readonly string[]).includes(value)
+    ? value as WriteCanvasNodeOrigin
+    : null
+);
+
+const normalizeCanvasNodeStatus = (value: unknown): WriteCanvasNodeStatus | null => (
+  typeof value === "string" && (WRITE_CANVAS_NODE_STATUSES as readonly string[]).includes(value)
+    ? value as WriteCanvasNodeStatus
+    : null
+);
+
+const normalizeCanvasEdgeRelation = (value: unknown): WriteCanvasEdgeRelation | null => (
+  typeof value === "string" && (WRITE_CANVAS_EDGE_RELATIONS as readonly string[]).includes(value)
+    ? value as WriteCanvasEdgeRelation
+    : null
+);
+
+const getCanvasNodeRole = (kind: WriteCanvasNodeKind): WriteCanvasNodeRole => {
+  if (["asset_text", "asset_file", "asset_image", "saved_article", "atom_card"].includes(kind)) return "material";
+  if (kind === "agent") return "task";
+  if (kind === "result") return "document";
+  return "insight";
+};
+
+const getCanvasContentType = (kind: WriteCanvasNodeKind) => ({
+  asset_text: "text", asset_file: "file", asset_image: "image", saved_article: "article",
+  atom_card: "atom_card", note: "note", agent: "agent", result: "result",
+}[kind]);
+
+const getCanvasNodeOrigin = (kind: WriteCanvasNodeKind): WriteCanvasNodeOrigin => (
+  ["asset_text", "asset_file", "asset_image", "saved_article", "atom_card"].includes(kind) ? "existing"
+    : kind === "result" ? "generated" : "manual"
+);
+
+const getCanvasNodeStatus = (kind: WriteCanvasNodeKind): WriteCanvasNodeStatus => (
+  kind === "agent" ? "ready" : kind === "result" ? "pending_review" : "ready"
+);
+
 const clampNumber = (value: unknown, fallback: number, min: number, max: number) => {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) return fallback;
@@ -3876,15 +3931,43 @@ const mapCanvasAgentRow = (row: any) => row ? ({
   updatedAt: row.updatedAt || row.updated_at
 }) : null;
 
+const mapCanvasDocumentSectionRow = (row: any) => ({
+  key: row.key ?? row.stable_key,
+  heading: row.heading || "",
+  body: row.body || "",
+  level: Number(row.level || 1),
+  meta: row.meta || {},
+});
+
+const mapCanvasDocumentRow = (row: any) => row ? ({
+  id: Number(row.id),
+  projectId: Number(row.projectId ?? row.project_id),
+  nodeId: Number(row.nodeId ?? row.node_id),
+  title: row.title || "",
+  summary: row.summary || "",
+  scenario: row.scenario || "",
+  status: row.status as WriteCanvasNodeStatus,
+  currentVersionId: row.currentVersionId ?? row.current_version_id ? Number(row.currentVersionId ?? row.current_version_id) : null,
+  sections: Array.isArray(row.sections) ? row.sections.map(mapCanvasDocumentSectionRow) : [],
+  createdAt: row.createdAt || row.created_at,
+  updatedAt: row.updatedAt || row.updated_at,
+}) : null;
+
 const mapCanvasNodeRow = (row: any) => ({
   id: Number(row.id),
   projectId: Number(row.projectId ?? row.project_id),
   kind: row.kind as WriteCanvasNodeKind,
+  role: row.role ?? row.node_role ?? getCanvasNodeRole(row.kind as WriteCanvasNodeKind),
+  contentType: row.contentType ?? row.content_type ?? getCanvasContentType(row.kind as WriteCanvasNodeKind),
+  origin: row.origin ?? getCanvasNodeOrigin(row.kind as WriteCanvasNodeKind),
+  status: row.status ?? getCanvasNodeStatus(row.kind as WriteCanvasNodeKind),
+  businessRef: row.businessRef ?? row.business_ref ?? null,
   title: row.title as string,
   summary: row.summary || "",
   refId: row.refId ?? row.ref_id ?? null,
   asset: mapCanvasAssetRow(row.asset || null),
   agent: mapCanvasAgentRow(row.agent || null),
+  document: mapCanvasDocumentRow(row.document || null),
   meta: row.meta || {},
   x: Number(row.x),
   y: Number(row.y),
@@ -3899,7 +3982,7 @@ const mapCanvasEdgeRow = (row: any) => ({
   projectId: Number(row.projectId ?? row.project_id),
   sourceNodeId: Number(row.sourceNodeId ?? row.source_node_id),
   targetNodeId: Number(row.targetNodeId ?? row.target_node_id),
-  relation: "context" as const,
+  relation: row.relation as WriteCanvasEdgeRelation,
   createdAt: row.createdAt || row.created_at
 });
 
@@ -4004,13 +4087,16 @@ const lockCanvasUser = async (client: pg.PoolClient, userId: number) => {
 };
 
 const getCanvasStoredBytes = async (client: pg.PoolClient, userId: number) => Number((await client.query(
-  `SELECT COALESCE(SUM(
-     octet_length(COALESCE(data_url, '')) +
-     octet_length(COALESCE(content_text, '')) +
-     octet_length(COALESCE(extracted_text, ''))
-   ), 0) AS bytes
-   FROM write_canvas_assets
-   WHERE user_id = $1`,
+  `SELECT COALESCE(SUM(bytes), 0) AS bytes FROM (
+     SELECT octet_length(COALESCE(data_url, '')) + octet_length(COALESCE(content_text, '')) + octet_length(COALESCE(extracted_text, '')) AS bytes
+     FROM write_canvas_assets WHERE user_id = $1
+     UNION ALL SELECT octet_length(title) + octet_length(summary) + octet_length(scenario)
+     FROM write_canvas_documents WHERE user_id = $1
+     UNION ALL SELECT octet_length(stable_key) + octet_length(heading) + octet_length(body) + octet_length(meta::text)
+     FROM write_canvas_document_sections WHERE user_id = $1
+     UNION ALL SELECT octet_length(snapshot::text)
+     FROM write_canvas_document_versions WHERE user_id = $1
+   ) stored`,
   [userId],
 )).rows[0]?.bytes || 0);
 
@@ -4059,7 +4145,8 @@ const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId
   if (!projectRow) return null;
 
   const nodeRows = (await pool.query(
-    `SELECT n.id, n.project_id AS "projectId", n.kind, n.title, n.summary, n.ref_id AS "refId",
+    `SELECT n.id, n.project_id AS "projectId", n.kind, n.node_role AS role, n.content_type AS "contentType",
+            n.origin, n.status, n.business_ref AS "businessRef", n.title, n.summary, n.ref_id AS "refId",
             n.meta, n.x, n.y, n.width, n.height, n.created_at AS "createdAt", n.updated_at AS "updatedAt",
             CASE WHEN a.id IS NULL THEN NULL ELSE jsonb_build_object(
               'id', a.id, 'type', a.type, 'title', a.title,
@@ -4072,10 +4159,20 @@ const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId
               'name', ai.name, 'model', ai.model, 'systemPrompt', ai.system_prompt,
               'temperature', ai.temperature, 'topP', ai.top_p, 'maxTokens', ai.max_tokens,
               'createdAt', ai.created_at, 'updatedAt', ai.updated_at
-            ) END AS agent
+            ) END AS agent,
+            CASE WHEN d.id IS NULL THEN NULL ELSE jsonb_build_object(
+              'id', d.id, 'projectId', d.project_id, 'nodeId', d.node_id,
+              'title', d.title, 'summary', d.summary, 'scenario', d.scenario, 'status', d.status,
+              'currentVersionId', d.current_version_id, 'createdAt', d.created_at, 'updatedAt', d.updated_at,
+              'sections', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object('key', ds.stable_key, 'heading', ds.heading, 'body', ds.body, 'level', ds.level, 'meta', ds.meta) ORDER BY ds.sort_order)
+                FROM write_canvas_document_sections ds WHERE ds.document_id = d.id
+              ), '[]'::jsonb)
+            ) END AS document
      FROM write_canvas_nodes n
      LEFT JOIN write_canvas_assets a ON a.id = n.asset_id AND a.user_id = n.user_id
      LEFT JOIN write_agent_instances ai ON ai.id = n.agent_id AND ai.user_id = n.user_id
+     LEFT JOIN write_canvas_documents d ON d.id = n.document_id AND d.user_id = n.user_id
      WHERE n.user_id = $1 AND n.project_id = $2
      ORDER BY n.created_at ASC`,
     [userId, projectId]
@@ -4117,6 +4214,89 @@ const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId
     edges: edgeRows,
     messages
   };
+};
+
+type CanvasDocumentSectionInput = {
+  key: string;
+  heading: string;
+  body: string;
+  level: number;
+  meta: Record<string, unknown>;
+};
+
+const normalizeCanvasDocumentSections = (value: unknown): CanvasDocumentSectionInput[] | null => {
+  if (!Array.isArray(value)) return null;
+  const keys = new Set<string>();
+  const sections: CanvasDocumentSectionInput[] = [];
+  for (const item of value) {
+    if (!isPlainRecord(item)) return null;
+    const key = typeof item.key === "string" && /^[a-zA-Z0-9_-]{1,120}$/.test(item.key)
+      ? item.key : randomUUID();
+    if (keys.has(key)) return null;
+    keys.add(key);
+    sections.push({
+      key,
+      heading: typeof item.heading === "string" ? item.heading.trim().slice(0, 240) : "",
+      body: typeof item.body === "string" ? item.body.slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH) : "",
+      level: Math.round(clampNumber(item.level, 1, 1, 6)),
+      meta: normalizeJsonObject(item.meta),
+    });
+  }
+  return sections;
+};
+
+const getCanvasDocumentBytes = (document: { title: string; summary: string; scenario: string; status: string }, sections: CanvasDocumentSectionInput[]) => {
+  const snapshot = JSON.stringify({ ...document, sections });
+  return Buffer.byteLength(document.title + document.summary + document.scenario + snapshot, "utf8")
+    + sections.reduce((total, section) => total + Buffer.byteLength(section.key + section.heading + section.body + JSON.stringify(section.meta), "utf8"), 0);
+};
+
+const writeCanvasDocumentSnapshot = async (
+  client: pg.PoolClient,
+  userId: number,
+  documentId: number,
+  document: { title: string; summary: string; scenario: string; status: WriteCanvasNodeStatus },
+  sections: CanvasDocumentSectionInput[],
+) => {
+  const snapshot = { ...document, sections };
+  const version = (await client.query(
+    `INSERT INTO write_canvas_document_versions (user_id, document_id, version_number, snapshot)
+     SELECT $1, $2, COALESCE(MAX(version_number), 0) + 1, $3::jsonb
+     FROM write_canvas_document_versions
+     WHERE document_id = $2
+     RETURNING id`,
+    [userId, documentId, JSON.stringify(snapshot)],
+  )).rows[0];
+  await client.query(`DELETE FROM write_canvas_document_sections WHERE document_id = $1 AND user_id = $2`, [documentId, userId]);
+  for (const [index, section] of sections.entries()) {
+    await client.query(
+      `INSERT INTO write_canvas_document_sections (user_id, document_id, stable_key, sort_order, heading, body, level, meta)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+      [userId, documentId, section.key, index, section.heading, section.body, section.level, JSON.stringify(section.meta)],
+    );
+  }
+  await client.query(
+    `UPDATE write_canvas_documents
+     SET title = $1, summary = $2, scenario = $3, status = $4, current_version_id = $5, updated_at = NOW()
+     WHERE id = $6 AND user_id = $7`,
+    [document.title, document.summary, document.scenario, document.status, Number(version.id), documentId, userId],
+  );
+  return Number(version.id);
+};
+
+const fetchCanvasDocument = async (pool: pg.Pool, userId: number, documentId: number) => {
+  const document = (await pool.query(
+    `SELECT d.id, d.project_id AS "projectId", d.node_id AS "nodeId", d.title, d.summary, d.scenario, d.status,
+            d.current_version_id AS "currentVersionId", d.created_at AS "createdAt", d.updated_at AS "updatedAt",
+            COALESCE((
+              SELECT jsonb_agg(jsonb_build_object('key', s.stable_key, 'heading', s.heading, 'body', s.body, 'level', s.level, 'meta', s.meta) ORDER BY s.sort_order)
+              FROM write_canvas_document_sections s WHERE s.document_id = d.id
+            ), '[]'::jsonb) AS sections
+     FROM write_canvas_documents d
+     WHERE d.id = $1 AND d.user_id = $2`,
+    [documentId, userId],
+  )).rows[0];
+  return mapCanvasDocumentRow(document);
 };
 
 const getCanvasAgentNode = async (pool: pg.Pool, userId: number, agentId: number) => {
@@ -5033,6 +5213,131 @@ async function startServer() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_messages_agent ON write_canvas_agent_messages(agent_id, created_at ASC)`);
+
+  await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS node_role TEXT`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS content_type TEXT`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS origin TEXT`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS status TEXT`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS business_ref TEXT`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS document_id BIGINT`);
+  await pool.query(`
+    UPDATE write_canvas_nodes
+    SET node_role = CASE kind
+      WHEN 'asset_text' THEN 'material' WHEN 'asset_file' THEN 'material' WHEN 'asset_image' THEN 'material'
+      WHEN 'saved_article' THEN 'material' WHEN 'atom_card' THEN 'material'
+      WHEN 'agent' THEN 'task' WHEN 'result' THEN 'document' ELSE 'insight' END,
+        content_type = CASE kind
+      WHEN 'asset_text' THEN 'text' WHEN 'asset_file' THEN 'file' WHEN 'asset_image' THEN 'image'
+      WHEN 'saved_article' THEN 'article' WHEN 'atom_card' THEN 'atom_card' WHEN 'agent' THEN 'agent'
+      WHEN 'result' THEN 'result' ELSE 'note' END,
+        origin = CASE WHEN kind IN ('asset_text', 'asset_file', 'asset_image', 'saved_article', 'atom_card') THEN 'existing'
+                      WHEN kind = 'result' THEN 'generated' ELSE 'manual' END,
+        status = CASE WHEN kind = 'result' THEN 'pending_review' ELSE 'ready' END
+    WHERE node_role IS NULL OR content_type IS NULL OR origin IS NULL OR status IS NULL
+  `);
+  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN node_role SET NOT NULL`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN content_type SET NOT NULL`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN origin SET NOT NULL`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN status SET NOT NULL`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_canvas_documents (
+      id                 BIGSERIAL PRIMARY KEY,
+      user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      project_id         BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
+      node_id            BIGINT UNIQUE,
+      title              TEXT NOT NULL DEFAULT '',
+      summary            TEXT NOT NULL DEFAULT '',
+      scenario           TEXT NOT NULL DEFAULT '',
+      status             TEXT NOT NULL CHECK (status IN ('parsing','ready','running','pending_review','adopted','rejected','editing','completed','failed')),
+      current_version_id BIGINT,
+      created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_documents_project ON write_canvas_documents(user_id, project_id, updated_at DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_canvas_document_versions (
+      id              BIGSERIAL PRIMARY KEY,
+      user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      document_id     BIGINT NOT NULL REFERENCES write_canvas_documents(id) ON DELETE CASCADE,
+      version_number  INTEGER NOT NULL,
+      snapshot        JSONB NOT NULL,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (document_id, version_number)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_document_versions_document ON write_canvas_document_versions(document_id, version_number DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS write_canvas_document_sections (
+      id          BIGSERIAL PRIMARY KEY,
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      document_id BIGINT NOT NULL REFERENCES write_canvas_documents(id) ON DELETE CASCADE,
+      stable_key  TEXT NOT NULL,
+      sort_order  INTEGER NOT NULL,
+      heading     TEXT NOT NULL DEFAULT '',
+      body        TEXT NOT NULL DEFAULT '',
+      level       INTEGER NOT NULL DEFAULT 1 CHECK (level BETWEEN 1 AND 6),
+      meta        JSONB NOT NULL DEFAULT '{}'::jsonb,
+      UNIQUE (document_id, stable_key),
+      UNIQUE (document_id, sort_order)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_document_sections_document ON write_canvas_document_sections(document_id, sort_order)`);
+  await pool.query(`
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_role_check') THEN
+        ALTER TABLE write_canvas_nodes ADD CONSTRAINT write_canvas_nodes_role_check CHECK (node_role IN ('material','insight','task','document','group'));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_origin_check') THEN
+        ALTER TABLE write_canvas_nodes ADD CONSTRAINT write_canvas_nodes_origin_check CHECK (origin IN ('existing','extracted','manual','generated'));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_status_check') THEN
+        ALTER TABLE write_canvas_nodes ADD CONSTRAINT write_canvas_nodes_status_check CHECK (status IN ('parsing','ready','running','pending_review','adopted','rejected','editing','completed','failed'));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_document_id_fkey') THEN
+        ALTER TABLE write_canvas_nodes ADD CONSTRAINT write_canvas_nodes_document_id_fkey FOREIGN KEY (document_id) REFERENCES write_canvas_documents(id) ON DELETE SET NULL;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_documents_node_id_fkey') THEN
+        ALTER TABLE write_canvas_documents ADD CONSTRAINT write_canvas_documents_node_id_fkey FOREIGN KEY (node_id) REFERENCES write_canvas_nodes(id) ON DELETE CASCADE;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_documents_current_version_id_fkey') THEN
+        ALTER TABLE write_canvas_documents ADD CONSTRAINT write_canvas_documents_current_version_id_fkey FOREIGN KEY (current_version_id) REFERENCES write_canvas_document_versions(id) ON DELETE SET NULL;
+      END IF;
+    END $$
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_nodes_document ON write_canvas_nodes(document_id) WHERE document_id IS NOT NULL`);
+  await pool.query(`
+    DELETE FROM write_canvas_edges edge
+    USING write_canvas_nodes source_node, write_canvas_nodes target_node
+    WHERE edge.relation = 'context'
+      AND source_node.id = edge.source_node_id
+      AND target_node.id = edge.target_node_id
+      AND (source_node.kind = 'agent' OR target_node.kind <> 'agent')
+      AND EXISTS (
+        SELECT 1 FROM write_canvas_edges duplicate
+        WHERE duplicate.project_id = edge.project_id
+          AND duplicate.source_node_id = edge.source_node_id
+          AND duplicate.target_node_id = edge.target_node_id
+          AND duplicate.relation = 'derived_from'
+      )
+  `);
+  await pool.query(`
+    UPDATE write_canvas_edges edge
+    SET relation = 'derived_from'
+    FROM write_canvas_nodes source_node, write_canvas_nodes target_node
+    WHERE edge.relation = 'context'
+      AND source_node.id = edge.source_node_id
+      AND target_node.id = edge.target_node_id
+      AND (source_node.kind = 'agent' OR target_node.kind <> 'agent')
+  `);
+  await pool.query(`
+    DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_edges_relation_check') THEN
+        ALTER TABLE write_canvas_edges DROP CONSTRAINT write_canvas_edges_relation_check;
+      END IF;
+      ALTER TABLE write_canvas_edges ADD CONSTRAINT write_canvas_edges_relation_check CHECK (relation IN ('context', 'derived_from', 'generated', 'structure'));
+    END $$
+  `);
 
   // --- saved_cards: add origin and saved_article_id columns ---
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'manual'`);
@@ -6093,6 +6398,9 @@ async function startServer() {
          UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_nodes t WHERE user_id = $1
          UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_edges t WHERE user_id = $1
          UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_agent_messages t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_documents t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_document_versions t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_document_sections t WHERE user_id = $1
          UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM user_ai_usage_daily t WHERE user_id = $1
        ) estimates`,
       [userId],
@@ -6132,6 +6440,9 @@ async function startServer() {
       canvasNodes,
       canvasEdges,
       canvasMessages,
+      canvasDocuments,
+      canvasDocumentVersions,
+      canvasDocumentSections,
       aiUsage,
     ] = await Promise.all([
       rows(`SELECT id, email, nickname, avatar_url, created_at, (password_hash IS NOT NULL) AS has_password FROM users WHERE id = $1`),
@@ -6153,6 +6464,9 @@ async function startServer() {
       rows(`SELECT * FROM write_canvas_nodes WHERE user_id = $1 ORDER BY id`),
       rows(`SELECT * FROM write_canvas_edges WHERE user_id = $1 ORDER BY id`),
       rows(`SELECT * FROM write_canvas_agent_messages WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_canvas_documents WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_canvas_document_versions WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_canvas_document_sections WHERE user_id = $1 ORDER BY id`),
       rows(`SELECT usage_date, operation_count, reserved_output_tokens, updated_at FROM user_ai_usage_daily WHERE user_id = $1 ORDER BY usage_date`),
     ]);
     const payload = {
@@ -6175,6 +6489,9 @@ async function startServer() {
         nodes: canvasNodes,
         edges: canvasEdges,
         messages: canvasMessages,
+        documents: canvasDocuments,
+        documentVersions: canvasDocumentVersions,
+        documentSections: canvasDocumentSections,
       },
       aiUsage,
     };
@@ -7393,6 +7710,16 @@ async function startServer() {
     const kind = normalizeCanvasNodeKind(req.body?.kind);
     if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
     if (!kind) return res.status(400).json({ error: "invalid node kind" });
+    const role = req.body?.role === undefined ? getCanvasNodeRole(kind) : normalizeCanvasNodeRole(req.body.role);
+    const origin = req.body?.origin === undefined ? getCanvasNodeOrigin(kind) : normalizeCanvasNodeOrigin(req.body.origin);
+    const status = req.body?.status === undefined ? getCanvasNodeStatus(kind) : normalizeCanvasNodeStatus(req.body.status);
+    if (!role || !origin || !status) return res.status(400).json({ error: "invalid node role, origin or status" });
+    const contentType = typeof req.body?.contentType === "string" && req.body.contentType.trim()
+      ? req.body.contentType.trim().slice(0, 80) : getCanvasContentType(kind);
+    const businessRef = typeof req.body?.businessRef === "string" ? req.body.businessRef.trim().slice(0, 500) : null;
+    const hasDocumentId = req.body?.documentId !== undefined && req.body?.documentId !== null && req.body?.documentId !== "";
+    const documentId = hasDocumentId ? Number(req.body.documentId) : null;
+    if (hasDocumentId && (!Number.isSafeInteger(documentId) || Number(documentId) <= 0)) return res.status(400).json({ error: "invalid documentId" });
     const x = clampNumber(req.body?.x, 120, -100000, 100000);
     const y = clampNumber(req.body?.y, 120, -100000, 100000);
     const width = clampNumber(req.body?.width, kind === "agent" ? 360 : 280, 160, 1200);
@@ -7431,6 +7758,13 @@ async function startServer() {
         [projectId, req.session.userId],
       )).rows[0]?.count || 0);
       if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) return await fail(413, "项目节点数量已达到上限");
+      if (documentId) {
+        const document = (await client.query(
+          `SELECT id FROM write_canvas_documents WHERE id = $1 AND user_id = $2 AND project_id = $3 FOR SHARE`,
+          [documentId, req.session.userId, projectId],
+        )).rows[0];
+        if (!document) return await fail(404, "document not found");
+      }
 
       if (kind === "agent") {
       const defaults = getDefaultCanvasAgentConfig();
@@ -7504,13 +7838,19 @@ async function startServer() {
 
       const nodeRow = (await client.query(
       `INSERT INTO write_canvas_nodes
-         (user_id, project_id, kind, title, summary, ref_id, asset_id, agent_id, meta, x, y, width, height)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         (user_id, project_id, kind, node_role, content_type, origin, status, business_ref, document_id, title, summary, ref_id, asset_id, agent_id, meta, x, y, width, height)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
        RETURNING id`,
       [
         req.session.userId,
         projectId,
         kind,
+        role,
+        contentType,
+        origin,
+        status,
+        businessRef,
+        documentId,
         title || "未命名节点",
         summary,
         refId,
@@ -7539,10 +7879,13 @@ async function startServer() {
     const nodeId = Number(req.params.id);
     if (!Number.isFinite(nodeId)) return res.status(400).json({ error: "invalid node id" });
     const current = (await pool.query(
-      `SELECT id, project_id, agent_id FROM write_canvas_nodes WHERE id = $1 AND user_id = $2`,
+      `SELECT id, project_id, agent_id, document_id FROM write_canvas_nodes WHERE id = $1 AND user_id = $2`,
       [nodeId, req.session.userId]
     )).rows[0];
     if (!current) return res.status(404).json({ error: "node not found" });
+    if (current.document_id && (req.body?.title !== undefined || req.body?.summary !== undefined || req.body?.status !== undefined)) {
+      return res.status(400).json({ error: "document title, summary and status must be updated through the document API" });
+    }
     const requestedAgentModel = current.agent_id && typeof req.body?.model === "string" && req.body.model.trim()
       ? resolveAllowedCanvasAgentModel(req.body.model, req.body.model)
       : null;
@@ -7552,6 +7895,26 @@ async function startServer() {
     const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 120) : null;
     const summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 500) : null;
     const meta = isPlainRecord(req.body?.meta) ? req.body.meta : null;
+    const role = req.body?.role === undefined ? null : normalizeCanvasNodeRole(req.body.role);
+    const origin = req.body?.origin === undefined ? null : normalizeCanvasNodeOrigin(req.body.origin);
+    const status = req.body?.status === undefined ? null : normalizeCanvasNodeStatus(req.body.status);
+    if ((req.body?.role !== undefined && !role) || (req.body?.origin !== undefined && !origin) || (req.body?.status !== undefined && !status)) {
+      return res.status(400).json({ error: "invalid node role, origin or status" });
+    }
+    const contentType = typeof req.body?.contentType === "string" ? req.body.contentType.trim().slice(0, 80) : null;
+    const businessRef = typeof req.body?.businessRef === "string" ? req.body.businessRef.trim().slice(0, 500) : null;
+    const hasDocumentId = req.body?.documentId !== undefined;
+    const documentId = req.body?.documentId === null || req.body?.documentId === "" ? null : Number(req.body?.documentId);
+    if (hasDocumentId && documentId !== null && (!Number.isSafeInteger(documentId) || documentId <= 0)) {
+      return res.status(400).json({ error: "invalid documentId" });
+    }
+    if (hasDocumentId && documentId) {
+      const document = (await pool.query(
+        `SELECT id FROM write_canvas_documents WHERE id = $1 AND user_id = $2 AND project_id = $3`,
+        [documentId, req.session.userId, current.project_id],
+      )).rows[0];
+      if (!document) return res.status(404).json({ error: "document not found" });
+    }
     await pool.query(
       `UPDATE write_canvas_nodes
        SET title = COALESCE($1, title),
@@ -7561,8 +7924,14 @@ async function startServer() {
            y = COALESCE($5, y),
            width = COALESCE($6, width),
            height = COALESCE($7, height),
+           node_role = COALESCE($8, node_role),
+           content_type = COALESCE($9, content_type),
+           origin = COALESCE($10, origin),
+           status = COALESCE($11, status),
+           business_ref = COALESCE($12, business_ref),
+           document_id = CASE WHEN $13 THEN $14 ELSE document_id END,
            updated_at = NOW()
-       WHERE id = $8 AND user_id = $9`,
+       WHERE id = $15 AND user_id = $16`,
       [
         title,
         summary,
@@ -7571,6 +7940,13 @@ async function startServer() {
         req.body?.y === undefined ? null : clampNumber(req.body.y, 0, -100000, 100000),
         req.body?.width === undefined ? null : clampNumber(req.body.width, 280, 160, 1200),
         req.body?.height === undefined ? null : clampNumber(req.body.height, 180, 120, 1000),
+        role,
+        contentType,
+        origin,
+        status,
+        businessRef,
+        hasDocumentId,
+        documentId,
         nodeId,
         req.session.userId
       ]
@@ -7669,9 +8045,11 @@ async function startServer() {
     const projectId = Number(req.body?.projectId);
     const sourceNodeId = Number(req.body?.sourceNodeId);
     const targetNodeId = Number(req.body?.targetNodeId);
+    const relation = req.body?.relation === undefined ? "context" : normalizeCanvasEdgeRelation(req.body.relation);
     if (![projectId, sourceNodeId, targetNodeId].every(Number.isFinite)) {
       return res.status(400).json({ error: "projectId, sourceNodeId and targetNodeId are required" });
     }
+    if (!relation) return res.status(400).json({ error: "invalid edge relation" });
     if (sourceNodeId === targetNodeId) return res.status(400).json({ error: "cannot connect node to itself" });
     const nodes = (await pool.query(
       `SELECT id, kind FROM write_canvas_nodes
@@ -7679,15 +8057,18 @@ async function startServer() {
       [req.session.userId, projectId, [sourceNodeId, targetNodeId]]
     )).rows;
     if (nodes.length !== 2) return res.status(404).json({ error: "nodes not found" });
+    const source = nodes.find(node => Number(node.id) === sourceNodeId);
     const target = nodes.find(node => Number(node.id) === targetNodeId);
-    if (target?.kind !== "agent") return res.status(400).json({ error: "target node must be an agent" });
+    if (relation === "context" && (target?.kind !== "agent" || source?.kind === "agent")) {
+      return res.status(400).json({ error: "context edges must connect a non-agent source to an agent target" });
+    }
     const row = (await pool.query(
       `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
-       VALUES ($1, $2, $3, $4, 'context')
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO UPDATE SET relation = EXCLUDED.relation
        RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
                  target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
-      [req.session.userId, projectId, sourceNodeId, targetNodeId]
+      [req.session.userId, projectId, sourceNodeId, targetNodeId, relation]
     )).rows[0];
     res.json({ edge: mapCanvasEdgeRow(row) });
   }));
@@ -7710,6 +8091,152 @@ async function startServer() {
       return res.status(400).json({ error: "edge id or edge endpoints are required" });
     }
     res.json({ success: result.rowCount > 0 });
+  }));
+
+  app.post("/api/write/canvas/projects/:projectId/documents", requireAuth, asyncHandler(async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    if (!Number.isSafeInteger(projectId) || projectId <= 0) return res.status(400).json({ error: "invalid project id" });
+    const title = typeof req.body?.title === "string" && req.body.title.trim() ? req.body.title.trim().slice(0, 240) : "未命名文档";
+    const summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 1000) : "";
+    const scenario = typeof req.body?.scenario === "string" ? req.body.scenario.trim().slice(0, 240) : "";
+    const status = req.body?.status === undefined ? "editing" : normalizeCanvasNodeStatus(req.body.status);
+    const sections = normalizeCanvasDocumentSections(req.body?.sections ?? []);
+    if (!status || !sections) return res.status(400).json({ error: "invalid document status or sections" });
+    const x = clampNumber(req.body?.x, 180, -100000, 100000);
+    const y = clampNumber(req.body?.y, 180, -100000, 100000);
+    const width = clampNumber(req.body?.width, 420, 160, 1200);
+    const height = clampNumber(req.body?.height, 320, 120, 1000);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const project = (await client.query(
+        `SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [projectId, req.session.userId],
+      )).rows[0];
+      if (!project) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const nodeCount = Number((await client.query(
+        `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
+        [projectId, req.session.userId],
+      )).rows[0]?.count || 0);
+      if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目节点数量已达到上限" });
+      }
+      const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
+      const documentValues = { title, summary, scenario, status };
+      if (storedBytes + getCanvasDocumentBytes(documentValues, sections) > canvasUserStorageMaxBytes) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "画布资料存储额度已用完，请删除旧资料后重试" });
+      }
+      const documentRow = (await client.query(
+        `INSERT INTO write_canvas_documents (user_id, project_id, title, summary, scenario, status)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [req.session.userId, projectId, title, summary, scenario, status],
+      )).rows[0];
+      const documentId = Number(documentRow.id);
+      const nodeRow = (await client.query(
+        `INSERT INTO write_canvas_nodes
+           (user_id, project_id, kind, node_role, content_type, origin, status, document_id, title, summary, meta, x, y, width, height)
+         VALUES ($1, $2, 'note', 'document', 'document', 'manual', $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
+         RETURNING id`,
+        [req.session.userId, projectId, status, documentId, title, summary, JSON.stringify({ scenario }), x, y, width, height],
+      )).rows[0];
+      await client.query(`UPDATE write_canvas_documents SET node_id = $1 WHERE id = $2 AND user_id = $3`, [Number(nodeRow.id), documentId, req.session.userId]);
+      await writeCanvasDocumentSnapshot(client, req.session.userId, documentId, documentValues, sections);
+      await client.query("COMMIT");
+      const document = await fetchCanvasDocument(pool, req.session.userId, documentId);
+      return res.json({ document });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.get("/api/write/canvas/documents/:id", requireAuth, asyncHandler(async (req, res) => {
+    const documentId = Number(req.params.id);
+    if (!Number.isSafeInteger(documentId) || documentId <= 0) return res.status(400).json({ error: "invalid document id" });
+    const document = await fetchCanvasDocument(pool, req.session.userId, documentId);
+    if (!document) return res.status(404).json({ error: "document not found" });
+    return res.json({ document });
+  }));
+
+  app.put("/api/write/canvas/documents/:id", requireAuth, asyncHandler(async (req, res) => {
+    const documentId = Number(req.params.id);
+    if (!Number.isSafeInteger(documentId) || documentId <= 0) return res.status(400).json({ error: "invalid document id" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const current = (await client.query(
+        `SELECT id, project_id, node_id, title, summary, scenario, status
+         FROM write_canvas_documents WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [documentId, req.session.userId],
+      )).rows[0];
+      if (!current) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "document not found" });
+      }
+      const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 240) : current.title;
+      const summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 1000) : current.summary;
+      const scenario = typeof req.body?.scenario === "string" ? req.body.scenario.trim().slice(0, 240) : current.scenario;
+      const status = req.body?.status === undefined ? normalizeCanvasNodeStatus(current.status) : normalizeCanvasNodeStatus(req.body.status);
+      if (!status) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "invalid document status" });
+      }
+      const existingSections = (await client.query(
+        `SELECT stable_key AS key, heading, body, level, meta
+         FROM write_canvas_document_sections WHERE document_id = $1 AND user_id = $2 ORDER BY sort_order`,
+        [documentId, req.session.userId],
+      )).rows.map(mapCanvasDocumentSectionRow) as CanvasDocumentSectionInput[];
+      const sections = req.body?.sections === undefined ? existingSections : normalizeCanvasDocumentSections(req.body.sections);
+      if (!sections) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "invalid document sections" });
+      }
+      const documentValues = { title, summary, scenario, status };
+      const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
+      if (storedBytes + getCanvasDocumentBytes(documentValues, sections) > canvasUserStorageMaxBytes) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "画布资料存储额度已用完，请删除旧资料后重试" });
+      }
+      await writeCanvasDocumentSnapshot(client, req.session.userId, documentId, documentValues, sections);
+      await client.query(
+        `UPDATE write_canvas_nodes SET title = $1, summary = $2, status = $3, meta = jsonb_set(meta, '{scenario}', to_jsonb($4::text), true), updated_at = NOW()
+         WHERE id = $5 AND user_id = $6`,
+        [title, summary, status, scenario, current.node_id, req.session.userId],
+      );
+      await client.query("COMMIT");
+      const document = await fetchCanvasDocument(pool, req.session.userId, documentId);
+      return res.json({ document });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.get("/api/write/canvas/documents/:id/versions", requireAuth, asyncHandler(async (req, res) => {
+    const documentId = Number(req.params.id);
+    if (!Number.isSafeInteger(documentId) || documentId <= 0) return res.status(400).json({ error: "invalid document id" });
+    const document = (await pool.query(
+      `SELECT id FROM write_canvas_documents WHERE id = $1 AND user_id = $2`,
+      [documentId, req.session.userId],
+    )).rows[0];
+    if (!document) return res.status(404).json({ error: "document not found" });
+    const versions = (await pool.query(
+      `SELECT id, version_number AS "versionNumber", snapshot, created_at AS "createdAt"
+       FROM write_canvas_document_versions WHERE document_id = $1 AND user_id = $2 ORDER BY version_number DESC`,
+      [documentId, req.session.userId],
+    )).rows.map(row => ({ ...row, id: Number(row.id), versionNumber: Number(row.versionNumber) }));
+    return res.json({ versions });
   }));
 
   app.post("/api/write/canvas/assets/upload", requireAuth, uploadLimiter, uploadConcurrencyMiddleware, canvasAssetUpload.single("file"), asyncHandler(async (req, res) => {
@@ -7784,13 +8311,14 @@ async function startServer() {
       const nodeKind = isImage ? "asset_image" : "asset_file";
       const nodeResponse = await client.query(
         `INSERT INTO write_canvas_nodes
-           (user_id, project_id, kind, title, summary, asset_id, meta, x, y, width, height)
-         VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, $7, $8, $9, $10)
+           (user_id, project_id, kind, node_role, content_type, origin, status, title, summary, asset_id, meta, x, y, width, height)
+         VALUES ($1, $2, $3, 'material', $4, 'existing', 'ready', $5, $6, $7, '{}'::jsonb, $8, $9, $10, $11)
          RETURNING id`,
         [
           req.session.userId,
           projectId,
           nodeKind,
+          isImage ? "image" : "file",
           title,
           isImage ? "图片资料" : normalizePlainText(extractedText).slice(0, 180),
           Number(assetRow.id),
@@ -8040,8 +8568,8 @@ async function startServer() {
       )).rows[0];
       const nodeRow = (await client.query(
         `INSERT INTO write_canvas_nodes
-           (user_id, project_id, kind, title, summary, asset_id, meta, x, y, width, height)
-         SELECT $1, n.project_id, 'result', $2, $3, $4, $5, n.x + 420, n.y + 40, 320, 220
+           (user_id, project_id, kind, node_role, content_type, origin, status, title, summary, asset_id, meta, x, y, width, height)
+         SELECT $1, n.project_id, 'result', 'document', 'result', 'generated', 'pending_review', $2, $3, $4, $5, n.x + 420, n.y + 40, 320, 220
          FROM write_canvas_nodes n
          WHERE n.id = $6 AND n.user_id = $1
          RETURNING id`,

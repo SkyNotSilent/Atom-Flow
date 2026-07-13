@@ -21,12 +21,24 @@ assert.match(server, /CREATE TABLE IF NOT EXISTS write_agent_templates/, "agent 
 assert.match(server, /CREATE TABLE IF NOT EXISTS write_agent_instances/, "agent instances table must exist");
 assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_assets/, "canvas assets table must exist");
 assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_agent_messages/, "canvas agent messages table must exist");
+assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_documents/, "canvas documents table must exist");
+assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_document_versions/, "canvas document version table must exist");
+assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_document_sections/, "canvas document section table must exist");
+assert.match(server, /node_role/, "canvas nodes must persist semantic roles");
+assert.match(server, /content_type/, "canvas nodes must persist content types");
+assert.match(server, /document_id/, "canvas nodes must link documents");
+assert.match(server, /CASE kind/, "existing canvas nodes must receive deterministic semantic backfills");
+assert.match(server, /relation IN \('context', 'derived_from', 'generated', 'structure'\)/, "canvas edges must allow the complete relation vocabulary");
 
 assert.match(server, /app\.get\("\/api\/write\/canvas\/projects", requireAuth/, "project list route must require auth");
 assert.match(server, /app\.post\("\/api\/write\/canvas\/projects", requireAuth/, "project create route must require auth");
 assert.match(server, /app\.post\("\/api\/write\/canvas\/projects\/:id\/nodes", requireAuth/, "node create route must require auth");
 assert.match(server, /app\.delete\("\/api\/write\/canvas\/nodes\/:id", requireAuth/, "node delete route must require auth");
 assert.match(server, /app\.post\("\/api\/write\/canvas\/edges", requireAuth/, "edge create route must require auth");
+assert.match(server, /app\.post\("\/api\/write\/canvas\/projects\/:projectId\/documents", requireAuth/, "document create route must require auth");
+assert.match(server, /app\.get\("\/api\/write\/canvas\/documents\/:id", requireAuth/, "document read route must require auth");
+assert.match(server, /app\.put\("\/api\/write\/canvas\/documents\/:id", requireAuth/, "document update route must require auth");
+assert.match(server, /app\.get\("\/api\/write\/canvas\/documents\/:id\/versions", requireAuth/, "document version route must require auth");
 assert.match(server, /app\.post\("\/api\/write\/canvas\/assets\/upload", requireAuth,[^\n]*canvasAssetUpload\.single/, "asset upload route must require auth");
 assert.match(server, /app\.post\("\/api\/write\/canvas\/agents\/:id\/chat\/stream", requireAuth/, "canvas agent stream route must require auth");
 assert.match(server, /resolveCanvasContextItems\(pool, req\.session\.userId/, "agent run must resolve context from canvas edges");
@@ -34,8 +46,19 @@ assert.match(server, /target\?\.kind !== "agent"/, "context edges must target ag
 assert.match(server, /canvasModelSupportsImages/, "canvas agent must include hidden multimodal capability gate");
 
 assert.match(types, /export type WriteCanvasNodeKind/, "canvas node kind must be typed");
+assert.match(types, /role: 'material' \| 'insight' \| 'task' \| 'document' \| 'group'/, "canvas node semantic role must be typed");
+assert.match(types, /origin: 'existing' \| 'extracted' \| 'manual' \| 'generated'/, "canvas node origin must be typed");
+assert.match(types, /export interface WriteCanvasDocument/, "canvas documents must be typed");
 assert.match(types, /export interface WriteCanvasProjectDetail/, "canvas project detail must be typed");
 assert.match(types, /export interface WriteAgentTemplate/, "agent templates must be typed");
+
+assert.match(server, /normalizeCanvasNodeRole/, "node role input must be allowlisted");
+assert.match(server, /normalizeCanvasNodeOrigin/, "node origin input must be allowlisted");
+assert.match(server, /normalizeCanvasNodeStatus/, "node status input must be allowlisted");
+assert.match(server, /target\?\.kind !== "agent" \|\| source\?\.kind === "agent"/, "context edges must be non-agent to agent only");
+assert.match(server, /write_canvas_document_versions[\s\S]*snapshot/, "document updates must create immutable snapshots");
+assert.match(server, /write_canvas_documents t WHERE user_id = \$1/, "document content must be included in export preflight");
+assert.match(server, /write_canvas_document_sections t WHERE user_id = \$1/, "document sections must be included in export preflight");
 
 assert.match(canvas, /<Tldraw/, "magic writing canvas must render tldraw");
 assert.match(canvas, /shapeUtils=\{shapeUtils\}/, "tldraw must register AtomFlow custom shapes");

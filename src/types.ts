@@ -274,11 +274,17 @@ export interface WriteCanvasNode {
   id: number;
   projectId: number;
   kind: WriteCanvasNodeKind;
+  role: 'material' | 'insight' | 'task' | 'document' | 'group';
+  contentType: string;
+  origin: 'existing' | 'extracted' | 'manual' | 'generated';
+  status: 'parsing' | 'ready' | 'running' | 'pending_review' | 'adopted' | 'rejected' | 'editing' | 'completed' | 'failed';
+  businessRef?: string | null;
   title: string;
   summary?: string;
   refId?: string | number | null;
   asset?: WriteCanvasAsset | null;
   agent?: WriteAgentInstance | null;
+  document?: WriteCanvasDocument | null;
   meta?: Record<string, unknown>;
   x: number;
   y: number;
@@ -288,12 +294,34 @@ export interface WriteCanvasNode {
   updatedAt: string;
 }
 
+export interface WriteCanvasDocumentSection {
+  key: string;
+  heading: string;
+  body: string;
+  level: number;
+  meta: Record<string, unknown>;
+}
+
+export interface WriteCanvasDocument {
+  id: number;
+  projectId: number;
+  nodeId: number;
+  title: string;
+  summary: string;
+  scenario: string;
+  status: 'parsing' | 'ready' | 'running' | 'pending_review' | 'adopted' | 'rejected' | 'editing' | 'completed' | 'failed';
+  currentVersionId?: number | null;
+  sections: WriteCanvasDocumentSection[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface WriteCanvasEdge {
   id: number;
   projectId: number;
   sourceNodeId: number;
   targetNodeId: number;
-  relation: 'context';
+  relation: 'context' | 'derived_from' | 'generated' | 'structure';
   createdAt: string;
 }
 
