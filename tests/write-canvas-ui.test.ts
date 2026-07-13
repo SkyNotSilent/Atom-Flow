@@ -40,6 +40,9 @@ assert.match(page, /setActivePanel\(null\)[\s\S]{0,220}setAiDecomposeNodeId\(nod
 assert.match(page, /pendingNodeGeometryRef/, "User geometry edits must be tracked before the debounce expires");
 assert.match(page, /mergePendingNodeGeometry/, "Server detail reloads must preserve optimistic local geometry");
 assert.match(page, /flushPendingNodeGeometry/, "Pending node geometry must be flushable before project changes");
+assert.match(page, /keepalive:\s*options\.keepalive/, "Final geometry persistence must opt into fetch keepalive during unload");
+assert.match(page, /addEventListener\('pagehide',[\s\S]{0,320}flushPendingNodeGeometry\([\s\S]{0,120}keepalive:\s*true/, "Page unload must flush pending geometry with keepalive");
+assert.match(page, /return \(\) => \{[\s\S]{0,220}flushPendingNodeGeometry\([\s\S]{0,120}keepalive:\s*true/, "Canvas unmount must flush pending geometry with keepalive");
 assert.match(page, /selectedIds\.length !== 1[\s\S]{0,220}setSelectedNodeId\(null\)/, "Multi-selection and arrow selection must clear stale business selection");
 assert.match(inspector, /node\.role === 'document'|node\.role === "document"/, "Inspector must route document nodes to the document editor");
 assert.match(editor, /useEditor\(/, "Document editing must use Tiptap");

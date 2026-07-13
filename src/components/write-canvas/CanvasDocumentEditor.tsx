@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { EditorContent, useEditor } from '@tiptap/react';
 import { StarterKit } from '@tiptap/starter-kit';
 import { Bold, ChevronDown, ChevronUp, Download, FileCode2, GripVertical, Heading2, Italic, Plus, Save, Trash2 } from 'lucide-react';
@@ -8,6 +8,35 @@ import { CANVAS_DOCUMENT_SCENARIOS, createScenarioSections, downloadCanvasDocume
 type CanvasDocumentEditorProps = {
   node: WriteCanvasNode;
   onSaved?: (document: WriteCanvasDocument) => void;
+};
+
+export type CanvasDocumentSavePayload = Pick<WriteCanvasDocument, 'title' | 'summary' | 'scenario' | 'status' | 'sections'>;
+
+export const buildCanvasDocumentSavePayload = (document: WriteCanvasDocument): CanvasDocumentSavePayload => ({
+  title: document.title,
+  summary: document.summary,
+  scenario: document.scenario,
+  status: document.status,
+  sections: document.sections,
+});
+
+export const createCanvasDocumentSnapshot = (document: WriteCanvasDocument) => JSON.stringify(buildCanvasDocumentSavePayload(document));
+
+export const shouldApplyCanvasDocumentSaveResult = (
+  requestId: number,
+  latestRequestId: number,
+  requestSnapshot: string,
+  currentSnapshot: string,
+) => requestId === latestRequestId && requestSnapshot === currentSnapshot;
+
+const AUTOSAVE_DELAY_MS = 900;
+
+type DocumentSaveStatus = 'idle' | 'dirty' | 'saving' | 'saved' | 'error';
+
+type PendingDocumentSave = {
+  document: WriteCanvasDocument;
+  payload: CanvasDocumentSavePayload;
+  snapshot: string;
 };
 
 const documentStatuses = [
@@ -67,9 +96,148 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
   const [document, setDocument] = useState<WriteCanvasDocument | null>(() => toDocument(node.document));
   const [activeSectionKey, setActiveSectionKey] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<DocumentSaveStatus>(() => document ? 'saved' : 'idle');
   const [error, setError] = useState('');
   const activeSectionKeyRef = useRef<string | null>(null);
+  const documentRef = useRef<WriteCanvasDocument | null>(document);
+  const lastPersistedSnapshotRef = useRef(document ? createCanvasDocumentSnapshot(document) : '');
+  const pendingSaveRef = useRef<PendingDocumentSave | null>(null);
+  const saveLoopRef = useRef<Promise<void> | null>(null);
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeSaveAbortControllerRef = useRef<AbortController | null>(null);
+  const requestSequenceRef = useRef(0);
+  const latestRequestIdRef = useRef(0);
+  const lastKeepaliveSnapshotRef = useRef('');
+  const mountedRef = useRef(true);
+  const onSavedRef = useRef(onSaved);
+
+  useEffect(() => {
+    onSavedRef.current = onSaved;
+  }, [onSaved]);
+
+  const setDocumentDraft = useCallback((update: React.SetStateAction<WriteCanvasDocument | null>) => {
+    setDocument(current => {
+      const next = typeof update === 'function' ? update(current) : update;
+      documentRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const adoptPersistedDocument = useCallback((nextDocument: WriteCanvasDocument) => {
+    pendingSaveRef.current = null;
+    lastPersistedSnapshotRef.current = createCanvasDocumentSnapshot(nextDocument);
+    lastKeepaliveSnapshotRef.current = '';
+    setDocumentDraft(nextDocument);
+    setSaveStatus('saved');
+    setError('');
+  }, [setDocumentDraft]);
+
+  const flushLatestDirtyDocument = useCallback(() => {
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+    const latest = documentRef.current;
+    if (!latest) return;
+    const snapshot = createCanvasDocumentSnapshot(latest);
+    const keepaliveKey = `${latest.id}:${snapshot}`;
+    if (snapshot === lastPersistedSnapshotRef.current || keepaliveKey === lastKeepaliveSnapshotRef.current) return;
+
+    pendingSaveRef.current = null;
+    lastKeepaliveSnapshotRef.current = keepaliveKey;
+    latestRequestIdRef.current = ++requestSequenceRef.current;
+    activeSaveAbortControllerRef.current?.abort();
+    activeSaveAbortControllerRef.current = null;
+    void fetch(`/api/write/canvas/documents/${latest.id}`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildCanvasDocumentSavePayload(latest)),
+      keepalive: true,
+    }).catch(() => undefined);
+  }, []);
+
+  const runSaveLoop = useCallback((): Promise<void> => {
+    if (saveLoopRef.current) return saveLoopRef.current;
+
+    const loop = (async () => {
+      while (pendingSaveRef.current) {
+        const pending = pendingSaveRef.current;
+        pendingSaveRef.current = null;
+        if (pending.snapshot === lastPersistedSnapshotRef.current) continue;
+
+        const requestId = ++requestSequenceRef.current;
+        latestRequestIdRef.current = requestId;
+        const abortController = new AbortController();
+        activeSaveAbortControllerRef.current = abortController;
+        if (mountedRef.current) {
+          setSaveStatus('saving');
+          setError('');
+        }
+
+        try {
+          const response = await fetch(`/api/write/canvas/documents/${pending.document.id}`, {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(pending.payload),
+            signal: abortController.signal,
+          });
+          if (!response.ok) throw new Error('作品保存失败');
+          const payload = await response.json() as { document?: unknown };
+          const saved = toDocument(payload.document);
+          if (!saved) throw new Error('作品保存失败');
+          if (requestId !== latestRequestIdRef.current) continue;
+
+          lastPersistedSnapshotRef.current = pending.snapshot;
+          const current = documentRef.current;
+          const currentSnapshot = current ? createCanvasDocumentSnapshot(current) : '';
+          if (current && shouldApplyCanvasDocumentSaveResult(requestId, latestRequestIdRef.current, pending.snapshot, currentSnapshot)) {
+            lastPersistedSnapshotRef.current = createCanvasDocumentSnapshot(saved);
+            lastKeepaliveSnapshotRef.current = '';
+            setDocumentDraft(saved);
+            if (mountedRef.current) {
+              setSaveStatus('saved');
+              setError('');
+              onSavedRef.current?.(saved);
+            }
+          } else if (mountedRef.current) {
+            setSaveStatus('dirty');
+          }
+        } catch (saveError) {
+          const wasAborted = saveError instanceof Error && saveError.name === 'AbortError';
+          if (!wasAborted && mountedRef.current && requestId === latestRequestIdRef.current) {
+            setSaveStatus('error');
+            setError(saveError instanceof Error ? saveError.message : '作品保存失败');
+          }
+        } finally {
+          if (activeSaveAbortControllerRef.current === abortController) activeSaveAbortControllerRef.current = null;
+        }
+      }
+    })();
+
+    saveLoopRef.current = loop;
+    void loop.finally(() => {
+      if (saveLoopRef.current !== loop) return;
+      saveLoopRef.current = null;
+      if (pendingSaveRef.current && mountedRef.current) void runSaveLoop();
+    });
+    return loop;
+  }, [setDocumentDraft]);
+
+  const enqueueSave = useCallback((nextDocument: WriteCanvasDocument) => {
+    const snapshot = createCanvasDocumentSnapshot(nextDocument);
+    if (snapshot === lastPersistedSnapshotRef.current) {
+      if (mountedRef.current) setSaveStatus('saved');
+      return Promise.resolve();
+    }
+    pendingSaveRef.current = {
+      document: nextDocument,
+      payload: buildCanvasDocumentSavePayload(nextDocument),
+      snapshot,
+    };
+    return runSaveLoop();
+  }, [runSaveLoop]);
 
   useEffect(() => {
     activeSectionKeyRef.current = activeSectionKey;
@@ -87,7 +255,7 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
       const key = activeSectionKeyRef.current;
       if (!key) return;
       const body = nextEditor.getHTML();
-      setDocument(current => current ? {
+      setDocumentDraft(current => current ? {
         ...current,
         sections: current.sections.map(section => section.key === key ? { ...section, body } : section),
       } : current);
@@ -97,16 +265,26 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
   useEffect(() => {
     const embedded = toDocument(node.document);
     if (embedded) {
-      setDocument(embedded);
+      const current = documentRef.current;
+      if (current && current.id !== embedded.id) flushLatestDirtyDocument();
+      if (current && current.id === embedded.id) {
+        const currentSnapshot = createCanvasDocumentSnapshot(current);
+        const embeddedSnapshot = createCanvasDocumentSnapshot(embedded);
+        const hasLocalDraft = currentSnapshot !== lastPersistedSnapshotRef.current;
+        if (hasLocalDraft && currentSnapshot !== embeddedSnapshot) return;
+      }
+      adoptPersistedDocument(embedded);
       setActiveSectionKey(current => current && embedded.sections.some(section => section.key === current) ? current : embedded.sections[0]?.key || null);
-      setError('');
       return;
     }
     if (!documentId) {
-      setDocument(null);
+      flushLatestDirtyDocument();
+      setDocumentDraft(null);
       setError('作品内容尚未加载。');
       return;
     }
+
+    if (documentRef.current && documentRef.current.id !== documentId) flushLatestDirtyDocument();
 
     let disposed = false;
     setIsLoading(true);
@@ -122,13 +300,48 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
           if (!disposed) setError('作品内容无效。');
           return;
         }
-        setDocument(nextDocument);
+        adoptPersistedDocument(nextDocument);
         setActiveSectionKey(current => current && nextDocument.sections.some(section => section.key === current) ? current : nextDocument.sections[0]?.key || null);
       })
       .catch(() => { if (!disposed) setError('作品加载失败。'); })
       .finally(() => { if (!disposed) setIsLoading(false); });
     return () => { disposed = true; };
-  }, [documentId, node.document, node.id]);
+  }, [adoptPersistedDocument, documentId, flushLatestDirtyDocument, node.document, node.id, setDocumentDraft]);
+
+  useEffect(() => {
+    if (!document || document.id !== documentId || isLoading) return;
+    if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    const snapshot = createCanvasDocumentSnapshot(document);
+    if (snapshot === lastPersistedSnapshotRef.current) {
+      if (!saveLoopRef.current) setSaveStatus('saved');
+      return;
+    }
+
+    setSaveStatus(current => current === 'saving' ? current : 'dirty');
+    setError('');
+    autosaveTimerRef.current = setTimeout(() => {
+      autosaveTimerRef.current = null;
+      const latest = documentRef.current;
+      if (latest) void enqueueSave(latest);
+    }, AUTOSAVE_DELAY_MS);
+    return () => {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+    };
+  }, [document, documentId, enqueueSave, isLoading]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const handlePageHide = () => flushLatestDirtyDocument();
+    window.addEventListener('pagehide', handlePageHide);
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide);
+      flushLatestDirtyDocument();
+      mountedRef.current = false;
+    };
+  }, [flushLatestDirtyDocument]);
 
   const activeSection = document?.sections.find(section => section.key === activeSectionKey) || document?.sections[0] || null;
 
@@ -138,13 +351,13 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
     if (editor && editor.getHTML() !== activeSection.body) editor.commands.setContent(activeSection.body || '');
   }, [activeSection, activeSectionKey, editor]);
 
-  const updateDocument = (data: Partial<WriteCanvasDocument>) => setDocument(current => current ? { ...current, ...data } : current);
-  const updateSection = (key: string, data: Partial<WriteCanvasDocumentSection>) => setDocument(current => current ? {
+  const updateDocument = (data: Partial<WriteCanvasDocument>) => setDocumentDraft(current => current ? { ...current, ...data } : current);
+  const updateSection = (key: string, data: Partial<WriteCanvasDocumentSection>) => setDocumentDraft(current => current ? {
     ...current,
     sections: current.sections.map(section => section.key === key ? { ...section, ...data } : section),
   } : current);
 
-  const moveSection = (key: string, direction: -1 | 1) => setDocument(current => {
+  const moveSection = (key: string, direction: -1 | 1) => setDocumentDraft(current => {
     if (!current) return current;
     const index = current.sections.findIndex(section => section.key === key);
     const target = index + direction;
@@ -154,7 +367,7 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
     return { ...current, sections };
   });
 
-  const deleteSection = (key: string) => setDocument(current => {
+  const deleteSection = (key: string) => setDocumentDraft(current => {
     if (!current || current.sections.length <= 1) return current;
     const sections = current.sections.filter(section => section.key !== key);
     setActiveSectionKey(active => active === key ? sections[0]?.key || null : active);
@@ -163,7 +376,7 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
 
   const addSection = () => {
     const section = createSection();
-    setDocument(current => current ? { ...current, sections: [...current.sections, section] } : current);
+    setDocumentDraft(current => current ? { ...current, sections: [...current.sections, section] } : current);
     setActiveSectionKey(section.key);
   };
 
@@ -172,38 +385,21 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
     const hasWrittenContent = document.sections.some(section => section.heading.trim() || section.body.replace(/<[^>]+>/g, '').trim());
     if (hasWrittenContent && !window.confirm('套用场景结构会替换当前大纲与正文，是否继续？')) return;
     const sections = createScenarioSections(document.scenario);
-    setDocument({ ...document, sections });
+    setDocumentDraft({ ...document, sections });
     setActiveSectionKey(sections[0]?.key || null);
   };
 
   const save = async () => {
-    if (!document || isSaving) return;
-    setIsSaving(true);
-    setError('');
-    try {
-      const response = await fetch(`/api/write/canvas/documents/${document.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: document.title,
-          summary: document.summary,
-          scenario: document.scenario,
-          status: document.status,
-          sections: document.sections,
-        }),
-      });
-      if (!response.ok) throw new Error('作品保存失败');
-      const payload = await response.json() as { document?: unknown };
-      const saved = toDocument(payload.document);
-      if (!saved) throw new Error('作品保存失败');
-      setDocument(saved);
-      onSaved?.(saved);
-    } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : '作品保存失败');
-    } finally {
-      setIsSaving(false);
+    const latest = documentRef.current;
+    if (!latest) return;
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
     }
+    await enqueueSave(latest);
   };
+
+  const isSaving = saveStatus === 'saving';
 
   if (isLoading) return <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-[12px] text-[#7B8087]">加载作品…</div>;
   if (!document) return <div className="min-h-0 flex-1 p-4 text-[12px] text-[#B34439]">{error || '作品内容不可用。'}</div>;
@@ -262,7 +458,18 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
         </section>
       ) : null}
 
-      {error ? <p className="mt-3 text-[11px] text-[#B34439]">{error}</p> : null}
+      <p aria-live="polite" className={`mt-3 text-[10px] ${saveStatus === 'error' ? 'text-[#B34439]' : 'text-[#747980]'}`}>
+        {saveStatus === 'saving'
+          ? '正在自动保存…'
+          : saveStatus === 'saved'
+            ? '已保存'
+            : saveStatus === 'error'
+              ? '自动保存失败，可点击下方按钮重试。'
+              : saveStatus === 'dirty'
+                ? '有未保存修改'
+                : ''}
+      </p>
+      {error ? <p className="mt-1 text-[11px] text-[#B34439]">{error}</p> : null}
       <div className="mt-5 grid grid-cols-[1fr_auto_auto] gap-2">
         <button type="button" disabled={isSaving} onClick={() => void save()} className="inline-flex items-center justify-center gap-1.5 rounded-[6px] bg-[#1F6FEB] px-3 py-2 text-[11px] font-medium text-white hover:bg-[#195FC9] disabled:opacity-50"><Save size={13} />{isSaving ? '保存中…' : '保存作品'}</button>
         <button type="button" title="导出 Markdown" aria-label="导出 Markdown" onClick={() => downloadCanvasDocument(document, 'markdown')} className="flex h-8 w-8 items-center justify-center rounded-[6px] border border-[#DCDAD4] bg-white text-[#59616A] hover:border-[#9ABCF0] hover:text-[#185ABD]"><Download size={14} /></button>

@@ -76,6 +76,9 @@ type PendingNodeGeometry = {
   height: number;
   persisted: boolean;
 };
+type FlushNodeGeometryOptions = {
+  keepalive?: boolean;
+};
 
 type ActivePanel = 'add' | 'inspector' | 'agent-group' | null;
 type CanvasQuickAction = 'summarize' | 'extract_insights' | 'extract_data' | 'extract_quotes' | 'extract_stories' | 'extract_cases' | 'extract_questions' | 'generate_outline';
@@ -259,7 +262,10 @@ export const MagicWritingCanvas: React.FC = () => {
     }),
   }), []);
 
-  const flushPendingNodeGeometry = useCallback(async (projectId = currentProjectIdRef.current) => {
+  const flushPendingNodeGeometry = useCallback(async (
+    projectId = currentProjectIdRef.current,
+    options: FlushNodeGeometryOptions = {},
+  ) => {
     if (positionSyncTimerRef.current) {
       window.clearTimeout(positionSyncTimerRef.current);
       positionSyncTimerRef.current = null;
@@ -275,6 +281,7 @@ export const MagicWritingCanvas: React.FC = () => {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ x: geometry.x, y: geometry.y, width: geometry.width, height: geometry.height }),
+          keepalive: options.keepalive,
         });
         if (!response.ok) return false;
         if (pendingNodeGeometryRef.current.get(nodeId) === geometry) geometry.persisted = true;
@@ -365,9 +372,16 @@ export const MagicWritingCanvas: React.FC = () => {
     activePanelRef.current = activePanel;
   }, [activePanel]);
 
-  useEffect(() => () => {
-    void flushPendingNodeGeometry(currentProjectIdRef.current);
-    quickActionAbortControllerRef.current?.abort();
+  useEffect(() => {
+    const handlePageHide = () => {
+      void flushPendingNodeGeometry(currentProjectIdRef.current, { keepalive: true });
+    };
+    window.addEventListener('pagehide', handlePageHide);
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide);
+      void flushPendingNodeGeometry(currentProjectIdRef.current, { keepalive: true });
+      quickActionAbortControllerRef.current?.abort();
+    };
   }, [flushPendingNodeGeometry]);
 
   const closeInspector = useCallback(() => {
@@ -910,6 +924,11 @@ export const MagicWritingCanvas: React.FC = () => {
     selectNode(group.nodeId, false);
   };
 
+  const refreshAgentGroupProject = useCallback(async () => {
+    const projectId = currentProjectIdRef.current;
+    if (projectId) await loadProjectDetail(projectId);
+  }, [loadProjectDetail]);
+
   const handleAgentGroupResults = async (nodeIds: number[]) => {
     const projectId = currentProjectIdRef.current;
     if (projectId) await loadProjectDetail(projectId);
@@ -1330,8 +1349,9 @@ export const MagicWritingCanvas: React.FC = () => {
           edges={detail?.edges || []}
           templates={templates}
           onClose={() => setActivePanel(null)}
-          onGroupCreated={group => void handleAgentGroupCreated(group)}
-          onResults={nodeIds => void handleAgentGroupResults(nodeIds)}
+          onGroupCreated={handleAgentGroupCreated}
+          onProjectRefresh={refreshAgentGroupProject}
+          onResults={handleAgentGroupResults}
           onToast={showToast}
         />
       ) : null}

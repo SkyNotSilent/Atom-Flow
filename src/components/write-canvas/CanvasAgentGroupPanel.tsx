@@ -31,6 +31,7 @@ type CanvasAgentGroupPanelProps = {
   templates: WriteAgentTemplate[];
   onClose: () => void;
   onGroupCreated: (group: WriteCanvasAgentGroup) => void | Promise<void>;
+  onProjectRefresh: () => void | Promise<void>;
   onResults: (nodeIds: number[]) => void | Promise<void>;
   onToast: (message: string) => void;
 };
@@ -201,6 +202,7 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
   templates,
   onClose,
   onGroupCreated,
+  onProjectRefresh,
   onResults,
   onToast,
 }) => {
@@ -306,6 +308,16 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
       if (!signal?.aborted) setIsHistoryLoading(false);
     }
   }, [applyPersistedRuns, contextNodes, edges]);
+
+  const reconcilePersistedRun = useCallback(async (group: WriteCanvasAgentGroup) => {
+    const [, projectResult] = await Promise.allSettled([
+      loadBatchHistory(group),
+      onProjectRefresh(),
+    ]);
+    if (projectResult.status === 'rejected') {
+      setHistoryError('运行已结束，但画布状态刷新失败，请稍后重试');
+    }
+  }, [loadBatchHistory, onProjectRefresh]);
 
   useEffect(() => {
     if (!selectedGroup) {
@@ -422,6 +434,8 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
     setRunStates(Object.fromEntries(selectedGroup.members.map(member => [member.id, { status: 'idle' }])));
     const outputNodeIds = new Set<number>();
     let receivedFinal = false;
+    let finalStatus: string | null = null;
+    let failureCount = 0;
 
     try {
       const response = await fetch(`/api/write/canvas/agent-groups/${selectedGroup.id}/batches/stream`, {
@@ -454,13 +468,8 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
         }
         if (type === 'final') {
           receivedFinal = true;
-          const failures = Array.isArray(data.failures) ? data.failures.length : 0;
-          const finalStatus = typeof data.status === 'string' ? data.status : failures > 0 ? 'partial' : 'completed';
-          await loadBatchHistory(selectedGroup);
-          if (outputNodeIds.size > 0) await onResults([...outputNodeIds]);
-          if (finalStatus === 'failed') onToast('批量生成失败');
-          else if (finalStatus === 'cancelled') onToast('批量生成已取消');
-          else onToast(failures > 0 || finalStatus === 'partial' ? `批量生成部分完成，${failures} 个成员失败` : '批量生成完成');
+          failureCount = Array.isArray(data.failures) ? data.failures.length : 0;
+          finalStatus = typeof data.status === 'string' ? data.status : failureCount > 0 ? 'partial' : 'completed';
         }
       });
       if (!receivedFinal) throw new Error('Agent 组运行连接提前结束');
@@ -475,6 +484,14 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
     } finally {
       if (runAbortRef.current === controller) runAbortRef.current = null;
       setIsRunning(false);
+      await reconcilePersistedRun(selectedGroup);
+      if (finalStatus === 'completed' && outputNodeIds.size > 0) {
+        await onResults([...outputNodeIds]);
+      }
+      if (finalStatus === 'failed') onToast('批量生成失败');
+      else if (finalStatus === 'cancelled') onToast('批量生成已取消');
+      else if (finalStatus === 'partial') onToast(`批量生成部分完成，${failureCount} 个成员失败`);
+      else if (finalStatus === 'completed') onToast('批量生成完成');
     }
   };
 
