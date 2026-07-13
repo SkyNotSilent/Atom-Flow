@@ -335,7 +335,8 @@ export interface WriteCanvasMessage {
 }
 
 export type WriteCanvasAgentRunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
-export type WriteCanvasAgentGroupStatus = 'ready' | 'running' | 'completed' | 'failed';
+export type WriteCanvasAgentBatchStatus = WriteCanvasAgentRunStatus | 'partial';
+export type WriteCanvasAgentGroupStatus = 'ready' | 'running' | 'completed' | 'partial' | 'failed' | 'cancelled';
 
 export interface WriteCanvasAgentRun {
   id: number;
@@ -358,6 +359,7 @@ export interface WriteCanvasAgentRun {
 
 export interface WriteCanvasAgentGroupMember {
   id: number;
+  projectId: number;
   name: string;
   model: string;
   systemPrompt: string;
@@ -371,6 +373,7 @@ export interface WriteCanvasAgentGroupMember {
 export interface WriteCanvasAgentGroup {
   id: number;
   projectId: number;
+  nodeId: number;
   name: string;
   sharedPrompt: string;
   status: WriteCanvasAgentGroupStatus;
@@ -386,7 +389,7 @@ export interface WriteCanvasAgentBatch {
   groupId: number;
   message: string;
   contextNodeIds: number[];
-  status: WriteCanvasAgentRunStatus;
+  status: WriteCanvasAgentBatchStatus;
   contextSnapshot: Record<string, unknown>;
   configSnapshot: Record<string, unknown>;
   output?: Record<string, unknown>;

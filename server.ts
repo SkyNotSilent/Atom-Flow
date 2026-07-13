@@ -1009,9 +1009,13 @@ const WRITE_CANVAS_MAX_MESSAGES_PER_AGENT = readBoundedEnvNumber(process.env.CAN
 const WRITE_CANVAS_MAX_PROJECTS_PER_USER = readBoundedEnvNumber(process.env.CANVAS_MAX_PROJECTS_PER_USER, 50, 5, 500);
 const WRITE_CANVAS_MAX_CONTEXT_ITEMS = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_ITEMS, 30, 5, 100);
 const WRITE_CANVAS_MAX_CONTEXT_CHARS = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_CHARS, 60000, 10000, 250000);
+const WRITE_CANVAS_MAX_AGGREGATE_CONTEXT_CHARS = readBoundedEnvNumber(process.env.CANVAS_MAX_AGGREGATE_CONTEXT_CHARS, 120000, 10000, 500000);
 const WRITE_CANVAS_MAX_CONTEXT_IMAGE_BYTES = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_IMAGE_MB, 12, 1, 40) * 1024 * 1024;
+const WRITE_CANVAS_MAX_CONTEXT_IMAGES = 4;
+const WRITE_CANVAS_ESTIMATED_TOKENS_PER_IMAGE = 2048;
 const WRITE_CANVAS_MAX_AGENT_GROUP_MEMBERS = 3;
 const WRITE_CANVAS_MAX_EXTRACTION_NODES = 12;
+const WRITE_CANVAS_AGENT_BATCH_STALE_MS = readBoundedEnvNumber(process.env.CANVAS_AGENT_BATCH_STALE_MS, 10 * 60 * 1000, 60_000, 60 * 60 * 1000);
 
 type WriteAgentSkillType = "card_storage" | "citation" | "writing" | "style";
 type WriteAgentSkillScenario = "storage" | "citation" | "drafting" | "style";
@@ -4023,6 +4027,52 @@ const normalizeCanvasQuickAction = (value: unknown): WriteCanvasQuickAction | nu
 
 const isCanvasExtractionAction = (action: WriteCanvasQuickAction) => action.startsWith("extract_");
 
+class CanvasInputLimitError extends Error {}
+class CanvasStorageLimitError extends Error {}
+
+const getCanvasAggregateContextChars = (
+  contexts: CanvasContextItem[],
+  message: string,
+  systemPrompt = "",
+  previousMessages: Array<{ content: string }> = [],
+) => contexts.reduce((total, item) => total + item.title.length + item.text.length + (item.sourceLabel?.length || 0), 0)
+  + message.length
+  + systemPrompt.length
+  + previousMessages.reduce((total, item) => total + item.content.length, 0);
+
+const assertCanvasAggregateContextWithinLimit = (
+  contexts: CanvasContextItem[],
+  message: string,
+  systemPrompt = "",
+  previousMessages: Array<{ content: string }> = [],
+) => {
+  const aggregateChars = getCanvasAggregateContextChars(contexts, message, systemPrompt, previousMessages);
+  if (aggregateChars > WRITE_CANVAS_MAX_AGGREGATE_CONTEXT_CHARS) {
+    throw new CanvasInputLimitError(`画布上下文超过 ${WRITE_CANVAS_MAX_AGGREGATE_CONTEXT_CHARS} 字符上限`);
+  }
+  return aggregateChars;
+};
+
+const estimateCanvasInputTokens = (
+  contexts: CanvasContextItem[],
+  message: string,
+  systemPrompt = "",
+  previousMessages: Array<{ content: string }> = [],
+) => {
+  const textTokens = Math.ceil(getCanvasAggregateContextChars(contexts, message, systemPrompt, previousMessages) / 4);
+  const imageTokens = contexts
+    .filter(context => Boolean(context.imageDataUrl))
+    .slice(0, WRITE_CANVAS_MAX_CONTEXT_IMAGES)
+    .length * WRITE_CANVAS_ESTIMATED_TOKENS_PER_IMAGE;
+  return textTokens + imageTokens;
+};
+
+const requireCanvasCompletionContent = (content: string) => {
+  const normalized = content.trim();
+  if (!normalized) throw new Error("AI provider returned empty content");
+  return normalized;
+};
+
 const getCanvasQuickActionPrompt = (action: WriteCanvasQuickAction) => {
   const prompts: Record<WriteCanvasQuickAction, string> = {
     summarize: "请只基于提供的单个画布节点，给出简洁、准确的中文摘要。",
@@ -4039,6 +4089,7 @@ const getCanvasQuickActionPrompt = (action: WriteCanvasQuickAction) => {
 
 const mapCanvasAgentGroupMemberRow = (row: any) => ({
   id: Number(row.id),
+  projectId: Number(row.projectId ?? row.project_id),
   name: row.name || "Agent",
   model: row.model,
   systemPrompt: row.systemPrompt ?? row.system_prompt ?? "",
@@ -4049,9 +4100,20 @@ const mapCanvasAgentGroupMemberRow = (row: any) => ({
   updatedAt: row.updatedAt || row.updated_at,
 });
 
+type CanvasAgentGroupMemberRecord = {
+  id: number;
+  name: string;
+  model: string;
+  system_prompt: string;
+  temperature: number;
+  top_p: number;
+  max_tokens: number;
+};
+
 const mapCanvasAgentGroupRow = (row: any) => ({
   id: Number(row.id),
   projectId: Number(row.projectId ?? row.project_id),
+  nodeId: Number(row.nodeId ?? row.node_id),
   name: row.name,
   sharedPrompt: row.sharedPrompt ?? row.shared_prompt ?? "",
   status: row.status,
@@ -4073,6 +4135,23 @@ const mapCanvasAgentRunRow = (row: any) => ({
   contextSnapshot: row.contextSnapshot ?? row.context_snapshot ?? {},
   configSnapshot: row.configSnapshot ?? row.config_snapshot ?? {},
   output: row.output || "",
+  error: row.error || null,
+  startedAt: row.startedAt || row.started_at || null,
+  completedAt: row.completedAt || row.completed_at || null,
+  createdAt: row.createdAt || row.created_at,
+  updatedAt: row.updatedAt || row.updated_at,
+});
+
+const mapCanvasAgentBatchRow = (row: Record<string, unknown>) => ({
+  id: Number(row.id),
+  projectId: Number(row.projectId ?? row.project_id),
+  groupId: Number(row.groupId ?? row.group_id),
+  message: row.message || "",
+  contextNodeIds: Array.isArray(row.contextNodeIds ?? row.context_node_ids) ? row.contextNodeIds ?? row.context_node_ids : [],
+  status: row.status,
+  contextSnapshot: row.contextSnapshot ?? row.context_snapshot ?? {},
+  configSnapshot: row.configSnapshot ?? row.config_snapshot ?? {},
+  output: row.output || {},
   error: row.error || null,
   startedAt: row.startedAt || row.started_at || null,
   completedAt: row.completedAt || row.completed_at || null,
@@ -4153,6 +4232,7 @@ const createCanvasGeneratedNodes = async (
   projectId: number,
   sourceNodeId: number | null,
   inputs: CanvasGeneratedNodeInput[],
+  additionalStorageBytes = 0,
 ) => {
   if (inputs.length === 0) return [] as number[];
   const project = (await client.query(`SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`, [projectId, userId])).rows[0];
@@ -4164,9 +4244,7 @@ const createCanvasGeneratedNodes = async (
   const nodeCount = Number((await client.query(`SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE user_id = $1 AND project_id = $2`, [userId, projectId])).rows[0]?.count || 0);
   if (nodeCount + inputs.length > WRITE_CANVAS_MAX_NODES_PER_PROJECT) throw new Error("项目节点数量已达到上限");
   const addedBytes = inputs.reduce((total, item) => total + Buffer.byteLength(item.content, "utf8") * 2, 0);
-  const storedBytes = await getCanvasStoredBytes(client, userId);
-  const maxStoredBytes = readBoundedEnvNumber(process.env.CANVAS_USER_STORAGE_MAX_MB, 100, 20, 2048) * 1024 * 1024;
-  if (storedBytes + addedBytes > maxStoredBytes) throw new Error("画布资料存储额度已用完，请删除旧资料后重试");
+  await assertCanvasStorageQuota(client, userId, addedBytes + additionalStorageBytes);
   const nodeIds: number[] = [];
   for (const item of inputs) {
     const asset = (await client.query(
@@ -4283,9 +4361,27 @@ const getCanvasStoredBytes = async (client: pg.PoolClient, userId: number) => Nu
      FROM write_canvas_document_sections WHERE user_id = $1
      UNION ALL SELECT octet_length(snapshot::text)
      FROM write_canvas_document_versions WHERE user_id = $1
+     UNION ALL SELECT octet_length(row_to_json(t)::text)
+     FROM write_canvas_agent_groups t WHERE user_id = $1
+     UNION ALL SELECT octet_length(row_to_json(t)::text)
+     FROM write_canvas_agent_group_members t WHERE user_id = $1
+     UNION ALL SELECT octet_length(row_to_json(t)::text)
+     FROM write_canvas_agent_runs t WHERE user_id = $1
+     UNION ALL SELECT octet_length(row_to_json(t)::text)
+     FROM write_canvas_agent_batches t WHERE user_id = $1
    ) stored`,
   [userId],
 )).rows[0]?.bytes || 0);
+
+const estimateCanvasStorageBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8") + 512;
+
+const assertCanvasStorageQuota = async (client: pg.PoolClient, userId: number, additionalBytes: number) => {
+  const storedBytes = await getCanvasStoredBytes(client, userId);
+  const maxStoredBytes = readBoundedEnvNumber(process.env.CANVAS_USER_STORAGE_MAX_MB, 100, 20, 2048) * 1024 * 1024;
+  if (storedBytes + Math.max(0, additionalBytes) > maxStoredBytes) {
+    throw new CanvasStorageLimitError("画布资料存储额度已用完，请删除旧资料后重试");
+  }
+};
 
 const ensureCanvasProject = async (pool: pg.Pool, userId: number) => {
   const client = await pool.connect();
@@ -4632,6 +4728,8 @@ const requestCanvasAgentCompletion = async (input: {
   maxTokens: number;
   signal?: AbortSignal;
 }) => {
+  input.signal?.throwIfAborted();
+  assertCanvasAggregateContextWithinLimit(input.contexts, input.message, input.systemPrompt, input.previousMessages);
   const config = getOpenAIWriteAgentConfig();
   if (!config) {
     throw new Error("Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL");
@@ -4657,7 +4755,7 @@ const requestCanvasAgentCompletion = async (input: {
   if (supportsImages) {
     let imageBytes = 0;
     for (const item of input.contexts) {
-      if (!item.imageDataUrl || imageParts.length >= 4) continue;
+      if (!item.imageDataUrl || imageParts.length >= WRITE_CANVAS_MAX_CONTEXT_IMAGES) continue;
       const estimatedBytes = Math.ceil(item.imageDataUrl.length * 0.75);
       if (imageBytes + estimatedBytes > WRITE_CANVAS_MAX_CONTEXT_IMAGE_BYTES) continue;
       imageBytes += estimatedBytes;
@@ -4679,6 +4777,7 @@ const requestCanvasAgentCompletion = async (input: {
       : { role: "user", content: userContent }
   ];
 
+  input.signal?.throwIfAborted();
   const response = await fetch(chatCompletionsUrl, {
     method: "POST",
     headers: {
@@ -4703,7 +4802,7 @@ const requestCanvasAgentCompletion = async (input: {
   }
   const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
   return {
-    content: (data.choices?.[0]?.message?.content || "").trim(),
+    content: requireCanvasCompletionContent(data.choices?.[0]?.message?.content || ""),
     model,
     provider: config.providerLabel,
     usedImages: imageParts.length
@@ -5307,7 +5406,8 @@ async function startServer() {
       viewport       JSONB NOT NULL DEFAULT '{}'::jsonb,
       last_opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (id, user_id)
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_projects_user ON write_canvas_projects(user_id, last_opened_at DESC)`);
@@ -5381,10 +5481,12 @@ async function startServer() {
       width       REAL NOT NULL DEFAULT 280,
       height      REAL NOT NULL DEFAULT 180,
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (id, user_id, project_id)
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_nodes_project ON write_canvas_nodes(project_id, updated_at DESC)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_nodes_tenant_project_unique ON write_canvas_nodes(id, user_id, project_id)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS write_canvas_edges (
@@ -5418,12 +5520,15 @@ async function startServer() {
       id              BIGSERIAL PRIMARY KEY,
       user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       project_id      BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
+      node_id         BIGINT,
       name            TEXT NOT NULL,
       shared_prompt   TEXT NOT NULL DEFAULT '',
-      status          TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('ready','running','completed','failed')),
+      status          TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('ready','running','completed','partial','failed','cancelled')),
       config_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (id, user_id, project_id),
+      FOREIGN KEY (node_id, user_id, project_id) REFERENCES write_canvas_nodes(id, user_id, project_id) ON DELETE CASCADE
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_groups_project ON write_canvas_agent_groups(user_id, project_id, updated_at DESC)`);
@@ -5431,7 +5536,8 @@ async function startServer() {
     CREATE TABLE IF NOT EXISTS write_canvas_agent_group_members (
       id              BIGSERIAL PRIMARY KEY,
       user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      group_id        BIGINT NOT NULL REFERENCES write_canvas_agent_groups(id) ON DELETE CASCADE,
+      project_id      BIGINT NOT NULL,
+      group_id        BIGINT NOT NULL,
       name            TEXT NOT NULL,
       model           TEXT NOT NULL,
       system_prompt   TEXT NOT NULL DEFAULT '',
@@ -5439,7 +5545,9 @@ async function startServer() {
       top_p           REAL NOT NULL DEFAULT 1,
       max_tokens      INTEGER NOT NULL DEFAULT 1200,
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (id, user_id, project_id, group_id),
+      FOREIGN KEY (group_id, user_id, project_id) REFERENCES write_canvas_agent_groups(id, user_id, project_id) ON DELETE CASCADE
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_group_members_group ON write_canvas_agent_group_members(user_id, group_id, id)`);
@@ -5448,10 +5556,10 @@ async function startServer() {
       id               BIGSERIAL PRIMARY KEY,
       user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       project_id       BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
-      group_id         BIGINT NOT NULL REFERENCES write_canvas_agent_groups(id) ON DELETE CASCADE,
+      group_id         BIGINT NOT NULL,
       message          TEXT NOT NULL DEFAULT '',
       context_node_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
-      status           TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','failed','cancelled')),
+      status           TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','partial','failed','cancelled')),
       context_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
       config_snapshot  JSONB NOT NULL DEFAULT '{}'::jsonb,
       output           JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -5459,7 +5567,9 @@ async function startServer() {
       started_at       TIMESTAMPTZ,
       completed_at     TIMESTAMPTZ,
       created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (id, user_id, project_id, group_id),
+      FOREIGN KEY (group_id, user_id, project_id) REFERENCES write_canvas_agent_groups(id, user_id, project_id) ON DELETE CASCADE
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_batches_group ON write_canvas_agent_batches(user_id, group_id, created_at DESC)`);
@@ -5467,11 +5577,11 @@ async function startServer() {
     CREATE TABLE IF NOT EXISTS write_canvas_agent_runs (
       id               BIGSERIAL PRIMARY KEY,
       user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      project_id       BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
-      group_id         BIGINT REFERENCES write_canvas_agent_groups(id) ON DELETE CASCADE,
-      group_member_id  BIGINT REFERENCES write_canvas_agent_group_members(id) ON DELETE CASCADE,
-      batch_id         BIGINT REFERENCES write_canvas_agent_batches(id) ON DELETE CASCADE,
-      source_node_id   BIGINT REFERENCES write_canvas_nodes(id) ON DELETE SET NULL,
+      project_id       BIGINT NOT NULL,
+      group_id         BIGINT,
+      group_member_id  BIGINT,
+      batch_id         BIGINT,
+      source_node_id   BIGINT,
       action           TEXT NOT NULL,
       status           TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','failed','cancelled')),
       context_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -5481,11 +5591,81 @@ async function startServer() {
       started_at       TIMESTAMPTZ,
       completed_at     TIMESTAMPTZ,
       created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (id, user_id, project_id),
+      CONSTRAINT write_canvas_agent_runs_project_owner_fkey FOREIGN KEY (project_id, user_id) REFERENCES write_canvas_projects(id, user_id) ON DELETE CASCADE,
+      CONSTRAINT write_canvas_agent_runs_group_owner_fkey FOREIGN KEY (group_id, user_id, project_id) REFERENCES write_canvas_agent_groups(id, user_id, project_id) ON DELETE CASCADE,
+      CONSTRAINT write_canvas_agent_runs_group_member_owner_fkey FOREIGN KEY (group_member_id, user_id, project_id, group_id) REFERENCES write_canvas_agent_group_members(id, user_id, project_id, group_id) ON DELETE SET NULL (group_member_id),
+      CONSTRAINT write_canvas_agent_runs_batch_owner_fkey FOREIGN KEY (batch_id, user_id, project_id, group_id) REFERENCES write_canvas_agent_batches(id, user_id, project_id, group_id) ON DELETE CASCADE,
+      CONSTRAINT write_canvas_agent_runs_source_owner_fkey FOREIGN KEY (source_node_id, user_id, project_id) REFERENCES write_canvas_nodes(id, user_id, project_id) ON DELETE SET NULL (source_node_id)
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_runs_user ON write_canvas_agent_runs(user_id, project_id, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_runs_batch ON write_canvas_agent_runs(batch_id, created_at ASC) WHERE batch_id IS NOT NULL`);
+
+  await pool.query(`ALTER TABLE write_canvas_agent_groups ADD COLUMN IF NOT EXISTS node_id BIGINT`);
+  await pool.query(`ALTER TABLE write_canvas_agent_group_members ADD COLUMN IF NOT EXISTS project_id BIGINT`);
+  await pool.query(`
+    UPDATE write_canvas_agent_group_members m
+    SET project_id = g.project_id
+    FROM write_canvas_agent_groups g
+    WHERE m.group_id = g.id AND m.user_id = g.user_id AND m.project_id IS NULL
+  `);
+  await pool.query(`ALTER TABLE write_canvas_agent_group_members ALTER COLUMN project_id SET NOT NULL`);
+  await pool.query(`
+    ALTER TABLE write_canvas_agent_groups DROP CONSTRAINT IF EXISTS write_canvas_agent_groups_status_check;
+    ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_status_check CHECK (status IN ('ready','running','completed','partial','failed','cancelled'));
+    ALTER TABLE write_canvas_agent_batches DROP CONSTRAINT IF EXISTS write_canvas_agent_batches_status_check;
+    ALTER TABLE write_canvas_agent_batches ADD CONSTRAINT write_canvas_agent_batches_status_check CHECK (status IN ('queued','running','completed','partial','failed','cancelled'));
+    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_project_id_fkey;
+    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_group_id_fkey;
+    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_group_member_id_fkey;
+    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_batch_id_fkey;
+    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_source_node_id_fkey;
+  `);
+  await pool.query(`
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_projects_tenant_key') THEN
+        ALTER TABLE write_canvas_projects ADD CONSTRAINT write_canvas_projects_tenant_key UNIQUE (id, user_id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_tenant_project_key') THEN
+        ALTER TABLE write_canvas_nodes ADD CONSTRAINT write_canvas_nodes_tenant_project_key UNIQUE (id, user_id, project_id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_groups_tenant_project_key') THEN
+        ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_tenant_project_key UNIQUE (id, user_id, project_id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_group_members_tenant_group_key') THEN
+        ALTER TABLE write_canvas_agent_group_members ADD CONSTRAINT write_canvas_agent_group_members_tenant_group_key UNIQUE (id, user_id, project_id, group_id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_batches_tenant_group_key') THEN
+        ALTER TABLE write_canvas_agent_batches ADD CONSTRAINT write_canvas_agent_batches_tenant_group_key UNIQUE (id, user_id, project_id, group_id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_groups_project_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_project_owner_fkey FOREIGN KEY (project_id, user_id) REFERENCES write_canvas_projects(id, user_id) ON DELETE CASCADE;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_group_members_group_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_group_members ADD CONSTRAINT write_canvas_agent_group_members_group_owner_fkey FOREIGN KEY (group_id, user_id, project_id) REFERENCES write_canvas_agent_groups(id, user_id, project_id) ON DELETE CASCADE;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_batches_group_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_batches ADD CONSTRAINT write_canvas_agent_batches_group_owner_fkey FOREIGN KEY (group_id, user_id, project_id) REFERENCES write_canvas_agent_groups(id, user_id, project_id) ON DELETE CASCADE;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_group_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs ADD CONSTRAINT write_canvas_agent_runs_group_owner_fkey FOREIGN KEY (group_id, user_id, project_id) REFERENCES write_canvas_agent_groups(id, user_id, project_id) ON DELETE CASCADE;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_project_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs ADD CONSTRAINT write_canvas_agent_runs_project_owner_fkey FOREIGN KEY (project_id, user_id) REFERENCES write_canvas_projects(id, user_id) ON DELETE CASCADE;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_group_member_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs ADD CONSTRAINT write_canvas_agent_runs_group_member_owner_fkey FOREIGN KEY (group_member_id, user_id, project_id, group_id) REFERENCES write_canvas_agent_group_members(id, user_id, project_id, group_id) ON DELETE SET NULL (group_member_id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_batch_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs ADD CONSTRAINT write_canvas_agent_runs_batch_owner_fkey FOREIGN KEY (batch_id, user_id, project_id, group_id) REFERENCES write_canvas_agent_batches(id, user_id, project_id, group_id) ON DELETE CASCADE;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_source_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs ADD CONSTRAINT write_canvas_agent_runs_source_owner_fkey FOREIGN KEY (source_node_id, user_id, project_id) REFERENCES write_canvas_nodes(id, user_id, project_id) ON DELETE SET NULL (source_node_id);
+      END IF;
+    END $$
+  `);
 
   await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS node_role TEXT`);
   await pool.query(`ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS content_type TEXT`);
@@ -5512,6 +5692,30 @@ async function startServer() {
   await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN content_type SET NOT NULL`);
   await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN origin SET NOT NULL`);
   await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN status SET NOT NULL`);
+  await pool.query(`
+    INSERT INTO write_canvas_nodes
+      (user_id, project_id, kind, node_role, content_type, origin, status, business_ref, title, summary, meta, x, y, width, height)
+    SELECT g.user_id, g.project_id, 'result', 'task', 'agent_group', 'manual', 'ready', g.id::text,
+           g.name, LEFT(g.shared_prompt, 500), jsonb_build_object('groupId', g.id), 360, 180, 340, 220
+    FROM write_canvas_agent_groups g
+    WHERE g.node_id IS NULL
+  `);
+  await pool.query(`
+    UPDATE write_canvas_agent_groups g
+    SET node_id = n.id
+    FROM write_canvas_nodes n
+    WHERE g.node_id IS NULL
+      AND n.user_id = g.user_id AND n.project_id = g.project_id
+      AND n.content_type = 'agent_group' AND n.business_ref = g.id::text
+  `);
+  await pool.query(`ALTER TABLE write_canvas_agent_groups ALTER COLUMN node_id SET NOT NULL`);
+  await pool.query(`
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_groups_node_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_node_owner_fkey FOREIGN KEY (node_id, user_id, project_id) REFERENCES write_canvas_nodes(id, user_id, project_id) ON DELETE CASCADE;
+      END IF;
+    END $$
+  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS write_canvas_documents (
       id                 BIGSERIAL PRIMARY KEY,
@@ -6537,9 +6741,10 @@ async function startServer() {
     next();
   };
 
-  const reserveDailyAiBudget = async (userId: number, reservedOutputTokens: number) => {
+  const reserveDailyAiBudget = async (userId: number, reservedOutputTokens: number, estimatedInputTokens = 0) => {
     const maxOperations = readBoundedEnvNumber(process.env.PAID_OPERATION_DAILY_LIMIT, 100, 1, 10000);
     const maxOutputTokens = readBoundedEnvNumber(process.env.PAID_OUTPUT_TOKENS_DAILY_LIMIT, 200_000, 1000, 10_000_000);
+    const reservedTokens = Math.max(0, Math.ceil(reservedOutputTokens)) + Math.max(0, Math.ceil(estimatedInputTokens));
     return (await pool.query(
       `INSERT INTO user_ai_usage_daily (user_id, usage_date, operation_count, reserved_output_tokens)
        SELECT $1, CURRENT_DATE, 1, $2
@@ -6551,8 +6756,48 @@ async function startServer() {
        WHERE user_ai_usage_daily.operation_count < $3
          AND user_ai_usage_daily.reserved_output_tokens + EXCLUDED.reserved_output_tokens <= $4
        RETURNING operation_count, reserved_output_tokens`,
-      [userId, reservedOutputTokens, maxOperations, maxOutputTokens],
+      [userId, reservedTokens, maxOperations, maxOutputTokens],
     )).rows[0] || null;
+  };
+
+  const finishCanvasAgentBatch = async (input: {
+    userId: number;
+    batchId: number;
+    groupId: number;
+    status: "completed" | "partial" | "failed" | "cancelled";
+    output: Record<string, unknown>;
+    error: string | null;
+  }) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, input.userId);
+      const owned = (await client.query(
+        `SELECT b.id
+         FROM write_canvas_agent_batches b
+         JOIN write_canvas_agent_groups g ON g.id = b.group_id AND g.user_id = b.user_id AND g.project_id = b.project_id
+         WHERE b.id = $1 AND b.group_id = $2 AND b.user_id = $3
+         FOR UPDATE OF b, g`,
+        [input.batchId, input.groupId, input.userId],
+      )).rows[0];
+      if (!owned) throw new Error("batch not found");
+      await client.query(
+        `UPDATE write_canvas_agent_batches
+         SET status = $1, output = $2::jsonb, error = $3, completed_at = NOW(), updated_at = NOW()
+         WHERE id = $4 AND group_id = $5 AND user_id = $6`,
+        [input.status, JSON.stringify(input.output), input.error, input.batchId, input.groupId, input.userId],
+      );
+      await client.query(
+        `UPDATE write_canvas_agent_groups SET status = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`,
+        [input.status, input.groupId, input.userId],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   };
 
   const dailyPaidOperationBudgetMiddleware: express.RequestHandler = asyncHandler(async (req, res, next) => {
@@ -8674,6 +8919,30 @@ async function startServer() {
     return res.json({ run: mapCanvasAgentRunRow(row) });
   }));
 
+  app.get("/api/write/canvas/projects/:projectId/runs", requireAuth, asyncHandler(async (req, res) => {
+    const projectId = Number(req.params.projectId);
+    if (!Number.isSafeInteger(projectId) || projectId <= 0) return res.status(400).json({ error: "invalid project id" });
+    const project = (await pool.query(`SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2`, [projectId, req.session.userId])).rows[0];
+    if (!project) return res.status(404).json({ error: "project not found" });
+    const runs = (await pool.query(
+      `SELECT * FROM write_canvas_agent_runs WHERE project_id = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT 100`,
+      [projectId, req.session.userId],
+    )).rows.map(mapCanvasAgentRunRow);
+    return res.json({ runs });
+  }));
+
+  app.get("/api/write/canvas/agent-groups/:id/batches", requireAuth, asyncHandler(async (req, res) => {
+    const groupId = Number(req.params.id);
+    if (!Number.isSafeInteger(groupId) || groupId <= 0) return res.status(400).json({ error: "invalid group id" });
+    const group = (await pool.query(`SELECT id FROM write_canvas_agent_groups WHERE id = $1 AND user_id = $2`, [groupId, req.session.userId])).rows[0];
+    if (!group) return res.status(404).json({ error: "group not found" });
+    const batches = (await pool.query(
+      `SELECT * FROM write_canvas_agent_batches WHERE group_id = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT 100`,
+      [groupId, req.session.userId],
+    )).rows.map(mapCanvasAgentBatchRow);
+    return res.json({ batches });
+  }));
+
   app.get("/api/write/canvas/projects/:projectId/agent-groups", requireAuth, asyncHandler(async (req, res) => {
     const projectId = Number(req.params.projectId);
     if (!Number.isSafeInteger(projectId) || projectId <= 0) return res.status(400).json({ error: "invalid project id" });
@@ -8681,7 +8950,7 @@ async function startServer() {
     if (!project) return res.status(404).json({ error: "project not found" });
     const groups = (await pool.query(
       `SELECT g.*, COALESCE(jsonb_agg(jsonb_build_object(
-          'id', m.id, 'name', m.name, 'model', m.model, 'systemPrompt', m.system_prompt,
+          'id', m.id, 'projectId', m.project_id, 'name', m.name, 'model', m.model, 'systemPrompt', m.system_prompt,
           'temperature', m.temperature, 'topP', m.top_p, 'maxTokens', m.max_tokens,
           'createdAt', m.created_at, 'updatedAt', m.updated_at
         ) ORDER BY m.id) FILTER (WHERE m.id IS NOT NULL), '[]'::jsonb) AS members
@@ -8722,6 +8991,7 @@ async function startServer() {
 
     const client = await pool.connect();
     let groupId: number;
+    let nodeId: number;
     try {
       await client.query("BEGIN");
       await lockCanvasUser(client, req.session.userId);
@@ -8730,29 +9000,48 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: "project not found" });
       }
-      const group = (await client.query(
-        `INSERT INTO write_canvas_agent_groups (user_id, project_id, name, shared_prompt, config_snapshot)
-         VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id`,
-        [req.session.userId, projectId, name, sharedPrompt, JSON.stringify({ sharedPrompt, members })],
+      const nodeCount = Number((await client.query(
+        `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE user_id = $1 AND project_id = $2`,
+        [req.session.userId, projectId],
+      )).rows[0]?.count || 0);
+      if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目节点数量已达到上限" });
+      }
+      const configSnapshot = { sharedPrompt, members };
+      await assertCanvasStorageQuota(client, req.session.userId, estimateCanvasStorageBytes({ group: { name, sharedPrompt, configSnapshot }, members, node: { name, sharedPrompt } }));
+      groupId = Number((await client.query(`SELECT nextval(pg_get_serial_sequence('write_canvas_agent_groups', 'id')) AS id`)).rows[0].id);
+      const node = (await client.query(
+        `INSERT INTO write_canvas_nodes
+           (user_id, project_id, kind, node_role, content_type, origin, status, business_ref, title, summary, meta, x, y, width, height)
+         VALUES ($1, $2, 'result', 'task', 'agent_group', 'manual', 'ready', $3, $4, $5, $6::jsonb, $7, $8, 340, 220)
+         RETURNING id`,
+        [req.session.userId, projectId, String(groupId), name, sharedPrompt.slice(0, 500), JSON.stringify({ groupId }), clampNumber(req.body?.x, 360, -100000, 100000), clampNumber(req.body?.y, 180, -100000, 100000)],
       )).rows[0];
-      groupId = Number(group.id);
+      nodeId = Number(node.id);
+      await client.query(
+        `INSERT INTO write_canvas_agent_groups (id, user_id, project_id, node_id, name, shared_prompt, config_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [groupId, req.session.userId, projectId, nodeId, name, sharedPrompt, JSON.stringify(configSnapshot)],
+      );
       for (const member of members) {
         await client.query(
-          `INSERT INTO write_canvas_agent_group_members (user_id, group_id, name, model, system_prompt, temperature, top_p, max_tokens)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [req.session.userId, groupId, member.name, member.model, member.systemPrompt, member.temperature, member.topP, member.maxTokens],
+          `INSERT INTO write_canvas_agent_group_members (user_id, project_id, group_id, name, model, system_prompt, temperature, top_p, max_tokens)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [req.session.userId, projectId, groupId, member.name, member.model, member.systemPrompt, member.temperature, member.topP, member.maxTokens],
         );
       }
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
+      if (error instanceof CanvasStorageLimitError) return res.status(413).json({ error: error.message });
       throw error;
     } finally {
       client.release();
     }
     const group = (await pool.query(
       `SELECT g.*, COALESCE(jsonb_agg(jsonb_build_object(
-          'id', m.id, 'name', m.name, 'model', m.model, 'systemPrompt', m.system_prompt,
+          'id', m.id, 'projectId', m.project_id, 'name', m.name, 'model', m.model, 'systemPrompt', m.system_prompt,
           'temperature', m.temperature, 'topP', m.top_p, 'maxTokens', m.max_tokens,
           'createdAt', m.created_at, 'updatedAt', m.updated_at
         ) ORDER BY m.id) FILTER (WHERE m.id IS NOT NULL), '[]'::jsonb) AS members
@@ -8760,7 +9049,7 @@ async function startServer() {
        WHERE g.id = $1 AND g.user_id = $2 GROUP BY g.id`,
       [groupId, req.session.userId],
     )).rows[0];
-    return res.json({ group: mapCanvasAgentGroupRow(group) });
+    return res.json({ group: mapCanvasAgentGroupRow(group), nodeId });
   }));
 
   app.post("/api/write/canvas/nodes/:id/actions/stream", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
@@ -8768,32 +9057,65 @@ async function startServer() {
     const action = normalizeCanvasQuickAction(req.body?.action);
     if (!Number.isSafeInteger(nodeId) || nodeId <= 0) return res.status(400).json({ error: "invalid node id" });
     if (!action) return res.status(400).json({ error: "unsupported canvas action" });
+    const requestAbortController = new AbortController();
+    const abortRequest = () => requestAbortController.abort(new Error("Client disconnected"));
+    req.once("aborted", abortRequest);
+    res.once("close", () => { if (!res.writableFinished) abortRequest(); });
+    requestAbortController.signal.throwIfAborted();
     const source = (await pool.query(`SELECT id, project_id, x, y FROM write_canvas_nodes WHERE id = $1 AND user_id = $2`, [nodeId, req.session.userId])).rows[0];
     if (!source) return res.status(404).json({ error: "node not found" });
+    requestAbortController.signal.throwIfAborted();
     const context = await resolveCanvasOwnedNodeContext(pool, req.session.userId, Number(source.project_id), nodeId);
     if (!context) return res.status(404).json({ error: "node content not found" });
     const defaults = getDefaultCanvasAgentConfig();
     if (!getOpenAIWriteAgentConfig() || !isAllowedCanvasAgentModel(defaults.model)) return res.status(500).json({ error: "Writing agent model is not configured or allowed" });
-    const run = (await pool.query(
-      `INSERT INTO write_canvas_agent_runs (user_id, project_id, source_node_id, action, context_snapshot, config_snapshot)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb) RETURNING id`,
-      [req.session.userId, Number(source.project_id), nodeId, action, JSON.stringify({ nodes: [{ nodeId: context.nodeId, kind: context.kind, title: context.title, text: context.text }] }), JSON.stringify({ model: defaults.model, systemPrompt: defaults.systemPrompt, temperature: defaults.temperature, topP: defaults.topP, maxTokens: defaults.maxTokens })],
-    )).rows[0];
-    const runId = Number(run.id);
+    const prompt = getCanvasQuickActionPrompt(action);
+    const systemPrompt = `${defaults.systemPrompt}\n\n${prompt}`;
+    try {
+      assertCanvasAggregateContextWithinLimit([context], prompt, systemPrompt);
+    } catch (error) {
+      if (error instanceof CanvasInputLimitError) return res.status(413).json({ error: error.message });
+      throw error;
+    }
+    const estimatedInputTokens = estimateCanvasInputTokens([context], prompt, systemPrompt);
+    const contextSnapshot = { nodes: [{ nodeId: context.nodeId, kind: context.kind, title: context.title, text: context.text }] };
+    const configSnapshot = { model: defaults.model, systemPrompt: defaults.systemPrompt, temperature: defaults.temperature, topP: defaults.topP, maxTokens: defaults.maxTokens, estimatedInputTokens };
+    const runClient = await pool.connect();
+    let runId: number;
+    try {
+      await runClient.query("BEGIN");
+      await lockCanvasUser(runClient, req.session.userId);
+      requestAbortController.signal.throwIfAborted();
+      await assertCanvasStorageQuota(runClient, req.session.userId, estimateCanvasStorageBytes({ action, contextSnapshot, configSnapshot }));
+      requestAbortController.signal.throwIfAborted();
+      const run = (await runClient.query(
+        `INSERT INTO write_canvas_agent_runs (user_id, project_id, source_node_id, action, context_snapshot, config_snapshot)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb) RETURNING id`,
+        [req.session.userId, Number(source.project_id), nodeId, action, JSON.stringify(contextSnapshot), JSON.stringify(configSnapshot)],
+      )).rows[0];
+      runId = Number(run.id);
+      await runClient.query("COMMIT");
+    } catch (error) {
+      await runClient.query("ROLLBACK");
+      if (error instanceof CanvasStorageLimitError) return res.status(413).json({ error: error.message });
+      throw error;
+    } finally {
+      runClient.release();
+    }
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders?.();
     const send = (type: string, data: unknown) => { res.write(`event: ${type}\n`); res.write(`data: ${JSON.stringify(data)}\n\n`); };
-    const requestAbortController = new AbortController();
-    res.once("close", () => { if (!res.writableFinished) requestAbortController.abort(new Error("Client disconnected")); });
     try {
       await pool.query(`UPDATE write_canvas_agent_runs SET status = 'running', started_at = NOW(), updated_at = NOW() WHERE id = $1 AND user_id = $2`, [runId, req.session.userId]);
       send("partial_status", { runId, message: "已读取选中节点" });
-      const reservation = await reserveDailyAiBudget(req.session.userId, defaults.maxTokens);
+      requestAbortController.signal.throwIfAborted();
+      const reservation = await reserveDailyAiBudget(req.session.userId, defaults.maxTokens, estimatedInputTokens);
       if (!reservation) throw new Error("今日 AI 使用额度已达到上限，请稍后再试");
       send("partial_status", { runId, message: "正在生成" });
-      const completion = await requestCanvasAgentCompletion({ model: defaults.model, systemPrompt: `${defaults.systemPrompt}\n\n${getCanvasQuickActionPrompt(action)}`, message: getCanvasQuickActionPrompt(action), contexts: [context], previousMessages: [], temperature: defaults.temperature, topP: defaults.topP, maxTokens: defaults.maxTokens, signal: requestAbortController.signal });
+      requestAbortController.signal.throwIfAborted();
+      const completion = await requestCanvasAgentCompletion({ model: defaults.model, systemPrompt, message: prompt, contexts: [context], previousMessages: [], temperature: defaults.temperature, topP: defaults.topP, maxTokens: defaults.maxTokens, signal: requestAbortController.signal });
       const extractionItems = isCanvasExtractionAction(action) ? parseCanvasExtractionItems(completion.content) : [];
       const outputs = isCanvasExtractionAction(action)
         ? (extractionItems.length ? extractionItems : [{ title: "提取内容", content: completion.content.slice(0, 12000) }]).map((item, index) => ({ title: item.title, content: item.content, role: "insight" as const, origin: "extracted" as const, status: "pending_review" as const, relation: "derived_from" as const, x: Number(source.x) + 420, y: Number(source.y) + index * 250, meta: { runId, action } }))
@@ -8803,7 +9125,7 @@ async function startServer() {
       try {
         await client.query("BEGIN");
         await lockCanvasUser(client, req.session.userId);
-        outputNodeIds = await createCanvasGeneratedNodes(client, req.session.userId, Number(source.project_id), nodeId, outputs);
+        outputNodeIds = await createCanvasGeneratedNodes(client, req.session.userId, Number(source.project_id), nodeId, outputs, Buffer.byteLength(completion.content, "utf8"));
         await client.query(`UPDATE write_canvas_agent_runs SET status = 'completed', output = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2 AND user_id = $3`, [completion.content, runId, req.session.userId]);
         await client.query("COMMIT");
       } catch (error) {
@@ -8832,30 +9154,98 @@ async function startServer() {
     if (!Array.isArray(rawContextNodeIds) || rawContextNodeIds.length > WRITE_CANVAS_MAX_CONTEXT_ITEMS) return res.status(400).json({ error: "invalid contextNodeIds" });
     const contextNodeIds = Array.from(new Set(rawContextNodeIds.map(Number)));
     if (contextNodeIds.some(id => !Number.isSafeInteger(id) || id <= 0)) return res.status(400).json({ error: "invalid contextNodeIds" });
-    const group = (await pool.query(`SELECT * FROM write_canvas_agent_groups WHERE id = $1 AND user_id = $2`, [groupId, req.session.userId])).rows[0];
+    const requestAbortController = new AbortController();
+    const abortRequest = () => requestAbortController.abort(new Error("Client disconnected"));
+    req.once("aborted", abortRequest);
+    res.once("close", () => { if (!res.writableFinished) abortRequest(); });
+    requestAbortController.signal.throwIfAborted();
+    const group = (await pool.query(
+      `SELECT g.*, n.x AS node_x, n.y AS node_y
+       FROM write_canvas_agent_groups g
+       JOIN write_canvas_nodes n ON n.id = g.node_id AND n.user_id = g.user_id AND n.project_id = g.project_id
+       WHERE g.id = $1 AND g.user_id = $2`,
+      [groupId, req.session.userId],
+    )).rows[0];
     if (!group) return res.status(404).json({ error: "group not found" });
-    const members = (await pool.query(`SELECT * FROM write_canvas_agent_group_members WHERE group_id = $1 AND user_id = $2 ORDER BY id LIMIT $3`, [groupId, req.session.userId, WRITE_CANVAS_MAX_AGENT_GROUP_MEMBERS])).rows;
+    const members = (await pool.query(
+      `SELECT * FROM write_canvas_agent_group_members WHERE group_id = $1 AND user_id = $2 AND project_id = $3 ORDER BY id LIMIT $4`,
+      [groupId, req.session.userId, Number(group.project_id), WRITE_CANVAS_MAX_AGENT_GROUP_MEMBERS],
+    )).rows as CanvasAgentGroupMemberRecord[];
     if (members.length < 1 || members.length > WRITE_CANVAS_MAX_AGENT_GROUP_MEMBERS || members.some(member => !isAllowedCanvasAgentModel(member.model))) return res.status(400).json({ error: "group member configuration is invalid" });
     if (!getOpenAIWriteAgentConfig()) return res.status(500).json({ error: "Writing agent model is not configured" });
+    requestAbortController.signal.throwIfAborted();
     const contexts = await Promise.all(contextNodeIds.map(nodeId => resolveCanvasOwnedNodeContext(pool, req.session.userId, Number(group.project_id), nodeId)));
     if (contexts.some(context => !context)) return res.status(404).json({ error: "context node not found in this project" });
     const resolvedContexts = contexts.filter((context): context is CanvasContextItem => Boolean(context));
+    try {
+      for (const member of members) {
+        assertCanvasAggregateContextWithinLimit(resolvedContexts, message, [member.system_prompt, group.shared_prompt].filter(Boolean).join("\n\n"));
+      }
+    } catch (error) {
+      if (error instanceof CanvasInputLimitError) return res.status(413).json({ error: error.message });
+      throw error;
+    }
+    const estimatedInputTokensByMember = new Map(members.map(member => [
+      Number(member.id),
+      estimateCanvasInputTokens(resolvedContexts, message, [member.system_prompt, group.shared_prompt].filter(Boolean).join("\n\n")),
+    ]));
     const contextSnapshot = { nodes: resolvedContexts.map(context => ({ nodeId: context.nodeId, kind: context.kind, title: context.title, text: context.text })) };
-    const configSnapshot = { sharedPrompt: group.shared_prompt, members: members.map(member => ({ id: member.id, name: member.name, model: member.model, systemPrompt: member.system_prompt, temperature: member.temperature, topP: member.top_p, maxTokens: member.max_tokens })) };
+    const configSnapshot = { sharedPrompt: group.shared_prompt, members: members.map(member => ({ id: member.id, name: member.name, model: member.model, systemPrompt: member.system_prompt, temperature: member.temperature, topP: member.top_p, maxTokens: member.max_tokens, estimatedInputTokens: estimatedInputTokensByMember.get(Number(member.id)) })) };
     const client = await pool.connect();
     let batchId: number;
-    let runs: Array<{ id: number; member: any }> = [];
+    const runs: Array<{ id: number; member: CanvasAgentGroupMemberRecord }> = [];
     try {
       await client.query("BEGIN");
       await lockCanvasUser(client, req.session.userId);
-      const lockedGroup = (await client.query(`SELECT id FROM write_canvas_agent_groups WHERE id = $1 AND user_id = $2 FOR UPDATE`, [groupId, req.session.userId])).rows[0];
+      const lockedGroup = (await client.query(
+        `SELECT id, project_id, node_id FROM write_canvas_agent_groups WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [groupId, req.session.userId],
+      )).rows[0];
       if (!lockedGroup) { await client.query("ROLLBACK"); return res.status(404).json({ error: "group not found" }); }
+      const activeBatch = (await client.query(
+        `SELECT id, started_at FROM write_canvas_agent_batches
+         WHERE group_id = $1 AND user_id = $2 AND status = 'running'
+         ORDER BY started_at DESC LIMIT 1 FOR UPDATE`,
+        [groupId, req.session.userId],
+      )).rows[0];
+      if (activeBatch && Date.now() - new Date(activeBatch.started_at).getTime() <= WRITE_CANVAS_AGENT_BATCH_STALE_MS) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "已有批次正在运行，请等待完成后再试" });
+      }
+      if (activeBatch) {
+        const staleError = "运行超时，已由后续请求恢复";
+        await client.query(
+          `UPDATE write_canvas_agent_batches SET status = 'failed', error = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2 AND user_id = $3`,
+          [staleError, Number(activeBatch.id), req.session.userId],
+        );
+        await client.query(
+          `UPDATE write_canvas_agent_runs SET status = 'failed', error = $1, completed_at = NOW(), updated_at = NOW()
+           WHERE batch_id = $2 AND user_id = $3 AND status IN ('queued','running')`,
+          [staleError, Number(activeBatch.id), req.session.userId],
+        );
+      }
+      requestAbortController.signal.throwIfAborted();
+      const persistenceEstimate = estimateCanvasStorageBytes({ batch: { message, contextNodeIds, contextSnapshot, configSnapshot }, runs: members.map(member => ({ memberId: member.id, contextSnapshot, configSnapshot: configSnapshot.members.find(item => Number(item.id) === Number(member.id)) })) });
+      await assertCanvasStorageQuota(client, req.session.userId, persistenceEstimate);
+      requestAbortController.signal.throwIfAborted();
       const batch = (await client.query(
         `INSERT INTO write_canvas_agent_batches (user_id, project_id, group_id, message, context_node_ids, status, context_snapshot, config_snapshot, started_at)
          VALUES ($1, $2, $3, $4, $5::jsonb, 'running', $6::jsonb, $7::jsonb, NOW()) RETURNING id`,
         [req.session.userId, Number(group.project_id), groupId, message, JSON.stringify(contextNodeIds), JSON.stringify(contextSnapshot), JSON.stringify(configSnapshot)],
       )).rows[0];
       batchId = Number(batch.id);
+      await client.query(
+        `DELETE FROM write_canvas_edges WHERE user_id = $1 AND project_id = $2 AND target_node_id = $3 AND relation = 'context'`,
+        [req.session.userId, Number(group.project_id), Number(group.node_id)],
+      );
+      for (const contextNodeId of contextNodeIds) {
+        await client.query(
+          `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+           VALUES ($1, $2, $3, $4, 'context')
+           ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO NOTHING`,
+          [req.session.userId, Number(group.project_id), contextNodeId, Number(group.node_id)],
+        );
+      }
       await client.query(`UPDATE write_canvas_agent_groups SET status = 'running', updated_at = NOW() WHERE id = $1 AND user_id = $2`, [groupId, req.session.userId]);
       for (const member of members) {
         const run = (await client.query(
@@ -8868,6 +9258,7 @@ async function startServer() {
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
+      if (error instanceof CanvasStorageLimitError) return res.status(413).json({ error: error.message });
       throw error;
     } finally {
       client.release();
@@ -8877,21 +9268,23 @@ async function startServer() {
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders?.();
     const send = (type: string, data: unknown) => { res.write(`event: ${type}\n`); res.write(`data: ${JSON.stringify(data)}\n\n`); };
-    const requestAbortController = new AbortController();
-    res.once("close", () => { if (!res.writableFinished) requestAbortController.abort(new Error("Client disconnected")); });
     const memberRuns = runs.slice(0, WRITE_CANVAS_MAX_AGENT_GROUP_MEMBERS).map(async ({ id: runId, member }, index) => {
       send("member_start", { batchId, runId, memberId: Number(member.id), name: member.name });
       try {
         await pool.query(`UPDATE write_canvas_agent_runs SET status = 'running', started_at = NOW(), updated_at = NOW() WHERE id = $1 AND user_id = $2`, [runId, req.session.userId]);
-        const reservation = await reserveDailyAiBudget(req.session.userId, Number(member.max_tokens));
+        requestAbortController.signal.throwIfAborted();
+        const estimatedInputTokens = estimatedInputTokensByMember.get(Number(member.id)) || 0;
+        const reservation = await reserveDailyAiBudget(req.session.userId, Number(member.max_tokens), estimatedInputTokens);
         if (!reservation) throw new Error("今日 AI 使用额度已达到上限，请稍后再试");
+        requestAbortController.signal.throwIfAborted();
         const completion = await requestCanvasAgentCompletion({ model: member.model, systemPrompt: [member.system_prompt || getDefaultCanvasAgentConfig().systemPrompt, group.shared_prompt].filter(Boolean).join("\n\n"), message, contexts: resolvedContexts, previousMessages: [], temperature: Number(member.temperature), topP: Number(member.top_p), maxTokens: Number(member.max_tokens), signal: requestAbortController.signal });
         const outputClient = await pool.connect();
         let outputNodeIds: number[];
         try {
           await outputClient.query("BEGIN");
           await lockCanvasUser(outputClient, req.session.userId);
-          outputNodeIds = await createCanvasGeneratedNodes(outputClient, req.session.userId, Number(group.project_id), resolvedContexts[0]?.nodeId ?? null, [{ title: `${member.name} 输出`, content: completion.content, role: "insight", origin: "generated", status: "pending_review", relation: "generated", x: 420 + index * 360, y: 240, meta: { batchId, runId, groupId, memberId: Number(member.id) } }]);
+          const lineage = { sourceNodeId: Number(group.node_id), relation: "generated" as const };
+          outputNodeIds = await createCanvasGeneratedNodes(outputClient, req.session.userId, Number(group.project_id), lineage.sourceNodeId, [{ title: `${member.name} 输出`, content: completion.content, role: "insight", origin: "generated", status: "pending_review", relation: lineage.relation, x: Number(group.node_x) + 400 + index * 360, y: Number(group.node_y), meta: { batchId, runId, groupId, memberId: Number(member.id) } }], Buffer.byteLength(completion.content, "utf8"));
           await outputClient.query(`UPDATE write_canvas_agent_runs SET status = 'completed', output = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2 AND user_id = $3`, [completion.content, runId, req.session.userId]);
           await outputClient.query("COMMIT");
         } catch (error) {
@@ -8904,7 +9297,8 @@ async function startServer() {
         return { runId, memberId: Number(member.id), status: "completed", output: completion.content, outputNodeIds };
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Agent 执行失败";
-        await pool.query(`UPDATE write_canvas_agent_runs SET status = 'failed', error = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2 AND user_id = $3`, [errorMessage.slice(0, 2000), runId, req.session.userId]);
+        const runStatus = requestAbortController.signal.aborted ? "cancelled" : "failed";
+        await pool.query(`UPDATE write_canvas_agent_runs SET status = $1, error = $2, completed_at = NOW(), updated_at = NOW() WHERE id = $3 AND user_id = $4`, [runStatus, errorMessage.slice(0, 2000), runId, req.session.userId]);
         if (!res.destroyed && !res.writableEnded) send("member_error", { batchId, runId, memberId: Number(member.id), message: errorMessage });
         throw error;
       }
@@ -8913,9 +9307,13 @@ async function startServer() {
       const settled = await Promise.allSettled(memberRuns);
       const successes = settled.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
       const failures = settled.flatMap(result => result.status === "rejected" ? [result.reason instanceof Error ? result.reason.message : String(result.reason)] : []);
-      const status = successes.length > 0 ? "completed" : "failed";
-      await pool.query(`UPDATE write_canvas_agent_batches SET status = $1, output = $2::jsonb, error = $3, completed_at = NOW(), updated_at = NOW() WHERE id = $4 AND user_id = $5`, [status, JSON.stringify({ runs: successes }), failures.join("; ").slice(0, 4000) || null, batchId, req.session.userId]);
-      await pool.query(`UPDATE write_canvas_agent_groups SET status = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, [status, groupId, req.session.userId]);
+      const status = requestAbortController.signal.aborted && successes.length === 0
+        ? "cancelled"
+        : successes.length > 0 && failures.length > 0
+          ? "partial"
+          : successes.length > 0 ? "completed" : "failed";
+      const persistedRuns = successes.map(({ output: _output, ...result }) => result);
+      await finishCanvasAgentBatch({ userId: req.session.userId, batchId, groupId, status, output: { runs: persistedRuns }, error: failures.join("; ").slice(0, 4000) || null });
       if (!res.destroyed && !res.writableEnded) { send("final", { batchId, status, successes, failures }); res.end(); }
     } finally {
       if (typeof res.locals.releasePaidConcurrency === "function") res.locals.releasePaidConcurrency();
