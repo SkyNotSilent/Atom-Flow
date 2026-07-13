@@ -334,6 +334,69 @@ export interface WriteCanvasMessage {
   createdAt: string;
 }
 
+export type WriteCanvasAgentRunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type WriteCanvasAgentGroupStatus = 'ready' | 'running' | 'completed' | 'failed';
+
+export interface WriteCanvasAgentRun {
+  id: number;
+  projectId: number;
+  groupId?: number | null;
+  groupMemberId?: number | null;
+  batchId?: number | null;
+  sourceNodeId?: number | null;
+  action: string;
+  status: WriteCanvasAgentRunStatus;
+  contextSnapshot: Record<string, unknown>;
+  configSnapshot: Record<string, unknown>;
+  output?: string;
+  error?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WriteCanvasAgentGroupMember {
+  id: number;
+  name: string;
+  model: string;
+  systemPrompt: string;
+  temperature: number;
+  topP: number;
+  maxTokens: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WriteCanvasAgentGroup {
+  id: number;
+  projectId: number;
+  name: string;
+  sharedPrompt: string;
+  status: WriteCanvasAgentGroupStatus;
+  configSnapshot: Record<string, unknown>;
+  members: WriteCanvasAgentGroupMember[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WriteCanvasAgentBatch {
+  id: number;
+  projectId: number;
+  groupId: number;
+  message: string;
+  contextNodeIds: number[];
+  status: WriteCanvasAgentRunStatus;
+  contextSnapshot: Record<string, unknown>;
+  configSnapshot: Record<string, unknown>;
+  output?: Record<string, unknown>;
+  error?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface WriteCanvasProjectDetail {
   project: WriteCanvasProject;
   nodes: WriteCanvasNode[];
