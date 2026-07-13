@@ -228,7 +228,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
   return (
     <div className="fixed inset-0 z-[140] bg-black/30 flex items-center justify-center p-4" onClick={onClose}>
       <div
-        className="w-full max-w-[380px] rounded-2xl border border-border bg-surface shadow-[0_20px_50px_rgba(0,0,0,0.2)]"
+        className="w-full max-w-[380px] max-h-[calc(100vh-2rem)] overflow-y-auto rounded-2xl border border-border bg-surface shadow-[0_20px_50px_rgba(0,0,0,0.2)]"
         onClick={e => e.stopPropagation()}
       >
         {/* Header */}
@@ -494,6 +494,25 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
               </button>
             </>
           )}
+          <div className="mt-4 pt-3 border-t border-border text-center text-[11px] text-text3">
+            <a
+              href="/legal/privacy"
+              target="_blank"
+              rel="noreferrer"
+              className="hover:text-accent"
+            >
+              隐私说明
+            </a>
+            <span className="mx-2">·</span>
+            <a
+              href="/legal/terms"
+              target="_blank"
+              rel="noreferrer"
+              className="hover:text-accent"
+            >
+              服务条款
+            </a>
+          </div>
         </div>
       </div>
     </div>

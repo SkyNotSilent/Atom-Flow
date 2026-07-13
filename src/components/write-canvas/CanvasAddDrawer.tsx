@@ -133,6 +133,9 @@ export const CanvasAddDrawer: React.FC<CanvasAddDrawerProps> = ({
             我的 Notes
           </button>
         </div>
+        <p className="mt-2 text-[10px] leading-4 text-[#858990]">
+          上传后将保存在当前实例；只有你明确连接或选择为 AI 上下文时，文件内容才会发送给当前实例配置的模型服务。
+        </p>
 
         <div className="mt-3 rounded-[7px] border border-[#DCDAD4] bg-white p-2">
           <textarea

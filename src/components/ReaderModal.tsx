@@ -1,9 +1,9 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { Check, X, Bookmark, Share, MoreHorizontal, Loader2, ExternalLink, Languages, Play, Pause } from 'lucide-react';
+import createDOMPurify, { type Config } from 'dompurify';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import rehypeRaw from 'rehype-raw';
 import { cn } from './Nav';
 import { getDisplaySource } from '../utils/articleDisplay';
 import { logger } from '../utils/logger';
@@ -17,6 +17,59 @@ const LANG_OPTIONS = [
   { value: 'fr', label: 'Français' },
   { value: 'de', label: 'Deutsch' },
 ];
+
+const ARTICLE_HTML_SANITIZE_CONFIG: Config = {
+  ALLOWED_TAGS: [
+    'article', 'section', 'div', 'span', 'p', 'br', 'hr',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'code',
+    'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+    'strong', 'em', 'b', 'i', 'u', 's', 'del', 'mark', 'small', 'sub', 'sup',
+    'a', 'img', 'figure', 'figcaption',
+    'table', 'caption', 'colgroup', 'col', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td',
+    'time',
+  ],
+  ALLOWED_ATTR: [
+    'href', 'src', 'alt', 'title', 'target', 'rel',
+    'width', 'height', 'loading', 'decoding', 'referrerpolicy',
+    'colspan', 'rowspan', 'scope', 'datetime', 'dir', 'lang',
+  ],
+  ALLOW_ARIA_ATTR: false,
+  ALLOW_DATA_ATTR: false,
+  ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel):[^\s]*|(?:\/{1,2}|\.\.?\/|#|\?)[^\s]*|[^\s:/?#]+(?:[/?#][^\s]*)?)$/i,
+  FORBID_TAGS: [
+    'style', 'form', 'input', 'button', 'select', 'textarea', 'option',
+    'iframe', 'frame', 'frameset', 'object', 'embed', 'applet', 'portal',
+    'script', 'noscript', 'template', 'svg', 'math',
+    'meta', 'link', 'base', 'title', 'head',
+  ],
+  FORBID_CONTENTS: [
+    'style', 'form', 'input', 'button', 'select', 'textarea', 'option',
+    'iframe', 'frame', 'frameset', 'object', 'embed', 'applet', 'portal',
+    'script', 'noscript', 'template', 'svg', 'math',
+    'meta', 'link', 'base', 'title', 'head',
+  ],
+  FORBID_ATTR: ['style', 'srcdoc', 'formaction', 'xlink:href'],
+};
+
+let articleDOMPurify: ReturnType<typeof createDOMPurify> | null = null;
+
+function isSafeArticleUrl(rawUrl: string): boolean {
+  const url = rawUrl.trim();
+  return /^(?:(?:https?|mailto|tel):[^\s]*|(?:\/{1,2}|\.\.?\/|#|\?)[^\s]*|[^\s:/?#]+(?:[/?#][^\s]*)?)$/i.test(url);
+}
+
+export function sanitizeArticleHtml(rawHtml: string): string {
+  if (typeof window === 'undefined') return '';
+  if (!articleDOMPurify) {
+    articleDOMPurify = createDOMPurify(window);
+    articleDOMPurify.addHook('uponSanitizeAttribute', (_node, data) => {
+      if ((data.attrName === 'href' || data.attrName === 'src') && !isSafeArticleUrl(data.attrValue)) {
+        data.keepAttr = false;
+      }
+    });
+  }
+  return String(articleDOMPurify.sanitize(rawHtml, ARTICLE_HTML_SANITIZE_CONFIG));
+}
 
 // Split text content into translatable segments (paragraphs / headings)
 function splitIntoSegments(text: string): string[] {
@@ -35,6 +88,7 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
   const [translatedSegments, setTranslatedSegments] = useState<string[] | null>(null);
   const [originalSegments, setOriginalSegments] = useState<string[] | null>(null);
   const [targetLang, setTargetLang] = useState('zh');
+  const [showTranslationNotice, setShowTranslationNotice] = useState(false);
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -43,6 +97,10 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
   const displaySource = currentArticle ? getDisplaySource(currentArticle) : '未知来源';
   const shouldShowLoading = Boolean(currentArticle && !currentArticle.fullFetched && !currentArticle.content && !currentArticle.markdownContent);
   const isPodcast = currentArticle?.source === '张小珺商业访谈录' && currentArticle?.audioUrl;
+  const sanitizedArticleContent = useMemo(
+    () => sanitizeArticleHtml(currentArticle?.content || ''),
+    [currentArticle?.content],
+  );
 
   useEffect(() => {
     if (contentRef.current && currentArticle) {
@@ -156,9 +214,10 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
     setTranslatedTitle(null);
     setTranslatedSegments(null);
     setOriginalSegments(null);
+    setShowTranslationNotice(false);
   };
 
-  const handleTranslate = async () => {
+  const performTranslate = async () => {
     if (!currentArticle) return;
 
     // Toggle off: clear translation
@@ -207,6 +266,14 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
     } finally {
       setIsTranslating(false);
     }
+  };
+
+  const handleTranslate = () => {
+    if (translateActive || translatedSegments) {
+      void performTranslate();
+      return;
+    }
+    setShowTranslationNotice(true);
   };
 
   const handleLangChange = (lang: string) => {
@@ -277,23 +344,34 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
               原文 <ExternalLink size={12} />
             </a>
           )}
-          <button
-            onClick={handleTranslate}
-            disabled={isTranslating}
-            title="翻译"
-            className={cn(
-              "w-8 h-8 flex items-center justify-center rounded-full border transition-colors",
-              translateActive
-                ? "border-accent bg-accent text-white"
-                : "border-border text-text2 hover:bg-surface2",
-              isTranslating && "cursor-wait opacity-70"
+          <div className="relative">
+            <button
+              onClick={handleTranslate}
+              disabled={isTranslating}
+              title="翻译"
+              className={cn(
+                "w-8 h-8 flex items-center justify-center rounded-full border transition-colors",
+                translateActive
+                  ? "border-accent bg-accent text-white"
+                  : "border-border text-text2 hover:bg-surface2",
+                isTranslating && "cursor-wait opacity-70"
+              )}
+            >
+              {isTranslating
+                ? <Loader2 size={15} className="animate-spin" />
+                : <Languages size={15} />
+              }
+            </button>
+            {showTranslationNotice && (
+              <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-xl border border-border bg-surface p-3 text-[11px] leading-5 text-text2 shadow-lg">
+                <p>继续后，文章标题和正文文本将发送给当前实例配置的翻译服务。请勿翻译无权处理的敏感内容。</p>
+                <div className="mt-2 flex justify-end gap-2">
+                  <button type="button" onClick={() => setShowTranslationNotice(false)} className="px-2 py-1 text-text3 hover:text-text-main">取消</button>
+                  <button type="button" onClick={() => { setShowTranslationNotice(false); void performTranslate(); }} className="rounded-md bg-accent px-2 py-1 font-medium text-white">继续翻译</button>
+                </div>
+              </div>
             )}
-          >
-            {isTranslating
-              ? <Loader2 size={15} className="animate-spin" />
-              : <Languages size={15} />
-            }
-          </button>
+          </div>
           <button onClick={handleShare} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-surface2 text-text2 transition-colors">
             <Share size={16} />
           </button>
@@ -428,7 +506,7 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
                 <div>
                   {originalSegments.map((seg, i) => (
                     <div key={i} className="mb-6">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}
                         components={{
                           a: ({node, href, children, ...props}) => (
                             <a {...props} href={href} className="text-accent hover:underline break-all" target="_blank" rel="noreferrer">{children}</a>
@@ -458,7 +536,6 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
               ) : currentArticle.markdownContent ? (
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[rehypeRaw]}
                   components={{
                     a: ({node, href, children, ...props}) => {
                       // Helper to extract text from React children
@@ -547,7 +624,7 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
                   {currentArticle.markdownContent}
                 </ReactMarkdown>
               ) : (
-                <div dangerouslySetInnerHTML={{ __html: currentArticle.content }} />
+                <div dangerouslySetInnerHTML={{ __html: sanitizedArticleContent }} />
               )}
             </div>
           )}

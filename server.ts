@@ -13,8 +13,6 @@ import createDOMPurify from "dompurify";
 import { promises as fs } from "fs";
 import { marked } from "marked";
 import path from "path";
-import mammoth from "mammoth";
-import { createRequire } from "module";
 import dotenv from "dotenv";
 import pg from "pg";
 import session from "express-session";
@@ -24,6 +22,7 @@ import { Resend } from "resend";
 import nodemailer from "nodemailer";
 import sharp from "sharp";
 import { createServer, ServerResponse, type IncomingMessage } from "http";
+import { Worker } from "node:worker_threads";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { gzipSync, gunzipSync } from "zlib";
 import { randomUUID, createHash, createHmac, randomInt } from "crypto";
@@ -53,9 +52,57 @@ import {
 } from "./src/server/security.js";
 
 dotenv.config();
-const nodeRequire = createRequire(import.meta.url);
 
 const isProduction = process.env.NODE_ENV === "production";
+const DEV_SESSION_SECRET = "atomflow-dev-secret-change-in-prod";
+const PUBLIC_WEB_PORTS = new Set(["", "80", "443"]);
+const LEGAL_PLACEHOLDER_PATTERN = /\[(?:DEPLOYMENT_OPERATOR_NAME|DEPLOYMENT_OPERATOR_ADDRESS|SERVICE_CONTACT_EMAIL|PRIVACY_CONTACT_EMAIL|SECURITY_CONTACT_EMAIL|SERVICE_URL|DATA_HOSTING_REGION|TERMS_EFFECTIVE_DATE|GOVERNING_LAW|DISPUTE_FORUM|LOG_RETENTION_DAYS|BACKUP_RETENTION_DAYS|RIGHTS_REQUEST_RESPONSE_DAYS)\]/g;
+const LEGAL_DOCUMENTS = {
+  privacy: "PRIVACY.md",
+  terms: "TERMS.md",
+  security: "SECURITY.md",
+} as const;
+
+const legalReplacementValues = (appUrl?: string) => ({
+  DEPLOYMENT_OPERATOR_NAME: process.env.DEPLOYMENT_OPERATOR_NAME || "",
+  DEPLOYMENT_OPERATOR_ADDRESS: process.env.DEPLOYMENT_OPERATOR_ADDRESS || "",
+  SERVICE_CONTACT_EMAIL: process.env.SERVICE_CONTACT_EMAIL || "",
+  PRIVACY_CONTACT_EMAIL: process.env.PRIVACY_CONTACT_EMAIL || "",
+  SECURITY_CONTACT_EMAIL: process.env.SECURITY_CONTACT_EMAIL || "",
+  SERVICE_URL: process.env.SERVICE_URL || appUrl || "",
+  DATA_HOSTING_REGION: process.env.DATA_HOSTING_REGION || "",
+  TERMS_EFFECTIVE_DATE: process.env.TERMS_EFFECTIVE_DATE || "",
+  GOVERNING_LAW: process.env.GOVERNING_LAW || "",
+  DISPUTE_FORUM: process.env.DISPUTE_FORUM || "",
+  LOG_RETENTION_DAYS: process.env.LOG_RETENTION_DAYS || "",
+  BACKUP_RETENTION_DAYS: process.env.BACKUP_RETENTION_DAYS || "",
+  RIGHTS_REQUEST_RESPONSE_DAYS: process.env.RIGHTS_REQUEST_RESPONSE_DAYS || "",
+});
+
+const validateProductionLegalConfiguration = (appUrl?: string) => {
+  if (!isProduction) return;
+  const missing = Object.entries(legalReplacementValues(appUrl))
+    .filter(([, value]) => !value || /\[|replace-|your-domain\.example|^your\b|^applicable\b|railway deployment/i.test(value))
+    .map(([key]) => key);
+  if (missing.length > 0) {
+    throw new Error(`Production legal configuration is incomplete: ${missing.join(", ")}`);
+  }
+};
+
+const renderLegalDocument = async (document: keyof typeof LEGAL_DOCUMENTS, appUrl?: string) => {
+  const source = await fs.readFile(path.join(process.cwd(), LEGAL_DOCUMENTS[document]), "utf8");
+  const values = legalReplacementValues(appUrl);
+  const rendered = source.replace(LEGAL_PLACEHOLDER_PATTERN, placeholder => {
+    const key = placeholder.slice(1, -1) as keyof typeof values;
+    return values[key] || placeholder;
+  });
+  if (isProduction && LEGAL_PLACEHOLDER_PATTERN.test(rendered)) {
+    LEGAL_PLACEHOLDER_PATTERN.lastIndex = 0;
+    throw new Error(`Legal document ${document} contains unresolved deployment placeholders`);
+  }
+  LEGAL_PLACEHOLDER_PATTERN.lastIndex = 0;
+  return rendered;
+};
 const logger = pino({
   level: process.env.LOG_LEVEL || (isProduction ? "info" : "debug"),
   base: {
@@ -66,6 +113,9 @@ const logger = pino({
     paths: [
       "req.headers.authorization",
       "req.headers.cookie",
+      "req.url",
+      "req.query",
+      "req.body",
       "res.headers.set-cookie",
       "password",
       "passwordHash",
@@ -76,13 +126,20 @@ const logger = pino({
     censor: "[redacted]",
   },
   serializers: {
-    err: pino.stdSerializers.err,
+    err: (error: unknown) => {
+      const serialized = pino.stdSerializers.err(error instanceof Error ? error : new Error(String(error)));
+      return {
+        ...serialized,
+        message: typeof serialized?.message === "string" ? sanitizeLogString(serialized.message) : serialized?.message,
+        stack: typeof serialized?.stack === "string" ? sanitizeLogString(serialized.stack) : undefined,
+      };
+    },
   },
 });
 
 const logOtpEvent = (event: "login" | "registration", email: string, code: string) => {
   if (isProduction) {
-    logger.info({ authEvent: event, email }, "Verification code generated");
+    logger.info({ authEvent: event, emailHash: hashLogIdentifier(email) }, "Verification code generated");
   } else {
     logger.debug({ authEvent: event, email, otp: code }, "Verification code generated");
   }
@@ -90,8 +147,26 @@ const logOtpEvent = (event: "login" | "registration", email: string, code: strin
 
 const verificationCodeDigest = (email: string, code: string) => createHmac(
   "sha256",
-  process.env.SESSION_SECRET || "atomflow-dev-secret-change-in-prod",
+  process.env.SESSION_SECRET || DEV_SESSION_SECRET,
 ).update(`${email}\0${code}`).digest("hex");
+
+const hashLogIdentifier = (value: string) => createHmac(
+  "sha256",
+  process.env.SESSION_SECRET || DEV_SESSION_SECRET,
+).update(value).digest("hex").slice(0, 16);
+
+const sanitizeLogString = (value: string) => value
+  .replace(/https?:\/\/[^\s"']+/gi, "[url]")
+  .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]")
+  .slice(0, 2000);
+
+const safeRequestPath = (req: IncomingMessage) => {
+  try {
+    return new URL(req.url || "/", "http://atomflow.local").pathname;
+  } catch {
+    return "/";
+  }
+};
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -99,23 +174,23 @@ const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
 
 const sanitizeClientLogValue = (value: unknown, depth = 0): unknown => {
   if (depth > 4) return "[truncated]";
-  if (value instanceof Error) return { name: value.name, message: value.message, stack: value.stack };
+  if (value instanceof Error) return { name: value.name, message: sanitizeLogString(value.message) };
   if (Array.isArray(value)) return value.slice(0, 20).map(item => sanitizeClientLogValue(item, depth + 1));
   if (!isPlainRecord(value)) {
-    if (typeof value === "string") return value.slice(0, 2000);
+    if (typeof value === "string") return sanitizeLogString(value);
     return value;
   }
 
   return Object.fromEntries(
     Object.entries(value).slice(0, 50).map(([key, item]) => {
-      const sensitiveKey = /password|token|secret|authorization|cookie|code/i.test(key);
+      const sensitiveKey = /password|token|secret|authorization|cookie|code|email|url|uri|input|content|prompt|query/i.test(key);
       return [key, sensitiveKey ? "[redacted]" : sanitizeClientLogValue(item, depth + 1)];
     })
   );
 };
 
 const shouldSkipRequestLog = (req: IncomingMessage) => {
-  const pathname = (req.url || "").split("?")[0];
+  const pathname = safeRequestPath(req);
   return (
     pathname.startsWith("/@vite") ||
     pathname.startsWith("/@react-refresh") ||
@@ -144,6 +219,7 @@ declare module "express-session" {
   interface SessionData {
     userId?: number;
     email?: string;
+    reauthenticatedAt?: number;
   }
 }
 
@@ -186,7 +262,7 @@ async function parseFirstAvailable(urls: string[]) {
     const perCandidateTimeout = expanded.length > 1 ? 5000 : 10000;
     for (const candidate of expanded) {
       try {
-        const parsed = await withTimeout(parser.parseURL(candidate), perCandidateTimeout);
+        const parsed = await parseBoundedFeedCandidate(candidate, perCandidateTimeout);
         const itemCount = parsed.items?.length ?? 0;
         if (itemCount > 0) {
           return parsed;
@@ -207,7 +283,7 @@ async function parseFreshestAvailable(urls: string[]) {
     const expanded = expandFeedUrls(url);
     for (const candidate of expanded) {
       try {
-        const parsed = await withTimeout(parser.parseURL(candidate), 2500);
+        const parsed = await parseBoundedFeedCandidate(candidate, 2500);
         const items = parsed.items || [];
         const itemCount = items.length;
         if (itemCount === 0) continue;
@@ -225,6 +301,22 @@ async function parseFreshestAvailable(urls: string[]) {
   }
   if (latest) return latest.parsed;
   throw lastError || new Error('No feed available');
+}
+
+async function parseBoundedFeedCandidate(candidate: string, timeoutMs: number) {
+  const resource = await fetchBoundedPublicResource(candidate, {
+    timeoutMs,
+    maxBytes: 3 * 1024 * 1024,
+    maxRedirects: 3,
+    headers: {
+      "User-Agent": "AtomFlow/1.0 RSS Reader",
+      "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+    },
+  });
+  if (resource.status < 200 || resource.status >= 300) {
+    throw new Error(`RSS source returned ${resource.status}`);
+  }
+  return parser.parseString(resource.body.toString("utf8"));
 }
 
 async function parseWithRetry(urls: string[], timeoutMs: number, retries: number) {
@@ -3633,6 +3725,33 @@ const getOpenAIWriteAgentConfig = (): OpenAIWriteAgentConfig | null => {
   };
 };
 
+const getAllowedCanvasAgentModels = () => {
+  const configuredModel = getOpenAIWriteAgentConfig()?.model;
+  const explicitlyAllowed = (process.env.WRITE_AGENT_ALLOWED_MODELS || "")
+    .split(",")
+    .map(model => normalizeAiModelName(model))
+    .filter(Boolean);
+  return new Set(
+    [configuredModel ? normalizeAiModelName(configuredModel) : "", ...explicitlyAllowed].filter(Boolean),
+  );
+};
+
+const isAllowedCanvasAgentModel = (model: string) => getAllowedCanvasAgentModels().has(normalizeAiModelName(model));
+
+const resolveAllowedCanvasAgentModel = (requestedModel: unknown, fallbackModel: string) => {
+  const candidate = typeof requestedModel === "string" && requestedModel.trim()
+    ? normalizeAiModelName(requestedModel)
+    : normalizeAiModelName(fallbackModel);
+  return isAllowedCanvasAgentModel(candidate) ? candidate : null;
+};
+
+const getCanvasAgentMaxOutputTokens = () => readBoundedEnvNumber(
+  process.env.WRITE_AGENT_MAX_OUTPUT_TOKENS,
+  2000,
+  128,
+  8000,
+);
+
 const isAiFallbackDisabled = () => process.env.DISABLE_AI_FALLBACK === "true";
 
 const requestAiChatCompletion = async (
@@ -3812,19 +3931,72 @@ const extractCanvasFileText = async (file: Express.Multer.File) => {
     return file.buffer.toString("utf8").slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH);
   }
   if (mime === "application/pdf" || ext === ".pdf") {
-    const pdfParse = nodeRequire("pdf-parse/lib/pdf-parse.js") as (buffer: Buffer) => Promise<{ text?: string }>;
-    const parsed = await pdfParse(file.buffer);
-    return normalizePlainText(parsed.text || "").slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH);
+    return runDocumentParserWorker("pdf", file.buffer);
   }
   if (
     mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
     ext === ".docx"
   ) {
-    const parsed = await mammoth.extractRawText({ buffer: file.buffer });
-    return normalizePlainText(parsed.value || "").slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH);
+    return runDocumentParserWorker("docx", file.buffer);
   }
   return "";
 };
+
+const DOCUMENT_PARSER_WORKER_SOURCE = `
+  const { parentPort, workerData } = require("node:worker_threads");
+  (async () => {
+    const buffer = Buffer.from(workerData.bytes);
+    let text = "";
+    if (workerData.kind === "pdf") {
+      const pdfParse = require("pdf-parse/lib/pdf-parse.js");
+      const parsed = await pdfParse(buffer, { max: workerData.maxPages });
+      if (Number(parsed.numpages || 0) > workerData.maxPages) throw new Error("PDF page limit exceeded");
+      text = parsed.text || "";
+    } else if (workerData.kind === "docx") {
+      const mammoth = require("mammoth");
+      const parsed = await mammoth.extractRawText({ buffer });
+      text = parsed.value || "";
+    } else {
+      throw new Error("Unsupported document type");
+    }
+    parentPort.postMessage({ ok: true, text: text.slice(0, workerData.maxChars) });
+  })().catch(error => parentPort.postMessage({ ok: false, error: error instanceof Error ? error.message : "Document parsing failed" }));
+`;
+
+const runDocumentParserWorker = (kind: "pdf" | "docx", buffer: Buffer) => new Promise<string>((resolve, reject) => {
+  const worker = new Worker(DOCUMENT_PARSER_WORKER_SOURCE, {
+    eval: true,
+    workerData: {
+      kind,
+      bytes: buffer,
+      maxPages: readBoundedEnvNumber(process.env.CANVAS_PDF_MAX_PAGES, 100, 1, 500),
+      maxChars: WRITE_AGENT_MAX_MESSAGE_LENGTH,
+    },
+    resourceLimits: {
+      maxOldGenerationSizeMb: 128,
+      maxYoungGenerationSizeMb: 32,
+      stackSizeMb: 4,
+    },
+  });
+  let settled = false;
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    void worker.terminate();
+    callback();
+  };
+  const timer = setTimeout(() => finish(() => reject(new Error("Document parsing timed out"))), 15_000);
+  timer.unref();
+  worker.once("message", (message: { ok?: boolean; text?: string; error?: string }) => {
+    if (message.ok) finish(() => resolve(normalizePlainText(message.text || "").slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH)));
+    else finish(() => reject(new Error(message.error || "Document parsing failed")));
+  });
+  worker.once("error", error => finish(() => reject(error)));
+  worker.once("exit", code => {
+    if (!settled && code !== 0) finish(() => reject(new Error(`Document parser exited with code ${code}`)));
+  });
+});
 
 const lockCanvasUser = async (client: pg.PoolClient, userId: number) => {
   const user = (await client.query(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, [userId])).rows[0];
@@ -4086,6 +4258,9 @@ const requestCanvasAgentCompletion = async (input: {
     throw new Error("Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL");
   }
   const model = normalizeAiModelName(input.model || config.model);
+  if (!isAllowedCanvasAgentModel(model)) {
+    throw new Error("Canvas Agent model is not allowed by the server configuration");
+  }
   const chatCompletionsUrl = config.providerLabel === "openai"
     ? "https://api.openai.com/v1/chat/completions"
     : buildOpenAiCompatibleChatCompletionsUrl(config.baseURL || "");
@@ -4136,7 +4311,7 @@ const requestCanvasAgentCompletion = async (input: {
       messages,
       temperature: clampNumber(input.temperature, 0.55, 0, 2),
       top_p: clampNumber(input.topP, 1, 0.01, 1),
-      max_tokens: Math.round(clampNumber(input.maxTokens, 1200, 128, 8000)),
+      max_tokens: Math.round(clampNumber(input.maxTokens, 1200, 128, getCanvasAgentMaxOutputTokens())),
     }),
     signal: input.signal
       ? AbortSignal.any([input.signal, AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS)])
@@ -4479,6 +4654,11 @@ async function fetchRSSFeeds(): Promise<Article[]> {
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 1000);
+  const appUrl = process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : undefined);
+  if (isProduction && (!appUrl || /your-domain\.example|replace-/i.test(appUrl))) {
+    throw new Error("APP_URL or RAILWAY_PUBLIC_DOMAIN must identify the real production origin");
+  }
+  validateProductionLegalConfiguration(appUrl);
   app.set("trust proxy", 1);
   app.disable("x-powered-by");
 
@@ -4522,6 +4702,10 @@ async function startServer() {
   }
 
   if (pool) {
+  const schemaLockClient = await pool.connect();
+  let schemaLockReleased = false;
+  try {
+  await schemaLockClient.query(`SELECT pg_advisory_lock(hashtext('atomflow-schema-migration'))`);
   try {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -4530,6 +4714,16 @@ async function startServer() {
       nickname     TEXT,
       avatar_url   TEXT,
       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_ai_usage_daily (
+      user_id               INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      usage_date            DATE NOT NULL DEFAULT CURRENT_DATE,
+      operation_count       INTEGER NOT NULL DEFAULT 0 CHECK (operation_count >= 0),
+      reserved_output_tokens BIGINT NOT NULL DEFAULT 0 CHECK (reserved_output_tokens >= 0),
+      updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, usage_date)
     )
   `);
   await pool.query(`
@@ -4543,6 +4737,17 @@ async function startServer() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_vc_email ON verification_codes(email, used, expires_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_vc_expires_at ON verification_codes(expires_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_vc_used_created_at ON verification_codes(created_at) WHERE used = TRUE`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS session (
+      sid VARCHAR NOT NULL PRIMARY KEY,
+      sess JSON NOT NULL,
+      expire TIMESTAMP(6) NOT NULL
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON session(expire)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_session_user_id ON session ((sess ->> 'userId'))`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS saved_cards (
       id             TEXT PRIMARY KEY,
@@ -4952,9 +5157,21 @@ async function startServer() {
   // Backfill: set default nickname for existing users who don't have one
   await pool.query("UPDATE users SET nickname = split_part(email, '@', 1) WHERE nickname IS NULL");
   schemaReady = true;
+  } finally {
+    try {
+      const unlocked = (await schemaLockClient.query(
+        `SELECT pg_advisory_unlock(hashtext('atomflow-schema-migration')) AS unlocked`,
+      )).rows[0]?.unlocked === true;
+      schemaLockReleased = unlocked;
+    } catch (error) {
+      logger.error({ err: error, module: "db" }, "Failed to release schema migration lock");
+    }
+  }
   } catch (err) {
     if (isProduction) throw err;
     logger.error({ err, module: "db" }, "Database schema migration failed; some features may be unavailable");
+  } finally {
+    schemaLockClient.release(schemaLockReleased ? undefined : true);
   }
   } // end if (pool)
 
@@ -5036,6 +5253,15 @@ async function startServer() {
     keyGenerator: normalizedEmailKey,
     skipSuccessfulRequests: true,
     message: { error: "该账号登录尝试过多，请稍后再试" },
+  });
+  const accountActionLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: 5,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "account-action",
+    keyGenerator: authenticatedUserKey,
+    message: { error: "账户操作过于频繁，请稍后再试" },
   });
   const verificationSendLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
@@ -5144,8 +5370,8 @@ async function startServer() {
       if (res.statusCode >= 400) return "warn";
       return "info";
     },
-    customSuccessMessage: (req, res, responseTime) => `${req.method} ${req.url} ${res.statusCode} ${Math.round(responseTime)}ms`,
-    customErrorMessage: (req, res, err) => `${req.method} ${req.url} ${res.statusCode} ${err.message}`,
+    customSuccessMessage: (req, res, responseTime) => `${req.method} ${safeRequestPath(req)} ${res.statusCode} ${Math.round(responseTime)}ms`,
+    customErrorMessage: (req, res, err) => `${req.method} ${safeRequestPath(req)} ${res.statusCode} ${sanitizeLogString(err.message)}`,
   }));
 
   app.post("/api/log", clientLogLimiter, (req, res) => {
@@ -5168,10 +5394,11 @@ async function startServer() {
   });
 
   // --- Session middleware (PostgreSQL) ---
-  const sessionSecret = process.env.SESSION_SECRET || "atomflow-dev-secret-change-in-prod";
-  if (isProduction && sessionSecret.length < 32) {
-    throw new Error("SESSION_SECRET must contain at least 32 characters in production");
+  const configuredSessionSecret = process.env.SESSION_SECRET?.trim();
+  if (isProduction && (!process.env.SESSION_SECRET || !configuredSessionSecret || configuredSessionSecret === DEV_SESSION_SECRET || configuredSessionSecret.startsWith("replace-") || configuredSessionSecret.length < 32)) {
+    throw new Error("SESSION_SECRET must be explicitly configured with at least 32 non-placeholder characters in production");
   }
+  const sessionSecret = configuredSessionSecret || DEV_SESSION_SECRET;
   const PgSession = connectPgSimple(session);
   const sessionMiddleware = session({
     name: "atomflow.sid",
@@ -5190,7 +5417,6 @@ async function startServer() {
   app.use(sessionMiddleware);
   app.use("/api", apiLimiter);
 
-  const appUrl = process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : undefined);
   const allowedOrigins = buildAllowedOrigins(appUrl, process.env.ALLOWED_ORIGINS);
   if (isProduction && allowedOrigins.size === 0) {
     throw new Error("APP_URL or RAILWAY_PUBLIC_DOMAIN must be configured in production");
@@ -5209,6 +5435,14 @@ async function startServer() {
     res.status(403).json({ error: "请求来源不受信任" });
   };
   app.use("/api", mutationOriginGuard);
+
+  app.get("/legal/:document", asyncHandler(async (req, res) => {
+    const document = req.params.document as keyof typeof LEGAL_DOCUMENTS;
+    if (!(document in LEGAL_DOCUMENTS)) return res.status(404).type("text/plain").send("Legal document not found");
+    const rendered = await renderLegalDocument(document, appUrl);
+    res.setHeader("Cache-Control", isProduction ? "public, max-age=300" : "no-store");
+    return res.type("text/markdown; charset=utf-8").send(rendered);
+  }));
 
   const paidConcurrencyGuard = createUserConcurrencyGuard(
     readBoundedEnvNumber(process.env.PAID_OPERATION_CONCURRENCY, 2, 1, 10),
@@ -5354,9 +5588,40 @@ async function startServer() {
       }
       req.session.userId = userId;
       req.session.email = email;
+      req.session.reauthenticatedAt = Date.now();
       resolve();
     });
   });
+
+  const invalidateUserSessions = async (userId: number, client: pg.Pool | pg.PoolClient = pool) => {
+    await client.query(
+      `DELETE FROM session WHERE sess ->> 'userId' = $1`,
+      [String(userId)],
+    );
+  };
+
+  const updatePasswordAndInvalidateSessions = async (userId: number, passwordHash: string) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const user = (await client.query(
+        'UPDATE users SET password_hash = $1 WHERE id = $2 RETURNING id, email',
+        [passwordHash, userId],
+      )).rows[0];
+      if (!user) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      await invalidateUserSessions(Number(user.id), client);
+      await client.query("COMMIT");
+      return user;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
 
   app.get("/api/health", asyncHandler(async (_req, res) => {
     if (!pool || !schemaReady) return res.status(503).json({ status: "unhealthy", database: pool ? "schema-unavailable" : "unavailable" });
@@ -5400,6 +5665,42 @@ async function startServer() {
     refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds"));
   }, 10 * 60 * 1000);
   feedRefreshTimer.unref();
+
+  const cleanupExpiredVerificationCodes = async () => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const elected = (await client.query(
+        `SELECT pg_try_advisory_xact_lock(hashtext('atomflow-verification-cleanup')) AS acquired`,
+      )).rows[0]?.acquired === true;
+      if (!elected) {
+        await client.query("ROLLBACK");
+        return;
+      }
+      const result = await client.query(
+        `DELETE FROM verification_codes
+         WHERE id IN (
+           SELECT id FROM verification_codes
+           WHERE expires_at < NOW() - INTERVAL '24 hours'
+              OR (used = TRUE AND created_at < NOW() - INTERVAL '24 hours')
+           ORDER BY id
+           LIMIT 5000
+         )`,
+      );
+      await client.query("COMMIT");
+      if (result.rowCount) logger.info({ module: "auth", deleted: result.rowCount }, "Expired verification records removed");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+  cleanupExpiredVerificationCodes().catch(error => logger.warn({ err: error, module: "auth" }, "Verification record cleanup failed"));
+  const verificationCleanupTimer = setInterval(() => {
+    cleanupExpiredVerificationCodes().catch(error => logger.warn({ err: error, module: "auth" }, "Verification record cleanup failed"));
+  }, 60 * 60 * 1000);
+  verificationCleanupTimer.unref();
 
   // --- Auth Routes ---
 
@@ -5453,7 +5754,7 @@ async function startServer() {
       }
       return res.json({ success: true });
     } catch (error) {
-      logger.error({ err: error, module: "auth", email }, "Failed to send verification code");
+      logger.error({ err: error, module: "auth", emailHash: hashLogIdentifier(email) }, "Failed to send verification code");
       return res.status(500).json({ error: '发送验证码失败，请稍后再试' });
     }
   }));
@@ -5574,7 +5875,7 @@ async function startServer() {
       }
       return res.json({ success: true });
     } catch (error) {
-      logger.error({ err: error, module: "auth", email }, "Failed to send registration code");
+      logger.error({ err: error, module: "auth", emailHash: hashLogIdentifier(email) }, "Failed to send registration code");
       return res.status(500).json({ error: '发送验证码失败，请稍后再试' });
     }
   }));
@@ -5646,6 +5947,47 @@ async function startServer() {
     next();
   };
 
+  const hasRecentAuthentication = (req: express.Request) => (
+    typeof req.session.reauthenticatedAt === "number" &&
+    Date.now() - req.session.reauthenticatedAt <= 15 * 60 * 1000
+  );
+
+  const requireRecentAuthentication: express.RequestHandler = (req, res, next) => {
+    if (!hasRecentAuthentication(req)) {
+      return res.status(403).json({ code: "REAUTH_REQUIRED", error: "请重新登录后再执行此账户操作" });
+    }
+    next();
+  };
+
+  const reserveDailyAiBudget = async (userId: number, reservedOutputTokens: number) => {
+    const maxOperations = readBoundedEnvNumber(process.env.PAID_OPERATION_DAILY_LIMIT, 100, 1, 10000);
+    const maxOutputTokens = readBoundedEnvNumber(process.env.PAID_OUTPUT_TOKENS_DAILY_LIMIT, 200_000, 1000, 10_000_000);
+    return (await pool.query(
+      `INSERT INTO user_ai_usage_daily (user_id, usage_date, operation_count, reserved_output_tokens)
+       SELECT $1, CURRENT_DATE, 1, $2
+       WHERE $2 <= $4
+       ON CONFLICT (user_id, usage_date) DO UPDATE
+       SET operation_count = user_ai_usage_daily.operation_count + 1,
+           reserved_output_tokens = user_ai_usage_daily.reserved_output_tokens + EXCLUDED.reserved_output_tokens,
+           updated_at = NOW()
+       WHERE user_ai_usage_daily.operation_count < $3
+         AND user_ai_usage_daily.reserved_output_tokens + EXCLUDED.reserved_output_tokens <= $4
+       RETURNING operation_count, reserved_output_tokens`,
+      [userId, reservedOutputTokens, maxOperations, maxOutputTokens],
+    )).rows[0] || null;
+  };
+
+  const dailyPaidOperationBudgetMiddleware: express.RequestHandler = asyncHandler(async (req, res, next) => {
+    const userId = req.session.userId;
+    if (!userId) return res.status(401).json({ error: "请先登录" });
+    const reservation = await reserveDailyAiBudget(userId, getCanvasAgentMaxOutputTokens());
+    if (!reservation) {
+      res.setHeader("Retry-After", "3600");
+      return res.status(429).json({ error: "今日 AI 使用额度已达到上限，请稍后再试" });
+    }
+    next();
+  });
+
   // --- Set/Change password (requires auth) ---
   app.put("/api/auth/set-password", requireAuth, asyncHandler(async (req, res) => {
     const password = req.body?.password || '';
@@ -5653,7 +5995,9 @@ async function startServer() {
       return res.status(400).json({ error: '密码至少 8 个字符' });
     }
     const passwordHash = await bcrypt.hash(password, 10);
-    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, req.session.userId]);
+    const user = await updatePasswordAndInvalidateSessions(req.session.userId, passwordHash);
+    if (!user) return res.status(404).json({ error: '用户不存在' });
+    await establishAuthenticatedSession(req, Number(user.id), String(user.email));
     return res.json({ success: true });
   }));
 
@@ -5669,32 +6013,45 @@ async function startServer() {
       return res.status(400).json({ error: '密码至少 8 个字符' });
     }
 
-    const record = (await pool.query(
-      `UPDATE verification_codes
-       SET used = TRUE
-       WHERE id = (
-         SELECT id FROM verification_codes
-         WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW() AND password_hash IS NULL
-         ORDER BY created_at DESC LIMIT 1
-       ) AND used = FALSE
-       RETURNING id`,
-      [email, verificationCodeDigest(email, code)]
-    )).rows[0];
-    if (!record) {
-      return res.status(400).json({ error: '验证码无效或已过期' });
-    }
-
-    const user = (await pool.query('SELECT id FROM users WHERE email = $1', [email])).rows[0];
-    if (!user) {
-      return res.status(404).json({ error: '该邮箱未注册' });
-    }
-
     const passwordHash = await bcrypt.hash(password, 10);
-    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, user.id]);
+    const client = await pool.connect();
+    let user: { id: number } | null = null;
+    try {
+      await client.query("BEGIN");
+      const record = (await client.query(
+        `UPDATE verification_codes
+         SET used = TRUE
+         WHERE id = (
+           SELECT id FROM verification_codes
+           WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > NOW() AND password_hash IS NULL
+           ORDER BY created_at DESC LIMIT 1
+           FOR UPDATE
+         ) AND used = FALSE
+         RETURNING id`,
+        [email, verificationCodeDigest(email, code)]
+      )).rows[0];
+      if (!record) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: '验证码无效或已过期' });
+      }
+      user = (await client.query('SELECT id FROM users WHERE email = $1 FOR UPDATE', [email])).rows[0] || null;
+      if (!user) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: '该邮箱未注册' });
+      }
+      await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, user.id]);
+      await invalidateUserSessions(Number(user.id), client);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
 
     // Auto login after reset
-    await establishAuthenticatedSession(req, Number(user.id), email);
-    const updated = (await pool.query('SELECT id, email, nickname, avatar_url, password_hash FROM users WHERE id = $1', [user.id])).rows[0];
+    await establishAuthenticatedSession(req, Number(user!.id), email);
+    const updated = (await pool.query('SELECT id, email, nickname, avatar_url, password_hash FROM users WHERE id = $1', [user!.id])).rows[0];
     return res.json({ success: true, user: { id: updated.id, email: updated.email, nickname: updated.nickname, avatar_url: updated.avatar_url, has_password: true } });
   }));
 
@@ -5711,6 +6068,172 @@ async function startServer() {
     )).rows[0];
     if (!user) return res.status(404).json({ error: '用户不存在' });
     return res.json({ success: true, user: { id: user.id, email: user.email, nickname: user.nickname, avatar_url: user.avatar_url, has_password: Boolean(user.password_hash) } });
+  }));
+
+  const estimateAccountExportBytes = async (client: pg.PoolClient, userId: number) => {
+    const row = (await client.query(
+      `SELECT COALESCE(SUM(bytes), 0)::bigint AS bytes
+       FROM (
+         SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint AS bytes FROM users t WHERE id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM user_preferences t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM user_subscriptions t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM user_articles t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM saved_articles t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM saved_cards t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(cr)::text)), 0)::bigint FROM card_relations cr JOIN saved_cards sc ON sc.id = cr.card_a WHERE sc.user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM notes t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_agent_threads t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(m)::text)), 0)::bigint FROM write_agent_messages m JOIN write_agent_threads w ON w.id = m.thread_id WHERE w.user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_agent_events t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_style_skills t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_projects t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_assets t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_agent_templates t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_agent_instances t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_nodes t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_edges t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_agent_messages t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM user_ai_usage_daily t WHERE user_id = $1
+       ) estimates`,
+      [userId],
+    )).rows[0];
+    return Math.ceil(Number(row?.bytes || 0) * 4) + 1024 * 1024;
+  };
+
+  app.get("/api/account/export", requireAuth, requireRecentAuthentication, accountActionLimiter, asyncHandler(async (req, res) => {
+    const userId = req.session.userId;
+    const client = await pool.connect();
+    try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const exportMaxBytes = readBoundedEnvNumber(process.env.ACCOUNT_EXPORT_MAX_MB, 16, 1, 32) * 1024 * 1024;
+    const estimatedExportBytes = await estimateAccountExportBytes(client, userId);
+    if (estimatedExportBytes > exportMaxBytes) {
+      await client.query("ROLLBACK");
+      return res.status(413).json({ error: "账户数据导出超过当前实例上限，请联系运营者协助导出" });
+    }
+    const rows = async (query: string) => (await client.query(query, [userId])).rows;
+    const [
+      profile,
+      preferences,
+      subscriptions,
+      articles,
+      savedArticles,
+      savedCards,
+      cardRelations,
+      notes,
+      writeThreads,
+      writeMessages,
+      writeEvents,
+      writeSkills,
+      canvasProjects,
+      canvasAssets,
+      agentTemplates,
+      agentInstances,
+      canvasNodes,
+      canvasEdges,
+      canvasMessages,
+      aiUsage,
+    ] = await Promise.all([
+      rows(`SELECT id, email, nickname, avatar_url, created_at, (password_hash IS NOT NULL) AS has_password FROM users WHERE id = $1`),
+      rows(`SELECT source_layout, theme, view_mode, updated_at FROM user_preferences WHERE user_id = $1`),
+      rows(`SELECT id, name, rss_url, color, icon, topic, created_at, updated_at FROM user_subscriptions WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM user_articles WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM saved_articles WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT id, type, content, tags, article_title, article_id, created_at, updated_at, origin, saved_article_id, summary, original_quote, context, citation_note, evidence_role, raw_card_meta FROM saved_cards WHERE user_id = $1 ORDER BY created_at`),
+      rows(`SELECT cr.* FROM card_relations cr JOIN saved_cards sc ON sc.id = cr.card_a WHERE sc.user_id = $1 ORDER BY cr.id`),
+      rows(`SELECT * FROM notes WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_agent_threads WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT m.* FROM write_agent_messages m JOIN write_agent_threads t ON t.id = m.thread_id WHERE t.user_id = $1 ORDER BY m.id`),
+      rows(`SELECT * FROM write_agent_events WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_style_skills WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_canvas_projects WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_canvas_assets WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_agent_templates WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_agent_instances WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_canvas_nodes WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_canvas_edges WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_canvas_agent_messages WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT usage_date, operation_count, reserved_output_tokens, updated_at FROM user_ai_usage_daily WHERE user_id = $1 ORDER BY usage_date`),
+    ]);
+    const payload = {
+      format: "atomflow-account-export-v1",
+      exportedAt: new Date().toISOString(),
+      profile: profile[0] || null,
+      preferences: preferences[0] || null,
+      subscriptions,
+      articles,
+      savedArticles,
+      savedCards,
+      cardRelations,
+      notes,
+      writing: { threads: writeThreads, messages: writeMessages, events: writeEvents, skills: writeSkills },
+      canvas: {
+        projects: canvasProjects,
+        assets: canvasAssets,
+        templates: agentTemplates,
+        agents: agentInstances,
+        nodes: canvasNodes,
+        edges: canvasEdges,
+        messages: canvasMessages,
+      },
+      aiUsage,
+    };
+    await client.query("COMMIT");
+    const exportBody = JSON.stringify(payload);
+    if (Buffer.byteLength(exportBody, "utf8") > exportMaxBytes) {
+      return res.status(413).json({ error: "账户数据导出超过当前实例上限，请联系运营者协助导出" });
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Disposition", `attachment; filename="atomflow-export-${new Date().toISOString().slice(0, 10)}.json"`);
+    res.type("application/json");
+    return res.send(exportBody);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.delete("/api/account", requireAuth, accountActionLimiter, asyncHandler(async (req, res) => {
+    const userId = req.session.userId;
+    const user = (await pool.query(
+      `SELECT id, email, password_hash FROM users WHERE id = $1`,
+      [userId],
+    )).rows[0];
+    if (!user) return res.status(404).json({ error: "用户不存在" });
+    const confirmation = typeof req.body?.confirmation === "string" ? req.body.confirmation.trim().toLowerCase() : "";
+    if (confirmation !== String(user.email).toLowerCase()) {
+      return res.status(400).json({ error: "请输入当前账户邮箱以确认注销" });
+    }
+    if (user.password_hash) {
+      const password = typeof req.body?.password === "string" ? req.body.password : "";
+      if (!password || !(await bcrypt.compare(password, user.password_hash))) {
+        return res.status(401).json({ error: "密码错误" });
+      }
+    } else if (!hasRecentAuthentication(req)) {
+      return res.status(403).json({ code: "REAUTH_REQUIRED", error: "请使用邮箱验证码重新登录后再注销账户" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`DELETE FROM verification_codes WHERE email = $1`, [user.email]);
+      await client.query(`DELETE FROM session WHERE sess ->> 'userId' = $1`, [String(userId)]);
+      const deleted = await client.query(`DELETE FROM users WHERE id = $1`, [userId]);
+      if (deleted.rowCount !== 1) throw new Error("Account deletion did not remove exactly one user");
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    await new Promise<void>((resolve, reject) => {
+      req.session.destroy(error => error ? reject(error) : resolve());
+    });
+    res.clearCookie("atomflow.sid", { httpOnly: true, secure: isProduction, sameSite: "lax" });
+    return res.json({ success: true });
   }));
 
   app.post("/api/auth/avatar", requireAuth, avatarUpload.single('avatar'), asyncHandler(async (req: any, res) => {
@@ -5839,11 +6362,12 @@ async function startServer() {
     const userId = req.session.userId;
     if (isBuiltin) return res.status(403).json({ error: "内置订阅源由服务器定时刷新" });
     try {
-      await validatePublicHttpUrl(input);
+      await validatePublicHttpUrl(input, { allowedPorts: PUBLIC_WEB_PORTS });
       const resource = await fetchBoundedPublicResource(input, {
         timeoutMs: 15000,
         maxBytes: remoteRssMaxBytes,
         maxRedirects: 3,
+        allowedPorts: PUBLIC_WEB_PORTS,
         headers: { "User-Agent": "AtomFlow/1.0 RSS Reader", "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" },
       });
       if (resource.status < 200 || resource.status >= 300) throw new Error(`RSS source returned ${resource.status}`);
@@ -5901,11 +6425,12 @@ async function startServer() {
     const userId = req.session.userId;
     if (isBuiltin) return res.status(403).json({ error: "内置订阅源由服务器定时刷新" });
     try {
-      await validatePublicHttpUrl(input);
+      await validatePublicHttpUrl(input, { allowedPorts: PUBLIC_WEB_PORTS });
       const resource = await fetchBoundedPublicResource(input, {
         timeoutMs: 30000,
         maxBytes: remoteRssMaxBytes,
         maxRedirects: 3,
+        allowedPorts: PUBLIC_WEB_PORTS,
         headers: { "User-Agent": "AtomFlow/1.0 RSS Reader", "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" },
       });
       if (resource.status < 200 || resource.status >= 300) throw new Error(`RSS source returned ${resource.status}`);
@@ -5988,7 +6513,7 @@ async function startServer() {
   }));
 
   // Save an article (mark as saved and extract cards)
-  app.post("/api/articles/:id/save", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, articleSaveConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/articles/:id/save", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, articleSaveConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
     let article = articles.find(a => a.id === articleId);
     let isUserArticle = false;
@@ -6325,7 +6850,7 @@ async function startServer() {
       res.setHeader('Cache-Control', 'public, max-age=31536000');
       res.send(resource.body);
     } catch (error) {
-      logger.error({ err: error, module: "image-proxy", imageUrl }, "Image proxy error");
+      logger.error({ err: error, module: "image-proxy", imageHost: parsedUrl.hostname }, "Image proxy error");
       if (error instanceof ResponseLimitError) return res.status(413).send("Remote image is too large");
       if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) return res.status(504).send("Remote image timed out");
       res.status(502).send("Failed to load image");
@@ -6334,7 +6859,7 @@ async function startServer() {
 
   // Favicon proxy for RSS source icons. Unlike article images, source icons can
   // come from arbitrary subscription domains, so keep the response small.
-  app.get("/api/favicon-proxy", remoteFetchLimiter, asyncHandler(async (req, res) => {
+  app.get("/api/favicon-proxy", requireAuth, remoteFetchLimiter, asyncHandler(async (req, res) => {
     const targetUrl = req.query.url as string;
     if (!targetUrl) {
       return res.status(400).send("Missing url parameter");
@@ -6348,6 +6873,21 @@ async function startServer() {
     if (!["http:", "https:"].includes(parsedUrl.protocol)) {
       return res.status(400).send("Invalid url protocol");
     }
+    if (parsedUrl.port && !["80", "443"].includes(parsedUrl.port)) {
+      return res.status(400).send("Invalid url port");
+    }
+    const authorizedIcon = (await pool.query(
+      `SELECT 1
+       FROM (
+         SELECT icon AS url FROM user_subscriptions WHERE user_id = $1
+         UNION ALL
+         SELECT source_icon AS url FROM user_articles WHERE user_id = $1
+       ) owned_icons
+       WHERE url = ANY($2::text[])
+       LIMIT 1`,
+      [req.session.userId, [targetUrl, parsedUrl.toString()]],
+    )).rows[0];
+    if (!authorizedIcon) return res.status(403).send("Favicon target is not an owned subscription icon");
     const hasImageFileExtension = /\.(?:ico|png|jpe?g|gif|webp|avif)$/i.test(parsedUrl.pathname);
     const fallbackUrls = hasImageFileExtension ? [] : [
       `${parsedUrl.origin}/favicon.ico`,
@@ -6379,7 +6919,7 @@ async function startServer() {
         res.send(resource.body);
         return;
       } catch (error) {
-        logger.debug({ err: error, module: "favicon-proxy", faviconUrl }, "Favicon candidate failed");
+        logger.debug({ err: error, module: "favicon-proxy", faviconHost: new URL(faviconUrl).hostname }, "Favicon candidate failed");
       }
     }
 
@@ -6545,9 +7085,38 @@ async function startServer() {
     res.json({ ...row, sourceImages: normalizeJsonStringArray(row.sourceImages) });
   }));
 
+  app.delete("/api/saved-articles/:id", requireAuth, asyncHandler(async (req, res) => {
+    const articleId = Number(req.params.id);
+    if (!Number.isSafeInteger(articleId) || articleId <= 0) return res.status(400).json({ error: "invalid saved article id" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `DELETE FROM write_canvas_nodes
+         WHERE user_id = $1 AND kind = 'saved_article' AND ref_id = $2`,
+        [req.session.userId, String(articleId)],
+      );
+      const result = await client.query(
+        `DELETE FROM saved_articles WHERE id = $1 AND user_id = $2`,
+        [articleId, req.session.userId],
+      );
+      if (result.rowCount !== 1) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Saved article not found" });
+      }
+      await client.query("COMMIT");
+      return res.json({ success: true });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
   // Translate article content (Baidu Translate API)
   // Supports both single string (content) and array of strings (segments) for paragraph-level translation
-  app.post("/api/translate", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/translate", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const { content, segments, targetLang = 'zh' } = req.body;
     const maxTranslationSegments = 50;
     const maxTranslationCharacters = 50_000;
@@ -6871,6 +7440,8 @@ async function startServer() {
         : null;
       if (templateId && !template) return await fail(404, "template not found");
       const agentName = title || template?.name || defaults.name;
+      const agentModel = resolveAllowedCanvasAgentModel(req.body?.model, template?.model || defaults.model);
+      if (!agentModel) return await fail(400, "该模型未被服务器允许");
       const row = (await client.query(
         `INSERT INTO write_agent_instances
            (user_id, project_id, template_id, name, model, system_prompt, temperature, top_p, max_tokens)
@@ -6881,11 +7452,11 @@ async function startServer() {
           projectId,
           template?.id || null,
           agentName,
-          req.body?.model || template?.model || defaults.model,
+          agentModel,
           req.body?.systemPrompt || template?.system_prompt || defaults.systemPrompt,
           clampNumber(req.body?.temperature ?? template?.temperature, defaults.temperature, 0, 2),
           clampNumber(req.body?.topP ?? template?.top_p, defaults.topP, 0.01, 1),
-          Math.round(clampNumber(req.body?.maxTokens ?? template?.max_tokens, defaults.maxTokens, 128, 8000))
+          Math.round(clampNumber(req.body?.maxTokens ?? template?.max_tokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens()))
         ]
       )).rows[0];
       agentId = Number(row.id);
@@ -6972,6 +7543,12 @@ async function startServer() {
       [nodeId, req.session.userId]
     )).rows[0];
     if (!current) return res.status(404).json({ error: "node not found" });
+    const requestedAgentModel = current.agent_id && typeof req.body?.model === "string" && req.body.model.trim()
+      ? resolveAllowedCanvasAgentModel(req.body.model, req.body.model)
+      : null;
+    if (current.agent_id && typeof req.body?.model === "string" && req.body.model.trim() && !requestedAgentModel) {
+      return res.status(400).json({ error: "该模型未被服务器允许" });
+    }
     const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 120) : null;
     const summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 500) : null;
     const meta = isPlainRecord(req.body?.meta) ? req.body.meta : null;
@@ -7012,11 +7589,11 @@ async function startServer() {
          WHERE id = $7 AND user_id = $8`,
         [
           title,
-          typeof req.body?.model === "string" && req.body.model.trim() ? normalizeAiModelName(req.body.model.trim()) : null,
+          requestedAgentModel,
           typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : null,
           req.body?.temperature === undefined ? null : clampNumber(req.body.temperature, defaults.temperature, 0, 2),
           req.body?.topP === undefined ? null : clampNumber(req.body.topP, defaults.topP, 0.01, 1),
-          req.body?.maxTokens === undefined ? null : Math.round(clampNumber(req.body.maxTokens, defaults.maxTokens, 128, 8000)),
+          req.body?.maxTokens === undefined ? null : Math.round(clampNumber(req.body.maxTokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens())),
           current.agent_id,
           req.session.userId
         ]
@@ -7252,6 +7829,8 @@ async function startServer() {
   app.post("/api/write/agent/templates", requireAuth, asyncHandler(async (req, res) => {
     const defaults = getDefaultCanvasAgentConfig();
     const name = typeof req.body?.name === "string" && req.body.name.trim() ? req.body.name.trim().slice(0, 60) : "写作 Agent 模板";
+    const templateModel = resolveAllowedCanvasAgentModel(req.body?.model, defaults.model);
+    if (!templateModel) return res.status(400).json({ error: "该模型未被服务器允许" });
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -7265,11 +7844,11 @@ async function startServer() {
         [
           req.session.userId,
           name,
-          typeof req.body?.model === "string" && req.body.model.trim() ? normalizeAiModelName(req.body.model.trim()) : defaults.model,
+          templateModel,
           typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : defaults.systemPrompt,
           clampNumber(req.body?.temperature, defaults.temperature, 0, 2),
           clampNumber(req.body?.topP, defaults.topP, 0.01, 1),
-          Math.round(clampNumber(req.body?.maxTokens, defaults.maxTokens, 128, 8000))
+          Math.round(clampNumber(req.body?.maxTokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens()))
         ]
       )).rows[0];
       if (!row) {
@@ -7286,7 +7865,7 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/write/canvas/agents/:id/chat/stream", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, canvasAgentConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/write/canvas/agents/:id/chat/stream", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, canvasAgentConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const agentId = Number(req.params.id);
     if (!Number.isFinite(agentId)) return res.status(400).json({ error: "invalid agent id" });
     const message = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH) : "";
@@ -7295,6 +7874,9 @@ async function startServer() {
     if (!agentRow) return res.status(404).json({ error: "agent not found" });
     if (!getOpenAIWriteAgentConfig()) {
       return res.status(500).json({ error: "Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL" });
+    }
+    if (!isAllowedCanvasAgentModel(agentRow.model)) {
+      return res.status(400).json({ error: "该 Agent 使用的模型未被服务器允许，请先更新模型设置" });
     }
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -7524,6 +8106,17 @@ async function startServer() {
     res.json(row);
   }));
 
+  app.delete("/api/write/agent/threads/:id", requireAuth, asyncHandler(async (req, res) => {
+    const threadId = Number(req.params.id);
+    if (!Number.isSafeInteger(threadId) || threadId <= 0) return res.status(400).json({ error: "invalid thread id" });
+    const result = await pool.query(
+      `DELETE FROM write_agent_threads WHERE id = $1 AND user_id = $2`,
+      [threadId, req.session.userId],
+    );
+    if (result.rowCount !== 1) return res.status(404).json({ error: "thread not found" });
+    return res.json({ success: true });
+  }));
+
   app.get("/api/write/agent/threads/:id/messages", requireAuth, asyncHandler(async (req, res) => {
     const thread = (await pool.query(
       `SELECT id, title, summary, state, thread_type, created_at, updated_at
@@ -7691,7 +8284,7 @@ async function startServer() {
 	    res.json({ success: true });
 	  }));
 
-	  app.post("/api/write/agent/skills/generate", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+	  app.post("/api/write/agent/skills/generate", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
 	    const { userInput, sampleText } = req.body;
 
 	    if (!userInput || typeof userInput !== "string" || userInput.trim().length < 5) {
@@ -7874,7 +8467,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/write/agent/chat/stream", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/write/agent/chat/stream", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const runId = randomUUID();
     const parsed = buildWriteAgentRequest(req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
@@ -7931,7 +8524,7 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/write/agent/chat", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/write/agent/chat", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const runId = randomUUID();
     const parsed = buildWriteAgentRequest(req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
@@ -8324,6 +8917,7 @@ async function startServer() {
     shuttingDown = true;
     logger.info({ module: "server", signal }, "Graceful shutdown started");
     clearInterval(feedRefreshTimer);
+    clearInterval(verificationCleanupTimer);
     for (const client of wss.clients) client.close(1012, "Server restarting");
 
     const forceExitTimer = setTimeout(() => {

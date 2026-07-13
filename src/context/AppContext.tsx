@@ -155,7 +155,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           }
         }
       } catch (error) {
-        logger.error("Failed to fetch full article", { error, articleId: article.id, articleUrl: article.url });
+        logger.error("Failed to fetch full article", { error, articleId: article.id });
       }
     }
   };

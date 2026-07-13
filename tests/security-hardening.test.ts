@@ -66,6 +66,13 @@ await assert.rejects(
   () => validatePublicHttpUrl("file:///etc/passwd", { lookup: async () => ["1.1.1.1"] }),
   /protocol/i,
 );
+await assert.rejects(
+  () => validatePublicHttpUrl("https://feeds.example.com:8443/rss", {
+    allowedPorts: new Set(["", "80", "443"]),
+    lookup: async () => ["1.1.1.1"],
+  }),
+  /port/i,
+);
 
 const allowedOrigins = buildAllowedOrigins("https://atomflow.example", "https://preview.atomflow.example, https://atomflow.example/");
 assert.deepEqual([...allowedOrigins].sort(), ["https://atomflow.example", "https://preview.atomflow.example"]);
@@ -144,6 +151,23 @@ await assert.rejects(
 );
 assert.equal(publicFetchCalls, 1, "private redirect must be blocked before a second fetch");
 
+let restrictedPortFetchCalls = 0;
+await assert.rejects(
+  () => fetchBoundedPublicResource("https://public.example/start", {
+    timeoutMs: 1000,
+    maxBytes: 1024,
+    maxRedirects: 2,
+    allowedPorts: new Set(["", "80", "443"]),
+    lookup: async () => ["1.1.1.1"],
+    fetchImpl: async () => {
+      restrictedPortFetchCalls += 1;
+      return new Response(null, { status: 302, headers: { location: "https://public.example:8443/feed" } });
+    },
+  }),
+  /port/i,
+);
+assert.equal(restrictedPortFetchCalls, 1, "restricted redirect port must be blocked before a second fetch");
+
 const fetchedResource = await fetchBoundedPublicResource("https://public.example/image.png", {
   timeoutMs: 1000,
   maxBytes: 4,
@@ -177,6 +201,7 @@ assert.match(server, /app\.use\(["']\/api["'], apiLimiter\)/, "API routes must h
 assert.match(server, /app\.use\(["']\/api["'], mutationOriginGuard\)/, "API mutations must enforce production origin policy");
 assert.match(server, /app\.get\(["']\/api\/health["']/, "Railway health endpoint must exist");
 assert.match(server, /const sessionMiddleware = session\(/, "HTTP and WebSocket paths must share one session parser");
+assert.match(server, /if \(isProduction && \(!process\.env\.SESSION_SECRET[\s\S]{0,220}configuredSessionSecret === DEV_SESSION_SECRET/, "Production must reject a missing or placeholder session secret");
 assert.match(server, /name:\s*["']atomflow\.sid["']/, "Session cookie must not use the framework default name");
 assert.match(server, /req\.session\.regenerate\(/, "Authentication must regenerate the session id");
 assert.match(server, /app\.post\(["']\/api\/auth\/login-password["'], passwordLoginLimiter,/, "Password login must be brute-force limited");
@@ -191,7 +216,8 @@ assert.match(server, /app\.post\(["']\/api\/write\/canvas\/agents\/:id\/chat\/st
 assert.match(server, /app\.post\(["']\/api\/write\/agent\/chat\/stream["'], requireAuth, paidOperationLimiter,/, "Writing Agent spend must be limited");
 assert.match(server, /connectionTimeoutMillis:/, "PostgreSQL connection acquisition must be bounded");
 assert.match(server, /idleTimeoutMillis:/, "Idle PostgreSQL connections must be bounded");
-assert.match(server, /await validatePublicHttpUrl\(input\)/, "Custom RSS targets must be checked before parsing");
+assert.match(server, /await validatePublicHttpUrl\(input, \{ allowedPorts: PUBLIC_WEB_PORTS \}\)/, "Custom RSS targets must be checked before parsing");
+assert.match(server, /validatePublicHttpUrl\(input, \{ allowedPorts: PUBLIC_WEB_PORTS \}\)/, "Custom RSS targets must be restricted to normal web ports");
 assert.match(server, /fetchBoundedPublicResource\(/, "Remote proxy responses must have redirect, timeout, DNS and byte boundaries");
 assert.match(server, /isAllowedUploadSignature\(req\.file\.buffer/, "Canvas uploads must verify file signatures");
 assert.match(server, /new WebSocketServer\(\{\s*noServer:\s*true,[\s\S]*maxPayload:\s*asrMaxFrameBytes,[\s\S]*perMessageDeflate:\s*false/, "ASR WebSocket payload and compression must be bounded");
@@ -235,6 +261,30 @@ assert.match(server, /canvasAgentConcurrencyGuard\.acquire\(`\$\{authenticatedUs
 assert.match(server, /write_agent_templates WHERE user_id = \$1\) < 100/, "Agent template creation must match the list capacity");
 assert.match(securitySource, /requestPinnedPublicResource/, "Remote fetches must pin a validated address to the actual socket");
 assert.match(securitySource, /lookup,[\s\S]{0,100}servername: parsed\.hostname/, "Pinned HTTP requests must preserve TLS hostname validation");
+assert.doesNotMatch(server, /parser\.parseURL\(/, "Built-in RSS refreshes must not use unbounded parser network requests");
+assert.match(server, /fetchBoundedPublicResource\(candidate,/, "Built-in RSS refreshes must use bounded, abortable fetches");
+assert.match(server, /getAllowedCanvasAgentModels/, "Canvas Agent models must be controlled by a server-side allowlist");
+assert.match(server, /isAllowedCanvasAgentModel/, "Canvas Agent model writes and runtime calls must enforce the allowlist");
+assert.match(server, /CREATE TABLE IF NOT EXISTS user_ai_usage_daily/, "Paid AI operations must have a shared daily budget ledger");
+assert.match(server, /reserveDailyAiBudget/, "Paid AI routes must reserve durable daily budget before provider calls");
+assert.match(server, /app\.get\("\/api\/favicon-proxy", requireAuth, remoteFetchLimiter/, "Favicon egress proxy must require authentication");
+assert.match(server, /invalidateUserSessions/, "Password changes and resets must invalidate prior sessions");
+assert.match(server, /invalidateUserSessions[\s\S]{0,220}client\.query\([\s\S]{0,120}DELETE FROM session/, "Session invalidation must use the caller's transaction client");
+assert.match(server, /BEGIN[\s\S]{0,1200}UPDATE users SET password_hash[\s\S]{0,600}invalidateUserSessions\([^,]+, client\)[\s\S]{0,300}COMMIT/, "Password updates and old-session invalidation must be atomic");
+assert.match(server, /safeRequestPath/, "HTTP logs must strip query strings");
+assert.match(server, /app\.get\("\/api\/account\/export", requireAuth/, "Users must be able to export their account data");
+assert.match(server, /estimateAccountExportBytes[\s\S]{0,1200}Promise\.all/, "Account exports must reject oversized datasets before materializing rows");
+assert.match(server, /requireRecentAuthentication/, "Sensitive account exports must require recent authentication");
+assert.match(server, /app\.delete\("\/api\/account", requireAuth/, "Users must be able to delete their account data");
+assert.match(server, /app\.delete\("\/api\/saved-articles\/:id", requireAuth/, "Users must be able to delete saved source articles");
+assert.match(server, /app\.delete\("\/api\/write\/agent\/threads\/:id", requireAuth/, "Users must be able to delete writing conversations");
+assert.match(server, /DELETE FROM verification_codes[\s\S]{0,120}expires_at/, "Expired verification records must be cleaned up");
+assert.match(server, /pg_try_advisory_xact_lock[\s\S]{0,800}DELETE FROM verification_codes/, "Verification cleanup must elect one bounded database worker");
+assert.match(server, /idx_vc_expires_at/, "Verification cleanup must have an expiry index");
+assert.match(server, /idx_session_user_id/, "Session invalidation must have a JSON user-id index");
+assert.match(server, /pg_advisory_lock/, "Schema initialization must be serialized across replicas");
+assert.match(server, /new Worker\(/, "Document parsing must run outside the main event loop");
+assert.match(server, /resourceLimits:/, "Document parser workers must have a memory limit");
 
 const railway = readFileSync(path.join(root, "railway.json"), "utf8");
 const railwayConfig = JSON.parse(railway) as { deploy?: { drainingSeconds?: unknown } };

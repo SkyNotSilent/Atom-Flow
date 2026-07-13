@@ -120,6 +120,7 @@ export const isPrivateOrReservedIp = (address: string) => {
 
 type PublicUrlValidationOptions = {
   lookup?: (hostname: string) => Promise<string[]>;
+  allowedPorts?: ReadonlySet<string>;
 };
 
 const defaultLookup = async (hostname: string) => {
@@ -136,6 +137,7 @@ const resolvePublicHttpUrl = async (rawUrl: string, options: PublicUrlValidation
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("URL protocol must be HTTP or HTTPS");
   if (parsed.username || parsed.password) throw new Error("URL credentials are not allowed");
+  if (options.allowedPorts && !options.allowedPorts.has(parsed.port)) throw new Error("URL port is not allowed");
   const hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
   if (!hostname || hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local")) {
     throw new Error("URL hostname is not public");
@@ -235,7 +237,10 @@ const requestPinnedPublicResource = (
 export const fetchBoundedPublicResource = async (rawUrl: string, options: BoundedPublicFetchOptions) => {
   let currentUrl = rawUrl;
   for (let redirectCount = 0; redirectCount <= options.maxRedirects; redirectCount += 1) {
-    const { parsed, addresses } = await resolvePublicHttpUrl(currentUrl, { lookup: options.lookup });
+    const { parsed, addresses } = await resolvePublicHttpUrl(currentUrl, {
+      lookup: options.lookup,
+      allowedPorts: options.allowedPorts,
+    });
     options.validateUrl?.(parsed);
     const resource = options.fetchImpl
       ? await (async () => {

@@ -155,6 +155,10 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
                 <button type="button" onClick={onSendAgentMessage} disabled={!agentInput.trim() || isAgentRunning} className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-[6px] bg-[#1F6FEB] px-3 py-2 text-[12px] font-medium text-white hover:bg-[#195FC9] disabled:opacity-50">
                   <Send size={14} /> {isAgentRunning ? '生成中…' : '发送'}
                 </button>
+                <p className="mt-2 text-center text-[10px] leading-4 text-[#858990]">
+                  发送后，消息和已连接资料会交给实例配置的 AI 服务商处理。{' '}
+                  <a href="/legal/privacy" target="_blank" rel="noreferrer" className="hover:text-[#1F6FEB]">隐私说明</a>
+                </p>
               </div>
             </div>
           ) : null}
