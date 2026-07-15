@@ -4,6 +4,7 @@ import {
   buildCanvasDocumentMarkdown,
   createScenarioSections,
   htmlToMarkdown,
+  sanitizeCanvasDocumentHtml,
 } from '../src/utils/canvasDocumentExport';
 import type { WriteCanvasDocument } from '../src/types';
 
@@ -54,5 +55,35 @@ assert.match(buildCanvasDocumentHtml(document), /<h2>第一节<\/h2>/);
 assert.match(buildCanvasDocumentHtml(document), /<strong>重点<\/strong>/);
 assert.equal(htmlToMarkdown('<p><b>粗体</b>和<i>斜体</i> &#20013; &lt;safe&gt;</p>'), '**粗体**和*斜体* 中 \\<safe\\>');
 assert.equal(htmlToMarkdown('<p><a href="jav&#x61;script:alert(1)">不安全链接</a></p>'), '不安全链接');
+
+const hostile = [
+  '<script>alert(1)</script>',
+  '<style>body{display:none}</style>',
+  '<p onclick="alert(2)" style="background:url(javascript:alert(3))">安全正文',
+  '<img src=x onerror="alert(4)">',
+  '<a href="jav&#x61;script:alert(5)" onmouseover="alert(6)">危险链接</a>',
+  '<a href="https://example.com/safe?a=1&amp;b=2" target="_blank" onclick="alert(7)">安全链接</a>',
+  '</p><iframe srcdoc="<script>alert(8)</script>"></iframe>',
+].join('');
+const sanitized = sanitizeCanvasDocumentHtml(hostile);
+assert.doesNotMatch(sanitized, /script|style=|onclick|onerror|onmouseover|javascript:|<img|<iframe/i);
+assert.match(sanitized, /<p>安全正文危险链接<a href="https:\/\/example\.com\/safe\?a=1&amp;b=2">安全链接<\/a><\/p>/);
+
+const hostileDocument = {
+  ...document,
+  sections: [{ ...document.sections[0], body: hostile }],
+};
+const exportedHtml = buildCanvasDocumentHtml(hostileDocument);
+assert.doesNotMatch(exportedHtml, /script|style=|onclick|onerror|onmouseover|javascript:|<img|<iframe/i);
+assert.match(exportedHtml, /安全正文/);
+
+const hostileMetadataMarkdown = buildCanvasDocumentMarkdown({
+  ...document,
+  title: '<img src=x onerror=alert(1)>',
+  summary: '<script>alert(2)</script>',
+  sections: [{ ...document.sections[0], heading: '<svg onload=alert(3)>' }],
+});
+assert.doesNotMatch(hostileMetadataMarkdown, /(^|[^\\])<(?:img|script|svg)\b/i, 'Markdown metadata must not preserve executable raw HTML');
+assert.match(hostileMetadataMarkdown, /\\<img src=x onerror=alert\(1\)\\>/, 'hostile title markup must be emitted as escaped text');
 
 console.log('PASS: canvas document scenarios and exports');

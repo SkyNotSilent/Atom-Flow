@@ -1005,6 +1005,7 @@ type CanvasContextItem = {
 };
 
 const WRITE_CANVAS_MAX_NODES_PER_PROJECT = readBoundedEnvNumber(process.env.CANVAS_MAX_NODES_PER_PROJECT, 500, 50, 5000);
+const WRITE_CANVAS_MAX_EDGES_PER_PROJECT = readBoundedEnvNumber(process.env.CANVAS_MAX_EDGES_PER_PROJECT, 2000, 100, 20000);
 const WRITE_CANVAS_MAX_MESSAGES_PER_AGENT = readBoundedEnvNumber(process.env.CANVAS_MAX_MESSAGES_PER_AGENT, 200, 20, 1000);
 const WRITE_CANVAS_MAX_PROJECTS_PER_USER = readBoundedEnvNumber(process.env.CANVAS_MAX_PROJECTS_PER_USER, 50, 5, 500);
 const WRITE_CANVAS_MAX_CONTEXT_ITEMS = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_ITEMS, 30, 5, 100);
@@ -1015,8 +1016,7 @@ const WRITE_CANVAS_MAX_CONTEXT_IMAGES = 4;
 const WRITE_CANVAS_ESTIMATED_TOKENS_PER_IMAGE = 2048;
 const WRITE_CANVAS_MAX_AGENT_GROUP_MEMBERS = 3;
 const WRITE_CANVAS_MAX_EXTRACTION_NODES = 12;
-const WRITE_CANVAS_AGENT_BATCH_STALE_MS = readBoundedEnvNumber(process.env.CANVAS_AGENT_BATCH_STALE_MS, 10 * 60 * 1000, 60_000, 60 * 60 * 1000);
-
+const CANVAS_DOCUMENT_MAX_VERSIONS = readBoundedEnvNumber(process.env.CANVAS_DOCUMENT_MAX_VERSIONS, 50, 5, 500);
 type WriteAgentSkillType = "card_storage" | "citation" | "writing" | "style";
 type WriteAgentSkillScenario = "storage" | "citation" | "drafting" | "style";
 
@@ -1556,7 +1556,18 @@ const WRITING_POLISH_SYSTEM_PROMPT = `你是中文写作润色 Agent。你的任
 4. 输出纯 Markdown，不要解释。`;
 
 const AI_REQUEST_TIMEOUT_MS = readBoundedEnvNumber(process.env.AI_REQUEST_TIMEOUT_MS, 120000, 5000, 300000);
+const WRITE_CANVAS_AGENT_BATCH_STALE_MS = Math.max(
+  AI_REQUEST_TIMEOUT_MS + 60_000,
+  readBoundedEnvNumber(process.env.CANVAS_AGENT_BATCH_STALE_MS, 10 * 60 * 1000, 60_000, 60 * 60 * 1000),
+);
+const CANVAS_AI_RECOVERY_STALE_MS = Math.max(
+  AI_REQUEST_TIMEOUT_MS + 60_000,
+  readBoundedEnvNumber(process.env.CANVAS_AI_RECOVERY_STALE_MS, AI_REQUEST_TIMEOUT_MS + 60_000, 60_000, 60 * 60 * 1000),
+);
+const CANVAS_AI_RECOVERY_INTERVAL_MS = readBoundedEnvNumber(process.env.CANVAS_AI_RECOVERY_INTERVAL_MS, 60_000, 10_000, 5 * 60 * 1000);
 const WRITE_AGENT_MAX_MESSAGE_LENGTH = 120000;
+const WRITE_CANVAS_MAX_META_BYTES = 32 * 1024;
+const WRITE_CANVAS_MAX_VIEWPORT_BYTES = 8 * 1024;
 const AI_DRAFT_MAX_TOKENS = 2400;
 const AI_POLISH_MAX_TOKENS = 2400;
 const MIMO_MIN_STRUCTURED_OUTPUT_TOKENS = 4096;
@@ -2673,6 +2684,7 @@ const runOpenAIWriteAgentRuntime = async (
     userState: WriteAgentState;
     runId?: string;
     onStep?: (event: { type: string; node?: string; message?: string; data?: unknown }) => void | Promise<void>;
+    onProviderStart?: () => void | Promise<void>;
   }
 ): Promise<WriteAgentGraphState> => {
   const config = getOpenAIWriteAgentConfig();
@@ -2774,6 +2786,7 @@ const runOpenAIWriteAgentRuntime = async (
   const { intent, requestedTools } = await withStep("classify_intent", "intent classified locally", async () => {
     let classified: WriteAgentIntentClassification = classifyWriteAgentIntent(input.message, input.isCreateArticle);
     if (classified.intent.needsModelRouter) {
+      await input.onProviderStart?.();
       const rawIntent = await requestAiChatCompletion([
         {
           role: "system",
@@ -2787,7 +2800,8 @@ const runOpenAIWriteAgentRuntime = async (
         temperature: 0.1,
         maxTokens: 260,
         logLabel: "write_agent_intent_router",
-        disableThinking: true
+        disableThinking: true,
+        config: getWriteAgentAiChatConfig(config),
       });
       classified = mergeWriteAgentModelRouterResult(
         classified,
@@ -2889,6 +2903,7 @@ const runOpenAIWriteAgentRuntime = async (
     name: "MaterialAgent",
     handoffDescription: "Select and explain relevant AtomFlow knowledge cards for writing tasks.",
     model: config.model,
+    modelSettings: { maxTokens: getCanvasAgentMaxOutputTokens() },
     instructions: "你负责判断召回素材是否足以支撑写作任务。必须明确素材不足，不要伪造来源。",
     tools: sdkTools,
     inputGuardrails: [writeAgentInputGuardrail],
@@ -2898,6 +2913,7 @@ const runOpenAIWriteAgentRuntime = async (
     name: "OutlineAgent",
     handoffDescription: "Generate article angles and outlines from AtomFlow knowledge cards.",
     model: config.model,
+    modelSettings: { maxTokens: getCanvasAgentMaxOutputTokens() },
     instructions: WRITING_PLAN_SYSTEM_PROMPT,
     inputGuardrails: [writeAgentInputGuardrail],
     outputGuardrails: [writeAgentOutputGuardrail]
@@ -2906,6 +2922,7 @@ const runOpenAIWriteAgentRuntime = async (
     name: "DraftAgent",
     handoffDescription: "Write article drafts from outlines, cards, citations and style skills.",
     model: config.model,
+    modelSettings: { maxTokens: getCanvasAgentMaxOutputTokens() },
     instructions: WRITING_AGENT_SYSTEM_PROMPT,
     inputGuardrails: [writeAgentInputGuardrail],
     outputGuardrails: [writeAgentOutputGuardrail]
@@ -2914,6 +2931,7 @@ const runOpenAIWriteAgentRuntime = async (
     name: "CoordinatorAgent",
     handoffDescription: "Coordinate AtomFlow writing tasks and produce final user-facing answers.",
     model: config.model,
+    modelSettings: { maxTokens: getCanvasAgentMaxOutputTokens() },
     instructions: `你是 AtomFlow 的写作助手 Agent。默认基于用户知识库回答，不要频繁反问。
 
 规则：
@@ -2947,6 +2965,7 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
       if (cardsForWriting.length > 0) {
         await input.onStep?.({ type: "partial_status", node: "generate_answer_or_draft", message: shouldGenerateDraft ? "正在规划文章结构" : "正在生成提纲" });
         const topicForWriting = mergedState.focusedTopic || input.message;
+        await input.onProviderStart?.();
         const planResult = await runner.run(outlineAgent, buildWritingPlanPrompt(topicForWriting, cardsForWriting, sanitizeWritingCards(recalledCards), styleSkill, agentSkills), {
           context: sdkContext,
           maxTurns: 4
@@ -2956,6 +2975,7 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
         const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
         if (shouldGenerateDraft) {
           await input.onStep?.({ type: "partial_status", node: "generate_answer_or_draft", message: "正在生成完整文章草稿" });
+          await input.onProviderStart?.();
           const draftResult = await runner.run(draftAgent, buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards), evidenceMap, styleSkill, agentSkills), {
             context: sdkContext,
             maxTurns: 4
@@ -2998,7 +3018,9 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
         generatedPlan?.angle ? `核心判断：${generatedPlan.angle}` : "",
         "你可以在「我的文章」里继续编辑；知识节点、原文摘录、来源图片和引用映射已经写入文章元信息。"
       ].filter(Boolean).join("\n")
-      : String((await runner.run(coordinatorAgent, formatOpenAIWriteAgentPrompt({
+      : String((await (async () => {
+        await input.onProviderStart?.();
+        return runner.run(coordinatorAgent, formatOpenAIWriteAgentPrompt({
         thread,
         message: input.message,
         mergedState,
@@ -3009,10 +3031,11 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
         generatedDraftText,
         agentSkills,
         styleSkill
-      }), {
-        context: sdkContext,
-        maxTurns: 6
-      })).finalOutput || "").trim();
+        }), {
+          context: sdkContext,
+          maxTurns: 6
+        });
+      })()).finalOutput || "").trim();
     return { value: null, summary: persistedDraftNote ? `note=${persistedDraftNote.id}` : `answer=${assistantContent.length}`, meta: { sdk: "openai-agents", provider: config.providerLabel, model: config.model } };
   });
 
@@ -3195,9 +3218,11 @@ const runSkillCreationGraph = async (
     userInput: string;
     sampleText?: string;
     onStep?: (event: { type: string; node?: string; message?: string; data?: unknown }) => void | Promise<void>;
+    onProviderStart?: () => void | Promise<void>;
   }
 ) => {
   const requestChat = async (messages: AiChatMessage[], temperature: number, maxTokens: number) => {
+    await input.onProviderStart?.();
     return requestAiChatCompletion(messages, {
       temperature,
       maxTokens,
@@ -3741,6 +3766,18 @@ const getOpenAIWriteAgentConfig = (): OpenAIWriteAgentConfig | null => {
   };
 };
 
+const getWriteAgentAiChatConfig = (config: OpenAIWriteAgentConfig): AiChatConfig => {
+  const baseUrl = config.providerLabel === "openai" ? "https://api.openai.com" : (config.baseURL || "");
+  return {
+    apiKey: config.apiKey,
+    baseUrl,
+    chatCompletionsUrl: config.providerLabel === "openai"
+      ? "https://api.openai.com/v1/chat/completions"
+      : buildOpenAiCompatibleChatCompletionsUrl(baseUrl),
+    model: normalizeAiModelName(config.model),
+  };
+};
+
 const getAllowedCanvasAgentModels = () => {
   const configuredModel = getOpenAIWriteAgentConfig()?.model;
   const explicitlyAllowed = (process.env.WRITE_AGENT_ALLOWED_MODELS || "")
@@ -3778,9 +3815,10 @@ const requestAiChatCompletion = async (
     timeoutMs?: number;
     logLabel: string;
     disableThinking?: boolean;
+    config?: AiChatConfig;
   }
 ) => {
-  const config = getAiChatConfig();
+  const config = options.config || getAiChatConfig();
   if (!config) {
     throw new Error("AI service not configured");
   }
@@ -3888,6 +3926,13 @@ const clampNumber = (value: unknown, fallback: number, min: number, max: number)
 const normalizeJsonObject = (value: unknown) => (
   isPlainRecord(value) ? value : {}
 );
+
+const getJsonByteLength = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
+
+const normalizeBoundedJsonObject = (value: unknown, maxBytes = WRITE_CANVAS_MAX_META_BYTES) => {
+  const normalized = normalizeJsonObject(value);
+  return getJsonByteLength(normalized) <= maxBytes ? normalized : null;
+};
 
 const getDefaultCanvasAgentConfig = () => {
   const config = getOpenAIWriteAgentConfig();
@@ -4030,6 +4075,7 @@ const isCanvasExtractionAction = (action: WriteCanvasQuickAction) => action.star
 class CanvasInputLimitError extends Error {}
 class CanvasStorageLimitError extends Error {}
 class CanvasAgentBatchLeaseLostError extends Error {}
+class CanvasAiActiveError extends Error {}
 
 const getCanvasAggregateContextChars = (
   contexts: CanvasContextItem[],
@@ -4167,7 +4213,10 @@ const resolveCanvasOwnedNodeContext = async (
   nodeId: number,
 ): Promise<CanvasContextItem | null> => {
   const node = (await pool.query(
-    `SELECT n.id, n.kind, n.title, n.summary, n.ref_id, a.content_text, a.extracted_text, a.data_url, a.mime_type
+    `SELECT n.id, n.kind, n.title, n.summary, n.ref_id, n.document_id, n.content_type, n.meta,
+            a.content_text, a.extracted_text,
+            CASE WHEN a.type = 'image' THEN a.data_url ELSE NULL END AS data_url,
+            a.mime_type
      FROM write_canvas_nodes n
      LEFT JOIN write_canvas_assets a ON a.id = n.asset_id AND a.user_id = n.user_id
      WHERE n.id = $1 AND n.user_id = $2 AND n.project_id = $3`,
@@ -4175,6 +4224,22 @@ const resolveCanvasOwnedNodeContext = async (
   )).rows[0];
   const kind = normalizeCanvasNodeKind(node?.kind);
   if (!node || !kind) return null;
+  if (node.document_id) {
+    const documentContext = await resolveCanvasDocumentContext(pool, userId, Number(node.document_id));
+    if (documentContext) {
+      return { nodeId: Number(node.id), kind, title: documentContext.title || node.title, text: documentContext.text };
+    }
+  }
+  if (node.content_type === "document_section") {
+    const documentId = Number(node.meta?.documentId);
+    const sectionKey = typeof node.meta?.sectionKey === "string" ? node.meta.sectionKey : "";
+    if (Number.isSafeInteger(documentId) && documentId > 0 && sectionKey) {
+      const sectionContext = await resolveCanvasDocumentContext(pool, userId, documentId, sectionKey);
+      if (sectionContext) {
+        return { nodeId: Number(node.id), kind, title: sectionContext.title || node.title, text: sectionContext.text };
+      }
+    }
+  }
   if (["asset_text", "asset_file", "asset_image", "result"].includes(kind)) {
     return {
       nodeId: Number(node.id), kind, title: node.title || "画布资料",
@@ -4227,6 +4292,22 @@ const parseCanvasExtractionItems = (output: string) => {
 
 type CanvasGeneratedNodeInput = { title: string; content: string; role: WriteCanvasNodeRole; origin: WriteCanvasNodeOrigin; status: WriteCanvasNodeStatus; relation: WriteCanvasEdgeRelation; x: number; y: number; meta: Record<string, unknown> };
 
+const assertCanvasEdgeCapacity = async (
+  client: pg.PoolClient,
+  userId: number,
+  projectId: number,
+  additionalEdges = 1,
+) => {
+  if (additionalEdges <= 0) return;
+  const edgeCount = Number((await client.query(
+    `SELECT COUNT(*)::int AS count FROM write_canvas_edges WHERE user_id = $1 AND project_id = $2`,
+    [userId, projectId],
+  )).rows[0]?.count || 0);
+  if (edgeCount + additionalEdges > WRITE_CANVAS_MAX_EDGES_PER_PROJECT) {
+    throw new CanvasStorageLimitError("项目连线数量已达到上限");
+  }
+};
+
 const createCanvasGeneratedNodes = async (
   client: pg.PoolClient,
   userId: number,
@@ -4244,6 +4325,7 @@ const createCanvasGeneratedNodes = async (
   }
   const nodeCount = Number((await client.query(`SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE user_id = $1 AND project_id = $2`, [userId, projectId])).rows[0]?.count || 0);
   if (nodeCount + inputs.length > WRITE_CANVAS_MAX_NODES_PER_PROJECT) throw new Error("项目节点数量已达到上限");
+  if (sourceNodeId) await assertCanvasEdgeCapacity(client, userId, projectId, inputs.length);
   const addedBytes = inputs.reduce((total, item) => total + Buffer.byteLength(item.content, "utf8") * 2, 0);
   await assertCanvasStorageQuota(client, userId, addedBytes + additionalStorageBytes);
   const nodeIds: number[] = [];
@@ -4352,10 +4434,43 @@ const lockCanvasUser = async (client: pg.PoolClient, userId: number) => {
   if (!user) throw new Error("Canvas user no longer exists");
 };
 
+const assertNoActiveCanvasAiWork = async (client: pg.PoolClient, userId: number, projectId: number) => {
+  const active = Boolean((await client.query(
+    `SELECT 1 FROM write_canvas_agent_runs
+     WHERE user_id = $1 AND project_id = $2 AND status IN ('queued','running')
+     UNION ALL
+     SELECT 1
+     FROM write_canvas_agent_messages message
+     JOIN write_agent_instances agent ON agent.id = message.agent_id AND agent.user_id = message.user_id
+     WHERE message.user_id = $1 AND agent.project_id = $2 AND message.meta->>'status' = 'pending'
+     UNION ALL
+     SELECT 1 FROM write_canvas_agent_batches
+     WHERE user_id = $1 AND project_id = $2 AND status = 'running'
+     LIMIT 1`,
+    [userId, projectId],
+  )).rows[0]);
+  if (active) throw new CanvasAiActiveError("项目中仍有 AI 任务运行，请等待完成后再删除");
+};
+
 const getCanvasStoredBytes = async (client: pg.PoolClient, userId: number) => Number((await client.query(
   `SELECT COALESCE(SUM(bytes), 0) AS bytes FROM (
-     SELECT octet_length(COALESCE(data_url, '')) + octet_length(COALESCE(content_text, '')) + octet_length(COALESCE(extracted_text, '')) AS bytes
+     SELECT octet_length(COALESCE(title, '')) + octet_length(COALESCE(content_text, ''))
+          + octet_length(COALESCE(extracted_text, '')) + octet_length(COALESCE(file_name, ''))
+          + octet_length(COALESCE(mime_type, '')) + octet_length(COALESCE(data_url, ''))
+          + octet_length(meta::text) AS bytes
      FROM write_canvas_assets WHERE user_id = $1
+     UNION ALL SELECT octet_length(name) + octet_length(viewport::text)
+     FROM write_canvas_projects WHERE user_id = $1
+     UNION ALL SELECT octet_length(name) + octet_length(model) + octet_length(system_prompt)
+     FROM write_agent_templates WHERE user_id = $1
+     UNION ALL SELECT octet_length(name) + octet_length(model) + octet_length(system_prompt)
+     FROM write_agent_instances WHERE user_id = $1
+     UNION ALL SELECT octet_length(title) + octet_length(summary) + octet_length(COALESCE(business_ref, '')) + octet_length(meta::text)
+     FROM write_canvas_nodes WHERE user_id = $1
+     UNION ALL SELECT octet_length(relation)
+     FROM write_canvas_edges WHERE user_id = $1
+     UNION ALL SELECT octet_length(content) + octet_length(meta::text)
+     FROM write_canvas_agent_messages WHERE user_id = $1
      UNION ALL SELECT octet_length(title) + octet_length(summary) + octet_length(scenario)
      FROM write_canvas_documents WHERE user_id = $1
      UNION ALL SELECT octet_length(stable_key) + octet_length(heading) + octet_length(body) + octet_length(meta::text)
@@ -4436,7 +4551,8 @@ const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId
               'id', a.id, 'type', a.type, 'title', a.title,
               'contentText', a.content_text, 'extractedText', a.extracted_text,
               'fileName', a.file_name, 'mimeType', a.mime_type,
-              'dataUrl', a.data_url, 'meta', a.meta, 'createdAt', a.created_at
+              'dataUrl', CASE WHEN a.type = 'image' THEN '/api/write/canvas/assets/' || a.id || '/original' ELSE NULL END,
+              'meta', a.meta, 'createdAt', a.created_at
             ) END AS asset,
             CASE WHEN ai.id IS NULL THEN NULL ELSE jsonb_build_object(
               'id', ai.id, 'projectId', ai.project_id, 'templateId', ai.template_id,
@@ -4481,6 +4597,7 @@ const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId
                 ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY created_at DESC, id DESC) AS message_rank
          FROM write_canvas_agent_messages
          WHERE user_id = $1 AND agent_id = ANY($2::bigint[])
+           AND COALESCE(meta->>'status', 'completed') = 'completed'
        ) ranked
        WHERE message_rank <= $3
        ORDER BY "agentId", "createdAt" ASC`,
@@ -4547,6 +4664,24 @@ const getCanvasDocumentUpdateAdditionalBytes = (
 ) => getCanvasDocumentSnapshotBytes(nextDocument, nextSections)
   + Math.max(0, getCanvasDocumentMutableBytes(nextDocument, nextSections) - getCanvasDocumentMutableBytes(currentDocument, currentSections));
 
+const pruneCanvasDocumentVersions = async (
+  client: pg.PoolClient,
+  userId: number,
+  documentId: number,
+  keepCount = CANVAS_DOCUMENT_MAX_VERSIONS,
+) => {
+  await client.query(
+    `DELETE FROM write_canvas_document_versions
+     WHERE id IN (
+       SELECT id FROM write_canvas_document_versions
+       WHERE user_id = $1 AND document_id = $2
+       ORDER BY version_number DESC
+       OFFSET $3
+     )`,
+    [userId, documentId, Math.max(0, keepCount)],
+  );
+};
+
 const writeCanvasDocumentSnapshot = async (
   client: pg.PoolClient,
   userId: number,
@@ -4577,6 +4712,7 @@ const writeCanvasDocumentSnapshot = async (
      WHERE id = $6 AND user_id = $7`,
     [document.title, document.summary, document.scenario, document.status, Number(version.id), documentId, userId],
   );
+  await pruneCanvasDocumentVersions(client, userId, documentId);
   return Number(version.id);
 };
 
@@ -4595,6 +4731,38 @@ const fetchCanvasDocument = async (pool: pg.Pool, userId: number, documentId: nu
   return mapCanvasDocumentRow(document);
 };
 
+const resolveCanvasDocumentContext = async (
+  pool: pg.Pool,
+  userId: number,
+  documentId: number,
+  sectionKey?: string,
+) => {
+  const row = (await pool.query(
+    `SELECT d.title, d.summary,
+            COALESCE(jsonb_agg(
+              jsonb_build_object('heading', s.heading, 'body', s.body)
+              ORDER BY s.sort_order
+            ) FILTER (WHERE s.id IS NOT NULL), '[]'::jsonb) AS sections
+     FROM write_canvas_documents d
+     LEFT JOIN write_canvas_document_sections s
+       ON s.document_id = d.id AND s.user_id = d.user_id
+      AND ($3::text IS NULL OR s.stable_key = $3)
+     WHERE d.id = $1 AND d.user_id = $2
+     GROUP BY d.id, d.title, d.summary`,
+    [documentId, userId, sectionKey || null],
+  )).rows[0];
+  if (!row) return null;
+  const sections = Array.isArray(row.sections) ? row.sections : [];
+  const sectionText = sections.map((section: Record<string, unknown>) => (
+    [section.heading, section.body].filter(value => typeof value === "string" && value).join("\n")
+  )).join("\n\n");
+  return {
+    title: sectionKey && typeof sections[0]?.heading === "string" ? sections[0].heading : row.title,
+    text: normalizePlainText([row.title, row.summary, sectionText].filter(Boolean).join("\n\n"))
+      .slice(0, WRITE_CANVAS_MAX_CONTEXT_CHARS),
+  };
+};
+
 const getCanvasAgentNode = async (pool: pg.Pool, userId: number, agentId: number) => {
   return (await pool.query(
     `SELECT n.id AS node_id, n.project_id, ai.*
@@ -4607,13 +4775,15 @@ const getCanvasAgentNode = async (pool: pg.Pool, userId: number, agentId: number
 
 const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNodeId: number, projectId: number): Promise<CanvasContextItem[]> => {
   const sourceRows = (await pool.query(
-    `SELECT n.id, n.kind, n.title, n.summary, n.ref_id, n.meta,
+    `SELECT n.id, n.kind, n.title, n.summary, n.ref_id, n.document_id, n.content_type, n.meta,
             a.id AS asset_id, a.type AS asset_type, a.title AS asset_title, a.content_text,
-            a.extracted_text, a.file_name, a.mime_type, a.data_url
+            a.extracted_text, a.file_name, a.mime_type,
+            CASE WHEN a.type = 'image' THEN a.data_url ELSE NULL END AS data_url
      FROM write_canvas_edges e
      JOIN write_canvas_nodes n ON n.id = e.source_node_id AND n.user_id = e.user_id
      LEFT JOIN write_canvas_assets a ON a.id = n.asset_id AND a.user_id = n.user_id
      WHERE e.user_id = $1 AND e.project_id = $2 AND e.target_node_id = $3 AND e.relation = 'context'
+       AND n.status <> 'rejected' AND n.node_role <> 'task'
      ORDER BY e.created_at ASC
      LIMIT $4`,
     [userId, projectId, agentNodeId, WRITE_CANVAS_MAX_CONTEXT_ITEMS]
@@ -4623,6 +4793,24 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
   for (const row of sourceRows) {
     const kind = normalizeCanvasNodeKind(row.kind);
     if (!kind) continue;
+    if (row.document_id) {
+      const documentContext = await resolveCanvasDocumentContext(pool, userId, Number(row.document_id));
+      if (documentContext) {
+        items.push({ nodeId: Number(row.id), kind, title: documentContext.title || row.title, text: documentContext.text });
+      }
+      continue;
+    }
+    if (row.content_type === "document_section") {
+      const documentId = Number(row.meta?.documentId);
+      const sectionKey = typeof row.meta?.sectionKey === "string" ? row.meta.sectionKey : "";
+      if (Number.isSafeInteger(documentId) && documentId > 0 && sectionKey) {
+        const sectionContext = await resolveCanvasDocumentContext(pool, userId, documentId, sectionKey);
+        if (sectionContext) {
+          items.push({ nodeId: Number(row.id), kind, title: sectionContext.title || row.title, text: sectionContext.text });
+        }
+      }
+      continue;
+    }
     if (["asset_text", "asset_file", "asset_image", "result"].includes(kind)) {
       const text = normalizePlainText([
         row.content_text,
@@ -4727,9 +4915,7 @@ const requestCanvasAgentCompletion = async (input: {
   temperature: number;
   topP: number;
   maxTokens: number;
-  signal?: AbortSignal;
 }) => {
-  input.signal?.throwIfAborted();
   assertCanvasAggregateContextWithinLimit(input.contexts, input.message, input.systemPrompt, input.previousMessages);
   const config = getOpenAIWriteAgentConfig();
   if (!config) {
@@ -4778,7 +4964,6 @@ const requestCanvasAgentCompletion = async (input: {
       : { role: "user", content: userContent }
   ];
 
-  input.signal?.throwIfAborted();
   const response = await fetch(chatCompletionsUrl, {
     method: "POST",
     headers: {
@@ -4792,9 +4977,7 @@ const requestCanvasAgentCompletion = async (input: {
       top_p: clampNumber(input.topP, 1, 0.01, 1),
       max_tokens: Math.round(clampNumber(input.maxTokens, 1200, 128, getCanvasAgentMaxOutputTokens())),
     }),
-    signal: input.signal
-      ? AbortSignal.any([input.signal, AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS)])
-      : AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) {
     const responseBody = await response.text();
@@ -4828,7 +5011,8 @@ const buildDefaultArticleCitationContext = (article: Article) => {
 
 const extractKnowledgeWithAI = async (
   article: Article,
-  storageSkills: WriteAgentSkillRecord[] = []
+  storageSkills: WriteAgentSkillRecord[] = [],
+  onProviderStart?: () => void | Promise<void>,
 ): Promise<ExtractedKnowledge> => {
   if (!getAiChatConfig()) return { cards: [] };
 
@@ -4845,6 +5029,7 @@ ${skillPrompt ? `\n本次入库必须遵循的 Skills：\n${skillPrompt}` : ""}
 
 正文：${plainContent}`;
 
+    await onProviderStart?.();
     const raw = await requestAiChatCompletion([
       { role: 'user', content: `${AI_SYSTEM_PROMPT}\n\n===文章===\n${userPrompt}` }
     ], {
@@ -5215,6 +5400,20 @@ async function startServer() {
       PRIMARY KEY (user_id, usage_date)
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_budget_reservations (
+      id              BIGSERIAL PRIMARY KEY,
+      user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      usage_date      DATE NOT NULL,
+      reserved_tokens BIGINT NOT NULL CHECK (reserved_tokens > 0),
+      operation_count INTEGER NOT NULL DEFAULT 1 CHECK (operation_count > 0),
+      route            TEXT NOT NULL DEFAULT '',
+      state            TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','provider_started','refunded')),
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ai_budget_reservations_pending ON ai_budget_reservations(updated_at) WHERE state = 'pending'`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS verification_codes (
       id           SERIAL PRIMARY KEY,
@@ -5600,6 +5799,9 @@ async function startServer() {
       config_snapshot  JSONB NOT NULL DEFAULT '{}'::jsonb,
       output           TEXT NOT NULL DEFAULT '',
       error            TEXT,
+      reserved_tokens  BIGINT NOT NULL DEFAULT 0 CHECK (reserved_tokens >= 0),
+      reservation_date DATE,
+      provider_started BOOLEAN NOT NULL DEFAULT FALSE,
       started_at       TIMESTAMPTZ,
       completed_at     TIMESTAMPTZ,
       created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -5614,6 +5816,16 @@ async function startServer() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_runs_user ON write_canvas_agent_runs(user_id, project_id, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_runs_batch ON write_canvas_agent_runs(batch_id, created_at ASC) WHERE batch_id IS NOT NULL`);
+  await pool.query(`ALTER TABLE write_canvas_agent_runs ADD COLUMN IF NOT EXISTS reserved_tokens BIGINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE write_canvas_agent_runs ADD COLUMN IF NOT EXISTS reservation_date DATE`);
+  await pool.query(`ALTER TABLE write_canvas_agent_runs ADD COLUMN IF NOT EXISTS provider_started BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_reserved_tokens_check') THEN
+        ALTER TABLE write_canvas_agent_runs ADD CONSTRAINT write_canvas_agent_runs_reserved_tokens_check CHECK (reserved_tokens >= 0);
+      END IF;
+    END $$
+  `);
 
   await runSchemaTransaction(async client => {
   await client.query(`ALTER TABLE write_canvas_agent_groups ADD COLUMN IF NOT EXISTS node_id BIGINT`);
@@ -5638,15 +5850,62 @@ async function startServer() {
   `);
   await client.query(`ALTER TABLE write_canvas_agent_group_members ALTER COLUMN project_id SET NOT NULL`);
   await client.query(`
-    ALTER TABLE write_canvas_agent_groups DROP CONSTRAINT IF EXISTS write_canvas_agent_groups_status_check;
-    ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_status_check CHECK (status IN ('ready','running','completed','partial','failed','cancelled'));
-    ALTER TABLE write_canvas_agent_batches DROP CONSTRAINT IF EXISTS write_canvas_agent_batches_status_check;
-    ALTER TABLE write_canvas_agent_batches ADD CONSTRAINT write_canvas_agent_batches_status_check CHECK (status IN ('queued','running','completed','partial','failed','cancelled'));
-    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_project_id_fkey;
-    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_group_id_fkey;
-    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_group_member_id_fkey;
-    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_batch_id_fkey;
-    ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT IF EXISTS write_canvas_agent_runs_source_node_id_fkey;
+    DO $$ DECLARE constraint_definition TEXT; BEGIN
+      SELECT pg_get_constraintdef(oid) INTO constraint_definition
+      FROM pg_constraint WHERE conname = 'write_canvas_agent_groups_status_check';
+      IF constraint_definition IS NULL THEN
+        ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_status_check
+          CHECK (status IN ('ready','running','completed','partial','failed','cancelled'));
+      ELSIF POSITION('partial' IN constraint_definition) = 0 OR POSITION('cancelled' IN constraint_definition) = 0 THEN
+        ALTER TABLE write_canvas_agent_groups DROP CONSTRAINT write_canvas_agent_groups_status_check;
+        ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_status_check
+          CHECK (status IN ('ready','running','completed','partial','failed','cancelled'));
+      END IF;
+
+      SELECT pg_get_constraintdef(oid) INTO constraint_definition
+      FROM pg_constraint WHERE conname = 'write_canvas_agent_batches_status_check';
+      IF constraint_definition IS NULL THEN
+        ALTER TABLE write_canvas_agent_batches ADD CONSTRAINT write_canvas_agent_batches_status_check
+          CHECK (status IN ('queued','running','completed','partial','failed','cancelled'));
+      ELSIF POSITION('partial' IN constraint_definition) = 0 OR POSITION('cancelled' IN constraint_definition) = 0 THEN
+        ALTER TABLE write_canvas_agent_batches DROP CONSTRAINT write_canvas_agent_batches_status_check;
+        ALTER TABLE write_canvas_agent_batches ADD CONSTRAINT write_canvas_agent_batches_status_check
+          CHECK (status IN ('queued','running','completed','partial','failed','cancelled'));
+      END IF;
+
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_project_id_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT write_canvas_agent_runs_project_id_fkey;
+      END IF;
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_group_id_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT write_canvas_agent_runs_group_id_fkey;
+      END IF;
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_group_member_id_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT write_canvas_agent_runs_group_member_id_fkey;
+      END IF;
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_batch_id_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT write_canvas_agent_runs_batch_id_fkey;
+      END IF;
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_source_node_id_fkey') THEN
+        ALTER TABLE write_canvas_agent_runs DROP CONSTRAINT write_canvas_agent_runs_source_node_id_fkey;
+      END IF;
+    END $$
+  `);
+  await client.query(`
+    UPDATE write_canvas_agent_groups g
+    SET current_batch_id = NULL, status = CASE WHEN status = 'running' THEN 'failed' ELSE status END, updated_at = NOW()
+    WHERE current_batch_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM write_canvas_agent_batches b
+        WHERE b.id = g.current_batch_id AND b.user_id = g.user_id
+          AND b.project_id = g.project_id AND b.group_id = g.id
+      )
+  `);
+  await client.query(`
+    DELETE FROM write_canvas_agent_runs
+    WHERE NOT (
+      (group_id IS NULL AND group_member_id IS NULL AND batch_id IS NULL)
+      OR (group_id IS NOT NULL AND batch_id IS NOT NULL)
+    )
   `);
   await client.query(`
     DO $$ BEGIN
@@ -5674,6 +5933,12 @@ async function startServer() {
       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_batches_group_owner_fkey') THEN
         ALTER TABLE write_canvas_agent_batches ADD CONSTRAINT write_canvas_agent_batches_group_owner_fkey FOREIGN KEY (group_id, user_id, project_id) REFERENCES write_canvas_agent_groups(id, user_id, project_id) ON DELETE CASCADE;
       END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_groups_current_batch_owner_fkey') THEN
+        ALTER TABLE write_canvas_agent_groups ADD CONSTRAINT write_canvas_agent_groups_current_batch_owner_fkey
+          FOREIGN KEY (current_batch_id, user_id, project_id, id)
+          REFERENCES write_canvas_agent_batches(id, user_id, project_id, group_id)
+          ON DELETE SET NULL (current_batch_id);
+      END IF;
       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_group_owner_fkey') THEN
         ALTER TABLE write_canvas_agent_runs ADD CONSTRAINT write_canvas_agent_runs_group_owner_fkey FOREIGN KEY (group_id, user_id, project_id) REFERENCES write_canvas_agent_groups(id, user_id, project_id) ON DELETE CASCADE;
       END IF;
@@ -5688,6 +5953,13 @@ async function startServer() {
       END IF;
       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_source_owner_fkey') THEN
         ALTER TABLE write_canvas_agent_runs ADD CONSTRAINT write_canvas_agent_runs_source_owner_fkey FOREIGN KEY (source_node_id, user_id, project_id) REFERENCES write_canvas_nodes(id, user_id, project_id) ON DELETE SET NULL (source_node_id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_runs_group_fields_check') THEN
+        ALTER TABLE write_canvas_agent_runs ADD CONSTRAINT write_canvas_agent_runs_group_fields_check
+          CHECK (
+            (group_id IS NULL AND group_member_id IS NULL AND batch_id IS NULL)
+            OR (group_id IS NOT NULL AND batch_id IS NOT NULL)
+          );
       END IF;
     END $$
   `);
@@ -5714,10 +5986,11 @@ async function startServer() {
         status = CASE WHEN kind = 'result' THEN 'pending_review' ELSE 'ready' END
     WHERE node_role IS NULL OR content_type IS NULL OR origin IS NULL OR status IS NULL
   `);
-  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN node_role SET NOT NULL`);
-  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN content_type SET NOT NULL`);
-  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN origin SET NOT NULL`);
-  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN status SET NOT NULL`);
+  // Keep these columns nullable during rolling deploys so an older instance can still insert nodes.
+  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN node_role DROP NOT NULL`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN content_type DROP NOT NULL`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN origin DROP NOT NULL`);
+  await pool.query(`ALTER TABLE write_canvas_nodes ALTER COLUMN status DROP NOT NULL`);
   await runSchemaTransaction(async client => {
   await client.query(`
     WITH ranked AS (
@@ -5739,6 +6012,11 @@ async function startServer() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_agent_group_business_ref_unique
     ON write_canvas_nodes(user_id, project_id, content_type, business_ref)
     WHERE content_type = 'agent_group' AND business_ref IS NOT NULL
+  `);
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_document_section_business_ref_unique
+    ON write_canvas_nodes(user_id, project_id, content_type, business_ref)
+    WHERE content_type = 'document_section' AND business_ref IS NOT NULL
   `);
   await client.query(`
     INSERT INTO write_canvas_nodes
@@ -5812,6 +6090,89 @@ async function startServer() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_document_sections_document ON write_canvas_document_sections(document_id, sort_order)`);
+  await runSchemaTransaction(async client => {
+    await client.query(`
+      UPDATE write_canvas_assets asset
+      SET project_id = node.project_id
+      FROM write_canvas_nodes node
+      WHERE node.asset_id = asset.id AND node.user_id = asset.user_id AND asset.project_id IS NULL
+    `);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_assets_tenant_project_key ON write_canvas_assets(id, user_id, project_id)`);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_agent_templates_tenant_key ON write_agent_templates(id, user_id)`);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_agent_instances_tenant_project_key ON write_agent_instances(id, user_id, project_id)`);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_agent_instances_tenant_key ON write_agent_instances(id, user_id)`);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_documents_tenant_project_key ON write_canvas_documents(id, user_id, project_id)`);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_documents_tenant_key ON write_canvas_documents(id, user_id)`);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_document_versions_tenant_document_key ON write_canvas_document_versions(id, user_id, document_id)`);
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_assets_project_owner_fkey') THEN
+          ALTER TABLE write_canvas_assets ADD CONSTRAINT write_canvas_assets_project_owner_fkey
+            FOREIGN KEY (project_id, user_id) REFERENCES write_canvas_projects(id, user_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_agent_instances_project_owner_fkey') THEN
+          ALTER TABLE write_agent_instances ADD CONSTRAINT write_agent_instances_project_owner_fkey
+            FOREIGN KEY (project_id, user_id) REFERENCES write_canvas_projects(id, user_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_agent_instances_template_owner_fkey') THEN
+          ALTER TABLE write_agent_instances ADD CONSTRAINT write_agent_instances_template_owner_fkey
+            FOREIGN KEY (template_id, user_id) REFERENCES write_agent_templates(id, user_id) ON DELETE SET NULL (template_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_project_owner_fkey') THEN
+          ALTER TABLE write_canvas_nodes ADD CONSTRAINT write_canvas_nodes_project_owner_fkey
+            FOREIGN KEY (project_id, user_id) REFERENCES write_canvas_projects(id, user_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_asset_owner_fkey') THEN
+          ALTER TABLE write_canvas_nodes ADD CONSTRAINT write_canvas_nodes_asset_owner_fkey
+            FOREIGN KEY (asset_id, user_id, project_id) REFERENCES write_canvas_assets(id, user_id, project_id) ON DELETE SET NULL (asset_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_agent_owner_fkey') THEN
+          ALTER TABLE write_canvas_nodes ADD CONSTRAINT write_canvas_nodes_agent_owner_fkey
+            FOREIGN KEY (agent_id, user_id, project_id) REFERENCES write_agent_instances(id, user_id, project_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_edges_project_owner_fkey') THEN
+          ALTER TABLE write_canvas_edges ADD CONSTRAINT write_canvas_edges_project_owner_fkey
+            FOREIGN KEY (project_id, user_id) REFERENCES write_canvas_projects(id, user_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_edges_source_owner_fkey') THEN
+          ALTER TABLE write_canvas_edges ADD CONSTRAINT write_canvas_edges_source_owner_fkey
+            FOREIGN KEY (source_node_id, user_id, project_id) REFERENCES write_canvas_nodes(id, user_id, project_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_edges_target_owner_fkey') THEN
+          ALTER TABLE write_canvas_edges ADD CONSTRAINT write_canvas_edges_target_owner_fkey
+            FOREIGN KEY (target_node_id, user_id, project_id) REFERENCES write_canvas_nodes(id, user_id, project_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_agent_messages_agent_owner_fkey') THEN
+          ALTER TABLE write_canvas_agent_messages ADD CONSTRAINT write_canvas_agent_messages_agent_owner_fkey
+            FOREIGN KEY (agent_id, user_id) REFERENCES write_agent_instances(id, user_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_documents_project_owner_fkey') THEN
+          ALTER TABLE write_canvas_documents ADD CONSTRAINT write_canvas_documents_project_owner_fkey
+            FOREIGN KEY (project_id, user_id) REFERENCES write_canvas_projects(id, user_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_documents_node_owner_fkey') THEN
+          ALTER TABLE write_canvas_documents ADD CONSTRAINT write_canvas_documents_node_owner_fkey
+            FOREIGN KEY (node_id, user_id, project_id) REFERENCES write_canvas_nodes(id, user_id, project_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_document_owner_fkey') THEN
+          ALTER TABLE write_canvas_nodes ADD CONSTRAINT write_canvas_nodes_document_owner_fkey
+            FOREIGN KEY (document_id, user_id, project_id) REFERENCES write_canvas_documents(id, user_id, project_id) ON DELETE SET NULL (document_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_document_versions_document_owner_fkey') THEN
+          ALTER TABLE write_canvas_document_versions ADD CONSTRAINT write_canvas_document_versions_document_owner_fkey
+            FOREIGN KEY (document_id, user_id) REFERENCES write_canvas_documents(id, user_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_document_sections_document_owner_fkey') THEN
+          ALTER TABLE write_canvas_document_sections ADD CONSTRAINT write_canvas_document_sections_document_owner_fkey
+            FOREIGN KEY (document_id, user_id) REFERENCES write_canvas_documents(id, user_id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_documents_current_version_owner_fkey') THEN
+          ALTER TABLE write_canvas_documents ADD CONSTRAINT write_canvas_documents_current_version_owner_fkey
+            FOREIGN KEY (current_version_id, user_id, id) REFERENCES write_canvas_document_versions(id, user_id, document_id) ON DELETE SET NULL (current_version_id);
+        END IF;
+      END $$
+    `);
+  });
   await pool.query(`
     DO $$ BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_nodes_role_check') THEN
@@ -5836,12 +6197,66 @@ async function startServer() {
   `);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_write_canvas_nodes_document ON write_canvas_nodes(document_id) WHERE document_id IS NOT NULL`);
   await pool.query(`
+    DO $$ DECLARE constraint_definition TEXT; BEGIN
+      SELECT pg_get_constraintdef(oid) INTO constraint_definition
+      FROM pg_constraint WHERE conname = 'write_canvas_edges_relation_check';
+      IF constraint_definition IS NULL THEN
+        ALTER TABLE write_canvas_edges ADD CONSTRAINT write_canvas_edges_relation_check
+          CHECK (relation IN ('context', 'derived_from', 'generated', 'structure'));
+      ELSIF POSITION('derived_from' IN constraint_definition) = 0
+         OR POSITION('generated' IN constraint_definition) = 0
+         OR POSITION('structure' IN constraint_definition) = 0 THEN
+        ALTER TABLE write_canvas_edges DROP CONSTRAINT write_canvas_edges_relation_check;
+        ALTER TABLE write_canvas_edges ADD CONSTRAINT write_canvas_edges_relation_check
+          CHECK (relation IN ('context', 'derived_from', 'generated', 'structure'));
+      END IF;
+    END $$
+  `);
+  await pool.query(`
+    DELETE FROM write_canvas_edges edge
+    USING write_canvas_nodes target_node
+    WHERE edge.relation = 'derived_from'
+      AND target_node.id = edge.target_node_id
+      AND target_node.node_role = 'task'
+      AND target_node.content_type = 'agent_group'
+      AND EXISTS (
+        SELECT 1 FROM write_canvas_edges duplicate
+        WHERE duplicate.project_id = edge.project_id
+          AND duplicate.source_node_id = edge.source_node_id
+          AND duplicate.target_node_id = edge.target_node_id
+          AND duplicate.relation = 'context'
+      )
+  `);
+  await pool.query(`
+    UPDATE write_canvas_edges edge
+    SET relation = 'context'
+    FROM write_canvas_nodes source_node, write_canvas_nodes target_node
+    WHERE edge.relation = 'derived_from'
+      AND source_node.id = edge.source_node_id
+      AND target_node.id = edge.target_node_id
+      AND target_node.node_role = 'task'
+      AND target_node.content_type = 'agent_group'
+      AND source_node.kind <> 'agent'
+      AND NOT (source_node.node_role = 'task' AND source_node.content_type = 'agent_group')
+      AND NOT EXISTS (
+        SELECT 1 FROM write_canvas_edges duplicate
+        WHERE duplicate.project_id = edge.project_id
+          AND duplicate.source_node_id = edge.source_node_id
+          AND duplicate.target_node_id = edge.target_node_id
+          AND duplicate.relation = 'context'
+      )
+  `);
+  await pool.query(`
     DELETE FROM write_canvas_edges edge
     USING write_canvas_nodes source_node, write_canvas_nodes target_node
     WHERE edge.relation = 'context'
       AND source_node.id = edge.source_node_id
       AND target_node.id = edge.target_node_id
-      AND (source_node.kind = 'agent' OR target_node.kind <> 'agent')
+      AND (
+        source_node.kind = 'agent'
+        OR (source_node.node_role = 'task' AND source_node.content_type = 'agent_group')
+        OR (target_node.kind <> 'agent' AND NOT (target_node.node_role = 'task' AND target_node.content_type = 'agent_group'))
+      )
       AND EXISTS (
         SELECT 1 FROM write_canvas_edges duplicate
         WHERE duplicate.project_id = edge.project_id
@@ -5857,17 +6272,12 @@ async function startServer() {
     WHERE edge.relation = 'context'
       AND source_node.id = edge.source_node_id
       AND target_node.id = edge.target_node_id
-      AND (source_node.kind = 'agent' OR target_node.kind <> 'agent')
+      AND (
+        source_node.kind = 'agent'
+        OR (source_node.node_role = 'task' AND source_node.content_type = 'agent_group')
+        OR (target_node.kind <> 'agent' AND NOT (target_node.node_role = 'task' AND target_node.content_type = 'agent_group'))
+      )
   `);
-  await pool.query(`
-    DO $$ BEGIN
-      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'write_canvas_edges_relation_check') THEN
-        ALTER TABLE write_canvas_edges DROP CONSTRAINT write_canvas_edges_relation_check;
-      END IF;
-      ALTER TABLE write_canvas_edges ADD CONSTRAINT write_canvas_edges_relation_check CHECK (relation IN ('context', 'derived_from', 'generated', 'structure'));
-    END $$
-  `);
-
   // --- saved_cards: add origin and saved_article_id columns ---
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'manual'`);
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS saved_article_id BIGINT REFERENCES saved_articles(id) ON DELETE SET NULL`);
@@ -6125,6 +6535,16 @@ async function startServer() {
     skipSuccessfulRequests: true,
     message: { error: "验证码尝试过多，请稍后再试" },
   });
+  const verificationCheckIpLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: readBoundedEnvNumber(process.env.AUTH_VERIFY_IP_RATE_LIMIT, 30, 5, 300),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    identifier: "verification-check-ip",
+    keyGenerator: requestIpKey,
+    skipSuccessfulRequests: true,
+    message: { error: "验证码尝试过多，请稍后再试" },
+  });
   const paidOperationLimiter = rateLimit({
     windowMs: 10 * 60 * 1000,
     limit: readBoundedEnvNumber(process.env.PAID_OPERATION_RATE_LIMIT, 20, 2, 500),
@@ -6374,8 +6794,21 @@ async function startServer() {
       next(error);
       return;
     }
-    res.once("finish", release);
-    res.once("close", release);
+    let released = false;
+    let processingStarted = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      release();
+    };
+    res.locals.beginCanvasUploadProcessing = () => {
+      processingStarted = true;
+      return releaseOnce;
+    };
+    res.once("finish", releaseOnce);
+    res.once("close", () => {
+      if (res.writableFinished || !processingStarted) releaseOnce();
+    });
     next();
   };
   const articleSaveConcurrencyMiddleware: express.RequestHandler = (req, res, next) => {
@@ -6593,7 +7026,7 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/auth/verify", verificationCheckLimiter, asyncHandler(async (req, res) => {
+  app.post("/api/auth/verify", verificationCheckIpLimiter, verificationCheckLimiter, asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     const code = (req.body?.code || '').trim();
     if (!email || !code) {
@@ -6714,7 +7147,7 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/auth/register/verify", verificationCheckLimiter, asyncHandler(async (req, res) => {
+  app.post("/api/auth/register/verify", verificationCheckIpLimiter, verificationCheckLimiter, asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     const code = (req.body?.code || '').trim();
     if (!email || !code) {
@@ -6793,24 +7226,448 @@ async function startServer() {
     next();
   };
 
-  const reserveDailyAiBudget = async (userId: number, reservedOutputTokens: number, estimatedInputTokens = 0) => {
+  const getDailyAiBudgetReservationTokens = (reservedOutputTokens: number, estimatedInputTokens = 0) => (
+    Math.max(0, Math.ceil(reservedOutputTokens)) + Math.max(0, Math.ceil(estimatedInputTokens))
+  );
+
+  type AiBudgetQueryable = pg.Pool | pg.PoolClient;
+  const normalizeAiBudgetDate = (value: unknown) => {
+    if (value instanceof Date && Number.isFinite(value.getTime())) {
+      const year = value.getFullYear();
+      const month = String(value.getMonth() + 1).padStart(2, "0");
+      const day = String(value.getDate()).padStart(2, "0");
+      return `${year}-${month}-${day}`;
+    }
+    if (typeof value === "string") {
+      const match = value.match(/^\d{4}-\d{2}-\d{2}/);
+      if (match) return match[0];
+    }
+    return null;
+  };
+
+  const reserveDailyAiBudget = async (
+    userId: number,
+    reservedOutputTokens: number,
+    estimatedInputTokens = 0,
+    queryable: AiBudgetQueryable = pool,
+  ) => {
     const maxOperations = readBoundedEnvNumber(process.env.PAID_OPERATION_DAILY_LIMIT, 100, 1, 10000);
     const maxOutputTokens = readBoundedEnvNumber(process.env.PAID_OUTPUT_TOKENS_DAILY_LIMIT, 200_000, 1000, 10_000_000);
-    const reservedTokens = Math.max(0, Math.ceil(reservedOutputTokens)) + Math.max(0, Math.ceil(estimatedInputTokens));
-    return (await pool.query(
+    const reservedTokens = getDailyAiBudgetReservationTokens(reservedOutputTokens, estimatedInputTokens);
+    return (await queryable.query(
       `INSERT INTO user_ai_usage_daily (user_id, usage_date, operation_count, reserved_output_tokens)
-       SELECT $1, CURRENT_DATE, 1, $2
-       WHERE $2 <= $4
+       SELECT $1::integer, CURRENT_DATE, 1, $2::bigint
+       WHERE $2::bigint <= $4::bigint
        ON CONFLICT (user_id, usage_date) DO UPDATE
        SET operation_count = user_ai_usage_daily.operation_count + 1,
            reserved_output_tokens = user_ai_usage_daily.reserved_output_tokens + EXCLUDED.reserved_output_tokens,
            updated_at = NOW()
-       WHERE user_ai_usage_daily.operation_count < $3
-         AND user_ai_usage_daily.reserved_output_tokens + EXCLUDED.reserved_output_tokens <= $4
-       RETURNING operation_count, reserved_output_tokens`,
+       WHERE user_ai_usage_daily.operation_count < $3::integer
+         AND user_ai_usage_daily.reserved_output_tokens + EXCLUDED.reserved_output_tokens <= $4::bigint
+       RETURNING usage_date::text AS usage_date, operation_count, reserved_output_tokens`,
       [userId, reservedTokens, maxOperations, maxOutputTokens],
     )).rows[0] || null;
   };
+
+  const releaseDailyAiBudget = async (
+    userId: number,
+    reservedTokens: number,
+    usageDate: string | null = null,
+    queryable: AiBudgetQueryable = pool,
+    operationCount = 1,
+  ) => {
+    if (reservedTokens <= 0) return;
+    await queryable.query(
+      `UPDATE user_ai_usage_daily
+       SET operation_count = GREATEST(0, operation_count - $4::integer),
+           reserved_output_tokens = GREATEST(0, reserved_output_tokens - $2::bigint),
+           updated_at = NOW()
+       WHERE user_id = $1 AND usage_date = COALESCE($3::date, CURRENT_DATE)`,
+      [userId, reservedTokens, usageDate, operationCount],
+    );
+  };
+
+  const reserveDurableDailyAiBudget = async (userId: number, reservedTokens: number, route: string) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, userId);
+      const reservation = await reserveDailyAiBudget(userId, reservedTokens, 0, client);
+      if (!reservation) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      const row = (await client.query(
+        `INSERT INTO ai_budget_reservations (user_id, usage_date, reserved_tokens, route)
+         VALUES ($1, $2::date, $3, $4)
+         RETURNING id, usage_date::text AS usage_date, reserved_tokens`,
+        [userId, reservation.usage_date, reservedTokens, route.slice(0, 240)],
+      )).rows[0];
+      await client.query("COMMIT");
+      return row;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
+  const refundDailyAiBudgetReservation = async (userId: number, res: express.Response) => {
+    const reservationId = Number(res.locals.dailyAiBudgetReservationId || 0);
+    if (!Number.isSafeInteger(reservationId) || reservationId <= 0) return;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, userId);
+      const reservation = (await client.query(
+        `SELECT id, reserved_tokens, operation_count, usage_date::text AS usage_date, state
+         FROM ai_budget_reservations
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [reservationId, userId],
+      )).rows[0];
+      if (!reservation || reservation.state !== "pending") {
+        await client.query("COMMIT");
+        return;
+      }
+      await releaseDailyAiBudget(
+        userId,
+        Number(reservation.reserved_tokens),
+        normalizeAiBudgetDate(reservation.usage_date),
+        client,
+        Number(reservation.operation_count),
+      );
+      await client.query(
+        `UPDATE ai_budget_reservations SET state = 'refunded', updated_at = NOW()
+         WHERE id = $1 AND user_id = $2 AND state = 'pending'`,
+        [reservationId, userId],
+      );
+      await client.query("COMMIT");
+      res.locals.dailyAiBudgetReservationTokens = 0;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
+  const markDailyAiBudgetProviderStarted = async (res: express.Response) => {
+    if (res.locals.dailyAiBudgetProviderStarted === true) return;
+    const currentPromise = res.locals.dailyAiBudgetProviderStartPromise as Promise<void> | undefined;
+    if (currentPromise) return currentPromise;
+    const reservationId = Number(res.locals.dailyAiBudgetReservationId || 0);
+    const userId = Number(res.locals.dailyAiBudgetUserId || 0);
+    if (!Number.isSafeInteger(reservationId) || reservationId <= 0 || !Number.isSafeInteger(userId) || userId <= 0) {
+      throw new Error("AI budget reservation is unavailable");
+    }
+    const startPromise = (async () => {
+      const updated = await pool.query(
+        `UPDATE ai_budget_reservations
+         SET state = 'provider_started', updated_at = NOW()
+         WHERE id = $1 AND user_id = $2 AND state = 'pending'
+         RETURNING id`,
+        [reservationId, userId],
+      );
+      if (updated.rowCount !== 1) {
+        const state = (await pool.query(
+          `SELECT state FROM ai_budget_reservations WHERE id = $1 AND user_id = $2`,
+          [reservationId, userId],
+        )).rows[0]?.state;
+        if (state !== "provider_started") throw new Error("AI budget reservation is no longer active");
+      }
+      res.locals.dailyAiBudgetProviderStarted = true;
+    })();
+    res.locals.dailyAiBudgetProviderStartPromise = startPromise;
+    try {
+      await startPromise;
+    } finally {
+      if (res.locals.dailyAiBudgetProviderStartPromise === startPromise) {
+        res.locals.dailyAiBudgetProviderStartPromise = null;
+      }
+    }
+  };
+
+  const reserveCanvasAgentRunBudget = async (
+    userId: number,
+    runId: number,
+    reservedOutputTokens: number,
+    estimatedInputTokens: number,
+  ) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, userId);
+      const reservation = await reserveDailyAiBudget(userId, reservedOutputTokens, estimatedInputTokens, client);
+      if (!reservation) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      const reservedTokens = getDailyAiBudgetReservationTokens(reservedOutputTokens, estimatedInputTokens);
+      const updated = await client.query(
+        `UPDATE write_canvas_agent_runs
+         SET reserved_tokens = $1, reservation_date = $2::date, updated_at = NOW()
+         WHERE id = $3 AND user_id = $4 AND status IN ('queued','running')`,
+        [reservedTokens, reservation.usage_date, runId, userId],
+      );
+      if (updated.rowCount !== 1) throw new Error("AI run is no longer active");
+      await client.query("COMMIT");
+      return { reservedTokens, reservationDate: normalizeAiBudgetDate(reservation.usage_date) };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
+  const markCanvasAgentRunProviderStarted = async (userId: number, runId: number) => {
+    const result = await pool.query(
+      `UPDATE write_canvas_agent_runs
+       SET provider_started = TRUE, updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND status = 'running' AND provider_started = FALSE`,
+      [runId, userId],
+    );
+    if (result.rowCount !== 1) throw new Error("AI run is no longer active");
+  };
+
+  const failStandaloneCanvasAgentRun = async (
+    userId: number,
+    runId: number,
+    status: "failed" | "cancelled",
+    error: string,
+  ) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, userId);
+      const run = (await client.query(
+        `SELECT reserved_tokens, reservation_date::text AS reservation_date, provider_started
+         FROM write_canvas_agent_runs
+         WHERE id = $1 AND user_id = $2 AND status IN ('queued','running')
+         FOR UPDATE`,
+        [runId, userId],
+      )).rows[0];
+      if (!run) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      if (!run.provider_started && Number(run.reserved_tokens) > 0) {
+        await releaseDailyAiBudget(userId, Number(run.reserved_tokens), normalizeAiBudgetDate(run.reservation_date), client);
+      }
+      await client.query(
+        `UPDATE write_canvas_agent_runs
+         SET status = $1, error = $2,
+             reserved_tokens = CASE WHEN provider_started THEN reserved_tokens ELSE 0 END,
+             completed_at = NOW(), updated_at = NOW()
+         WHERE id = $3 AND user_id = $4`,
+        [status, error, runId, userId],
+      );
+      await client.query("COMMIT");
+      return true;
+    } catch (failure) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw failure;
+    } finally {
+      client.release();
+    }
+  };
+
+  const cancelPendingCanvasAgentMessage = async (userId: number, agentId: number, messageId: number) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, userId);
+      const message = (await client.query(
+        `SELECT meta FROM write_canvas_agent_messages
+         WHERE id = $1 AND user_id = $2 AND agent_id = $3 AND meta->>'status' = 'pending'
+         FOR UPDATE`,
+        [messageId, userId, agentId],
+      )).rows[0];
+      if (!message) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      const meta = isPlainRecord(message.meta) ? message.meta : {};
+      if (meta.providerStarted !== true) {
+        await releaseDailyAiBudget(
+          userId,
+          Number(meta.budgetReservedTokens || 0),
+          typeof meta.budgetReservationDate === "string" ? meta.budgetReservationDate.slice(0, 10) : null,
+          client,
+        );
+      }
+      await client.query(
+        `DELETE FROM write_canvas_agent_messages WHERE id = $1 AND user_id = $2 AND agent_id = $3`,
+        [messageId, userId, agentId],
+      );
+      await client.query("COMMIT");
+      return true;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
+  const recoverStaleCanvasAiWork = async () => {
+    const client = await pool.connect();
+    const staleBefore = new Date(Date.now() - CANVAS_AI_RECOVERY_STALE_MS);
+    const interruptedError = "运行超时或服务中断";
+    const refundReservations = async (reservations: Array<{ userId: number; reservedTokens: number; reservationDate: string | null }>) => {
+      const grouped = new Map<string, { userId: number; reservedTokens: number; reservationDate: string | null; operationCount: number }>();
+      for (const reservation of reservations) {
+        if (reservation.reservedTokens <= 0) continue;
+        const key = `${reservation.userId}:${reservation.reservationDate || "current"}`;
+        const current = grouped.get(key);
+        if (current) {
+          current.reservedTokens += reservation.reservedTokens;
+          current.operationCount += 1;
+        } else grouped.set(key, { ...reservation, operationCount: 1 });
+      }
+      for (const reservation of grouped.values()) {
+        await releaseDailyAiBudget(
+          reservation.userId,
+          reservation.reservedTokens,
+          reservation.reservationDate,
+          client,
+          reservation.operationCount,
+        );
+      }
+    };
+    try {
+      await client.query("BEGIN");
+      const elected = (await client.query(
+        `SELECT pg_try_advisory_xact_lock(hashtext('atomflow-canvas-ai-recovery')) AS acquired`,
+      )).rows[0]?.acquired === true;
+      if (!elected) {
+        await client.query("ROLLBACK");
+        return;
+      }
+
+      const candidateUserIds = (await client.query(
+        `SELECT DISTINCT user_id FROM (
+           SELECT user_id FROM write_canvas_agent_runs
+           WHERE status IN ('queued','running') AND updated_at < $1
+           UNION
+           SELECT user_id FROM write_canvas_agent_messages
+           WHERE meta->>'status' = 'pending' AND created_at < $1
+           UNION
+           SELECT user_id FROM ai_budget_reservations
+           WHERE state = 'pending' AND updated_at < $1
+         ) candidates
+         ORDER BY user_id`,
+        [staleBefore],
+      )).rows.map(row => Number(row.user_id));
+      for (const userId of candidateUserIds) await lockCanvasUser(client, userId);
+
+      const staleRuns = (await client.query(
+        `SELECT id, user_id, reserved_tokens, reservation_date::text AS reservation_date, provider_started
+         FROM write_canvas_agent_runs
+         WHERE status IN ('queued','running') AND updated_at < $1
+         FOR UPDATE`,
+        [staleBefore],
+      )).rows;
+      await refundReservations(staleRuns
+        .filter(run => !run.provider_started)
+        .map(run => ({
+          userId: Number(run.user_id),
+          reservedTokens: Number(run.reserved_tokens),
+          reservationDate: normalizeAiBudgetDate(run.reservation_date),
+        })));
+      if (staleRuns.length > 0) {
+        await client.query(
+          `UPDATE write_canvas_agent_runs
+           SET status = 'failed', error = $1,
+               reserved_tokens = CASE WHEN provider_started THEN reserved_tokens ELSE 0 END,
+               completed_at = NOW(), updated_at = NOW()
+           WHERE id = ANY($2::bigint[])`,
+          [interruptedError, staleRuns.map(run => Number(run.id))],
+        );
+      }
+
+      const staleMessages = (await client.query(
+        `SELECT id, user_id, meta
+         FROM write_canvas_agent_messages
+         WHERE meta->>'status' = 'pending' AND created_at < $1
+         FOR UPDATE`,
+        [staleBefore],
+      )).rows;
+      await refundReservations(staleMessages.flatMap(message => {
+        const meta = isPlainRecord(message.meta) ? message.meta : {};
+        if (meta.providerStarted === true) return [];
+        return [{
+          userId: Number(message.user_id),
+          reservedTokens: Number(meta.budgetReservedTokens || 0),
+          reservationDate: typeof meta.budgetReservationDate === "string" ? meta.budgetReservationDate.slice(0, 10) : null,
+        }];
+      }));
+      if (staleMessages.length > 0) {
+        await client.query(`DELETE FROM write_canvas_agent_messages WHERE id = ANY($1::bigint[])`, [staleMessages.map(message => Number(message.id))]);
+      }
+      const staleGenericReservations = (await client.query(
+        `SELECT id, user_id, reserved_tokens, usage_date::text AS usage_date
+         FROM ai_budget_reservations
+         WHERE state = 'pending' AND updated_at < $1
+         FOR UPDATE`,
+        [staleBefore],
+      )).rows;
+      await refundReservations(staleGenericReservations.map(reservation => ({
+        userId: Number(reservation.user_id),
+        reservedTokens: Number(reservation.reserved_tokens),
+        reservationDate: normalizeAiBudgetDate(reservation.usage_date),
+      })));
+      if (staleGenericReservations.length > 0) {
+        await client.query(
+          `UPDATE ai_budget_reservations
+           SET state = 'refunded', updated_at = NOW()
+           WHERE id = ANY($1::bigint[]) AND state = 'pending'`,
+          [staleGenericReservations.map(reservation => Number(reservation.id))],
+        );
+      }
+      await client.query(
+        `DELETE FROM write_canvas_agent_messages
+         WHERE COALESCE(meta->>'status', 'completed') IN ('failed','cancelled')`,
+      );
+
+      await client.query(
+        `UPDATE write_canvas_agent_batches b
+         SET status = CASE
+               WHEN EXISTS (SELECT 1 FROM write_canvas_agent_runs r WHERE r.batch_id = b.id AND r.status = 'completed')
+                 THEN CASE WHEN EXISTS (SELECT 1 FROM write_canvas_agent_runs r WHERE r.batch_id = b.id AND r.status IN ('failed','cancelled')) THEN 'partial' ELSE 'completed' END
+               ELSE 'failed'
+             END,
+             error = CASE WHEN EXISTS (SELECT 1 FROM write_canvas_agent_runs r WHERE r.batch_id = b.id AND r.status = 'completed') THEN b.error ELSE $1 END,
+             completed_at = NOW(), updated_at = NOW()
+         WHERE b.status = 'running' AND b.updated_at < $2
+           AND NOT EXISTS (SELECT 1 FROM write_canvas_agent_runs r WHERE r.batch_id = b.id AND r.status IN ('queued','running'))`,
+        [interruptedError, staleBefore],
+      );
+      await client.query(
+        `UPDATE write_canvas_agent_groups g
+         SET status = b.status, current_batch_id = NULL, updated_at = NOW()
+         FROM write_canvas_agent_batches b
+         WHERE g.current_batch_id = b.id AND b.status IN ('completed','partial','failed','cancelled')`,
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
+  let canvasAiRecoveryTimer: NodeJS.Timeout | null = null;
+  if (pool) {
+    recoverStaleCanvasAiWork().catch(error => logger.warn({ err: error, module: "canvas-ai" }, "Canvas AI recovery failed"));
+    canvasAiRecoveryTimer = setInterval(() => {
+      recoverStaleCanvasAiWork().catch(error => logger.warn({ err: error, module: "canvas-ai" }, "Canvas AI recovery failed"));
+    }, CANVAS_AI_RECOVERY_INTERVAL_MS);
+    canvasAiRecoveryTimer.unref();
+  }
 
   const assertCurrentCanvasAgentBatchLease = async (
     client: pg.PoolClient,
@@ -6844,9 +7701,30 @@ async function startServer() {
       await client.query("BEGIN");
       await lockCanvasUser(client, input.userId);
       await assertCurrentCanvasAgentBatchLease(client, input.userId, input.groupId, input.batchId);
+      const run = (await client.query(
+        `SELECT reserved_tokens, reservation_date::text AS reservation_date, provider_started
+         FROM write_canvas_agent_runs
+         WHERE id = $1 AND batch_id = $2 AND user_id = $3 AND status IN ('queued','running')
+         FOR UPDATE`,
+        [input.runId, input.batchId, input.userId],
+      )).rows[0];
+      if (!run) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      if (!run.provider_started && Number(run.reserved_tokens) > 0) {
+        await releaseDailyAiBudget(
+          input.userId,
+          Number(run.reserved_tokens),
+          normalizeAiBudgetDate(run.reservation_date),
+          client,
+        );
+      }
       const result = await client.query(
         `UPDATE write_canvas_agent_runs
-         SET status = $1, error = $2, completed_at = NOW(), updated_at = NOW()
+         SET status = $1, error = $2,
+             reserved_tokens = CASE WHEN provider_started THEN reserved_tokens ELSE 0 END,
+             completed_at = NOW(), updated_at = NOW()
          WHERE id = $3 AND batch_id = $4 AND user_id = $5 AND status IN ('queued','running')`,
         [input.status, input.error, input.runId, input.batchId, input.userId],
       );
@@ -6900,32 +7778,79 @@ async function startServer() {
     }
   };
 
-  const dailyPaidOperationBudgetMiddleware: express.RequestHandler = asyncHandler(async (req, res, next) => {
+  const createDailyPaidOperationBudgetMiddleware = (
+    resolveReservedTokens: (req: express.Request) => number,
+  ): express.RequestHandler => asyncHandler(async (req, res, next) => {
     const userId = req.session.userId;
     if (!userId) return res.status(401).json({ error: "请先登录" });
-    const reservation = await reserveDailyAiBudget(userId, getCanvasAgentMaxOutputTokens());
+    const reservedTokens = Math.max(1, Math.ceil(resolveReservedTokens(req)));
+    const reservation = await reserveDurableDailyAiBudget(userId, reservedTokens, req.path);
     if (!reservation) {
       res.setHeader("Retry-After", "3600");
       return res.status(429).json({ error: "今日 AI 使用额度已达到上限，请稍后再试" });
     }
+    res.locals.dailyAiBudgetReservationTokens = reservedTokens;
+    res.locals.dailyAiBudgetReservationDate = normalizeAiBudgetDate(reservation.usage_date);
+    res.locals.dailyAiBudgetReservationId = Number(reservation.id);
+    res.locals.dailyAiBudgetUserId = userId;
+    res.locals.dailyAiBudgetProviderStarted = false;
+    let refundPromise: Promise<void> | null = null;
+    const refundIfUnused = () => {
+      if (res.locals.dailyAiBudgetProviderStarted === true) return;
+      if (!refundPromise) {
+        refundPromise = refundDailyAiBudgetReservation(userId, res).catch(error => {
+          refundPromise = null;
+          logger.error({ err: error, module: "ai-budget", userId }, "Failed to refund unused AI budget reservation");
+        });
+      }
+    };
+    res.once("finish", refundIfUnused);
+    res.once("close", refundIfUnused);
     next();
   });
 
-  // --- Set/Change password (requires auth) ---
-  app.put("/api/auth/set-password", requireAuth, asyncHandler(async (req, res) => {
+  const WRITE_AGENT_MAX_PROVIDER_CALLS = 15;
+  const dailyPaidOperationBudgetMiddleware = createDailyPaidOperationBudgetMiddleware(() => getCanvasAgentMaxOutputTokens());
+  const skillCreationDailyPaidOperationBudgetMiddleware = createDailyPaidOperationBudgetMiddleware(() => 2000);
+  const writeAgentDailyPaidOperationBudgetMiddleware = createDailyPaidOperationBudgetMiddleware(
+    () => getCanvasAgentMaxOutputTokens() * WRITE_AGENT_MAX_PROVIDER_CALLS,
+  );
+  const translationDailyPaidOperationBudgetMiddleware = createDailyPaidOperationBudgetMiddleware(req => {
+    const segments = Array.isArray(req.body?.segments) ? req.body.segments : null;
+    const providerCalls = segments
+      ? Math.max(1, Math.min(50, segments.filter((segment: unknown) => typeof segment === "string" && segment.trim()).length))
+      : 1;
+    return getCanvasAgentMaxOutputTokens() * providerCalls;
+  });
+
+  // --- Set/Change password (requires recent proof of account ownership) ---
+  app.put("/api/auth/set-password", requireAuth, accountActionLimiter, asyncHandler(async (req, res) => {
     const password = req.body?.password || '';
     if (!password || password.length < 8) {
       return res.status(400).json({ error: '密码至少 8 个字符' });
     }
-    const passwordHash = await bcrypt.hash(password, 10);
-    const user = await updatePasswordAndInvalidateSessions(req.session.userId, passwordHash);
+    const user = (await pool.query(
+      `SELECT id, password_hash FROM users WHERE id = $1`,
+      [req.session.userId],
+    )).rows[0];
     if (!user) return res.status(404).json({ error: '用户不存在' });
-    await establishAuthenticatedSession(req, Number(user.id), String(user.email));
+    if (user.password_hash) {
+      const currentPassword = typeof req.body?.currentPassword === "string" ? req.body.currentPassword : "";
+      if (!currentPassword || !(await bcrypt.compare(currentPassword, user.password_hash))) {
+        return res.status(401).json({ error: "当前密码错误" });
+      }
+    } else if (!hasRecentAuthentication(req)) {
+      return res.status(403).json({ code: "REAUTH_REQUIRED", error: "请使用邮箱验证码重新登录后再设置密码" });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const updatedUser = await updatePasswordAndInvalidateSessions(req.session.userId, passwordHash);
+    if (!updatedUser) return res.status(404).json({ error: '用户不存在' });
+    await establishAuthenticatedSession(req, Number(updatedUser.id), String(updatedUser.email));
     return res.json({ success: true });
   }));
 
   // --- Reset password (forgot password: verify code + set new password, no auth) ---
-  app.post("/api/auth/reset-password", verificationCheckLimiter, asyncHandler(async (req, res) => {
+  app.post("/api/auth/reset-password", verificationCheckIpLimiter, verificationCheckLimiter, asyncHandler(async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
     const code = (req.body?.code || '').trim();
     const password = req.body?.password || '';
@@ -6936,7 +7861,6 @@ async function startServer() {
       return res.status(400).json({ error: '密码至少 8 个字符' });
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
     const client = await pool.connect();
     let user: { id: number } | null = null;
     try {
@@ -6962,6 +7886,7 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: '该邮箱未注册' });
       }
+      const passwordHash = await bcrypt.hash(password, 10);
       await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, user.id]);
       await invalidateUserSessions(Number(user.id), client);
       await client.query("COMMIT");
@@ -7464,7 +8389,7 @@ async function startServer() {
   }));
 
   // Save an article (mark as saved and extract cards)
-  app.post("/api/articles/:id/save", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, articleSaveConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/articles/:id/save", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, dailyPaidOperationBudgetMiddleware, articleSaveConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
     let article = articles.find(a => a.id === articleId);
     let isUserArticle = false;
@@ -7529,7 +8454,7 @@ async function startServer() {
 	      let extractionSkills: WriteAgentSkillRecord[] = [];
 	      if (!cardsToSave || cardsToSave.length === 0) {
 	        extractionSkills = (await resolveWriteAgentSkills(pool, req.session.userId)).filter(skill => skill.type === "card_storage" || skill.type === "citation");
-	        const extracted = await extractKnowledgeWithAI(article, extractionSkills);
+	        const extracted = await extractKnowledgeWithAI(article, extractionSkills, () => markDailyAiBudgetProviderStarted(res));
         const aiCards = extracted.cards;
         if (extracted.articleCitationContext) {
           articleCitationContext = extracted.articleCitationContext;
@@ -8042,6 +8967,17 @@ async function startServer() {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const referencedProjects = (await client.query(
+        `SELECT DISTINCT project_id
+         FROM write_canvas_nodes
+         WHERE user_id = $1 AND kind = 'saved_article' AND ref_id = $2
+         ORDER BY project_id`,
+        [req.session.userId, String(articleId)],
+      )).rows;
+      for (const project of referencedProjects) {
+        await assertNoActiveCanvasAiWork(client, req.session.userId, Number(project.project_id));
+      }
       await client.query(
         `DELETE FROM write_canvas_nodes
          WHERE user_id = $1 AND kind = 'saved_article' AND ref_id = $2`,
@@ -8059,6 +8995,7 @@ async function startServer() {
       return res.json({ success: true });
     } catch (error) {
       await client.query("ROLLBACK");
+      if (error instanceof CanvasAiActiveError) return res.status(409).json({ code: "CANVAS_AI_ACTIVE", error: error.message });
       throw error;
     } finally {
       client.release();
@@ -8067,7 +9004,7 @@ async function startServer() {
 
   // Translate article content (Baidu Translate API)
   // Supports both single string (content) and array of strings (segments) for paragraph-level translation
-  app.post("/api/translate", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/translate", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, translationDailyPaidOperationBudgetMiddleware, asyncHandler(async (req, res) => {
     const { content, segments, targetLang = 'zh' } = req.body;
     const maxTranslationSegments = 50;
     const maxTranslationCharacters = 50_000;
@@ -8131,6 +9068,7 @@ async function startServer() {
       const salt = Date.now().toString() + Math.random();
       const sign = crypto.createHash('md5').update(appid + text + salt + key).digest('hex');
       const params = new URLSearchParams({ q: text, from: 'auto', to: toLang, appid, salt, sign });
+      await markDailyAiBudgetProviderStarted(res);
       const response = await fetch(`https://fanyi-api.baidu.com/api/trans/vip/translate?${params}`, {
         signal: AbortSignal.timeout(15_000),
       });
@@ -8289,7 +9227,12 @@ async function startServer() {
     const projectId = Number(req.params.id);
     if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
     const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 80) : null;
-    const viewport = isPlainRecord(req.body?.viewport) ? req.body.viewport : null;
+    const viewport = req.body?.viewport === undefined
+      ? null
+      : normalizeBoundedJsonObject(req.body.viewport, WRITE_CANVAS_MAX_VIEWPORT_BYTES);
+    if (req.body?.viewport !== undefined && !viewport) {
+      return res.status(413).json({ error: "viewport payload is too large" });
+    }
     const row = (await pool.query(
       `UPDATE write_canvas_projects
        SET name = COALESCE($1, name),
@@ -8311,14 +9254,20 @@ async function startServer() {
     try {
       await client.query("BEGIN");
       await lockCanvasUser(client, req.session.userId);
+      const project = (await client.query(
+        `SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [projectId, req.session.userId],
+      )).rows[0];
+      if (!project) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      await assertNoActiveCanvasAiWork(client, req.session.userId, projectId);
       const result = await client.query(
         `DELETE FROM write_canvas_projects WHERE id = $1 AND user_id = $2`,
         [projectId, req.session.userId]
       );
-      if (result.rowCount === 0) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ error: "project not found" });
-      }
+      if (result.rowCount !== 1) throw new Error("Canvas project deletion lost its ownership lock");
       const remaining = (await client.query(
         `SELECT id FROM write_canvas_projects WHERE user_id = $1 LIMIT 1`,
         [req.session.userId]
@@ -8333,6 +9282,7 @@ async function startServer() {
       res.json({ success: true });
     } catch (error) {
       await client.query("ROLLBACK");
+      if (error instanceof CanvasAiActiveError) return res.status(409).json({ code: "CANVAS_AI_ACTIVE", error: error.message });
       throw error;
     } finally {
       client.release();
@@ -8356,7 +9306,8 @@ async function startServer() {
     const y = clampNumber(req.body?.y, 120, -100000, 100000);
     const width = clampNumber(req.body?.width, kind === "agent" ? 360 : 280, 160, 1200);
     const height = clampNumber(req.body?.height, kind === "agent" ? 260 : 180, 120, 1000);
-    const meta = normalizeJsonObject(req.body?.meta);
+    const meta = normalizeBoundedJsonObject(req.body?.meta);
+    if (!meta) return res.status(413).json({ error: "node metadata is too large" });
     let title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 120) : "";
     let summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 500) : "";
     let refId: string | null = typeof req.body?.refId === "string" || typeof req.body?.refId === "number" ? String(req.body.refId) : null;
@@ -8449,8 +9400,12 @@ async function startServer() {
       title = title || asset.title || "上传资料";
       summary = summary || normalizePlainText(asset.extracted_text || "").slice(0, 180);
       } else if (["saved_article", "atom_card", "note"].includes(kind)) {
-      const referenceId = Number(refId);
-      if (!Number.isSafeInteger(referenceId) || referenceId <= 0) return await fail(400, "valid refId is required");
+      const referenceId = kind === "atom_card" ? String(refId || "").trim() : Number(refId);
+      if (kind === "atom_card") {
+        if (!referenceId || String(referenceId).length > 128) return await fail(400, "valid refId is required");
+      } else if (!Number.isSafeInteger(referenceId) || Number(referenceId) <= 0) {
+        return await fail(400, "valid refId is required");
+      }
       const table = kind === "saved_article" ? "saved_articles" : kind === "atom_card" ? "saved_cards" : "notes";
       const reference = (await client.query(
         `SELECT id FROM ${table} WHERE id = $1 AND user_id = $2`,
@@ -8460,6 +9415,12 @@ async function startServer() {
       refId = String(referenceId);
       }
 
+      await assertCanvasStorageQuota(client, req.session.userId, estimateCanvasStorageBytes({
+        title: title || "未命名节点",
+        summary,
+        businessRef,
+        meta,
+      }));
       const nodeRow = (await client.query(
       `INSERT INTO write_canvas_nodes
          (user_id, project_id, kind, node_role, content_type, origin, status, business_ref, title, summary, ref_id, asset_id, agent_id, meta, x, y, width, height)
@@ -8501,6 +9462,11 @@ async function startServer() {
   app.put("/api/write/canvas/nodes/:id", requireAuth, asyncHandler(async (req, res) => {
     const nodeId = Number(req.params.id);
     if (!Number.isFinite(nodeId)) return res.status(400).json({ error: "invalid node id" });
+    const hasGeometryUpdate = ["x", "y", "width", "height"].some(field => req.body?.[field] !== undefined);
+    const expectedUpdatedAt = typeof req.body?.expectedUpdatedAt === "string" ? req.body.expectedUpdatedAt : "";
+    if (hasGeometryUpdate && (!expectedUpdatedAt || !Number.isFinite(Date.parse(expectedUpdatedAt)))) {
+      return res.status(428).json({ code: "GEOMETRY_VERSION_REQUIRED", error: "node geometry updates require expectedUpdatedAt" });
+    }
     const current = (await pool.query(
       `SELECT id, project_id, agent_id, document_id FROM write_canvas_nodes WHERE id = $1 AND user_id = $2`,
       [nodeId, req.session.userId]
@@ -8518,7 +9484,8 @@ async function startServer() {
     }
     const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 120) : null;
     const summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 500) : null;
-    const meta = isPlainRecord(req.body?.meta) ? req.body.meta : null;
+    const meta = req.body?.meta === undefined ? null : normalizeBoundedJsonObject(req.body.meta);
+    if (req.body?.meta !== undefined && !meta) return res.status(413).json({ error: "node metadata is too large" });
     const role = req.body?.role === undefined ? null : normalizeCanvasNodeRole(req.body.role);
     const origin = req.body?.origin === undefined ? null : normalizeCanvasNodeOrigin(req.body.origin);
     const status = req.body?.status === undefined ? null : normalizeCanvasNodeStatus(req.body.status);
@@ -8527,62 +9494,128 @@ async function startServer() {
     }
     const contentType = typeof req.body?.contentType === "string" ? req.body.contentType.trim().slice(0, 80) : null;
     const businessRef = typeof req.body?.businessRef === "string" ? req.body.businessRef.trim().slice(0, 500) : null;
-    await pool.query(
-      `UPDATE write_canvas_nodes
-       SET title = COALESCE($1, title),
-           summary = COALESCE($2, summary),
-           meta = COALESCE($3, meta),
-           x = COALESCE($4, x),
-           y = COALESCE($5, y),
-           width = COALESCE($6, width),
-           height = COALESCE($7, height),
-           node_role = COALESCE($8, node_role),
-           content_type = COALESCE($9, content_type),
-           origin = COALESCE($10, origin),
-           status = COALESCE($11, status),
-           business_ref = COALESCE($12, business_ref),
-           updated_at = NOW()
-       WHERE id = $13 AND user_id = $14`,
-      [
-        title,
-        summary,
-        meta ? JSON.stringify(meta) : null,
-        req.body?.x === undefined ? null : clampNumber(req.body.x, 0, -100000, 100000),
-        req.body?.y === undefined ? null : clampNumber(req.body.y, 0, -100000, 100000),
-        req.body?.width === undefined ? null : clampNumber(req.body.width, 280, 160, 1200),
-        req.body?.height === undefined ? null : clampNumber(req.body.height, 180, 120, 1000),
-        role,
-        contentType,
-        origin,
-        status,
-        businessRef,
-        nodeId,
-        req.session.userId
-      ]
-    );
-    if (current.agent_id) {
-      const defaults = getDefaultCanvasAgentConfig();
-      await pool.query(
-        `UPDATE write_agent_instances
-         SET name = COALESCE($1, name),
-             model = COALESCE($2, model),
-             system_prompt = COALESCE($3, system_prompt),
-             temperature = COALESCE($4, temperature),
-             top_p = COALESCE($5, top_p),
-             max_tokens = COALESCE($6, max_tokens),
+    const defaults = getDefaultCanvasAgentConfig();
+    const nextSystemPrompt = typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : null;
+    const nextTemperature = req.body?.temperature === undefined ? null : clampNumber(req.body.temperature, defaults.temperature, 0, 2);
+    const nextTopP = req.body?.topP === undefined ? null : clampNumber(req.body.topP, defaults.topP, 0.01, 1);
+    const nextMaxTokens = req.body?.maxTokens === undefined
+      ? null
+      : Math.round(clampNumber(req.body.maxTokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens()));
+    const updateClient = await pool.connect();
+    try {
+      await updateClient.query("BEGIN");
+      await lockCanvasUser(updateClient, req.session.userId);
+      const fresh = (await updateClient.query(
+        `SELECT n.id, n.project_id, n.agent_id, n.title, n.summary, n.meta, n.business_ref,
+                n.x, n.y, n.width, n.height, n.updated_at,
+                ai.name AS agent_name, ai.model AS agent_model, ai.system_prompt,
+                ai.temperature, ai.top_p, ai.max_tokens
+         FROM write_canvas_nodes n
+         LEFT JOIN write_agent_instances ai ON ai.id = n.agent_id AND ai.user_id = n.user_id
+         WHERE n.id = $1 AND n.user_id = $2
+         FOR UPDATE OF n`,
+        [nodeId, req.session.userId],
+      )).rows[0];
+      if (!fresh) {
+        await updateClient.query("ROLLBACK");
+        return res.status(404).json({ error: "node not found" });
+      }
+      if (hasGeometryUpdate && new Date(fresh.updated_at).toISOString() !== expectedUpdatedAt) {
+        await updateClient.query("ROLLBACK");
+        return res.status(409).json({
+          code: "NODE_VERSION_CONFLICT",
+          error: "节点已在其他窗口更新",
+          node: {
+            id: Number(fresh.id),
+            x: Number(fresh.x),
+            y: Number(fresh.y),
+            width: Number(fresh.width),
+            height: Number(fresh.height),
+            updatedAt: new Date(fresh.updated_at).toISOString(),
+          },
+        });
+      }
+      const currentNodeBytes = getJsonByteLength({
+        title: fresh.title,
+        summary: fresh.summary,
+        meta: fresh.meta,
+        businessRef: fresh.business_ref,
+      });
+      const nextNodeBytes = getJsonByteLength({
+        title: title ?? fresh.title,
+        summary: summary ?? fresh.summary,
+        meta: meta ?? fresh.meta,
+        businessRef: businessRef ?? fresh.business_ref,
+      });
+      const currentAgentBytes = fresh.agent_id ? getJsonByteLength({
+        name: fresh.agent_name,
+        model: fresh.agent_model,
+        systemPrompt: fresh.system_prompt,
+      }) : 0;
+      const nextAgentBytes = fresh.agent_id ? getJsonByteLength({
+        name: title ?? fresh.agent_name,
+        model: requestedAgentModel ?? fresh.agent_model,
+        systemPrompt: nextSystemPrompt ?? fresh.system_prompt,
+      }) : 0;
+      await assertCanvasStorageQuota(
+        updateClient,
+        req.session.userId,
+        Math.max(0, nextNodeBytes - currentNodeBytes) + Math.max(0, nextAgentBytes - currentAgentBytes),
+      );
+      await updateClient.query(
+        `UPDATE write_canvas_nodes
+         SET title = COALESCE($1, title),
+             summary = COALESCE($2, summary),
+             meta = COALESCE($3, meta),
+             x = COALESCE($4, x),
+             y = COALESCE($5, y),
+             width = COALESCE($6, width),
+             height = COALESCE($7, height),
+             node_role = COALESCE($8, node_role),
+             content_type = COALESCE($9, content_type),
+             origin = COALESCE($10, origin),
+             status = COALESCE($11, status),
+             business_ref = COALESCE($12, business_ref),
              updated_at = NOW()
-         WHERE id = $7 AND user_id = $8`,
+         WHERE id = $13 AND user_id = $14`,
         [
           title,
-          requestedAgentModel,
-          typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : null,
-          req.body?.temperature === undefined ? null : clampNumber(req.body.temperature, defaults.temperature, 0, 2),
-          req.body?.topP === undefined ? null : clampNumber(req.body.topP, defaults.topP, 0.01, 1),
-          req.body?.maxTokens === undefined ? null : Math.round(clampNumber(req.body.maxTokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens())),
-          current.agent_id,
-          req.session.userId
-        ]
+          summary,
+          meta ? JSON.stringify(meta) : null,
+          req.body?.x === undefined ? null : clampNumber(req.body.x, 0, -100000, 100000),
+          req.body?.y === undefined ? null : clampNumber(req.body.y, 0, -100000, 100000),
+          req.body?.width === undefined ? null : clampNumber(req.body.width, 280, 160, 1200),
+          req.body?.height === undefined ? null : clampNumber(req.body.height, 180, 120, 1000),
+          role,
+          contentType,
+          origin,
+          status,
+          businessRef,
+          nodeId,
+          req.session.userId,
+        ],
       );
+      if (fresh.agent_id) {
+        await updateClient.query(
+          `UPDATE write_agent_instances
+           SET name = COALESCE($1, name),
+               model = COALESCE($2, model),
+               system_prompt = COALESCE($3, system_prompt),
+               temperature = COALESCE($4, temperature),
+               top_p = COALESCE($5, top_p),
+               max_tokens = COALESCE($6, max_tokens),
+               updated_at = NOW()
+           WHERE id = $7 AND user_id = $8`,
+          [title, requestedAgentModel, nextSystemPrompt, nextTemperature, nextTopP, nextMaxTokens, fresh.agent_id, req.session.userId],
+        );
+      }
+      await updateClient.query("COMMIT");
+    } catch (error) {
+      await updateClient.query("ROLLBACK");
+      if (error instanceof CanvasStorageLimitError) return res.status(413).json({ error: error.message });
+      throw error;
+    } finally {
+      updateClient.release();
     }
     const detail = await fetchCanvasProjectDetail(pool, req.session.userId, Number(current.project_id));
     const node = detail?.nodes.find(item => item.id === nodeId);
@@ -8596,8 +9629,9 @@ async function startServer() {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
       const current = (await client.query(
-        `SELECT id, agent_id, asset_id
+        `SELECT id, project_id, agent_id, asset_id, document_id
          FROM write_canvas_nodes
          WHERE id = $1 AND user_id = $2
          FOR UPDATE`,
@@ -8607,10 +9641,20 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: "node not found" });
       }
+      await assertNoActiveCanvasAiWork(client, req.session.userId, Number(current.project_id));
       if (current.asset_id) {
         await client.query(
           `SELECT id FROM write_canvas_assets WHERE id = $1 AND user_id = $2 FOR UPDATE`,
           [current.asset_id, req.session.userId]
+        );
+      }
+
+      if (current.document_id) {
+        await client.query(
+          `DELETE FROM write_canvas_nodes
+           WHERE user_id = $1 AND content_type = 'document_section'
+             AND meta->>'documentId' = $2`,
+          [req.session.userId, String(current.document_id)],
         );
       }
 
@@ -8644,6 +9688,7 @@ async function startServer() {
       res.json({ success: true });
     } catch (error) {
       await client.query("ROLLBACK");
+      if (error instanceof CanvasAiActiveError) return res.status(409).json({ code: "CANVAS_AI_ACTIVE", error: error.message });
       throw error;
     } finally {
       client.release();
@@ -8659,27 +9704,189 @@ async function startServer() {
       return res.status(400).json({ error: "projectId, sourceNodeId and targetNodeId are required" });
     }
     if (!relation) return res.status(400).json({ error: "invalid edge relation" });
+    if (relation !== "context" && relation !== "structure") return res.status(400).json({ error: "business lineage edges are managed by canvas operations" });
     if (sourceNodeId === targetNodeId) return res.status(400).json({ error: "cannot connect node to itself" });
-    const nodes = (await pool.query(
-      `SELECT id, kind FROM write_canvas_nodes
-       WHERE user_id = $1 AND project_id = $2 AND id = ANY($3::bigint[])`,
-      [req.session.userId, projectId, [sourceNodeId, targetNodeId]]
-    )).rows;
-    if (nodes.length !== 2) return res.status(404).json({ error: "nodes not found" });
-    const source = nodes.find(node => Number(node.id) === sourceNodeId);
-    const target = nodes.find(node => Number(node.id) === targetNodeId);
-    if (relation === "context" && (target?.kind !== "agent" || source?.kind === "agent")) {
-      return res.status(400).json({ error: "context edges must connect a non-agent source to an agent target" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const project = (await client.query(
+        `SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [projectId, req.session.userId],
+      )).rows[0];
+      if (!project) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const nodes = (await client.query(
+        `SELECT id, kind, node_role, content_type, status FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND id = ANY($3::bigint[])
+         FOR SHARE`,
+        [req.session.userId, projectId, [sourceNodeId, targetNodeId]],
+      )).rows;
+      if (nodes.length !== 2) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "nodes not found" });
+      }
+      const source = nodes.find(node => Number(node.id) === sourceNodeId);
+      const target = nodes.find(node => Number(node.id) === targetNodeId);
+      const targetAcceptsContext = target?.kind === "agent"
+        || (target?.node_role === "task" && target?.content_type === "agent_group");
+      const sourceAcceptsContext = source?.kind !== "agent"
+        && source?.status !== "rejected"
+        && source?.node_role !== "task";
+      if (relation === "context" && (!targetAcceptsContext || !sourceAcceptsContext)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "context edges must connect an active material, insight or document source to an Agent task" });
+      }
+      const sourceAcceptsStructure = source?.kind !== "agent"
+        && source?.node_role !== "task"
+        && source?.node_role !== "group"
+        && source?.status !== "rejected";
+      const targetAcceptsStructure = target?.kind !== "agent"
+        && target?.node_role !== "task"
+        && target?.node_role !== "group"
+        && target?.status !== "rejected";
+      if (relation === "structure" && (!sourceAcceptsStructure || !targetAcceptsStructure)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "structure edges must connect active non-task content nodes" });
+      }
+      const existing = (await client.query(
+        `SELECT id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                target_node_id AS "targetNodeId", relation, created_at AS "createdAt"
+         FROM write_canvas_edges
+         WHERE user_id = $1 AND project_id = $2 AND source_node_id = $3 AND target_node_id = $4 AND relation = $5
+         FOR UPDATE`,
+        [req.session.userId, projectId, sourceNodeId, targetNodeId, relation],
+      )).rows[0];
+      if (existing) {
+        await client.query("COMMIT");
+        return res.json({ edge: mapCanvasEdgeRow(existing) });
+      }
+      if (relation === "structure") {
+        const createsCycle = Boolean((await client.query(
+          `WITH RECURSIVE descendants(node_id) AS (
+             SELECT target_node_id FROM write_canvas_edges
+             WHERE user_id = $1 AND project_id = $2 AND source_node_id = $3 AND relation = 'structure'
+             UNION
+             SELECT edge.target_node_id
+             FROM write_canvas_edges edge
+             JOIN descendants ON edge.source_node_id = descendants.node_id
+             WHERE edge.user_id = $1 AND edge.project_id = $2 AND edge.relation = 'structure'
+           )
+           SELECT 1 FROM descendants WHERE node_id = $4 LIMIT 1`,
+          [req.session.userId, projectId, targetNodeId, sourceNodeId],
+        )).rows[0]);
+        if (createsCycle) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({ error: "structure edge would create a cycle" });
+        }
+      }
+      const edgeCount = Number((await client.query(
+        `SELECT COUNT(*)::int AS count FROM write_canvas_edges WHERE user_id = $1 AND project_id = $2`,
+        [req.session.userId, projectId],
+      )).rows[0]?.count || 0);
+      if (edgeCount >= WRITE_CANVAS_MAX_EDGES_PER_PROJECT) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目连线数量已达到上限" });
+      }
+      await assertCanvasStorageQuota(client, req.session.userId, estimateCanvasStorageBytes({ relation }));
+      const row = (await client.query(
+        `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                   target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+        [req.session.userId, projectId, sourceNodeId, targetNodeId, relation],
+      )).rows[0];
+      await client.query("COMMIT");
+      return res.json({ edge: mapCanvasEdgeRow(row) });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if (error instanceof CanvasStorageLimitError) return res.status(413).json({ error: error.message });
+      throw error;
+    } finally {
+      client.release();
     }
-    const row = (await pool.query(
-      `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO UPDATE SET relation = EXCLUDED.relation
-       RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
-                 target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
-      [req.session.userId, projectId, sourceNodeId, targetNodeId, relation]
-    )).rows[0];
-    res.json({ edge: mapCanvasEdgeRow(row) });
+  }));
+
+  app.post("/api/write/canvas/edges/replace", requireAuth, asyncHandler(async (req, res) => {
+    const edgeId = Number(req.body?.edgeId);
+    const sourceNodeId = Number(req.body?.sourceNodeId);
+    const targetNodeId = Number(req.body?.targetNodeId);
+    if (![edgeId, sourceNodeId, targetNodeId].every(value => Number.isSafeInteger(value) && value > 0)) {
+      return res.status(400).json({ error: "edgeId, sourceNodeId and targetNodeId are required" });
+    }
+    if (sourceNodeId === targetNodeId) return res.status(400).json({ error: "cannot connect node to itself" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const edge = (await client.query(
+        `SELECT id, project_id, relation FROM write_canvas_edges
+         WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [edgeId, req.session.userId],
+      )).rows[0];
+      if (!edge) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "edge not found" });
+      }
+      if (edge.relation !== "context") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "only context edges can be replaced" });
+      }
+      const projectId = Number(edge.project_id);
+      const nodes = (await client.query(
+        `SELECT id, kind, node_role, content_type, status FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND id = ANY($3::bigint[])
+         FOR SHARE`,
+        [req.session.userId, projectId, [sourceNodeId, targetNodeId]],
+      )).rows;
+      if (nodes.length !== 2) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "nodes not found" });
+      }
+      const source = nodes.find(node => Number(node.id) === sourceNodeId);
+      const target = nodes.find(node => Number(node.id) === targetNodeId);
+      const targetAcceptsContext = target?.kind === "agent"
+        || (target?.node_role === "task" && target?.content_type === "agent_group");
+      const sourceAcceptsContext = source?.kind !== "agent"
+        && source?.status !== "rejected"
+        && source?.node_role !== "task";
+      if (!targetAcceptsContext || !sourceAcceptsContext) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "context edges must connect an active material, insight or document source to an Agent task" });
+      }
+      const duplicate = (await client.query(
+        `SELECT id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                target_node_id AS "targetNodeId", relation, created_at AS "createdAt"
+         FROM write_canvas_edges
+         WHERE user_id = $1 AND project_id = $2 AND source_node_id = $3 AND target_node_id = $4
+           AND relation = 'context' AND id <> $5
+         FOR UPDATE`,
+        [req.session.userId, projectId, sourceNodeId, targetNodeId, edgeId],
+      )).rows[0];
+      let row: Record<string, unknown>;
+      if (duplicate) {
+        await client.query(`DELETE FROM write_canvas_edges WHERE id = $1 AND user_id = $2`, [edgeId, req.session.userId]);
+        row = duplicate;
+      } else {
+        row = (await client.query(
+          `UPDATE write_canvas_edges
+           SET source_node_id = $1, target_node_id = $2
+           WHERE id = $3 AND user_id = $4
+           RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                     target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+          [sourceNodeId, targetNodeId, edgeId, req.session.userId],
+        )).rows[0];
+      }
+      await client.query("COMMIT");
+      return res.json({ edge: mapCanvasEdgeRow(row) });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }));
 
   app.delete("/api/write/canvas/edges", requireAuth, asyncHandler(async (req, res) => {
@@ -8705,6 +9912,10 @@ async function startServer() {
   app.post("/api/write/canvas/projects/:projectId/documents", requireAuth, asyncHandler(async (req, res) => {
     const projectId = Number(req.params.projectId);
     if (!Number.isSafeInteger(projectId) || projectId <= 0) return res.status(400).json({ error: "invalid project id" });
+    const sourceNodeId = req.body?.sourceNodeId === undefined ? null : Number(req.body.sourceNodeId);
+    if (sourceNodeId !== null && (!Number.isSafeInteger(sourceNodeId) || sourceNodeId <= 0)) {
+      return res.status(400).json({ error: "invalid source node id" });
+    }
     const title = typeof req.body?.title === "string" && req.body.title.trim() ? req.body.title.trim().slice(0, 240) : "未命名文档";
     const summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 1000) : "";
     const scenario = typeof req.body?.scenario === "string" ? req.body.scenario.trim().slice(0, 240) : "";
@@ -8727,6 +9938,14 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: "project not found" });
       }
+      const sourceNode = sourceNodeId === null ? null : (await client.query(
+        `SELECT id FROM write_canvas_nodes WHERE id = $1 AND user_id = $2 AND project_id = $3 FOR SHARE`,
+        [sourceNodeId, req.session.userId, projectId],
+      )).rows[0];
+      if (sourceNodeId !== null && !sourceNode) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "source node not found" });
+      }
       const nodeCount = Number((await client.query(
         `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
         [projectId, req.session.userId],
@@ -8735,6 +9954,7 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(413).json({ error: "项目节点数量已达到上限" });
       }
+      if (sourceNodeId !== null) await assertCanvasEdgeCapacity(client, req.session.userId, projectId);
       const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
       const documentValues = { title, summary, scenario, status };
       if (storedBytes + getCanvasDocumentBytes(documentValues, sections) > canvasUserStorageMaxBytes) {
@@ -8754,6 +9974,14 @@ async function startServer() {
          RETURNING id`,
         [req.session.userId, projectId, status, documentId, title, summary, JSON.stringify({ scenario }), x, y, width, height],
       )).rows[0];
+      if (sourceNodeId !== null) {
+        await client.query(
+          `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+           VALUES ($1, $2, $3, $4, 'generated')
+           ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO NOTHING`,
+          [req.session.userId, projectId, sourceNodeId, Number(nodeRow.id)],
+        );
+      }
       await client.query(`UPDATE write_canvas_documents SET node_id = $1 WHERE id = $2 AND user_id = $3`, [Number(nodeRow.id), documentId, req.session.userId]);
       await writeCanvasDocumentSnapshot(client, req.session.userId, documentId, documentValues, sections);
       await client.query("COMMIT");
@@ -8761,6 +9989,7 @@ async function startServer() {
       return res.json({ document });
     } catch (error) {
       await client.query("ROLLBACK");
+      if (error instanceof CanvasStorageLimitError) return res.status(413).json({ error: error.message });
       throw error;
     } finally {
       client.release();
@@ -8778,18 +10007,32 @@ async function startServer() {
   app.put("/api/write/canvas/documents/:id", requireAuth, asyncHandler(async (req, res) => {
     const documentId = Number(req.params.id);
     if (!Number.isSafeInteger(documentId) || documentId <= 0) return res.status(400).json({ error: "invalid document id" });
+    const rawCurrentVersionId = req.body?.currentVersionId;
+    const expectedCurrentVersionId = rawCurrentVersionId === null ? null : Number(rawCurrentVersionId);
+    if (rawCurrentVersionId === undefined || (expectedCurrentVersionId !== null && (!Number.isSafeInteger(expectedCurrentVersionId) || expectedCurrentVersionId <= 0))) {
+      return res.status(400).json({ error: "currentVersionId is required" });
+    }
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
       await lockCanvasUser(client, req.session.userId);
       const current = (await client.query(
-        `SELECT id, project_id, node_id, title, summary, scenario, status
+        `SELECT id, project_id, node_id, title, summary, scenario, status, current_version_id
          FROM write_canvas_documents WHERE id = $1 AND user_id = $2 FOR UPDATE`,
         [documentId, req.session.userId],
       )).rows[0];
       if (!current) {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: "document not found" });
+      }
+      const currentVersionId = current.current_version_id === null ? null : Number(current.current_version_id);
+      if (currentVersionId !== expectedCurrentVersionId) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          code: "DOCUMENT_VERSION_CONFLICT",
+          error: "作品已在其他窗口更新，请刷新后合并修改",
+          currentVersionId,
+        });
       }
       const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 240) : current.title;
       const summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 1000) : current.summary;
@@ -8810,6 +10053,7 @@ async function startServer() {
         return res.status(400).json({ error: "invalid document sections" });
       }
       const documentValues = { title, summary, scenario, status };
+      await pruneCanvasDocumentVersions(client, req.session.userId, documentId, CANVAS_DOCUMENT_MAX_VERSIONS - 1);
       const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
       const additionalBytes = getCanvasDocumentUpdateAdditionalBytes(
         { title: current.title, summary: current.summary, scenario: current.scenario, status: current.status },
@@ -8821,6 +10065,13 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(413).json({ error: "画布资料存储额度已用完，请删除旧资料后重试" });
       }
+      await client.query(
+        `DELETE FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND content_type = 'document_section'
+           AND meta->>'documentId' = $3
+           AND NOT (COALESCE(meta->>'sectionKey', '') = ANY($4::text[]))`,
+        [req.session.userId, Number(current.project_id), String(documentId), sections.map(section => section.key)],
+      );
       await writeCanvasDocumentSnapshot(client, req.session.userId, documentId, documentValues, sections);
       await client.query(
         `UPDATE write_canvas_nodes SET title = $1, summary = $2, status = $3, meta = jsonb_set(meta, '{scenario}', to_jsonb($4::text), true), updated_at = NOW()
@@ -8854,7 +10105,113 @@ async function startServer() {
     return res.json({ versions });
   }));
 
+  app.post("/api/write/canvas/documents/:id/sections/:sectionKey/project", requireAuth, asyncHandler(async (req, res) => {
+    const documentId = Number(req.params.id);
+    const sectionKey = req.params.sectionKey;
+    if (!Number.isSafeInteger(documentId) || documentId <= 0 || !/^[a-zA-Z0-9_-]{1,120}$/.test(sectionKey)) {
+      return res.status(400).json({ error: "invalid document section" });
+    }
+    const client = await pool.connect();
+    let projectId = 0;
+    let nodeId = 0;
+    let edgeRow: Record<string, unknown> | null = null;
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const section = (await client.query(
+        `SELECT d.project_id, d.node_id AS document_node_id, d.status,
+                s.stable_key, s.sort_order, s.heading, s.body,
+                n.x AS document_x, n.y AS document_y
+         FROM write_canvas_documents d
+         JOIN write_canvas_document_sections s ON s.document_id = d.id AND s.user_id = d.user_id
+         JOIN write_canvas_nodes n ON n.id = d.node_id AND n.user_id = d.user_id AND n.project_id = d.project_id
+         WHERE d.id = $1 AND d.user_id = $2 AND s.stable_key = $3
+         FOR UPDATE OF d, s, n`,
+        [documentId, req.session.userId, sectionKey],
+      )).rows[0];
+      if (!section) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "document section not found" });
+      }
+      projectId = Number(section.project_id);
+      const businessRef = `${documentId}:${sectionKey}`;
+      const existing = (await client.query(
+        `SELECT id FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND content_type = 'document_section' AND business_ref = $3
+         FOR UPDATE`,
+        [req.session.userId, projectId, businessRef],
+      )).rows[0];
+      if (!existing) {
+        const nodeCount = Number((await client.query(
+          `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
+          [projectId, req.session.userId],
+        )).rows[0]?.count || 0);
+        if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+          await client.query("ROLLBACK");
+          return res.status(413).json({ error: "项目节点数量已达到上限" });
+        }
+      }
+      const title = section.heading || `段落 ${Number(section.sort_order) + 1}`;
+      const summary = normalizePlainText(section.body || "").slice(0, 500);
+      const meta = { documentId, sectionKey };
+      await assertCanvasStorageQuota(client, req.session.userId, estimateCanvasStorageBytes({ title, summary, businessRef, meta }));
+      const node = (await client.query(
+        `INSERT INTO write_canvas_nodes
+           (user_id, project_id, kind, node_role, content_type, origin, status, business_ref, title, summary, meta, x, y, width, height)
+         VALUES ($1, $2, 'note', 'document', 'document_section', 'manual', $3, $4, $5, $6, $7::jsonb, $8, $9, 340, 220)
+         ON CONFLICT (user_id, project_id, content_type, business_ref)
+           WHERE content_type = 'document_section' AND business_ref IS NOT NULL
+         DO UPDATE SET title = EXCLUDED.title, summary = EXCLUDED.summary, status = EXCLUDED.status,
+                       meta = EXCLUDED.meta, updated_at = NOW()
+         RETURNING id`,
+        [
+          req.session.userId,
+          projectId,
+          section.status,
+          businessRef,
+          title,
+          summary,
+          JSON.stringify(meta),
+          Number(section.document_x) + 420,
+          Number(section.document_y) + Number(section.sort_order) * 240,
+        ],
+      )).rows[0];
+      nodeId = Number(node.id);
+      const existingEdge = (await client.query(
+        `SELECT id FROM write_canvas_edges
+         WHERE user_id = $1 AND project_id = $2 AND source_node_id = $3 AND target_node_id = $4 AND relation = 'structure'
+         FOR UPDATE`,
+        [req.session.userId, projectId, Number(section.document_node_id), nodeId],
+      )).rows[0];
+      if (!existingEdge) await assertCanvasEdgeCapacity(client, req.session.userId, projectId);
+      edgeRow = (await client.query(
+        `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+         VALUES ($1, $2, $3, $4, 'structure')
+         ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO UPDATE SET relation = EXCLUDED.relation
+         RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                   target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+        [req.session.userId, projectId, Number(section.document_node_id), nodeId],
+      )).rows[0];
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if (error instanceof CanvasStorageLimitError) return res.status(413).json({ error: error.message });
+      throw error;
+    } finally {
+      client.release();
+    }
+    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, projectId);
+    return res.json({
+      node: detail?.nodes.find(item => item.id === nodeId),
+      edge: edgeRow ? mapCanvasEdgeRow(edgeRow) : null,
+    });
+  }));
+
   app.post("/api/write/canvas/assets/upload", requireAuth, uploadLimiter, uploadConcurrencyMiddleware, canvasAssetUpload.single("file"), asyncHandler(async (req, res) => {
+    const releaseCanvasUploadConcurrency = typeof res.locals.beginCanvasUploadProcessing === "function"
+      ? res.locals.beginCanvasUploadProcessing()
+      : () => undefined;
+    try {
     const projectId = Number(req.body?.projectId);
     if (!Number.isFinite(projectId)) return res.status(400).json({ error: "projectId is required" });
     if (!req.file) return res.status(400).json({ error: "file is required" });
@@ -8870,14 +10227,17 @@ async function startServer() {
     const project = (await pool.query(`SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2`, [projectId, req.session.userId])).rows[0];
     if (!project) return res.status(404).json({ error: "project not found" });
     const isImage = req.file.mimetype.startsWith("image/");
+    let extractionError: string | null = null;
     const extractedText = isImage ? "" : await extractCanvasFileText(req.file).catch(error => {
       logger.warn({ err: error, module: "canvas-upload", fileName: req.file?.originalname }, "Canvas file text extraction failed");
+      extractionError = error instanceof Error ? error.message.slice(0, 500) : "文件文本提取失败";
       return "";
     });
     const title = (typeof req.body?.title === "string" && req.body.title.trim())
       ? req.body.title.trim().slice(0, 120)
       : req.file.originalname || "上传资料";
-    const dataUrl = isImage ? `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}` : null;
+    // Preserve the original for retry, download and future parsers even when extraction fails.
+    const dataUrl = `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}`;
     const assetType = isImage ? "image" : "file";
     const client = await pool.connect();
     let nodeId: number;
@@ -8900,7 +10260,10 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(413).json({ error: "项目节点数量已达到上限" });
       }
-      const newAssetBytes = Buffer.byteLength(dataUrl || "", "utf8") + Buffer.byteLength(extractedText, "utf8");
+      const uploadMeta = { size: req.file.size, extractionError };
+      const newAssetBytes = Buffer.byteLength(dataUrl, "utf8")
+        + Buffer.byteLength(extractedText, "utf8")
+        + Buffer.byteLength(JSON.stringify(uploadMeta), "utf8");
       const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
       if (storedBytes + newAssetBytes > canvasUserStorageMaxBytes) {
         await client.query("ROLLBACK");
@@ -8920,23 +10283,25 @@ async function startServer() {
           req.file.originalname,
           req.file.mimetype,
           dataUrl,
-          JSON.stringify({ size: req.file.size })
+          JSON.stringify(uploadMeta)
         ]
       )).rows[0];
       const nodeKind = isImage ? "asset_image" : "asset_file";
       const nodeResponse = await client.query(
         `INSERT INTO write_canvas_nodes
            (user_id, project_id, kind, node_role, content_type, origin, status, title, summary, asset_id, meta, x, y, width, height)
-         VALUES ($1, $2, $3, 'material', $4, 'existing', 'ready', $5, $6, $7, '{}'::jsonb, $8, $9, $10, $11)
+         VALUES ($1, $2, $3, 'material', $4, 'existing', $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13)
          RETURNING id`,
         [
           req.session.userId,
           projectId,
           nodeKind,
           isImage ? "image" : "file",
+          extractionError ? "failed" : "ready",
           title,
           isImage ? "图片资料" : normalizePlainText(extractedText).slice(0, 180),
           Number(assetRow.id),
+          JSON.stringify(extractionError ? { extractionError } : {}),
           clampNumber(req.body?.x, 180, -100000, 100000),
           clampNumber(req.body?.y, 180, -100000, 100000),
           isImage ? 280 : 300,
@@ -8947,6 +10312,7 @@ async function startServer() {
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
+      if (error instanceof CanvasStorageLimitError) return res.status(413).json({ error: error.message });
       throw error;
     } finally {
       client.release();
@@ -8954,6 +10320,29 @@ async function startServer() {
     const detail = await fetchCanvasProjectDetail(pool, req.session.userId, projectId);
     const node = detail?.nodes.find(item => item.id === nodeId);
     res.json({ node });
+    } finally {
+      releaseCanvasUploadConcurrency();
+    }
+  }));
+
+  app.get("/api/write/canvas/assets/:id/original", requireAuth, asyncHandler(async (req, res) => {
+    const assetId = Number(req.params.id);
+    if (!Number.isSafeInteger(assetId) || assetId <= 0) return res.status(400).json({ error: "invalid asset id" });
+    const asset = (await pool.query(
+      `SELECT file_name, mime_type, data_url
+       FROM write_canvas_assets
+       WHERE id = $1 AND user_id = $2`,
+      [assetId, req.session.userId],
+    )).rows[0];
+    if (!asset?.data_url) return res.status(404).json({ error: "original asset not found" });
+    const match = String(asset.data_url).match(/^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/);
+    if (!match) return res.status(500).json({ error: "stored asset is invalid" });
+    const bytes = Buffer.from(match[2], "base64");
+    res.setHeader("Content-Type", asset.mime_type || match[1] || "application/octet-stream");
+    res.setHeader("Content-Length", String(bytes.length));
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(asset.file_name || "canvas-asset")}`);
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.send(bytes);
   }));
 
   app.get("/api/write/agent/templates", requireAuth, asyncHandler(async (req, res) => {
@@ -9211,15 +10600,20 @@ async function startServer() {
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders?.();
     const send = (type: string, data: unknown) => { res.write(`event: ${type}\n`); res.write(`data: ${JSON.stringify(data)}\n\n`); };
+    let reservedBudgetTokens = 0;
+    let providerStarted = false;
     try {
       await pool.query(`UPDATE write_canvas_agent_runs SET status = 'running', started_at = NOW(), updated_at = NOW() WHERE id = $1 AND user_id = $2`, [runId, req.session.userId]);
       send("partial_status", { runId, message: "已读取选中节点" });
       requestAbortController.signal.throwIfAborted();
-      const reservation = await reserveDailyAiBudget(req.session.userId, defaults.maxTokens, estimatedInputTokens);
+      const reservation = await reserveCanvasAgentRunBudget(req.session.userId, runId, defaults.maxTokens, estimatedInputTokens);
       if (!reservation) throw new Error("今日 AI 使用额度已达到上限，请稍后再试");
+      reservedBudgetTokens = reservation.reservedTokens;
       send("partial_status", { runId, message: "正在生成" });
       requestAbortController.signal.throwIfAborted();
-      const completion = await requestCanvasAgentCompletion({ model: defaults.model, systemPrompt, message: prompt, contexts: [context], previousMessages: [], temperature: defaults.temperature, topP: defaults.topP, maxTokens: defaults.maxTokens, signal: requestAbortController.signal });
+      await markCanvasAgentRunProviderStarted(req.session.userId, runId);
+      providerStarted = true;
+      const completion = await requestCanvasAgentCompletion({ model: defaults.model, systemPrompt, message: prompt, contexts: [context], previousMessages: [], temperature: defaults.temperature, topP: defaults.topP, maxTokens: defaults.maxTokens });
       const extractionItems = isCanvasExtractionAction(action) ? parseCanvasExtractionItems(completion.content) : [];
       const outputs = isCanvasExtractionAction(action)
         ? (extractionItems.length ? extractionItems : [{ title: "提取内容", content: completion.content.slice(0, 12000) }]).map((item, index) => ({ title: item.title, content: item.content, role: "insight" as const, origin: "extracted" as const, status: "pending_review" as const, relation: "derived_from" as const, x: Number(source.x) + 420, y: Number(source.y) + index * 250, meta: { runId, action } }))
@@ -9243,12 +10637,14 @@ async function startServer() {
     } catch (error) {
       const message = error instanceof Error ? error.message : "画布 AI 操作失败";
       const runStatus = requestAbortController.signal.aborted ? "cancelled" : "failed";
-      await pool.query(
-        `UPDATE write_canvas_agent_runs
-         SET status = $1, error = $2, completed_at = NOW(), updated_at = NOW()
-         WHERE id = $3 AND user_id = $4 AND status IN ('queued','running')`,
-        [runStatus, message.slice(0, 2000), runId, req.session.userId],
-      );
+      await failStandaloneCanvasAgentRun(
+        req.session.userId,
+        runId,
+        runStatus,
+        message.slice(0, 2000),
+      ).catch(refundError => {
+        logger.error({ err: refundError, module: "canvas-quick-ai", runId, providerStarted, reservedBudgetTokens }, "Failed to finalize canvas quick AI budget");
+      });
       if (!res.destroyed && !res.writableEnded) { send("error", { runId, message }); res.end(); }
     } finally {
       if (typeof res.locals.releasePaidConcurrency === "function") res.locals.releasePaidConcurrency();
@@ -9284,6 +10680,18 @@ async function startServer() {
     if (members.length < 1 || members.length > WRITE_CANVAS_MAX_AGENT_GROUP_MEMBERS || members.some(member => !isAllowedCanvasAgentModel(member.model))) return res.status(400).json({ error: "group member configuration is invalid" });
     if (!getOpenAIWriteAgentConfig()) return res.status(500).json({ error: "Writing agent model is not configured" });
     requestAbortController.signal.throwIfAborted();
+    const contextNodes = contextNodeIds.length === 0 ? [] : (await pool.query(
+      `SELECT id, kind, node_role, content_type, status
+       FROM write_canvas_nodes
+       WHERE user_id = $1 AND project_id = $2 AND id = ANY($3::bigint[])`,
+      [req.session.userId, Number(group.project_id), contextNodeIds],
+    )).rows;
+    const invalidContextNode = contextNodes.find(node => (
+      node.kind === "agent" || node.node_role === "task" || node.status === "rejected"
+    ));
+    if (contextNodes.length !== contextNodeIds.length || invalidContextNode) {
+      return res.status(400).json({ error: "contextNodeIds must reference active material, insight or document nodes in this project" });
+    }
     const contexts = await Promise.all(contextNodeIds.map(nodeId => resolveCanvasOwnedNodeContext(pool, req.session.userId, Number(group.project_id), nodeId)));
     if (contexts.some(context => !context)) return res.status(404).json({ error: "context node not found in this project" });
     const resolvedContexts = contexts.filter((context): context is CanvasContextItem => Boolean(context));
@@ -9324,25 +10732,64 @@ async function startServer() {
       }
       if (activeBatch) {
         const staleError = "运行超时，已由后续请求恢复";
+        const staleRuns = (await client.query(
+          `SELECT id, reserved_tokens, reservation_date::text AS reservation_date, provider_started
+           FROM write_canvas_agent_runs
+           WHERE batch_id = $1 AND user_id = $2 AND status IN ('queued','running')
+           FOR UPDATE`,
+          [Number(activeBatch.id), req.session.userId],
+        )).rows;
+        for (const run of staleRuns) {
+          if (run.provider_started || Number(run.reserved_tokens) <= 0) continue;
+          await releaseDailyAiBudget(
+            req.session.userId,
+            Number(run.reserved_tokens),
+            normalizeAiBudgetDate(run.reservation_date),
+            client,
+          );
+        }
         await client.query(
           `UPDATE write_canvas_agent_batches
            SET status = CASE
              WHEN EXISTS (
                SELECT 1 FROM write_canvas_agent_runs
                WHERE batch_id = $2 AND user_id = $3 AND status = 'completed'
-             ) THEN 'partial' ELSE 'failed' END,
-             error = $1, completed_at = NOW(), updated_at = NOW()
+             ) THEN CASE WHEN EXISTS (
+               SELECT 1 FROM write_canvas_agent_runs
+               WHERE batch_id = $2 AND user_id = $3 AND status <> 'completed'
+             ) THEN 'partial' ELSE 'completed' END
+             ELSE 'failed' END,
+             error = CASE WHEN NOT EXISTS (
+               SELECT 1 FROM write_canvas_agent_runs
+               WHERE batch_id = $2 AND user_id = $3 AND status <> 'completed'
+             ) THEN NULL ELSE $1 END,
+             completed_at = NOW(), updated_at = NOW()
            WHERE id = $2 AND user_id = $3 AND status = 'running'`,
           [staleError, Number(activeBatch.id), req.session.userId],
         );
         await client.query(
-          `UPDATE write_canvas_agent_runs SET status = 'failed', error = $1, completed_at = NOW(), updated_at = NOW()
+          `UPDATE write_canvas_agent_runs
+           SET status = 'failed', error = $1,
+               reserved_tokens = CASE WHEN provider_started THEN reserved_tokens ELSE 0 END,
+               completed_at = NOW(), updated_at = NOW()
            WHERE batch_id = $2 AND user_id = $3 AND status IN ('queued','running')`,
           [staleError, Number(activeBatch.id), req.session.userId],
         );
       }
       requestAbortController.signal.throwIfAborted();
-      const persistenceEstimate = estimateCanvasStorageBytes({ batch: { message, contextNodeIds, contextSnapshot, configSnapshot }, runs: members.map(member => ({ memberId: member.id, contextSnapshot, configSnapshot: configSnapshot.members.find(item => Number(item.id) === Number(member.id)) })) });
+      const edgeCounts = (await client.query(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE target_node_id = $3 AND relation = 'context')::int AS current_group_context
+         FROM write_canvas_edges WHERE user_id = $1 AND project_id = $2`,
+        [req.session.userId, Number(group.project_id), Number(group.node_id)],
+      )).rows[0];
+      const additionalEdges = Math.max(0, contextNodeIds.length - Number(edgeCounts?.current_group_context || 0));
+      if (Number(edgeCounts?.total || 0) + additionalEdges > WRITE_CANVAS_MAX_EDGES_PER_PROJECT) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目连线数量已达到上限" });
+      }
+      const persistenceEstimate = estimateCanvasStorageBytes({ batch: { message, contextNodeIds, contextSnapshot, configSnapshot }, runs: members.map(member => ({ memberId: member.id, contextSnapshot, configSnapshot: configSnapshot.members.find(item => Number(item.id) === Number(member.id)) })) })
+        + additionalEdges * estimateCanvasStorageBytes({ relation: "context" });
       await assertCanvasStorageQuota(client, req.session.userId, persistenceEstimate);
       requestAbortController.signal.throwIfAborted();
       const batch = (await client.query(
@@ -9389,6 +10836,8 @@ async function startServer() {
     res.flushHeaders?.();
     const send = (type: string, data: unknown) => { res.write(`event: ${type}\n`); res.write(`data: ${JSON.stringify(data)}\n\n`); };
     const memberRuns = runs.slice(0, WRITE_CANVAS_MAX_AGENT_GROUP_MEMBERS).map(async ({ id: runId, member }, index) => {
+      let reservedBudgetTokens = 0;
+      let providerStarted = false;
       send("member_start", { batchId, runId, memberId: Number(member.id), name: member.name });
       try {
         const startedRun = await pool.query(
@@ -9405,10 +10854,13 @@ async function startServer() {
         if (startedRun.rowCount !== 1) throw new CanvasAgentBatchLeaseLostError("Agent batch was superseded before provider execution");
         requestAbortController.signal.throwIfAborted();
         const estimatedInputTokens = estimatedInputTokensByMember.get(Number(member.id)) || 0;
-        const reservation = await reserveDailyAiBudget(req.session.userId, Number(member.max_tokens), estimatedInputTokens);
+        const reservation = await reserveCanvasAgentRunBudget(req.session.userId, runId, Number(member.max_tokens), estimatedInputTokens);
         if (!reservation) throw new Error("今日 AI 使用额度已达到上限，请稍后再试");
+        reservedBudgetTokens = reservation.reservedTokens;
         requestAbortController.signal.throwIfAborted();
-        const completion = await requestCanvasAgentCompletion({ model: member.model, systemPrompt: [member.system_prompt || getDefaultCanvasAgentConfig().systemPrompt, group.shared_prompt].filter(Boolean).join("\n\n"), message, contexts: resolvedContexts, previousMessages: [], temperature: Number(member.temperature), topP: Number(member.top_p), maxTokens: Number(member.max_tokens), signal: requestAbortController.signal });
+        await markCanvasAgentRunProviderStarted(req.session.userId, runId);
+        providerStarted = true;
+        const completion = await requestCanvasAgentCompletion({ model: member.model, systemPrompt: [member.system_prompt || getDefaultCanvasAgentConfig().systemPrompt, group.shared_prompt].filter(Boolean).join("\n\n"), message, contexts: resolvedContexts, previousMessages: [], temperature: Number(member.temperature), topP: Number(member.top_p), maxTokens: Number(member.max_tokens) });
         const outputClient = await pool.connect();
         let outputNodeIds: number[];
         try {
@@ -9436,7 +10888,10 @@ async function startServer() {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Agent 执行失败";
         const runStatus = requestAbortController.signal.aborted ? "cancelled" : "failed";
-        await failCanvasAgentRunIfLeaseCurrent({ userId: req.session.userId, groupId, batchId, runId, status: runStatus, error: errorMessage.slice(0, 2000) });
+        await failCanvasAgentRunIfLeaseCurrent({ userId: req.session.userId, groupId, batchId, runId, status: runStatus, error: errorMessage.slice(0, 2000) }).catch(refundError => {
+          logger.error({ err: refundError, module: "canvas-agent-group", batchId, runId, providerStarted, reservedBudgetTokens }, "Failed to finalize canvas Agent group budget");
+          return false;
+        });
         if (!res.destroyed && !res.writableEnded) send("member_error", { batchId, runId, memberId: Number(member.id), message: errorMessage });
         throw error;
       }
@@ -9462,13 +10917,19 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/write/canvas/agents/:id/chat/stream", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, canvasAgentConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/write/canvas/agents/:id/chat/stream", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, canvasAgentConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const agentId = Number(req.params.id);
-    if (!Number.isFinite(agentId)) return res.status(400).json({ error: "invalid agent id" });
+    if (!Number.isFinite(agentId)) {
+      return res.status(400).json({ error: "invalid agent id" });
+    }
     const message = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH) : "";
-    if (!message) return res.status(400).json({ error: "message is required" });
+    if (!message) {
+      return res.status(400).json({ error: "message is required" });
+    }
     const agentRow = await getCanvasAgentNode(pool, req.session.userId, agentId);
-    if (!agentRow) return res.status(404).json({ error: "agent not found" });
+    if (!agentRow) {
+      return res.status(404).json({ error: "agent not found" });
+    }
     if (!getOpenAIWriteAgentConfig()) {
       return res.status(500).json({ error: "Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL" });
     }
@@ -9486,27 +10947,72 @@ async function startServer() {
     };
 
     const runId = randomUUID();
+    let userMessageId: number | null = null;
+    let turnPersisted = false;
+    let providerStarted = false;
     const requestAbortController = new AbortController();
     res.once("close", () => {
       if (!res.writableFinished) requestAbortController.abort(new Error("Client disconnected"));
     });
     try {
       send("partial_status", { runId, message: "读取画布连线上下文" });
-      const contexts = await resolveCanvasContextItems(pool, req.session.userId, Number(agentRow.node_id), Number(agentRow.project_id));
       const previousMessages = (await pool.query(
         `SELECT role, content
          FROM write_canvas_agent_messages
          WHERE user_id = $1 AND agent_id = $2
+           AND COALESCE(meta->>'status', 'completed') = 'completed'
          ORDER BY created_at DESC
          LIMIT 10`,
         [req.session.userId, agentId]
       )).rows.reverse().filter(row => row.role === "user" || row.role === "assistant");
-      await pool.query(
-        `INSERT INTO write_canvas_agent_messages (user_id, agent_id, role, content, meta)
-         VALUES ($1, $2, 'user', $3, $4)`,
-        [req.session.userId, agentId, message, JSON.stringify({ runId })]
-      );
+      const contexts = await resolveCanvasContextItems(pool, req.session.userId, Number(agentRow.node_id), Number(agentRow.project_id));
+      assertCanvasAggregateContextWithinLimit(contexts, message, agentRow.system_prompt, previousMessages);
+      const estimatedInputTokens = estimateCanvasInputTokens(contexts, message, agentRow.system_prompt, previousMessages);
+      const reservedBudgetTokens = getDailyAiBudgetReservationTokens(Number(agentRow.max_tokens), estimatedInputTokens);
+      const inputClient = await pool.connect();
+      try {
+        await inputClient.query("BEGIN");
+        await lockCanvasUser(inputClient, req.session.userId);
+        const reservation = await reserveDailyAiBudget(
+          req.session.userId,
+          Number(agentRow.max_tokens),
+          estimatedInputTokens,
+          inputClient,
+        );
+        if (!reservation) throw new Error("今日 AI 使用额度已达到上限，请稍后再试");
+        const inputMeta = {
+          runId,
+          status: "pending",
+          providerStarted: false,
+          budgetReservedTokens: reservedBudgetTokens,
+          budgetReservationDate: normalizeAiBudgetDate(reservation.usage_date),
+        };
+        await assertCanvasStorageQuota(inputClient, req.session.userId, estimateCanvasStorageBytes({ message, meta: inputMeta }));
+        const userMessage = (await inputClient.query(
+          `INSERT INTO write_canvas_agent_messages (user_id, agent_id, role, content, meta)
+           VALUES ($1, $2, 'user', $3, $4)
+           RETURNING id`,
+          [req.session.userId, agentId, message, JSON.stringify(inputMeta)],
+        )).rows[0];
+        userMessageId = Number(userMessage.id);
+        await inputClient.query("COMMIT");
+      } catch (error) {
+        await inputClient.query("ROLLBACK");
+        throw error;
+      } finally {
+        inputClient.release();
+      }
       send("partial_status", { runId, message: `已连接 ${contexts.length} 个上下文节点` });
+      requestAbortController.signal.throwIfAborted();
+      const providerStart = await pool.query(
+        `UPDATE write_canvas_agent_messages
+         SET meta = meta || $1::jsonb
+         WHERE id = $2 AND user_id = $3 AND agent_id = $4 AND meta->>'status' = 'pending'
+         RETURNING id`,
+        [JSON.stringify({ providerStarted: true }), userMessageId, req.session.userId, agentId],
+      );
+      if (providerStart.rowCount !== 1) throw new Error("Agent turn is no longer active");
+      providerStarted = true;
       const completion = await requestCanvasAgentCompletion({
         model: agentRow.model,
         systemPrompt: agentRow.system_prompt,
@@ -9516,35 +11022,52 @@ async function startServer() {
         temperature: Number(agentRow.temperature),
         topP: Number(agentRow.top_p),
         maxTokens: Number(agentRow.max_tokens),
-        signal: requestAbortController.signal,
       });
-      const assistantRow = (await pool.query(
-        `INSERT INTO write_canvas_agent_messages (user_id, agent_id, role, content, meta)
-         VALUES ($1, $2, 'assistant', $3, $4)
-         RETURNING id, agent_id AS "agentId", role, content, meta, created_at AS "createdAt"`,
-        [
-          req.session.userId,
-          agentId,
-          completion.content,
-          JSON.stringify({
-            runId,
-            model: completion.model,
-            provider: completion.provider,
-            contextNodeIds: contexts.map(item => item.nodeId),
-            usedImages: completion.usedImages
-          })
-        ]
-      )).rows[0];
-      await pool.query(
-        `DELETE FROM write_canvas_agent_messages
-         WHERE user_id = $1 AND agent_id = $2 AND id IN (
-           SELECT id FROM write_canvas_agent_messages
-           WHERE user_id = $1 AND agent_id = $2
-           ORDER BY created_at DESC, id DESC
-           OFFSET $3
-         )`,
-        [req.session.userId, agentId, WRITE_CANVAS_MAX_MESSAGES_PER_AGENT],
-      );
+      const outputClient = await pool.connect();
+      let assistantRow: Record<string, unknown> | null = null;
+      try {
+        await outputClient.query("BEGIN");
+        await lockCanvasUser(outputClient, req.session.userId);
+        const assistantMeta = {
+          runId,
+          status: "completed",
+          model: completion.model,
+          provider: completion.provider,
+          contextNodeIds: contexts.map(item => item.nodeId),
+          usedImages: completion.usedImages,
+        };
+        await assertCanvasStorageQuota(outputClient, req.session.userId, estimateCanvasStorageBytes({ content: completion.content, meta: assistantMeta }));
+        await outputClient.query(
+          `UPDATE write_canvas_agent_messages
+           SET meta = meta || $1::jsonb
+           WHERE id = $2 AND user_id = $3 AND agent_id = $4`,
+          [JSON.stringify({ status: "completed" }), userMessageId, req.session.userId, agentId],
+        );
+        assistantRow = (await outputClient.query(
+          `INSERT INTO write_canvas_agent_messages (user_id, agent_id, role, content, meta)
+           VALUES ($1, $2, 'assistant', $3, $4)
+           RETURNING id, agent_id AS "agentId", role, content, meta, created_at AS "createdAt"`,
+          [req.session.userId, agentId, completion.content, JSON.stringify(assistantMeta)],
+        )).rows[0];
+        await outputClient.query(
+          `DELETE FROM write_canvas_agent_messages
+           WHERE user_id = $1 AND agent_id = $2 AND id IN (
+             SELECT id FROM write_canvas_agent_messages
+             WHERE user_id = $1 AND agent_id = $2
+             ORDER BY created_at DESC, id DESC
+             OFFSET $3
+           )`,
+          [req.session.userId, agentId, WRITE_CANVAS_MAX_MESSAGES_PER_AGENT],
+        );
+        await outputClient.query("COMMIT");
+        turnPersisted = true;
+      } catch (error) {
+        await outputClient.query("ROLLBACK");
+        throw error;
+      } finally {
+        outputClient.release();
+      }
+      if (!assistantRow) throw new Error("Assistant message persistence failed");
       send("final", {
         runId,
         message: mapCanvasMessageRow(assistantRow),
@@ -9555,6 +11078,10 @@ async function startServer() {
       });
       res.end();
     } catch (error) {
+      if (userMessageId && !turnPersisted) {
+        await cancelPendingCanvasAgentMessage(req.session.userId, agentId, userMessageId)
+          .catch(refundError => logger.error({ err: refundError, module: "canvas-agent", runId, providerStarted }, "Failed to finalize incomplete canvas turn budget"));
+      }
       logger.error({ err: error, module: "canvas-agent", runId, agentId, userId: req.session.userId }, "Canvas agent failed");
       if (!res.destroyed && !res.writableEnded) {
         send("error", {
@@ -9579,7 +11106,8 @@ async function startServer() {
     if (!content && Number.isFinite(messageId)) {
       const messageRow = (await pool.query(
         `SELECT content FROM write_canvas_agent_messages
-         WHERE id = $1 AND agent_id = $2 AND user_id = $3 AND role = 'assistant'`,
+         WHERE id = $1 AND agent_id = $2 AND user_id = $3 AND role = 'assistant'
+           AND COALESCE(meta->>'status', 'completed') = 'completed'`,
         [messageId, agentId, req.session.userId]
       )).rows[0];
       content = messageRow?.content || "";
@@ -9623,6 +11151,7 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(413).json({ error: "项目节点数量已达到上限" });
       }
+      await assertCanvasEdgeCapacity(client, req.session.userId, Number(lockedAgent.project_id));
       const newAssetBytes = Buffer.byteLength(content, "utf8") * 2;
       const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
       if (storedBytes + newAssetBytes > canvasUserStorageMaxBytes) {
@@ -9658,15 +11187,16 @@ async function startServer() {
       nodeId = Number(nodeRow.id);
       edgeRow = (await client.query(
         `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
-         VALUES ($1, $2, $3, $4, 'context')
+         VALUES ($1, $2, $3, $4, 'generated')
          ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO UPDATE SET relation = EXCLUDED.relation
          RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
                    target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
-        [req.session.userId, lockedAgent.project_id, nodeId, Number(lockedAgent.node_id)]
+        [req.session.userId, lockedAgent.project_id, Number(lockedAgent.node_id), nodeId]
       )).rows[0];
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
+      if (error instanceof CanvasStorageLimitError) return res.status(413).json({ error: error.message });
       throw error;
     } finally {
       client.release();
@@ -9881,7 +11411,7 @@ async function startServer() {
 	    res.json({ success: true });
 	  }));
 
-	  app.post("/api/write/agent/skills/generate", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+	  app.post("/api/write/agent/skills/generate", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, skillCreationDailyPaidOperationBudgetMiddleware, asyncHandler(async (req, res) => {
 	    const { userInput, sampleText } = req.body;
 
 	    if (!userInput || typeof userInput !== "string" || userInput.trim().length < 5) {
@@ -9896,6 +11426,7 @@ async function startServer() {
 	      userId: req.session.userId!,
 	      userInput: userInput.trim(),
 	      sampleText: sampleText?.trim(),
+	      onProviderStart: () => markDailyAiBudgetProviderStarted(res),
 	      onStep: async (event) => {
 	        logger.debug({ event }, "Skill creation graph step");
 	      }
@@ -10064,7 +11595,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/write/agent/chat/stream", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/write/agent/chat/stream", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, writeAgentDailyPaidOperationBudgetMiddleware, asyncHandler(async (req, res) => {
     const runId = randomUUID();
     const parsed = buildWriteAgentRequest(req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
@@ -10091,6 +11622,7 @@ async function startServer() {
         isCreateArticle: parsed.isCreateArticle,
         userState: parsed.graphUserState,
         runId,
+        onProviderStart: () => markDailyAiBudgetProviderStarted(res),
         onStep: async event => {
           send(event.type, {
             runId,
@@ -10121,7 +11653,7 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/write/agent/chat", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/write/agent/chat", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, writeAgentDailyPaidOperationBudgetMiddleware, asyncHandler(async (req, res) => {
     const runId = randomUUID();
     const parsed = buildWriteAgentRequest(req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
@@ -10135,7 +11667,8 @@ async function startServer() {
       message: parsed.normalizedMessage,
       isCreateArticle: parsed.isCreateArticle,
       userState: parsed.graphUserState,
-      runId
+      runId,
+      onProviderStart: () => markDailyAiBudgetProviderStarted(res),
     });
 
     logger.info({
@@ -10515,6 +12048,7 @@ async function startServer() {
     logger.info({ module: "server", signal }, "Graceful shutdown started");
     clearInterval(feedRefreshTimer);
     clearInterval(verificationCleanupTimer);
+    if (canvasAiRecoveryTimer) clearInterval(canvasAiRecoveryTimer);
     for (const client of wss.clients) client.close(1012, "Server restarting");
 
     const forceExitTimer = setTimeout(() => {

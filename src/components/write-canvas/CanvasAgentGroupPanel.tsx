@@ -97,6 +97,16 @@ const runStatusLabels: Record<WriteCanvasAgentRun['status'], string> = {
   cancelled: '已取消',
 };
 
+const AGENT_GROUP_RECONCILE_WARNING_ATTEMPTS = 8;
+const AGENT_GROUP_RECONCILE_DELAY_MS = 400;
+const AGENT_GROUP_RECONCILE_SLOW_DELAY_MS = 2000;
+
+export const isTerminalAgentGroupBatchStatus = (status: WriteCanvasAgentBatch['status']) => (
+  status === 'completed' || status === 'partial' || status === 'failed' || status === 'cancelled'
+);
+
+const waitForAgentGroupReconcile = (delayMs: number) => new Promise(resolve => setTimeout(resolve, delayMs));
+
 export const getAgentGroupContextNodes = (nodes: WriteCanvasNode[]) => nodes.filter(node => (
   node.kind !== 'agent'
   && node.role !== 'task'
@@ -224,6 +234,7 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
   const [isHistoryLoading, setIsHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState('');
   const runAbortRef = useRef<AbortController | null>(null);
+  const activeRunTokenRef = useRef<symbol | null>(null);
 
   const selectedGroup = useMemo(
     () => groups.find(group => group.id === selectedGroupId) || null,
@@ -266,7 +277,10 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
     return () => controller.abort();
   }, [projectId]);
 
-  useEffect(() => () => runAbortRef.current?.abort(), []);
+  useEffect(() => () => {
+    activeRunTokenRef.current = null;
+    runAbortRef.current?.abort();
+  }, []);
 
   const applyPersistedRuns = useCallback((group: WriteCanvasAgentGroup, history: AgentGroupBatchHistory[]) => {
     const latestRuns = history[0]?.runs || [];
@@ -276,7 +290,9 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
       if (run.status === 'completed') {
         return [member.id, { status: 'completed', output: run.output || '' } satisfies MemberRunState];
       }
-      if (run.status === 'running') return [member.id, { status: 'running' } satisfies MemberRunState];
+      if (run.status === 'queued' || run.status === 'running') {
+        return [member.id, { status: 'running' } satisfies MemberRunState];
+      }
       if (run.status === 'failed' || run.status === 'cancelled') {
         return [member.id, {
           status: 'failed',
@@ -301,37 +317,102 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
         const allowedNodeIds = new Set(contextNodes.map(node => node.id));
         setSelectedContextIds((history[0]?.contextNodeIds || []).filter(id => allowedNodeIds.has(id)).slice(0, 30));
       }
+      return history;
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return;
       setHistoryError(error instanceof Error ? error.message : '运行历史加载失败');
+      return null;
     } finally {
       if (!signal?.aborted) setIsHistoryLoading(false);
     }
   }, [applyPersistedRuns, contextNodes, edges]);
 
-  const reconcilePersistedRun = useCallback(async (group: WriteCanvasAgentGroup) => {
-    const [, projectResult] = await Promise.allSettled([
-      loadBatchHistory(group),
-      onProjectRefresh(),
-    ]);
+  const reconcilePersistedRun = useCallback(async (
+    group: WriteCanvasAgentGroup,
+    observedBatchId: number | null,
+    runStartedAt: number,
+    isCurrentRun: () => boolean,
+  ) => {
+    let reachedTerminalState = false;
+    let attempt = 0;
+    while (isCurrentRun()) {
+      if (!isCurrentRun()) return;
+      const history = await loadBatchHistory(group);
+      if (!isCurrentRun()) return;
+      const batch = history?.find(item => observedBatchId
+        ? item.id === observedBatchId
+        : Date.parse(item.createdAt) >= runStartedAt - 1000);
+      if (batch && isTerminalAgentGroupBatchStatus(batch.status)) {
+        reachedTerminalState = true;
+        break;
+      }
+      attempt += 1;
+      if (attempt === AGENT_GROUP_RECONCILE_WARNING_ATTEMPTS) {
+        setHistoryError('运行状态仍在同步，确认服务端终态前不会发起新批次');
+      }
+      await waitForAgentGroupReconcile(
+        attempt >= AGENT_GROUP_RECONCILE_WARNING_ATTEMPTS
+          ? AGENT_GROUP_RECONCILE_SLOW_DELAY_MS
+          : AGENT_GROUP_RECONCILE_DELAY_MS,
+      );
+    }
+    if (!isCurrentRun()) return;
+    const projectResult = await Promise.resolve(onProjectRefresh()).then(
+      () => ({ status: 'fulfilled' as const }),
+      () => ({ status: 'rejected' as const }),
+    );
+    if (!isCurrentRun()) return;
     if (projectResult.status === 'rejected') {
       setHistoryError('运行已结束，但画布状态刷新失败，请稍后重试');
+    } else if (reachedTerminalState) {
+      setHistoryError('');
     }
   }, [loadBatchHistory, onProjectRefresh]);
 
   useEffect(() => {
     if (!selectedGroup) {
+      activeRunTokenRef.current = null;
+      setIsRunning(false);
       setRunStates({});
       setBatchHistory([]);
       setSelectedContextIds([]);
       return;
     }
+    setIsRunning(false);
     setRunStates(Object.fromEntries(selectedGroup.members.map(member => [member.id, { status: 'idle' }])));
     setRunError('');
     const controller = new AbortController();
-    void loadBatchHistory(selectedGroup, controller.signal);
-    return () => controller.abort();
-  }, [loadBatchHistory, selectedGroup]);
+    let resumeToken: symbol | null = null;
+    const restorePersistedBatch = async () => {
+      const history = await loadBatchHistory(selectedGroup, controller.signal);
+      const latestBatch = history?.[0];
+      if (controller.signal.aborted || !latestBatch || isTerminalAgentGroupBatchStatus(latestBatch.status)) return;
+
+      resumeToken = Symbol(`agent-group-resume-${latestBatch.id}`);
+      activeRunTokenRef.current = resumeToken;
+      setIsRunning(true);
+      setHistoryError('正在恢复上次运行状态…');
+      const isCurrentRun = () => !controller.signal.aborted && activeRunTokenRef.current === resumeToken;
+      try {
+        await reconcilePersistedRun(
+          selectedGroup,
+          latestBatch.id,
+          Number.isFinite(Date.parse(latestBatch.createdAt)) ? Date.parse(latestBatch.createdAt) : Date.now(),
+          isCurrentRun,
+        );
+      } finally {
+        if (activeRunTokenRef.current === resumeToken) {
+          activeRunTokenRef.current = null;
+          setIsRunning(false);
+        }
+      }
+    };
+    void restorePersistedBatch();
+    return () => {
+      controller.abort();
+      if (resumeToken && activeRunTokenRef.current === resumeToken) activeRunTokenRef.current = null;
+    };
+  }, [loadBatchHistory, reconcilePersistedRun, selectedGroup]);
 
   useEffect(() => {
     if (edges !== undefined) setSelectedContextIds(canonicalContextIds);
@@ -428,11 +509,17 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
       return;
     }
     const controller = new AbortController();
+    const runToken = Symbol('agent-group-run');
     runAbortRef.current = controller;
+    activeRunTokenRef.current = runToken;
+    const isCurrentRun = () => activeRunTokenRef.current === runToken && runAbortRef.current === controller;
     setIsRunning(true);
     setRunError('');
     setRunStates(Object.fromEntries(selectedGroup.members.map(member => [member.id, { status: 'idle' }])));
     const outputNodeIds = new Set<number>();
+    const runStartedAt = Date.now();
+    let observedBatchId: number | null = null;
+    let requestAccepted = false;
     let receivedFinal = false;
     let finalStatus: string | null = null;
     let failureCount = 0;
@@ -445,9 +532,13 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(await getResponseError(response, 'Agent 组运行失败'));
+      requestAccepted = true;
       if (!response.body) throw new Error('浏览器无法读取流式响应');
 
       await parseSseStream(response.body, async ({ type, data }) => {
+        if (!isCurrentRun()) return;
+        const eventBatchId = Number(data.batchId);
+        if (Number.isSafeInteger(eventBatchId) && eventBatchId > 0) observedBatchId = eventBatchId;
         const memberId = Number(data.memberId);
         if (type === 'member_start' && Number.isSafeInteger(memberId)) {
           setRunStates(current => ({ ...current, [memberId]: { status: 'running' } }));
@@ -474,6 +565,9 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
       });
       if (!receivedFinal) throw new Error('Agent 组运行连接提前结束');
     } catch (error) {
+      if (!isCurrentRun()) {
+        return;
+      }
       if (error instanceof DOMException && error.name === 'AbortError') {
         setRunError('本次运行已取消');
       } else {
@@ -482,20 +576,31 @@ export const CanvasAgentGroupPanel: React.FC<CanvasAgentGroupPanelProps> = ({
         onToast(nextError);
       }
     } finally {
-      if (runAbortRef.current === controller) runAbortRef.current = null;
-      setIsRunning(false);
-      await reconcilePersistedRun(selectedGroup);
-      if (finalStatus === 'completed' && outputNodeIds.size > 0) {
-        await onResults([...outputNodeIds]);
+      try {
+        if (!isCurrentRun()) return;
+        if (requestAccepted) {
+          await reconcilePersistedRun(selectedGroup, observedBatchId, runStartedAt, isCurrentRun);
+        }
+        if (!isCurrentRun()) return;
+        if (finalStatus === 'failed') onToast('批量生成失败');
+        else if (finalStatus === 'cancelled') onToast('批量生成已取消');
+        else if (finalStatus === 'partial') onToast(`批量生成部分完成，${failureCount} 个成员失败`);
+        else if (finalStatus === 'completed') onToast('批量生成完成');
+        if (finalStatus === 'completed' && outputNodeIds.size > 0) {
+          await onResults([...outputNodeIds]);
+        }
+      } finally {
+        if (activeRunTokenRef.current === runToken) activeRunTokenRef.current = null;
+        if (runAbortRef.current === controller) {
+          runAbortRef.current = null;
+          setIsRunning(false);
+        }
       }
-      if (finalStatus === 'failed') onToast('批量生成失败');
-      else if (finalStatus === 'cancelled') onToast('批量生成已取消');
-      else if (finalStatus === 'partial') onToast(`批量生成部分完成，${failureCount} 个成员失败`);
-      else if (finalStatus === 'completed') onToast('批量生成完成');
     }
   };
 
   const close = () => {
+    activeRunTokenRef.current = null;
     runAbortRef.current?.abort();
     onClose();
   };

@@ -4,6 +4,7 @@ import path from 'node:path';
 import {
   getAgentGroupContextIds,
   getAgentGroupContextNodes,
+  isTerminalAgentGroupBatchStatus,
   normalizeAgentGroupBatchHistory,
 } from '../src/components/write-canvas/CanvasAgentGroupPanel';
 import type {
@@ -27,9 +28,36 @@ assert.match(component, /outputNodeIds/);
 assert.match(component, /payload\.group\.nodeId/, 'creation must use the backend-created canonical group node');
 assert.match(component, /agent-groups\/\$\{selectedGroup\.id\}\/batches/, 'panel must restore persisted batch history');
 assert.match(component, /onProjectRefresh/, 'panel must ask the parent to reload canonical project nodes and edges');
-assert.match(component, /reconcilePersistedRun[\s\S]{0,420}loadBatchHistory[\s\S]{0,260}onProjectRefresh/, 'terminal reconciliation must reload history and project state together');
+assert.match(component, /reconcilePersistedRun[\s\S]{0,1600}loadBatchHistory[\s\S]{0,1200}onProjectRefresh/, 'terminal reconciliation must reload history and project state together');
 assert.match(component, /finally \{[\s\S]{0,520}reconcilePersistedRun/, 'success, partial, failure, and abort paths must share terminal reconciliation');
+assert.match(component, /AGENT_GROUP_RECONCILE_WARNING_ATTEMPTS\s*=\s*\d+/, 'long reconciliation must expose a delayed-state warning');
+assert.match(component, /AGENT_GROUP_RECONCILE_SLOW_DELAY_MS\s*=\s*\d+/, 'long reconciliation must reduce its polling rate');
+assert.match(component, /attempt >= AGENT_GROUP_RECONCILE_WARNING_ATTEMPTS[\s\S]{0,160}AGENT_GROUP_RECONCILE_SLOW_DELAY_MS/, 'post-warning reconciliation must use the slower polling interval');
+assert.match(component, /while \(isCurrentRun\(\)\)/, 'abort and error reconciliation must keep polling until durable terminal state');
+assert.match(component, /observedBatchId/, 'reconciliation must follow the batch observed in the stream');
+assert.match(component, /let requestAccepted = false/, 'the panel must distinguish a rejected launch from a persisted batch');
+assert.match(component, /requestAccepted = true[\s\S]{0,400}response\.body/, 'an accepted response must be reconciled even when its stream body is unavailable');
+assert.match(component, /if \(requestAccepted\)[\s\S]{0,240}reconcilePersistedRun/, 'pre-batch HTTP failures must release the run lock instead of polling forever');
 assert.match(component, /finalStatus === 'completed'[\s\S]{0,180}onResults/, 'only a fully completed batch should auto-select generated results');
+assert.match(component, /activeRunTokenRef/, 'each batch run must own an identity token');
+const persistedBatchRecovery = component.match(/const restorePersistedBatch[\s\S]*?void restorePersistedBatch\(\)/)?.[0] || '';
+assert.match(persistedBatchRecovery, /latestBatch/, 'reopening must inspect the latest persisted batch');
+assert.match(persistedBatchRecovery, /!latestBatch \|\| isTerminalAgentGroupBatchStatus/, 'terminal history must not recreate a run lock');
+assert.match(persistedBatchRecovery, /setIsRunning\(true\)/, 'a non-terminal persisted batch must restore the run lock');
+assert.match(persistedBatchRecovery, /await reconcilePersistedRun/, 'a non-terminal persisted batch must resume terminal reconciliation');
+const selectedGroupRecoveryEffect = component.match(/useEffect\(\(\) => \{[\s\S]*?const restorePersistedBatch[\s\S]*?\}, \[loadBatchHistory, reconcilePersistedRun, selectedGroup\]\);/)?.[0] || '';
+assert.match(selectedGroupRecoveryEffect, /return;\s*}\s*setIsRunning\(false\);\s*setRunStates/, 'switching groups must clear the prior run lock before restoring history');
+assert.match(component, /run\.status === 'queued'[\s\S]{0,100}status: 'running'/, 'queued persisted members must render as active work');
+assert.match(
+  component,
+  /await reconcilePersistedRun[\s\S]{0,600}await onResults[\s\S]{0,800}setIsRunning\(false\)/,
+  'the run lock must remain held through persisted reconciliation and result delivery',
+);
+assert.doesNotMatch(
+  component,
+  /finally \{[\s\S]{0,180}setIsRunning\(false\)[\s\S]{0,300}await reconcilePersistedRun/,
+  'a batch must not unlock before terminal reconciliation',
+);
 assert.match(component, /最近运行/, 'panel must display recent persisted runs');
 assert.match(component, /partial/, 'panel must distinguish partial batches');
 assert.match(component, /failed/, 'panel must display failed batches and member outcomes');
@@ -129,5 +157,12 @@ assert.deepEqual(
   [41],
   'member outcomes returned beside batches must be associated with their persisted batch',
 );
+
+assert.equal(isTerminalAgentGroupBatchStatus('completed'), true);
+assert.equal(isTerminalAgentGroupBatchStatus('partial'), true);
+assert.equal(isTerminalAgentGroupBatchStatus('failed'), true);
+assert.equal(isTerminalAgentGroupBatchStatus('cancelled'), true);
+assert.equal(isTerminalAgentGroupBatchStatus('running'), false);
+assert.equal(isTerminalAgentGroupBatchStatus('queued'), false);
 
 console.log('PASS: canvas Agent group panel contracts');

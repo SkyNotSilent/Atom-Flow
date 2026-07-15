@@ -14,7 +14,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "node --import tsx --test --test-concurrency=1 tests/security-hardening.test.ts tests/compliance-disclosures.test.ts tests/reader-sanitization.test.ts tests/logging.test.ts tests/avatar.test.ts tests/knowledge-deduplication.test.ts tests/agent-draft-export.test.ts tests/write-agent-intent.test.ts tests/write-agent-sse.test.ts tests/write-agent-api.test.ts tests/write-canvas-api.test.ts tests/write-canvas-ai-api.test.ts tests/canvas-document-export.test.ts tests/canvas-agent-group-ui.test.ts tests/canvas-document-autosave.test.ts"
+    "test": "node --import tsx --test --test-concurrency=1 tests/security-hardening.test.ts tests/compliance-disclosures.test.ts tests/reader-sanitization.test.ts tests/logging.test.ts tests/avatar.test.ts tests/knowledge-deduplication.test.ts tests/agent-draft-export.test.ts tests/write-agent-intent.test.ts tests/write-agent-sse.test.ts tests/write-agent-api.test.ts tests/write-canvas-api.test.ts tests/write-canvas-ai-api.test.ts tests/write-canvas-ui.test.ts tests/canvas-document-export.test.ts tests/canvas-agent-group-ui.test.ts tests/canvas-document-autosave.test.ts"
   },
   "dependencies": {
     "@langchain/core": "^1.1.44",

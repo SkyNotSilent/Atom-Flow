@@ -191,6 +191,7 @@ const root = process.cwd();
 const server = readFileSync(path.join(root, "server.ts"), "utf8");
 const securitySource = readFileSync(path.join(root, "src/server/security.ts"), "utf8");
 const viteConfig = readFileSync(path.join(root, "vite.config.ts"), "utf8");
+const packageJson = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as { scripts?: { test?: string } };
 assert.doesNotMatch(viteConfig, /GEMINI_API_KEY|process\.env\.[A-Z0-9_]+[^\n]*JSON\.stringify/, "Server API keys must never be injected into the browser bundle");
 assert.match(server, /import helmet from "helmet"/, "Helmet must protect HTTP responses");
 assert.match(server, /import compression from "compression"/, "Large JSON and static responses must be compressed");
@@ -220,6 +221,10 @@ assert.match(server, /await validatePublicHttpUrl\(input, \{ allowedPorts: PUBLI
 assert.match(server, /validatePublicHttpUrl\(input, \{ allowedPorts: PUBLIC_WEB_PORTS \}\)/, "Custom RSS targets must be restricted to normal web ports");
 assert.match(server, /fetchBoundedPublicResource\(/, "Remote proxy responses must have redirect, timeout, DNS and byte boundaries");
 assert.match(server, /isAllowedUploadSignature\(req\.file\.buffer/, "Canvas uploads must verify file signatures");
+assert.match(server, /beginCanvasUploadProcessing/, "Canvas upload slots must remain owned while parsing continues after a disconnect");
+const canvasUploadRoute = server.slice(server.indexOf('app.post("/api/write/canvas/assets/upload"'), server.indexOf('app.get("/api/write/canvas/assets/:id/original"'));
+assert.match(canvasUploadRoute, /const releaseCanvasUploadConcurrency/, "Canvas upload processing must own an explicit release callback");
+assert.match(canvasUploadRoute, /finally \{\s*releaseCanvasUploadConcurrency\(\)/, "Canvas uploads must release their processing slot from the route finally block");
 assert.match(server, /new WebSocketServer\(\{\s*noServer:\s*true,[\s\S]*maxPayload:\s*asrMaxFrameBytes,[\s\S]*perMessageDeflate:\s*false/, "ASR WebSocket payload and compression must be bounded");
 assert.match(server, /sessionMiddleware\(upgradeRequest/, "ASR upgrades must parse the authenticated session");
 assert.match(server, /pendingAudioBytes/, "ASR pending audio bytes must be bounded");
@@ -236,6 +241,13 @@ assert.match(server, /SIGTERM/, "Railway shutdown must drain the HTTP server and
 assert.match(server, /randomInt\(100000, 1000000\)/, "Authentication codes must use a cryptographic random source");
 assert.doesNotMatch(server, /Math\.floor\(100000 \+ Math\.random\(\) \* 900000\)/, "Authentication codes must not use Math.random");
 assert.match(server, /verificationCodeDigest\(email, code\)/, "Verification codes must be stored and compared as keyed digests");
+assert.match(server, /verificationCheckIpLimiter/, "Verification attempts must also have an IP-wide limiter");
+const resetPasswordRoute = server.slice(server.indexOf('app.post("/api/auth/reset-password"'), server.indexOf('// --- Account data export'));
+assert.ok(
+  resetPasswordRoute.indexOf("if (!record)") >= 0
+    && resetPasswordRoute.indexOf("const passwordHash = await bcrypt.hash") > resetPasswordRoute.indexOf("if (!record)"),
+  "Password reset must reject an invalid verification code before running bcrypt",
+);
 assert.equal((server.match(/\) AND used = FALSE\s+RETURNING id/g) || []).length, 3, "Every OTP update must reject an already-consumed row");
 assert.match(server, /\) AND used = FALSE\s+RETURNING id, password_hash/, "Registration OTP updates must reject an already-consumed row");
 assert.match(server, /asrMaxSessionAudioBytes/, "ASR sessions must have a total audio byte limit");
@@ -266,9 +278,36 @@ assert.match(server, /fetchBoundedPublicResource\(candidate,/, "Built-in RSS ref
 assert.match(server, /getAllowedCanvasAgentModels/, "Canvas Agent models must be controlled by a server-side allowlist");
 assert.match(server, /isAllowedCanvasAgentModel/, "Canvas Agent model writes and runtime calls must enforce the allowlist");
 assert.match(server, /CREATE TABLE IF NOT EXISTS user_ai_usage_daily/, "Paid AI operations must have a shared daily budget ledger");
+assert.match(server, /CREATE TABLE IF NOT EXISTS ai_budget_reservations/, "generic paid routes must persist each budget reservation independently");
+assert.match(server, /state\s+TEXT NOT NULL DEFAULT 'pending'[\s\S]{0,180}pending[\s\S]{0,120}provider_started[\s\S]{0,120}refunded/, "durable reservations must record the provider billing boundary and refunds");
 assert.match(server, /reserveDailyAiBudget/, "Paid AI routes must reserve durable daily budget before provider calls");
+assert.match(server, /const markDailyAiBudgetProviderStarted =/, "paid routes must explicitly commit their reservation at provider dispatch");
+assert.match(server, /markDailyAiBudgetProviderStarted[\s\S]{0,900}UPDATE ai_budget_reservations[\s\S]{0,240}state = 'provider_started'/, "provider dispatch must be persisted before a generic paid request reaches the upstream API");
+assert.match(server, /refundDailyAiBudgetReservation[\s\S]{0,1400}FROM ai_budget_reservations[\s\S]{0,700}releaseDailyAiBudget[\s\S]{0,500}state = 'refunded'/, "generic reservation refunds must update the daily ledger and durable record atomically");
+assert.match(server, /recoverStaleCanvasAiWork[\s\S]{0,9000}ai_budget_reservations[\s\S]{0,900}state = 'refunded'/, "periodic recovery must retry stale generic reservations that never reached a provider");
+assert.match(server, /refundIfUnused[\s\S]{0,500}refundDailyAiBudgetReservation[\s\S]{0,500}res\.once\("finish", refundIfUnused\)/, "unused paid-operation reservations must be refunded when a response finishes");
+assert.match(server, /res\.once\("close", refundIfUnused\)/, "unused paid-operation reservations must be refunded when a request disconnects");
+assert.match(server, /writeAgentDailyPaidOperationBudgetMiddleware/, "multi-turn writing Agent requests need a dedicated worst-case budget reservation");
+assert.match(server, /WRITE_AGENT_MAX_PROVIDER_CALLS\s*=\s*15/, "writing Agent budget must cover routing, outline, draft, and coordinator turns");
+assert.match(server, /translationDailyPaidOperationBudgetMiddleware/, "multi-segment translation must reserve budget per provider call");
+assert.match(server, /const baiduTranslate[\s\S]{0,500}await markDailyAiBudgetProviderStarted\(res\)/, "translation must await the durable provider-start boundary before dispatch");
+assert.match(server, /modelSettings:\s*\{\s*maxTokens:\s*getCanvasAgentMaxOutputTokens\(\)\s*\}/, "OpenAI SDK Agent turns must enforce the same per-call output ceiling used by the budget");
+assert.match(server, /onProviderStart/, "provider-backed graph runtimes must expose the durable dispatch boundary");
 assert.match(server, /app\.get\("\/api\/favicon-proxy", requireAuth, remoteFetchLimiter/, "Favicon egress proxy must require authentication");
 assert.match(server, /invalidateUserSessions/, "Password changes and resets must invalidate prior sessions");
+assert.doesNotMatch(
+  server,
+  /write_canvas_nodes ALTER COLUMN (?:node_role|content_type|origin|status) SET NOT NULL/,
+  "New canvas semantic columns must remain compatible with old instances during rolling deploys",
+);
+assert.match(
+  server,
+  /write_canvas_nodes ALTER COLUMN node_role DROP NOT NULL/,
+  "Startup must relax semantic columns that an interrupted earlier rollout may already have tightened",
+);
+assert.match(packageJson.scripts?.test || "", /tests\/write-canvas-ui\.test\.ts/, "Default tests must include the canvas UI contract suite");
+assert.match(server, /app\.put\("\/api\/auth\/set-password", requireAuth, accountActionLimiter,/, "Password changes must use the sensitive-account action limiter");
+assert.match(server, /app\.put\("\/api\/auth\/set-password"[\s\S]{0,900}currentPassword[\s\S]{0,300}bcrypt\.compare\(currentPassword, user\.password_hash\)/, "Changing an existing password must verify the current password");
 assert.match(server, /invalidateUserSessions[\s\S]{0,220}client\.query\([\s\S]{0,120}DELETE FROM session/, "Session invalidation must use the caller's transaction client");
 assert.match(server, /BEGIN[\s\S]{0,1200}UPDATE users SET password_hash[\s\S]{0,600}invalidateUserSessions\([^,]+, client\)[\s\S]{0,300}COMMIT/, "Password updates and old-session invalidation must be atomic");
 assert.match(server, /safeRequestPath/, "HTTP logs must strip query strings");
@@ -277,6 +316,7 @@ assert.match(server, /estimateAccountExportBytes[\s\S]{0,1200}Promise\.all/, "Ac
 assert.match(server, /requireRecentAuthentication/, "Sensitive account exports must require recent authentication");
 assert.match(server, /app\.delete\("\/api\/account", requireAuth/, "Users must be able to delete their account data");
 assert.match(server, /app\.delete\("\/api\/saved-articles\/:id", requireAuth/, "Users must be able to delete saved source articles");
+assert.match(server, /app\.delete\("\/api\/saved-articles\/:id"[\s\S]{0,900}lockCanvasUser\(client, req\.session\.userId\)[\s\S]{0,900}assertNoActiveCanvasAiWork/, "Deleting an article must preserve canvas runs that still reference it");
 assert.match(server, /app\.delete\("\/api\/write\/agent\/threads\/:id", requireAuth/, "Users must be able to delete writing conversations");
 assert.match(server, /DELETE FROM verification_codes[\s\S]{0,120}expires_at/, "Expired verification records must be cleaned up");
 assert.match(server, /pg_try_advisory_xact_lock[\s\S]{0,800}DELETE FROM verification_codes/, "Verification cleanup must elect one bounded database worker");

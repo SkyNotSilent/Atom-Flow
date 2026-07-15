@@ -30,6 +30,7 @@ import type {
   Note,
   SavedArticle,
   WriteAgentTemplate,
+  WriteCanvasAgentRun,
   WriteCanvasEdge,
   WriteCanvasAgentGroup,
   WriteCanvasMessage,
@@ -65,21 +66,20 @@ type CanvasStoreRecord = {
   typeName: string;
   type?: string;
   fromId?: TLShapeId;
+  x?: number;
+  y?: number;
   props?: Record<string, unknown>;
   meta?: Record<string, unknown>;
 };
 type PendingNodeGeometry = {
   projectId: number;
+  baseUpdatedAt: string;
   x: number;
   y: number;
   width: number;
   height: number;
   persisted: boolean;
 };
-type FlushNodeGeometryOptions = {
-  keepalive?: boolean;
-};
-
 type ActivePanel = 'add' | 'inspector' | 'agent-group' | null;
 type CanvasQuickAction = 'summarize' | 'extract_insights' | 'extract_data' | 'extract_quotes' | 'extract_stories' | 'extract_cases' | 'extract_questions' | 'generate_outline';
 
@@ -158,6 +158,47 @@ const nodeIdFromShape = (shape: CanvasShape | undefined) => {
 };
 const isAtomFlowShape = (shape: CanvasShape): shape is AtomFlowShape => (shape as AtomFlowShape).type === 'atomflow-node';
 
+const NODE_GEOMETRY_DRAFT_KEY_PREFIX = 'atomflow.canvas-node-geometry.v1';
+const CANVAS_TAB_ID_SESSION_KEY = 'atomflow.canvas-tab-id.v1';
+const QUICK_ACTION_RECONCILE_MAX_ATTEMPTS = 8;
+const QUICK_ACTION_RECONCILE_DELAY_MS = 400;
+
+const getCanvasTabId = () => {
+  try {
+    const existing = window.sessionStorage.getItem(CANVAS_TAB_ID_SESSION_KEY);
+    if (existing) return existing;
+    const created = window.crypto.randomUUID();
+    window.sessionStorage.setItem(CANVAS_TAB_ID_SESSION_KEY, created);
+    return created;
+  } catch {
+    return `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+};
+
+const waitForQuickActionReconcile = () => new Promise(resolve => window.setTimeout(resolve, QUICK_ACTION_RECONCILE_DELAY_MS));
+const isTerminalQuickActionRun = (run: WriteCanvasAgentRun) => (
+  run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled'
+);
+
+const hasChangedNodeGeometry = (before: CanvasStoreRecord, after: CanvasStoreRecord) => before.x !== after.x
+  || before.y !== after.y
+  || before.props?.w !== after.props?.w
+  || before.props?.h !== after.props?.h;
+
+const getChangedNodeGeometryRecords = (changes: {
+  added: Record<string, unknown>;
+  updated: Record<string, unknown>;
+}) => {
+  const added = Object.values(changes.added) as CanvasStoreRecord[];
+  const updated = Object.values(changes.updated).flatMap(value => {
+    if (!Array.isArray(value) || value.length < 2) return [];
+    const before = value[0] as CanvasStoreRecord;
+    const after = value[1] as CanvasStoreRecord;
+    return hasChangedNodeGeometry(before, after) ? [after] : [];
+  });
+  return [...added, ...updated].filter(record => record.typeName === 'shape' && record.type === 'atomflow-node');
+};
+
 const getStoredCamera = (viewport?: Record<string, unknown>) => {
   const camera = viewport?.camera;
   if (!camera || typeof camera !== 'object') return null;
@@ -227,8 +268,12 @@ export const MagicWritingCanvas: React.FC = () => {
   const pendingDeletedEdgeIdsRef = useRef(new Set<number>());
   const pendingCanonicalEdgeIdsRef = useRef(new Set<number>());
   const pendingNodeGeometryRef = useRef(new Map<number, PendingNodeGeometry>());
+  const nodeGeometryFlushPromisesRef = useRef(new Map<number, Promise<boolean>>());
+  const canvasTabIdRef = useRef('');
   const quickActionAbortControllerRef = useRef<AbortController | null>(null);
+  const quickActionRunSequenceRef = useRef(0);
   const detailRequestSequenceRef = useRef(0);
+  if (!canvasTabIdRef.current) canvasTabIdRef.current = getCanvasTabId();
 
   const selectedNode = useMemo(
     () => detail?.nodes.find(node => node.id === selectedNodeId) || null,
@@ -237,11 +282,63 @@ export const MagicWritingCanvas: React.FC = () => {
   const selectedAgentMessages = selectedNode?.agent ? detail?.messages[selectedNode.agent.id] || [] : [];
   const contextAgentNode = contextAgentNodeId ? detail?.nodes.find(node => node.id === contextAgentNodeId) || null : null;
 
+  const restorePendingNodeGeometryDraft = useCallback((projectId: number) => {
+    try {
+      const raw = window.localStorage.getItem(`${NODE_GEOMETRY_DRAFT_KEY_PREFIX}:${projectId}:${canvasTabIdRef.current}`);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { projectId?: unknown; nodes?: unknown };
+      if (Number(parsed.projectId) !== projectId || !Array.isArray(parsed.nodes)) return;
+      for (const item of parsed.nodes) {
+        if (!item || typeof item !== 'object') continue;
+        const geometry = item as Record<string, unknown>;
+        const nodeId = Number(geometry.nodeId);
+        const baseUpdatedAt = typeof geometry.baseUpdatedAt === 'string' ? geometry.baseUpdatedAt : '';
+        const values = [geometry.x, geometry.y, geometry.width, geometry.height].map(Number);
+        if (!Number.isSafeInteger(nodeId) || nodeId <= 0 || !baseUpdatedAt || !values.every(Number.isFinite)) continue;
+        if (!pendingNodeGeometryRef.current.has(nodeId)) {
+          pendingNodeGeometryRef.current.set(nodeId, {
+            projectId,
+            baseUpdatedAt,
+            x: values[0],
+            y: values[1],
+            width: values[2],
+            height: values[3],
+            persisted: false,
+          });
+        }
+      }
+    } catch {
+      // Draft recovery is best effort; normal server geometry remains authoritative.
+    }
+  }, []);
+
+  const persistPendingNodeGeometryDraft = useCallback((projectId = currentProjectIdRef.current) => {
+    if (!projectId) return;
+    const nodes = [...pendingNodeGeometryRef.current.entries()]
+      .filter(([, geometry]) => geometry.projectId === projectId && !geometry.persisted)
+      .map(([nodeId, geometry]) => ({ nodeId, baseUpdatedAt: geometry.baseUpdatedAt, x: geometry.x, y: geometry.y, width: geometry.width, height: geometry.height }));
+    const key = `${NODE_GEOMETRY_DRAFT_KEY_PREFIX}:${projectId}:${canvasTabIdRef.current}`;
+    try {
+      if (nodes.length) window.localStorage.setItem(key, JSON.stringify({ projectId, nodes }));
+      else window.localStorage.removeItem(key);
+    } catch {
+      // Debounced persistence still handles the common path when storage is unavailable.
+    }
+  }, []);
+
   const mergePendingNodeGeometry = useCallback((payload: WriteCanvasProjectDetail) => ({
     ...payload,
     nodes: payload.nodes.map(node => {
       const pending = pendingNodeGeometryRef.current.get(node.id);
       if (!pending || pending.projectId !== payload.project.id) return node;
+      if (
+        !pending.persisted
+        && pending.baseUpdatedAt !== node.updatedAt
+        && !nodeGeometryFlushPromisesRef.current.has(node.id)
+      ) {
+        pendingNodeGeometryRef.current.delete(node.id);
+        return node;
+      }
       if (
         pending.persisted
         && node.x === pending.x
@@ -262,36 +359,89 @@ export const MagicWritingCanvas: React.FC = () => {
     }),
   }), []);
 
-  const flushPendingNodeGeometry = useCallback(async (
-    projectId = currentProjectIdRef.current,
-    options: FlushNodeGeometryOptions = {},
-  ) => {
+  const flushPendingNodeGeometry = useCallback(async (projectId = currentProjectIdRef.current) => {
     if (positionSyncTimerRef.current) {
       window.clearTimeout(positionSyncTimerRef.current);
       positionSyncTimerRef.current = null;
     }
     if (!projectId) return true;
-    const pending = [...pendingNodeGeometryRef.current.entries()]
-      .filter(([, geometry]) => geometry.projectId === projectId && !geometry.persisted);
-    if (!pending.length) return true;
+    const pendingNodeIds = [...pendingNodeGeometryRef.current.entries()]
+      .filter(([, geometry]) => geometry.projectId === projectId && !geometry.persisted)
+      .map(([nodeId]) => nodeId);
+    if (!pendingNodeIds.length) return true;
 
-    const saved = await Promise.all(pending.map(async ([nodeId, geometry]) => {
-      try {
-        const response = await fetch(`/api/write/canvas/nodes/${nodeId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ x: geometry.x, y: geometry.y, width: geometry.width, height: geometry.height }),
-          keepalive: options.keepalive,
-        });
-        if (!response.ok) return false;
-        if (pendingNodeGeometryRef.current.get(nodeId) === geometry) geometry.persisted = true;
-        return true;
-      } catch {
-        return false;
-      }
+    const saved = await Promise.all(pendingNodeIds.map(nodeId => {
+      const activeFlush = nodeGeometryFlushPromisesRef.current.get(nodeId);
+      if (activeFlush) return activeFlush;
+
+      const flush = (async () => {
+        while (true) {
+          const geometry = pendingNodeGeometryRef.current.get(nodeId);
+          if (!geometry || geometry.projectId !== projectId || geometry.persisted) return true;
+          try {
+            const response = await fetch(`/api/write/canvas/nodes/${nodeId}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ x: geometry.x, y: geometry.y, width: geometry.width, height: geometry.height, expectedUpdatedAt: geometry.baseUpdatedAt }),
+            });
+            const payload = await response.json().catch(() => null) as { code?: unknown; node?: Partial<WriteCanvasNode> } | null;
+            if (!response.ok) {
+              if (response.status === 409 && payload?.code === 'NODE_VERSION_CONFLICT' && payload.node) {
+                pendingNodeGeometryRef.current.delete(nodeId);
+                const canonical = payload.node;
+                setDetail(current => {
+                  if (!current || current.project.id !== projectId) return current;
+                  const next = { ...current, nodes: current.nodes.map(node => node.id === nodeId ? { ...node, ...canonical } : node) };
+                  detailRef.current = next;
+                  return next;
+                });
+                showToast('节点位置已在其他窗口更新，已载入服务器布局');
+              }
+              return false;
+            }
+
+            const savedNode = payload?.node;
+            if (!savedNode || typeof savedNode.updatedAt !== 'string' || !savedNode.updatedAt) return false;
+            const latest = pendingNodeGeometryRef.current.get(nodeId);
+            if (!latest) return true;
+            latest.baseUpdatedAt = savedNode.updatedAt;
+            latest.persisted = latest === geometry;
+            setDetail(current => {
+              if (!current || current.project.id !== projectId) return current;
+              const next = {
+                ...current,
+                nodes: current.nodes.map(node => node.id === nodeId ? {
+                  ...node,
+                  ...savedNode,
+                  ...(latest === geometry ? {} : {
+                    x: latest.x,
+                    y: latest.y,
+                    width: latest.width,
+                    height: latest.height,
+                  }),
+                } : node),
+              };
+              detailRef.current = next;
+              return next;
+            });
+            persistPendingNodeGeometryDraft(projectId);
+            if (latest === geometry) return true;
+          } catch {
+            return false;
+          }
+        }
+      })();
+      const trackedFlush = flush.finally(() => {
+        if (nodeGeometryFlushPromisesRef.current.get(nodeId) === trackedFlush) {
+          nodeGeometryFlushPromisesRef.current.delete(nodeId);
+        }
+      });
+      nodeGeometryFlushPromisesRef.current.set(nodeId, trackedFlush);
+      return trackedFlush;
     }));
+    persistPendingNodeGeometryDraft(projectId);
     return saved.every(Boolean);
-  }, []);
+  }, [persistPendingNodeGeometryDraft, showToast]);
 
   const closeQuickAction = useCallback((abortRunning = true) => {
     if (abortRunning) quickActionAbortControllerRef.current?.abort();
@@ -330,17 +480,52 @@ export const MagicWritingCanvas: React.FC = () => {
   }, [user]);
 
   const loadProjectDetail = useCallback(async (projectId: number) => {
+    restorePendingNodeGeometryDraft(projectId);
     const requestSequence = ++detailRequestSequenceRef.current;
     const response = await fetch(`/api/write/canvas/projects/${projectId}`);
     if (!response.ok) return null;
     const payload = mergePendingNodeGeometry(await response.json() as WriteCanvasProjectDetail);
     if (requestSequence !== detailRequestSequenceRef.current || currentProjectIdRef.current !== projectId) return null;
+    persistPendingNodeGeometryDraft(projectId);
     detailRef.current = payload;
     setDetail(payload);
     setProjects(previous => previous.map(project => project.id === payload.project.id ? payload.project : project));
     setSelectedNodeId(previous => previous && payload.nodes.some(node => node.id === previous) ? previous : null);
+    void flushPendingNodeGeometry(projectId);
     return payload;
-  }, [mergePendingNodeGeometry]);
+  }, [flushPendingNodeGeometry, mergePendingNodeGeometry, persistPendingNodeGeometryDraft, restorePendingNodeGeometryDraft]);
+
+  const reconcileQuickActionRun = useCallback(async (
+    projectId: number,
+    sourceNodeId: number,
+    action: CanvasQuickAction,
+    observedRunId: number | null,
+    runStartedAt: number,
+    runSequence: number,
+  ) => {
+    for (let attempt = 0; attempt < QUICK_ACTION_RECONCILE_MAX_ATTEMPTS; attempt += 1) {
+      if (currentProjectIdRef.current !== projectId || quickActionRunSequenceRef.current !== runSequence) return;
+      try {
+        const response = await fetch(`/api/write/canvas/projects/${projectId}/runs`);
+        if (response.ok) {
+          const payload = await response.json() as { runs?: WriteCanvasAgentRun[] };
+          const runs = Array.isArray(payload.runs) ? payload.runs : [];
+          const run = observedRunId
+            ? runs.find(item => item.id === observedRunId)
+            : runs.find(item => item.sourceNodeId === sourceNodeId
+              && item.action === action
+              && Date.parse(item.createdAt) >= runStartedAt - 1000);
+          if (run && isTerminalQuickActionRun(run)) break;
+        }
+      } catch {
+        // A bounded retry handles transient disconnects while the server commits the run terminal state.
+      }
+      if (attempt < QUICK_ACTION_RECONCILE_MAX_ATTEMPTS - 1) await waitForQuickActionReconcile();
+    }
+    if (currentProjectIdRef.current === projectId && quickActionRunSequenceRef.current === runSequence) {
+      await loadProjectDetail(projectId);
+    }
+  }, [loadProjectDetail]);
 
   useEffect(() => {
     if (!user) {
@@ -374,15 +559,16 @@ export const MagicWritingCanvas: React.FC = () => {
 
   useEffect(() => {
     const handlePageHide = () => {
-      void flushPendingNodeGeometry(currentProjectIdRef.current, { keepalive: true });
+      persistPendingNodeGeometryDraft(currentProjectIdRef.current);
     };
     window.addEventListener('pagehide', handlePageHide);
     return () => {
       window.removeEventListener('pagehide', handlePageHide);
-      void flushPendingNodeGeometry(currentProjectIdRef.current, { keepalive: true });
+      persistPendingNodeGeometryDraft(currentProjectIdRef.current);
+      quickActionRunSequenceRef.current += 1;
       quickActionAbortControllerRef.current?.abort();
     };
-  }, [flushPendingNodeGeometry]);
+  }, [persistPendingNodeGeometryDraft]);
 
   const closeInspector = useCallback(() => {
     setActivePanel(null);
@@ -432,9 +618,10 @@ export const MagicWritingCanvas: React.FC = () => {
     const shapePartial = {
       id,
       type: 'arrow',
+      isLocked: edge.relation !== 'context',
       x: source.x + source.width / 2,
       y: source.y + source.height / 2,
-      meta: { atomflowCanonical: true, atomflowEdgeId: edge.id },
+      meta: { atomflowCanonical: true, atomflowEdgeId: edge.id, atomflowRelation: edge.relation },
       props: {
         start: { x: 0, y: 0 },
         end: { x: target.x - source.x, y: target.y - source.y },
@@ -497,7 +684,7 @@ export const MagicWritingCanvas: React.FC = () => {
           const target = nextDetail.nodes.find(node => node.id === edge.targetNodeId);
           if (source && target) createBoundEdge(editor, edge, source, target);
         }
-      }, { history: 'ignore' });
+      }, { history: 'ignore', ignoreShapeLock: true });
     });
 
     const storedCamera = getStoredCamera(nextDetail.project.viewport);
@@ -566,19 +753,44 @@ export const MagicWritingCanvas: React.FC = () => {
   const deleteNodeById = useCallback(async (nodeId: number, options?: { quiet?: boolean }) => {
     if (pendingDeletedNodeIdsRef.current.has(nodeId)) return;
     pendingDeletedNodeIdsRef.current.add(nodeId);
+    const nodeProjectId = pendingNodeGeometryRef.current.get(nodeId)?.projectId || currentProjectIdRef.current;
+    let removed = false;
+    let restoredFromServer = false;
+    let failureMessage = '删除节点失败，已恢复画布';
     try {
       const response = await fetch(`/api/write/canvas/nodes/${nodeId}`, { method: 'DELETE' });
-      const projectId = currentProjectIdRef.current;
-      if (response.ok && projectId) {
-        await loadProjectDetail(projectId);
+      if (response.ok) {
+        removed = true;
+        pendingNodeGeometryRef.current.delete(nodeId);
+        persistPendingNodeGeometryDraft(nodeProjectId);
+        if (nodeProjectId && currentProjectIdRef.current === nodeProjectId) await loadProjectDetail(nodeProjectId);
         if (!options?.quiet) showToast('节点已删除');
-      } else if (!options?.quiet) {
-        showToast('删除节点失败');
+      } else {
+        const payload = await response.json().catch(() => null) as { code?: unknown; error?: unknown } | null;
+        failureMessage = payload?.code === 'CANVAS_AI_ACTIVE'
+          ? '节点正在执行 AI 任务，完成后才能删除'
+          : typeof payload?.error === 'string' && payload.error.trim()
+            ? payload.error
+            : failureMessage;
+        if (payload?.code === 'CANVAS_AI_ACTIVE' && nodeProjectId && currentProjectIdRef.current === nodeProjectId) {
+          restoredFromServer = Boolean(await loadProjectDetail(nodeProjectId));
+        }
       }
+    } catch {
+      failureMessage = '网络中断，节点未删除并已恢复画布';
     } finally {
       pendingDeletedNodeIdsRef.current.delete(nodeId);
+      if (!removed) {
+        const editor = editorRef.current;
+        const currentDetail = detailRef.current;
+        if (editor && currentDetail && currentDetail.project.id === nodeProjectId) syncEditorWithDetail(editor, currentDetail);
+        if (!restoredFromServer && nodeProjectId && currentProjectIdRef.current === nodeProjectId) {
+          await loadProjectDetail(nodeProjectId);
+        }
+        showToast(failureMessage);
+      }
     }
-  }, [loadProjectDetail, showToast]);
+  }, [loadProjectDetail, persistPendingNodeGeometryDraft, showToast, syncEditorWithDetail]);
 
   const reconcileSelection = useCallback((editor: Editor) => {
     const currentDetail = detailRef.current;
@@ -631,7 +843,9 @@ export const MagicWritingCanvas: React.FC = () => {
       const source = currentDetail.nodes.find(node => node.id === sourceNodeId);
       const target = currentDetail.nodes.find(node => node.id === targetNodeId);
       pendingArrowIdsRef.current.add(String(shape.id));
-      if (source && target?.kind === 'agent' && source.kind !== 'agent') {
+      const targetAcceptsContext = target?.kind === 'agent'
+        || (target?.role === 'task' && target?.contentType === 'agent_group');
+      if (source && targetAcceptsContext && source.kind !== 'agent' && source.role !== 'task') {
         void connectNodes(source.id, target.id, { quiet: true }).finally(() => {
           editor.store.mergeRemoteChanges(() => {
             editor.run(() => {
@@ -667,29 +881,38 @@ export const MagicWritingCanvas: React.FC = () => {
       const edgeId = Number(shape.meta.atomflowEdgeId);
       const edge = currentDetail.edges.find(item => item.id === edgeId);
       if (!edge || pendingCanonicalEdgeIdsRef.current.has(edgeId)) continue;
-      if (edge.relation !== 'context') continue;
       const bindings = getArrowBindings(editor, shape as TLArrowShape);
       const sourceNodeId = bindings.start ? nodeIdFromShape(editor.getShape(bindings.start.toId)) : null;
       const targetNodeId = bindings.end ? nodeIdFromShape(editor.getShape(bindings.end.toId)) : null;
       if (sourceNodeId === edge.sourceNodeId && targetNodeId === edge.targetNodeId) continue;
 
+      if (edge.relation !== 'context') {
+        const canonicalSource = currentDetail.nodes.find(node => node.id === edge.sourceNodeId);
+        const canonicalTarget = currentDetail.nodes.find(node => node.id === edge.targetNodeId);
+        if (canonicalSource && canonicalTarget) {
+          editor.store.mergeRemoteChanges(() => {
+            editor.run(
+              () => createBoundEdge(editor, edge, canonicalSource, canonicalTarget),
+              { history: 'ignore', ignoreShapeLock: true },
+            );
+          });
+        }
+        continue;
+      }
+
       const source = currentDetail.nodes.find(node => node.id === sourceNodeId);
       const target = currentDetail.nodes.find(node => node.id === targetNodeId);
       pendingCanonicalEdgeIdsRef.current.add(edgeId);
       try {
-        if (source && target?.kind === 'agent' && source.kind !== 'agent') {
-          const createResponse = await fetch('/api/write/canvas/edges', {
+        const targetAcceptsContext = target?.kind === 'agent'
+          || (target?.role === 'task' && target?.contentType === 'agent_group');
+        if (source && targetAcceptsContext && source.kind !== 'agent' && source.role !== 'task') {
+          const replaceResponse = await fetch('/api/write/canvas/edges/replace', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ projectId, sourceNodeId: source.id, targetNodeId: target.id }),
+            body: JSON.stringify({ edgeId, sourceNodeId: source.id, targetNodeId: target.id }),
           });
-          if (!createResponse.ok) throw new Error('edge create failed');
-          const deleteResponse = await fetch('/api/write/canvas/edges', {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: edge.id }),
-          });
-          if (!deleteResponse.ok) throw new Error('edge delete failed');
+          if (!replaceResponse.ok) throw new Error('edge replace failed');
         } else {
           showToast('上下文连线需要从资料节点指向 Agent');
         }
@@ -700,7 +923,7 @@ export const MagicWritingCanvas: React.FC = () => {
         await loadProjectDetail(projectId);
       }
     }
-  }, [loadProjectDetail, showToast]);
+  }, [createBoundEdge, loadProjectDetail, showToast]);
 
   const onMount = useCallback((editor: Editor) => {
     editorRef.current = editor;
@@ -722,23 +945,34 @@ export const MagicWritingCanvas: React.FC = () => {
         }
       }, 700);
     });
-    const stopGeometryListener = editor.store.listen(() => {
+    const stopGeometryListener = editor.store.listen(({ changes }) => {
       if (isSyncingEditorRef.current) return;
       const projectId = currentProjectIdRef.current;
       if (!projectId) return;
-      const shapes = (editor.getCurrentPageShapes() as CanvasShape[]).filter(isAtomFlowShape);
-      for (const shape of shapes) {
-        const nodeId = Number(shape.props.nodeId);
-        if (!Number.isFinite(nodeId)) continue;
+      const changedRecords = getChangedNodeGeometryRecords(changes as unknown as {
+        added: Record<string, unknown>;
+        updated: Record<string, unknown>;
+      });
+      for (const record of changedRecords) {
+        const nodeId = Number(record.props?.nodeId);
+        const geometry = [record.x, record.y, record.props?.w, record.props?.h].map(Number);
+        if (!Number.isSafeInteger(nodeId) || nodeId <= 0 || !geometry.every(Number.isFinite)) continue;
+        const previous = pendingNodeGeometryRef.current.get(nodeId);
+        const canonical = detailRef.current?.nodes.find(node => node.id === nodeId);
+        const baseUpdatedAt = previous?.baseUpdatedAt || canonical?.updatedAt || '';
+        if (!baseUpdatedAt) continue;
         pendingNodeGeometryRef.current.set(nodeId, {
           projectId,
-          x: shape.x,
-          y: shape.y,
-          width: shape.props.w,
-          height: shape.props.h,
+          baseUpdatedAt,
+          x: geometry[0],
+          y: geometry[1],
+          width: geometry[2],
+          height: geometry[3],
           persisted: false,
         });
       }
+      if (!changedRecords.length) return;
+      persistPendingNodeGeometryDraft(projectId);
       if (positionSyncTimerRef.current) window.clearTimeout(positionSyncTimerRef.current);
       positionSyncTimerRef.current = window.setTimeout(() => {
         void flushPendingNodeGeometry(projectId);
@@ -761,7 +995,7 @@ export const MagicWritingCanvas: React.FC = () => {
       if (editorChangeTimerRef.current) window.clearTimeout(editorChangeTimerRef.current);
       if (viewportSyncTimerRef.current) window.clearTimeout(viewportSyncTimerRef.current);
     };
-  }, [flushPendingNodeGeometry, reconcileCanonicalArrowChanges, reconcileSelection, reconcileUserDocumentChanges, syncEditorWithDetail]);
+  }, [flushPendingNodeGeometry, persistPendingNodeGeometryDraft, reconcileCanonicalArrowChanges, reconcileSelection, reconcileUserDocumentChanges, syncEditorWithDetail]);
 
   const getViewportPlacement = useCallback((width: number, height: number) => {
     const bounds = editorRef.current?.getViewportPageBounds();
@@ -855,6 +1089,7 @@ export const MagicWritingCanvas: React.FC = () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        sourceNodeId: source.id,
         title: `${source.title}作品`,
         summary: source.summary || '',
         scenario: 'custom-longform',
@@ -939,7 +1174,15 @@ export const MagicWritingCanvas: React.FC = () => {
   const submitAiDecomposition = async () => {
     const source = detailRef.current?.nodes.find(node => node.id === aiDecomposeNodeId);
     if (!source || isQuickActionRunning) return;
+    const projectId = currentProjectIdRef.current;
+    if (!projectId) return;
     const abortController = new AbortController();
+    const runSequence = ++quickActionRunSequenceRef.current;
+    const isCurrentQuickAction = () => quickActionRunSequenceRef.current === runSequence
+      && quickActionAbortControllerRef.current === abortController;
+    const runStartedAt = Date.now();
+    let observedRunId: number | null = null;
+    let projectReloaded = false;
     quickActionAbortControllerRef.current = abortController;
     setIsQuickActionRunning(true);
     setQuickActionStatus('正在读取节点内容');
@@ -957,11 +1200,17 @@ export const MagicWritingCanvas: React.FC = () => {
       let outputNodeIds: number[] = [];
       let receivedFinal = false;
       const consumeEvents = (events: ReturnType<typeof parseSseEvents>) => {
+        for (const event of events) {
+          const eventRunId = Number(event.payload.runId);
+          if (Number.isSafeInteger(eventRunId) && eventRunId > 0) observedRunId = eventRunId;
+        }
         const errorEvent = events.find(event => event.event === 'error');
         if (errorEvent) throw new Error(String(errorEvent.payload.message || 'AI 操作失败'));
         events
           .filter(event => event.event === 'partial_status')
-          .forEach(event => setQuickActionStatus(String(event.payload.message || '正在生成')));
+          .forEach(event => {
+            if (isCurrentQuickAction()) setQuickActionStatus(String(event.payload.message || '正在生成'));
+          });
         for (const event of events.filter(item => item.event === 'final')) {
           if (!Array.isArray(event.payload.outputNodeIds)) {
             throw new Error('AI 返回格式错误：终态缺少结果节点');
@@ -982,17 +1231,26 @@ export const MagicWritingCanvas: React.FC = () => {
       buffer += decoder.decode();
       if (buffer.trim()) consumeEvents(parseSseEvents(buffer));
       if (!receivedFinal) throw new Error('AI 返回中断：未收到完成事件');
-      const projectId = currentProjectIdRef.current;
-      if (projectId) await loadProjectDetail(projectId);
-      setAiDecomposeNodeId(null);
-      if (outputNodeIds[0]) selectNode(outputNodeIds[0]);
-      showToast('AI 结果已生成到画布');
+      await loadProjectDetail(projectId);
+      projectReloaded = true;
+      if (isCurrentQuickAction()) {
+        setAiDecomposeNodeId(null);
+        if (outputNodeIds[0]) selectNode(outputNodeIds[0]);
+        showToast('AI 结果已生成到画布');
+      }
     } catch (error) {
-      if (!(error instanceof DOMException && error.name === 'AbortError')) {
+      if (isCurrentQuickAction() && !(error instanceof DOMException && error.name === 'AbortError')) {
         showToast(error instanceof Error ? error.message : 'AI 操作失败');
       }
     } finally {
-      if (quickActionAbortControllerRef.current === abortController) {
+      if (!projectReloaded && currentProjectIdRef.current === projectId) {
+        try {
+          await reconcileQuickActionRun(projectId, source.id, aiQuickAction, observedRunId, runStartedAt, runSequence);
+        } catch {
+          // The next normal project refresh will retry reconciliation.
+        }
+      }
+      if (isCurrentQuickAction()) {
         quickActionAbortControllerRef.current = null;
         setIsQuickActionRunning(false);
         setQuickActionStatus('');
@@ -1021,8 +1279,12 @@ export const MagicWritingCanvas: React.FC = () => {
       const isTab = event.key === 'Tab';
       const isEnter = event.key === 'Enter';
       if (!isTab && !isEnter) return;
-      const target = event.target instanceof HTMLElement ? event.target : null;
-      if (target?.closest('input, textarea, select, button, [contenteditable="true"], [role="button"], [role="menuitem"]')) return;
+      if ((!isTab && event.defaultPrevented) || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (activePanel !== null || activePanelRef.current !== null || aiDecomposeNodeId !== null || projectMenuOpen) return;
+      const target = event.target instanceof Element ? event.target : null;
+      const activeElement = document.activeElement instanceof Element ? document.activeElement : null;
+      const interactiveSelector = 'input, textarea, select, button, a[href], [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [role="menuitem"], [role="option"], [role="tab"]';
+      if (target?.closest(interactiveSelector) || activeElement?.closest(interactiveSelector)) return;
       const editor = editorRef.current;
       const selectedShapeIds = editor?.getSelectedShapeIds() || [];
       if (!editor || selectedShapeIds.length !== 1) return;
@@ -1043,7 +1305,7 @@ export const MagicWritingCanvas: React.FC = () => {
       window.removeEventListener('atomflow-canvas-node-action', actionHandler);
       window.removeEventListener('keydown', keyHandler);
     };
-  }, [closeQuickAction, createDocumentFromNode, createInsightBranch, openAgentGroups]);
+  }, [activePanel, aiDecomposeNodeId, closeQuickAction, createDocumentFromNode, createInsightBranch, openAgentGroups, projectMenuOpen]);
 
   const createProject = () => loginAndDo(async () => {
     const response = await fetch('/api/write/canvas/projects', {
@@ -1196,11 +1458,14 @@ export const MagicWritingCanvas: React.FC = () => {
 
   const sendAgentMessage = async () => {
     if (!selectedNode?.agent || !agentInput.trim()) return;
+    const agentId = selectedNode.agent.id;
+    const projectId = currentProjectIdRef.current;
     const message = agentInput.trim();
+    let observedAgentRunId = '';
     setAgentInput('');
     setIsAgentRunning(true);
     try {
-      const response = await fetch(`/api/write/canvas/agents/${selectedNode.agent.id}/chat/stream`, {
+      const response = await fetch(`/api/write/canvas/agents/${agentId}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message }),
@@ -1209,6 +1474,21 @@ export const MagicWritingCanvas: React.FC = () => {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let receivedTerminal = false;
+      const consumeAgentEvents = async (events: ReturnType<typeof parseSseEvents>) => {
+        for (const event of events) {
+          if (typeof event.payload.runId === 'string' && event.payload.runId) observedAgentRunId = event.payload.runId;
+        }
+        const error = events.find(event => event.event === 'error');
+        if (error) {
+          receivedTerminal = true;
+          throw new Error(String(error.payload.message || 'Agent 暂时不可用'));
+        }
+        if (events.some(event => event.event === 'final')) {
+          receivedTerminal = true;
+          if (projectId) await loadProjectDetail(projectId);
+        }
+      };
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -1217,14 +1497,24 @@ export const MagicWritingCanvas: React.FC = () => {
         if (boundary < 0) continue;
         const events = parseSseEvents(buffer.slice(0, boundary + 2));
         buffer = buffer.slice(boundary + 2);
-        const error = events.find(event => event.event === 'error');
-        if (error) throw new Error(String(error.payload.message || 'Agent 暂时不可用'));
-        if (events.some(event => event.event === 'final') && currentProjectIdRef.current) {
-          await loadProjectDetail(currentProjectIdRef.current);
-        }
+        await consumeAgentEvents(events);
       }
+      if (buffer.trim()) await consumeAgentEvents(parseSseEvents(buffer));
+      if (!receivedTerminal) throw new Error('Agent 连接提前结束，请重试');
     } catch (error) {
-      showToast(error instanceof Error ? error.message : 'Agent 暂时不可用');
+      let persistedResult = false;
+      if (projectId && observedAgentRunId) {
+        const refreshed = await loadProjectDetail(projectId);
+        persistedResult = Boolean(refreshed?.messages[agentId]?.some(item => (
+          item.role === 'assistant' && String(item.meta?.runId || '') === observedAgentRunId
+        )));
+      }
+      if (persistedResult) {
+        showToast('Agent 已完成，已恢复生成结果');
+      } else {
+        setAgentInput(current => current.trim() ? current : message);
+        showToast(error instanceof Error ? error.message : 'Agent 暂时不可用');
+      }
     } finally {
       setIsAgentRunning(false);
     }

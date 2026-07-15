@@ -6,6 +6,8 @@ const root = process.cwd();
 const server = readFileSync(path.join(root, "server.ts"), "utf-8");
 const types = readFileSync(path.join(root, "src", "types.ts"), "utf-8");
 
+assert.match(server, /const getWriteAgentAiChatConfig =/, "writing Agent auxiliary calls need the same provider config as the SDK runtime");
+assert.match(server, /write_agent_intent_router[\s\S]{0,240}config:\s*getWriteAgentAiChatConfig\(config\)/, "intent routing must honor the OPENAI writing-Agent override");
 assert.match(server, /app\.post\("\/api\/write\/agent\/chat\/stream", requireAuth/, "stream route must require auth");
 assert.match(server, /app\.post\("\/api\/write\/agent\/chat", requireAuth/, "non-stream route must require auth");
 assert.match(server, /Writing agent model is not configured/, "routes must return a clear model configuration error");

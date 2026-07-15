@@ -211,6 +211,62 @@ const safeMarkdownUrl = (value: string) => {
   }
 };
 
+const escapeHtml = (value: string) => value
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;');
+
+const TIPTAP_DOCUMENT_TAGS = new Set([
+  'a',
+  'blockquote',
+  'br',
+  'code',
+  'em',
+  'h1',
+  'h2',
+  'h3',
+  'hr',
+  'li',
+  'ol',
+  'p',
+  'pre',
+  's',
+  'strong',
+  'u',
+  'ul',
+]);
+
+const TIPTAP_TAG_ALIASES: Record<string, string> = {
+  b: 'strong',
+  del: 's',
+  i: 'em',
+  strike: 's',
+};
+
+const sanitizeHtmlNodes = (nodes: HtmlNode[]): string => nodes.map(node => {
+  if (node.type === 'text') return escapeHtml(decodeHtmlEntities(node.value));
+  if (OMITTED_HTML_TAGS.has(node.tag)) return '';
+
+  const normalizedTag = TIPTAP_TAG_ALIASES[node.tag]
+    || (/^h[4-6]$/.test(node.tag) ? 'h3' : node.tag);
+  const content = sanitizeHtmlNodes(node.children);
+  if (!TIPTAP_DOCUMENT_TAGS.has(normalizedTag)) return content;
+  if (normalizedTag === 'br' || normalizedTag === 'hr') return `<${normalizedTag}>`;
+  if (normalizedTag === 'a') {
+    const href = safeMarkdownUrl(node.attributes.href || '');
+    return href ? `<a href="${escapeHtml(href)}">${content}</a>` : content;
+  }
+  if (normalizedTag === 'ol') {
+    const start = Number.parseInt(node.attributes.start || '', 10);
+    const startAttribute = Number.isSafeInteger(start) && start > 1 ? ` start="${start}"` : '';
+    return `<ol${startAttribute}>${content}</ol>`;
+  }
+  return `<${normalizedTag}>${content}</${normalizedTag}>`;
+}).join('');
+
+export const sanitizeCanvasDocumentHtml = (html: string) => sanitizeHtmlNodes(parseHtmlFragment(html).children);
+
 const codeFence = (value: string, minimum = 1) => {
   const longestRun = Math.max(0, ...Array.from(value.matchAll(/`+/g), match => match[0].length));
   return '`'.repeat(Math.max(minimum, longestRun + 1));
@@ -350,27 +406,23 @@ export const createScenarioSections = (scenario: string): WriteCanvasDocumentSec
 };
 
 export const buildCanvasDocumentMarkdown = (document: WriteCanvasDocument) => {
-  const blocks = [`# ${document.title || '未命名作品'}`];
-  if (document.summary.trim()) blocks.push(document.summary.trim());
+  const safeMarkdownMetadata = (value: string) => escapeMarkdownText(normalizeInlineWhitespace(value.trim()));
+  const blocks = [`# ${safeMarkdownMetadata(document.title || '未命名作品')}`];
+  if (document.summary.trim()) blocks.push(safeMarkdownMetadata(document.summary));
   document.sections.forEach(section => {
     const level = Math.min(6, Math.max(2, section.level + 1));
-    blocks.push(`${'#'.repeat(level)} ${section.heading || '未命名段落'}`);
+    blocks.push(`${'#'.repeat(level)} ${safeMarkdownMetadata(section.heading || '未命名段落')}`);
     const body = htmlToMarkdown(section.body);
     if (body) blocks.push(body);
   });
   return `${blocks.join('\n\n').trim()}\n`;
 };
 
-const escapeHtml = (value: string) => value
-  .replace(/&/g, '&amp;')
-  .replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;')
-  .replace(/"/g, '&quot;');
-
 export const buildCanvasDocumentHtml = (document: WriteCanvasDocument) => {
   const sections = document.sections.map(section => {
     const level = Math.min(6, Math.max(2, section.level + 1));
-    return `<section><h${level}>${escapeHtml(section.heading || '未命名段落')}</h${level}>${section.body || '<p></p>'}</section>`;
+    const body = sanitizeCanvasDocumentHtml(section.body);
+    return `<section><h${level}>${escapeHtml(section.heading || '未命名段落')}</h${level}>${body || '<p></p>'}</section>`;
   }).join('\n');
   return `<!doctype html>\n<html lang="zh-CN">\n<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(document.title || '未命名作品')}</title></head>\n<body><article><h1>${escapeHtml(document.title || '未命名作品')}</h1>${document.summary ? `<p>${escapeHtml(document.summary)}</p>` : ''}${sections}</article></body>\n</html>\n`;
 };
