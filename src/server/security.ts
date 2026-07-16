@@ -192,15 +192,23 @@ const readIncomingMessageBuffer = async (response: IncomingMessage, maxBytes: nu
   return Buffer.concat(chunks, total);
 };
 
+export const createPinnedLookup = (validatedAddress: string): LookupFunction => {
+  const family = isIP(validatedAddress);
+  return (_hostname, lookupOptions, callback) => {
+    if (lookupOptions.all) {
+      callback(null, [{ address: validatedAddress, family }]);
+      return;
+    }
+    callback(null, validatedAddress, family);
+  };
+};
+
 const requestPinnedPublicResource = (
   parsed: URL,
   validatedAddress: string,
   options: Pick<BoundedPublicFetchOptions, "headers" | "maxBytes" | "timeoutMs">,
 ) => new Promise<{ status: number; headers: Headers; body: Buffer }>((resolve, reject) => {
-  const family = isIP(validatedAddress);
-  const lookup: LookupFunction = (_hostname, _lookupOptions, callback) => {
-    callback(null, validatedAddress, family);
-  };
+  const lookup = createPinnedLookup(validatedAddress);
   const requestOptions: import("node:https").RequestOptions = {
     protocol: parsed.protocol,
     hostname: parsed.hostname,

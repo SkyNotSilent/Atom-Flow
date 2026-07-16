@@ -7,6 +7,7 @@ import {
   ConcurrencyLimitError,
   ResponseLimitError,
   buildAllowedOrigins,
+  createPinnedLookup,
   createUserConcurrencyGuard,
   fetchBoundedPublicResource,
   isAllowedMutationOrigin,
@@ -45,6 +46,19 @@ for (const address of [
 }
 assert.equal(isPrivateOrReservedIp("1.1.1.1"), false);
 assert.equal(isPrivateOrReservedIp("2606:4700:4700::1111"), false);
+
+const pinnedLookup = createPinnedLookup("1.1.1.1");
+await new Promise<void>((resolve, reject) => {
+  pinnedLookup("feeds.example.com", { all: true }, (error, addresses) => {
+    if (error) return reject(error);
+    try {
+      assert.deepEqual(addresses, [{ address: "1.1.1.1", family: 4 }]);
+      resolve();
+    } catch (assertionError) {
+      reject(assertionError);
+    }
+  });
+});
 
 const publicUrl = await validatePublicHttpUrl("https://feeds.example.com/rss", {
   lookup: async hostname => {
