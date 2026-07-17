@@ -17,6 +17,7 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
   const [open, setOpen] = useState(false);
   const [text, setText] = useState('');
   const [saving, setSaving] = useState(false);
+  const [showMicNotice, setShowMicNotice] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
@@ -77,10 +78,15 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
     if (isRecording) {
       stopRecording();
     } else {
-      resetTranscript();
-      startRecording();
+      setShowMicNotice(true);
     }
-  }, [isRecording, startRecording, stopRecording, resetTranscript]);
+  }, [isRecording, stopRecording]);
+
+  const confirmMicStart = useCallback(() => {
+    setShowMicNotice(false);
+    resetTranscript();
+    startRecording();
+  }, [resetTranscript, startRecording]);
 
   const handleSave = useCallback(async () => {
     const content = text.trim();
@@ -162,6 +168,16 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
             <div className="mt-1.5 text-xs text-red-500 animate-pulse flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-red-500 inline-block" />
               正在听写...
+            </div>
+          )}
+
+          {showMicNotice && !isRecording && (
+            <div className="mt-2 rounded-lg border border-border bg-surface2 p-2 text-[11px] leading-4 text-text2">
+              <p>开始后，音频将实时发送给当前实例配置的语音识别服务；停止录音后不再发送。</p>
+              <div className="mt-2 flex justify-end gap-2">
+                <button type="button" onClick={() => setShowMicNotice(false)} className="px-2 py-1 text-text3 hover:text-text1">取消</button>
+                <button type="button" onClick={confirmMicStart} className="rounded-md bg-primary px-2 py-1 font-medium text-white">开始听写</button>
+              </div>
             </div>
           )}
 

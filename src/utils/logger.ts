@@ -34,11 +34,6 @@ const reportToServer = (level: 'warn' | 'error', message: string, context?: LogC
     },
   });
 
-  const blob = new Blob([body], { type: 'application/json' });
-  if (navigator.sendBeacon?.('/api/log', blob)) {
-    return;
-  }
-
   void fetch('/api/log', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

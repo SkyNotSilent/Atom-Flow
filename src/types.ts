@@ -111,6 +111,7 @@ export interface Article {
   id: number;
   saved: boolean;
   source: string;
+  sourceAliases?: string[];
   sourceIcon?: string;
   topic: string;
   time: string;
@@ -121,6 +122,7 @@ export interface Article {
   sourceImages?: string[];
   content: string;
   markdownContent?: string;
+  contentFormat?: 'html' | 'markdown' | 'text';
   url?: string;
   audioUrl?: string;
   audioDuration?: string;
@@ -274,11 +276,17 @@ export interface WriteCanvasNode {
   id: number;
   projectId: number;
   kind: WriteCanvasNodeKind;
+  role: 'material' | 'insight' | 'task' | 'document' | 'group';
+  contentType: string;
+  origin: 'existing' | 'extracted' | 'manual' | 'generated';
+  status: 'parsing' | 'ready' | 'running' | 'pending_review' | 'adopted' | 'rejected' | 'editing' | 'completed' | 'failed';
+  businessRef?: string | null;
   title: string;
   summary?: string;
   refId?: string | number | null;
   asset?: WriteCanvasAsset | null;
   agent?: WriteAgentInstance | null;
+  document?: WriteCanvasDocument | null;
   meta?: Record<string, unknown>;
   x: number;
   y: number;
@@ -288,12 +296,34 @@ export interface WriteCanvasNode {
   updatedAt: string;
 }
 
+export interface WriteCanvasDocumentSection {
+  key: string;
+  heading: string;
+  body: string;
+  level: number;
+  meta: Record<string, unknown>;
+}
+
+export interface WriteCanvasDocument {
+  id: number;
+  projectId: number;
+  nodeId: number;
+  title: string;
+  summary: string;
+  scenario: string;
+  status: 'parsing' | 'ready' | 'running' | 'pending_review' | 'adopted' | 'rejected' | 'editing' | 'completed' | 'failed';
+  currentVersionId?: number | null;
+  sections: WriteCanvasDocumentSection[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface WriteCanvasEdge {
   id: number;
   projectId: number;
   sourceNodeId: number;
   targetNodeId: number;
-  relation: 'context';
+  relation: 'context' | 'derived_from' | 'generated' | 'structure';
   createdAt: string;
 }
 
@@ -304,6 +334,72 @@ export interface WriteCanvasMessage {
   content: string;
   meta?: Record<string, unknown>;
   createdAt: string;
+}
+
+export type WriteCanvasAgentRunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type WriteCanvasAgentBatchStatus = WriteCanvasAgentRunStatus | 'partial';
+export type WriteCanvasAgentGroupStatus = 'ready' | 'running' | 'completed' | 'partial' | 'failed' | 'cancelled';
+
+export interface WriteCanvasAgentRun {
+  id: number;
+  projectId: number;
+  groupId?: number | null;
+  groupMemberId?: number | null;
+  batchId?: number | null;
+  sourceNodeId?: number | null;
+  action: string;
+  status: WriteCanvasAgentRunStatus;
+  contextSnapshot: Record<string, unknown>;
+  configSnapshot: Record<string, unknown>;
+  output?: string;
+  error?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WriteCanvasAgentGroupMember {
+  id: number;
+  projectId: number;
+  name: string;
+  model: string;
+  systemPrompt: string;
+  temperature: number;
+  topP: number;
+  maxTokens: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WriteCanvasAgentGroup {
+  id: number;
+  projectId: number;
+  nodeId: number;
+  name: string;
+  sharedPrompt: string;
+  status: WriteCanvasAgentGroupStatus;
+  configSnapshot: Record<string, unknown>;
+  members: WriteCanvasAgentGroupMember[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WriteCanvasAgentBatch {
+  id: number;
+  projectId: number;
+  groupId: number;
+  message: string;
+  contextNodeIds: number[];
+  status: WriteCanvasAgentBatchStatus;
+  contextSnapshot: Record<string, unknown>;
+  configSnapshot: Record<string, unknown>;
+  output?: Record<string, unknown>;
+  error?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface WriteCanvasProjectDetail {

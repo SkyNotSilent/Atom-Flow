@@ -46,6 +46,7 @@ const checks: Check[] = [
       assert(/from\s+["']pino["']/.test(server), "server.ts should import pino");
       assert(/from\s+["']pino-http["']/.test(server), "server.ts should import pino-http");
       assert(/pinoHttp\s*\(/.test(server), "server.ts should mount pino-http middleware");
+      assert(/"req\.url"/.test(server) && /"req\.query"/.test(server), "structured request logs should redact URL queries");
     },
   },
   {
@@ -65,8 +66,8 @@ const checks: Check[] = [
     run: () => {
       const server = readFileSync(serverPath, "utf-8");
       assert(
-        /if \(isProduction\) \{\s*logger\.info\(\{ authEvent: event, email \}/.test(server),
-        "production OTP logs should omit the code",
+        /if \(isProduction\) \{\s*logger\.info\(\{ authEvent: event, emailHash: hashLogIdentifier\(email\) \}/.test(server),
+        "production OTP logs should omit the code and hash the email identifier",
       );
       assert(
         /else \{\s*logger\.debug\(\{ authEvent: event, email, otp: code \}/.test(server),
@@ -82,7 +83,8 @@ const checks: Check[] = [
     run: () => {
       assert(existsSync(frontendLoggerPath), "src/utils/logger.ts should exist");
       const logger = readFileSync(frontendLoggerPath, "utf-8");
-      assert(/sendBeacon/.test(logger), "frontend logger should use sendBeacon");
+      assert(/fetch\(["']\/api\/log["']/.test(logger), "frontend logger should use the CSRF-aware fetch wrapper");
+      assert(!/sendBeacon/.test(logger), "frontend logger should not bypass CSRF protection with sendBeacon");
       assert(/\/api\/log/.test(logger), "frontend logger should report to /api/log");
     },
   },

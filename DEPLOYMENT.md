@@ -88,6 +88,11 @@ SMTP_USER=your-gmail@gmail.com
 SMTP_PASS=your-app-password
 BAIDU_TRANSLATE_APPID=your-appid
 BAIDU_TRANSLATE_KEY=your-key
+WRITE_AGENT_ALLOWED_MODELS=mimo-v2.5-pro
+WRITE_AGENT_MAX_OUTPUT_TOKENS=2000
+PAID_OPERATION_DAILY_LIMIT=100
+PAID_OUTPUT_TOKENS_DAILY_LIMIT=200000
+CANVAS_PDF_MAX_PAGES=100
 ```
 
 > **注意**：Railway 会自动注入 `DATABASE_URL`（添加 PostgreSQL 插件后）。其他变量需要在 Railway Variables 面板手动添加。
@@ -97,7 +102,7 @@ BAIDU_TRANSLATE_KEY=your-key
 - **Wait for CI**：GitHub checks 全部通过后再合并和部署。
 - `SESSION_SECRET` 使用至少 32 个随机字符，`APP_URL` 使用正式 HTTPS 地址；`VITE_TLDRAW_LICENSE_KEY` 必须在构建阶段存在。
 - Railway 的 `/api/health` 健康检查通过，且 `healthcheckTimeout` 已显式配置。
-- 当前全局 RSS 和限流仍有单进程状态，Railway 先保持 1 个 Web 副本。公开发布前完成 Cloudflare/WAF、Redis、对象存储、后台队列、监控告警和数据库备份；共享状态迁移并压测后再扩到 2 个以上副本。
+- 每用户每日付费操作和输出 token 预留额度已写入 PostgreSQL；分钟级限流、全局并发、RSS 缓存和任务协调仍有单进程状态，因此 Railway 先保持 1 个 Web 副本。公开发布前完成 Cloudflare/WAF、Redis、对象存储、后台队列、监控告警和数据库备份；共享状态迁移并压测后再扩到 2 个以上副本。
 - 本地或单进程内存限流只适合开发验证，不能替代多副本生产环境的共享限流和协调。
 
 ## 验证部署

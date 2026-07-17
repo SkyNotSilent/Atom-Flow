@@ -24,6 +24,11 @@ export const readBoundedEnvNumber = (value: string | undefined, fallback: number
   return Math.min(max, Math.max(min, Math.round(parsed)));
 };
 
+export const isAuthenticationPath = (pathname: string) => {
+  const normalizedPath = pathname.toLowerCase().replace(/\/+$/, "");
+  return normalizedPath === "/auth" || normalizedPath.startsWith("/auth/");
+};
+
 const ipv4ToNumber = (address: string) => {
   const parts = address.split(".").map(Number);
   if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return null;
@@ -120,6 +125,7 @@ export const isPrivateOrReservedIp = (address: string) => {
 
 type PublicUrlValidationOptions = {
   lookup?: (hostname: string) => Promise<string[]>;
+  allowedPorts?: ReadonlySet<string>;
 };
 
 const defaultLookup = async (hostname: string) => {
@@ -136,6 +142,7 @@ const resolvePublicHttpUrl = async (rawUrl: string, options: PublicUrlValidation
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("URL protocol must be HTTP or HTTPS");
   if (parsed.username || parsed.password) throw new Error("URL credentials are not allowed");
+  if (options.allowedPorts && !options.allowedPorts.has(parsed.port)) throw new Error("URL port is not allowed");
   const hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
   if (!hostname || hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local")) {
     throw new Error("URL hostname is not public");
@@ -190,15 +197,23 @@ const readIncomingMessageBuffer = async (response: IncomingMessage, maxBytes: nu
   return Buffer.concat(chunks, total);
 };
 
+export const createPinnedLookup = (validatedAddress: string): LookupFunction => {
+  const family = isIP(validatedAddress);
+  return (_hostname, lookupOptions, callback) => {
+    if (lookupOptions.all) {
+      callback(null, [{ address: validatedAddress, family }]);
+      return;
+    }
+    callback(null, validatedAddress, family);
+  };
+};
+
 const requestPinnedPublicResource = (
   parsed: URL,
   validatedAddress: string,
   options: Pick<BoundedPublicFetchOptions, "headers" | "maxBytes" | "timeoutMs">,
 ) => new Promise<{ status: number; headers: Headers; body: Buffer }>((resolve, reject) => {
-  const family = isIP(validatedAddress);
-  const lookup: LookupFunction = (_hostname, _lookupOptions, callback) => {
-    callback(null, validatedAddress, family);
-  };
+  const lookup = createPinnedLookup(validatedAddress);
   const requestOptions: import("node:https").RequestOptions = {
     protocol: parsed.protocol,
     hostname: parsed.hostname,
@@ -235,7 +250,10 @@ const requestPinnedPublicResource = (
 export const fetchBoundedPublicResource = async (rawUrl: string, options: BoundedPublicFetchOptions) => {
   let currentUrl = rawUrl;
   for (let redirectCount = 0; redirectCount <= options.maxRedirects; redirectCount += 1) {
-    const { parsed, addresses } = await resolvePublicHttpUrl(currentUrl, { lookup: options.lookup });
+    const { parsed, addresses } = await resolvePublicHttpUrl(currentUrl, {
+      lookup: options.lookup,
+      allowedPorts: options.allowedPorts,
+    });
     options.validateUrl?.(parsed);
     const resource = options.fetchImpl
       ? await (async () => {

@@ -203,6 +203,7 @@ export const NotesPanel: React.FC = () => {
         excerpt: data.excerpt || reference.excerpt || '',
         content: data.content || reference.excerpt || '',
         markdownContent: data.content || undefined,
+        contentFormat: data.contentFormat,
         url: data.url || reference.url,
         fullFetched: true,
         cards: []

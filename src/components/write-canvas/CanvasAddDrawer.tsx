@@ -1,13 +1,16 @@
 import React, { useMemo, useState } from 'react';
 import {
   Bot,
+  BookOpenText,
   FileText,
   ImagePlus,
   Layers3,
+  Lightbulb,
   MessageSquareText,
   Search,
   StickyNote,
   Upload,
+  UsersRound,
   X,
 } from 'lucide-react';
 import type { AtomCard, Note, SavedArticle, WriteAgentTemplate } from '../../types';
@@ -28,6 +31,9 @@ type CanvasAddDrawerProps = {
   onUpload: (file: File) => void;
   onAddPaste: () => void;
   onAddAgent: (template?: WriteAgentTemplate) => void;
+  onAddInsight: () => void;
+  onAddDocument: () => void;
+  onOpenAgentGroups: () => void;
   onAddCard: (card: AtomCard) => void;
   onAddArticle: (article: SavedArticle) => void;
   onAddNote: (note: Note) => void;
@@ -57,6 +63,9 @@ export const CanvasAddDrawer: React.FC<CanvasAddDrawerProps> = ({
   onUpload,
   onAddPaste,
   onAddAgent,
+  onAddInsight,
+  onAddDocument,
+  onOpenAgentGroups,
   onAddCard,
   onAddArticle,
   onAddNote,
@@ -123,16 +132,33 @@ export const CanvasAddDrawer: React.FC<CanvasAddDrawerProps> = ({
               原子卡
             </button>
           ) : (
-            <button type="button" onClick={() => onAddAgent()} className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-[7px] border border-[#DCDAD4] bg-white text-[11px] font-medium text-[#34383E] hover:border-[#8FB5F2] hover:bg-[#F4F8FF]">
-              <Bot size={17} className="text-[#1F6FEB]" />
-              空白 Agent
-            </button>
+            <>
+              <button type="button" onClick={onAddInsight} className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-[7px] border border-[#DCDAD4] bg-white text-[11px] font-medium text-[#34383E] hover:border-[#8FB5F2] hover:bg-[#F4F8FF]">
+                <Lightbulb size={17} className="text-[#1F6FEB]" />
+                手写知识
+              </button>
+              <button type="button" onClick={onAddDocument} className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-[7px] border border-[#DCDAD4] bg-white text-[11px] font-medium text-[#34383E] hover:border-[#8FB5F2] hover:bg-[#F4F8FF]">
+                <BookOpenText size={17} className="text-[#1F6FEB]" />
+                空白作品
+              </button>
+              <button type="button" onClick={() => onAddAgent()} className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-[7px] border border-[#DCDAD4] bg-white text-[11px] font-medium text-[#34383E] hover:border-[#8FB5F2] hover:bg-[#F4F8FF]">
+                <Bot size={17} className="text-[#1F6FEB]" />
+                空白 Agent
+              </button>
+              <button type="button" onClick={onOpenAgentGroups} className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-[7px] border border-[#DCDAD4] bg-white text-[11px] font-medium text-[#34383E] hover:border-[#8FB5F2] hover:bg-[#F4F8FF]">
+                <UsersRound size={17} className="text-[#1F6FEB]" />
+                Agent 组
+              </button>
+            </>
           )}
           <button type="button" onClick={() => setFilter('notes')} className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-[7px] border border-[#DCDAD4] bg-white text-[11px] font-medium text-[#34383E] hover:border-[#8FB5F2] hover:bg-[#F4F8FF]">
             <StickyNote size={17} className="text-[#1F6FEB]" />
             我的 Notes
           </button>
         </div>
+        <p className="mt-2 text-[10px] leading-4 text-[#858990]">
+          上传后将保存在当前实例；只有你明确连接或选择为 AI 上下文时，文件内容才会发送给当前实例配置的模型服务。
+        </p>
 
         <div className="mt-3 rounded-[7px] border border-[#DCDAD4] bg-white p-2">
           <textarea

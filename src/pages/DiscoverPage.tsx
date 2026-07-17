@@ -99,20 +99,6 @@ export const DiscoverPage: React.FC = () => {
     setLoadingSources(prev => new Set(prev).add(source.name));
     
     try {
-      const response = await fetch('/api/sources/fetch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          source: source.name,
-          input: source.url,
-          color: source.color
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to add source');
-      }
-
       // 更新 localStorage
       const stored = localStorage.getItem('atomflow:source-layout:v1');
       const parsed = stored ? JSON.parse(stored) : { version: 2, entries: [] };
@@ -137,13 +123,10 @@ export const DiscoverPage: React.FC = () => {
       }));
 
       setAddedSources(prev => new Set(prev).add(source.name));
-      await reloadArticles();
       showToast(`已添加 ${source.name}`);
-      
-      // 触发页面刷新以更新导航栏
-      window.location.reload();
+      window.dispatchEvent(new Event('atomflow:preferences-loaded'));
     } catch (error) {
-      logger.error('Failed to add source', { error, source: source.name, input: source.url });
+      logger.error('Failed to add source', { error, source: source.name });
       showToast('添加失败，请稍后重试');
     } finally {
       setLoadingSources(prev => {
@@ -216,7 +199,7 @@ export const DiscoverPage: React.FC = () => {
       // 触发页面刷新以更新导航栏
       window.location.reload();
     } catch (error) {
-      logger.error('Failed to add custom source', { error, source: sourceName, input });
+      logger.error('Failed to add custom source', { error, source: sourceName });
       showToast('添加失败，请检查链接是否正确');
     } finally {
       setIsAddingCustom(false);
@@ -248,6 +231,9 @@ export const DiscoverPage: React.FC = () => {
             placeholder="输入 RSS 链接或 RSSHub 路由（如：rsshub://sspai/index）"
             className="w-full px-3 py-2 rounded-lg border border-border bg-bg text-[13px] text-text-main outline-none focus:border-accent transition-colors"
           />
+          <p className="text-[11px] leading-4 text-text3">
+            服务器将访问此地址并保存订阅内容。请勿填写内网地址、含密钥链接或无权抓取的来源。
+          </p>
           <div className="flex gap-2">
             <input
               type="text"

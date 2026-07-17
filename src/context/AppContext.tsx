@@ -4,9 +4,12 @@ import { logger } from '../utils/logger';
 
 export type WriteWorkspaceMode = 'graph' | 'articles' | 'skills';
 export type WriteGraphView = 'all' | 'activated';
+const RSS_REFRESH_RETRY_DELAYS_MS = [1500, 3000, 6000, 12000, 24000] as const;
 
 interface AppState {
   articles: Article[];
+  articlesLoaded: boolean;
+  sourceArticles: Record<string, Article[]>;
   savedCards: AtomCard[];
   savedArticles: SavedArticle[];
   saveArticle: (articleId: number) => Promise<boolean>;
@@ -25,6 +28,7 @@ interface AppState {
   activeSource: string | null;
   setActiveSource: (source: string | null) => void;
   reloadArticles: () => Promise<void>;
+  loadSourceArticles: (source: string) => Promise<Article[]>;
   isSavingArticle: (articleId: number) => boolean;
   getSavingStageText: (articleId: number) => string | null;
   knowledgeTypeFilter: string;
@@ -78,6 +82,8 @@ const AppContext = createContext<AppState | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [articles, setArticles] = useState<Article[]>([]);
+  const [articlesLoaded, setArticlesLoaded] = useState(false);
+  const [sourceArticles, setSourceArticles] = useState<Record<string, Article[]>>({});
   const [savedCards, setSavedCards] = useState<AtomCard[]>([]);
   const [savedArticles, setSavedArticles] = useState<SavedArticle[]>([]);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -105,16 +111,85 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [selectedStyleSkillId, setSelectedStyleSkillId] = useState<number | string>('system-columnist');
   const [selectedSkillIds, setSelectedSkillIds] = useState<Array<number | string>>(['system-card-storage', 'system-citation', 'system-writing', 'system-columnist']);
   const syncTimerRef = useRef<number | null>(null);
+  const articleRetryTimerRef = useRef<number | null>(null);
+  const sourceRetryTimersRef = useRef<Map<string, number>>(new Map());
   const quickOpenMode = false;
   const forceRefetchInTesting = false;
   const saveStages = ['提取全文', '识别要点', '原子化拆分', '提炼入库'];
 
-  const reloadArticles = async () => {
-    const articlesRes = await fetch('/api/articles');
-    if (articlesRes.ok) {
-      setArticles(await articlesRes.json());
+  const reloadArticles = async (retryAttempt = 0): Promise<void> => {
+    let retryScheduled = articleRetryTimerRef.current !== null;
+    try {
+      const articlesRes = await fetch('/api/articles');
+      if (articlesRes.ok) {
+        const nextArticles = await articlesRes.json() as Article[];
+        setArticles(nextArticles);
+        const retryPending = nextArticles.length === 0
+          && articlesRes.headers.get('X-AtomFlow-RSS-Refreshing') === 'true';
+        if (retryPending && retryAttempt < RSS_REFRESH_RETRY_DELAYS_MS.length) {
+          retryScheduled = true;
+          if (articleRetryTimerRef.current === null) {
+            articleRetryTimerRef.current = window.setTimeout(() => {
+              articleRetryTimerRef.current = null;
+              void reloadArticles(retryAttempt + 1).catch(error => logger.error('Failed to retry article loading', { error }));
+            }, RSS_REFRESH_RETRY_DELAYS_MS[retryAttempt]);
+          }
+        } else {
+          retryScheduled = false;
+        }
+      }
+    } finally {
+      if (!retryScheduled) {
+        if (articleRetryTimerRef.current !== null) {
+          window.clearTimeout(articleRetryTimerRef.current);
+          articleRetryTimerRef.current = null;
+        }
+        setArticlesLoaded(true);
+      }
     }
   };
+
+  const loadSourceArticles = async (source: string, retryAttempt = 0): Promise<Article[]> => {
+    const response = await fetch(`/api/articles?source=${encodeURIComponent(source)}`, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`Failed to load source: ${response.status}`);
+    }
+    const nextArticles = await response.json() as Article[];
+    const existingTimer = sourceRetryTimersRef.current.get(source);
+    const refreshPending = response.headers.get('X-AtomFlow-RSS-Refreshing') === 'true';
+    if (nextArticles.length > 0) {
+      setSourceArticles(current => ({ ...current, [source]: nextArticles }));
+    }
+    if (refreshPending && retryAttempt < RSS_REFRESH_RETRY_DELAYS_MS.length && existingTimer === undefined) {
+      const timer = window.setTimeout(() => {
+        sourceRetryTimersRef.current.delete(source);
+        void loadSourceArticles(source, retryAttempt + 1).catch(error => logger.error('Failed to retry source loading', { error, source }));
+      }, RSS_REFRESH_RETRY_DELAYS_MS[retryAttempt]);
+      sourceRetryTimersRef.current.set(source, timer);
+    } else if (!refreshPending && existingTimer !== undefined) {
+      window.clearTimeout(existingTimer);
+      sourceRetryTimersRef.current.delete(source);
+    }
+
+    return nextArticles;
+  };
+
+  const updateSourceArticleCache = (articleId: number, patch: Partial<Article>) => {
+    setSourceArticles(current => Object.fromEntries(
+      Object.entries(current).map(([source, sourceItems]) => [
+        source,
+        sourceItems.map(item => item.id === articleId ? { ...item, ...patch } : item),
+      ]),
+    ));
+  };
+
+  useEffect(() => () => {
+    if (articleRetryTimerRef.current !== null) {
+      window.clearTimeout(articleRetryTimerRef.current);
+    }
+    sourceRetryTimersRef.current.forEach(timer => window.clearTimeout(timer));
+    sourceRetryTimersRef.current.clear();
+  }, []);
   
   const setReadingArticle = async (article: Article | null) => {
     setReadingArticleState(article);
@@ -132,6 +207,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (res.ok) {
           const data = await res.json();
           setArticles(prev => prev.map(a => a.id === article.id ? data.article : a));
+          updateSourceArticleCache(article.id, data.article);
           setReadingArticleState(data.article);
           return;
         }
@@ -149,13 +225,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
               if (retryRes.ok) {
                 const data = await retryRes.json();
                 setArticles((prev: Article[]) => prev.map(a => a.id === matched.id ? data.article : a));
+                updateSourceArticleCache(matched.id, data.article);
                 setReadingArticleState(data.article);
               }
             }
           }
         }
       } catch (error) {
-        logger.error("Failed to fetch full article", { error, articleId: article.id, articleUrl: article.url });
+        logger.error("Failed to fetch full article", { error, articleId: article.id });
       }
     }
   };
@@ -558,6 +635,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (fullRes.ok) {
           const fullData = await fullRes.json();
           setArticles(prev => prev.map(a => a.id === resolvedArticleId ? fullData.article : a));
+          updateSourceArticleCache(resolvedArticleId, fullData.article);
           if (readingArticle?.id === articleId || readingArticle?.id === resolvedArticleId) {
             setReadingArticleState(fullData.article);
           }
@@ -573,6 +651,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (res.ok) {
         const saveData = await res.json().catch(() => null);
         const savedArticleFromResponse = saveData?.article as Article | undefined;
+        updateSourceArticleCache(resolvedArticleId, { ...savedArticleFromResponse, saved: true });
+        if (resolvedArticleId !== articleId) {
+          updateSourceArticleCache(articleId, { ...savedArticleFromResponse, saved: true });
+        }
         setSaveProgress([articleId, resolvedArticleId], saveStages[3]);
         // Refresh data to get the new cards and updated article state
         const [articlesRes, cardsRes, savedArticlesRes] = await Promise.all([
@@ -686,6 +768,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const handleLoginSuccess = async (userData: User) => {
     setUser(userData);
+    setSourceArticles({});
     setShowLoginModal(false);
     try {
       const [cardsRes] = await Promise.all([
@@ -716,6 +799,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setAssistantThreads([]);
     setAssistantThreadId(null);
     setWriteAgentSkills([]);
+    setSourceArticles({});
     await reloadArticles(); // reload without user articles
   };
 
@@ -757,12 +841,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   return (
     <AppContext.Provider value={{
-      articles, savedCards, savedArticles, saveArticle, addCards, addCard, updateCard, deleteCard,
+      articles, articlesLoaded, sourceArticles, savedCards, savedArticles, saveArticle, addCards, addCard, updateCard, deleteCard,
       showToast, toastMsg, theme, toggleTheme,
       viewMode, setViewMode,
       readingArticle, setReadingArticle,
       activeSource, setActiveSource,
-      reloadArticles,
+      reloadArticles, loadSourceArticles,
       reloadNotes,
       isSavingArticle,
       getSavingStageText,
