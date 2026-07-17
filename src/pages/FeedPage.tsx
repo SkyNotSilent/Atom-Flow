@@ -8,9 +8,8 @@ import { getDisplaySource, sourceMatches } from '../utils/articleDisplay';
 import { AtomFlowGalaxyIcon } from '../components/AtomFlowGalaxyIcon';
 
 export const FeedPage: React.FC = () => {
-  const { articles, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText, showToast, reloadArticles, viewMode, setViewMode } = useAppContext();
+  const { articles, articlesLoaded, sourceArticles, loadSourceArticles, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText, showToast, user, viewMode, setViewMode } = useAppContext();
   const [showSrcModal, setShowSrcModal] = useState(false);
-  const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [isRetrying, setIsRetrying] = useState(false);
   const [currentDate, setCurrentDate] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -35,58 +34,44 @@ export const FeedPage: React.FC = () => {
     return () => clearInterval(timer);
   }, []);
 
-  // 源名称到RSS URL的映射
-  const SOURCE_RSS_MAP: Record<string, string> = {
-    'AI HOT 精选': 'https://aihot.virxact.com/feed.xml',
-    'AI HOT 全部': 'https://aihot.virxact.com/feed/all.xml',
-    '少数派': 'rsshub://sspai/index',
-    '36氪': 'rsshub://36kr/hot-list',
-    '虎嗅': 'https://www.huxiu.com/rss/0.xml',
-    '人人都是产品经理': 'https://www.woshipm.com/feed',
-    '数字生命卡兹克': 'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml',
-    '新智元': 'https://plink.anyfeeder.com/weixin/AI_era',
-    '即刻话题': 'rsshub://jike/topic/63579abb6724cc583b9bba9a',
-    'GitHub Blog': 'https://github.blog/feed/',
-    'Sam Altman': 'rsshub://twitter/user/sama',
-    '张小珺商业访谈录': 'https://feed.xyzfm.space/dk4yh3pkpjp3',
-    'Lex Fridman': 'rsshub://youtube/user/%40lexfridman',
-    'Y Combinator': 'rsshub://youtube/user/%40ycombinator',
-    'Andrej Karpathy': 'rsshub://youtube/user/@AndrejKarpathy'
-  };
+  const BUILTIN_SOURCE_NAMES = new Set([
+    'AI HOT 精选', 'AI HOT 全部', '少数派', '36氪', '虎嗅', '人人都是产品经理',
+    '数字生命卡兹克', '新智元', '即刻话题', 'GitHub Blog', 'Sam Altman',
+    '张小珺商业访谈录', 'Lex Fridman', 'Y Combinator', 'Andrej Karpathy'
+  ]);
 
-  // 检测初始加载状态
-  React.useEffect(() => {
-    if (articles.length > 0) {
-      setIsInitialLoading(false);
-    }
-  }, [articles]);
+  const isInitialLoading = !articlesLoaded;
 
   const handleRetrySource = async () => {
     if (!activeSource || isRetrying) return;
     
-    const rssUrl = SOURCE_RSS_MAP[activeSource];
-    if (!rssUrl) {
+    if (!BUILTIN_SOURCE_NAMES.has(activeSource)) {
       showToast('该信息源不支持重试');
+      return;
+    }
+    if (!user) {
+      showToast('登录后可立即刷新，服务端也会自动重试');
       return;
     }
 
     setIsRetrying(true);
-    showToast('正在重新获取，最多等待60秒...');
+    showToast('正在重新加载信息源...');
     
     try {
-      const res = await fetch('/api/sources/retry', {
+      const refreshResponse = await fetch('/api/sources/retry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: activeSource, input: rssUrl, full: true })
+        body: JSON.stringify({ source: activeSource }),
       });
-      
-      if (res.ok) {
-        const data = await res.json();
-        await reloadArticles();
-        showToast(`成功获取 ${data.added} 篇文章`);
+      if (!refreshResponse.ok) {
+        throw new Error(`Failed to refresh source: ${refreshResponse.status}`);
+      }
+      const refreshResult = await refreshResponse.json() as { refreshed?: boolean };
+      const nextArticles = await loadSourceArticles(activeSource);
+      if (refreshResult.refreshed === false) {
+        showToast(nextArticles.length > 0 ? '未获取到新内容，已保留现有内容' : '暂时没有可用内容，服务端将继续自动重试');
       } else {
-        const error = await res.json();
-        showToast(`获取失败：${error.details || error.error}`);
+        showToast(nextArticles.length > 0 ? '信息源已重新加载' : '信息源已刷新，当前没有内容');
       }
     } catch (error) {
       showToast('网络错误，请稍后重试');
@@ -132,12 +117,13 @@ export const FeedPage: React.FC = () => {
   // 当查看特定信息源时，只按时间排序，不应用复杂的排序逻辑
   const filteredArticles = React.useMemo(() => {
     if (activeSource) {
-      return [...articles]
+      const availableArticles = sourceArticles[activeSource] || articles;
+      return [...availableArticles]
         .filter(a => sourceMatches(a, activeSource || ''))
         .sort((a, b) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0));
     }
     return rankArticles(articles);
-  }, [articles, activeSource]);
+  }, [articles, sourceArticles, activeSource]);
 
   // 切换信息源时滚动到顶部
   useEffect(() => {

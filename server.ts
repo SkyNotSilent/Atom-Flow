@@ -3,7 +3,6 @@ import compression from "compression";
 import helmet from "helmet";
 import { ipKeyGenerator, rateLimit } from "express-rate-limit";
 import { createServer as createViteServer } from "vite";
-import { MOCK_ARTICLES } from "./src/data/mock.js";
 import { AtomCard, Article, User } from "./src/types.js";
 import multer from "multer";
 import Parser from "rss-parser";
@@ -50,6 +49,16 @@ import {
   validateDocxArchiveBounds,
   validatePublicHttpUrl,
 } from "./src/server/security.js";
+import {
+  BUILTIN_RSS_FEEDS,
+  collectSettledFeedArticles,
+  createSerializedTaskQueue,
+  mergeArticleSourceMemberships,
+  mergeWithSourceFallback,
+  normalizeArticleUrl,
+  sanitizeGlobalArticleCache,
+  stableArticleId,
+} from "./src/server/rss.js";
 
 dotenv.config();
 
@@ -370,9 +379,13 @@ function escapeRegExp(text: string): string {
 }
 
 function mergeArticles(previous: Article[], next: Article[]): Article[] {
-  const prevByUrl = new Map(previous.filter(a => a.url).map(a => [a.url as string, a]));
+  const prevByUrl = new Map(previous.flatMap(article => {
+    const normalizedUrl = normalizeArticleUrl(article.url);
+    return normalizedUrl ? [[normalizedUrl, article] as const] : [];
+  }));
   return next.map(article => {
-    const prev = article.url ? prevByUrl.get(article.url) : undefined;
+    const normalizedUrl = normalizeArticleUrl(article.url);
+    const prev = normalizedUrl ? prevByUrl.get(normalizedUrl) : undefined;
     if (!prev) return article;
     return {
       ...article,
@@ -384,27 +397,6 @@ function mergeArticles(previous: Article[], next: Article[]): Article[] {
       readabilityUsed: prev.readabilityUsed
     };
   });
-}
-
-function mergeWithSourceFallback(previous: Article[], next: Article[]) {
-  const sourceKey = (item: Article) => {
-    if (item.url?.includes('36kr.com')) return '36氪';
-    if (item.url?.includes('woshipm.com')) return '人人都是产品经理';
-    if (item.url?.includes('sspai.com')) return '少数派';
-    if (item.url?.includes('huxiu.com')) return '虎嗅';
-    return item.source;
-  };
-  const nextSources = new Set(next.map(sourceKey));
-  const fallback = previous.filter(item => !nextSources.has(sourceKey(item)));
-  const combined = [...next, ...fallback];
-  const unique = new Map<string, Article>();
-  for (const article of combined) {
-    const key = article.url ? `url:${article.url}` : `st:${article.source}:${article.title}`;
-    if (!unique.has(key)) {
-      unique.set(key, article);
-    }
-  }
-  return Array.from(unique.values());
 }
 
 async function loadArticlesCache() {
@@ -420,9 +412,15 @@ async function loadArticlesCache() {
   }
 }
 
-async function saveArticlesCache(articles: Article[]) {
+const writeArticleCacheSnapshot = createSerializedTaskQueue<string>(async snapshot => {
   await fs.mkdir(path.dirname(CACHE_FILE), { recursive: true });
-  await fs.writeFile(CACHE_FILE, JSON.stringify(articles), "utf-8");
+  const temporaryPath = `${CACHE_FILE}.${process.pid}.tmp`;
+  await fs.writeFile(temporaryPath, snapshot, "utf-8");
+  await fs.rename(temporaryPath, CACHE_FILE);
+});
+
+async function saveArticlesCache(articles: Article[]) {
+  await writeArticleCacheSnapshot(JSON.stringify(sanitizeGlobalArticleCache(articles)));
 }
 
 // Built-in source names — these are globally shared and never stored per-user
@@ -482,7 +480,7 @@ async function applyUserSavedStateToArticles(userId: number, articleList: Articl
       [userId]
     ),
     pool.query(
-      `SELECT url, title, source
+      `SELECT url, normalized_url, title, source
        FROM saved_articles
        WHERE user_id = $1`,
       [userId]
@@ -492,7 +490,9 @@ async function applyUserSavedStateToArticles(userId: number, articleList: Articl
   const savedArticleIds = new Set(cardResult.rows.map(row => Number(row.article_id)));
   const savedUrls = new Set(
     savedArticleResult.rows
-      .map(row => row.url)
+      .map(row => typeof row.normalized_url === "string"
+        ? row.normalized_url
+        : typeof row.url === "string" ? normalizeArticleUrl(row.url) : undefined)
       .filter((url): url is string => typeof url === "string" && url.length > 0)
   );
   const savedSourceTitles = new Set(
@@ -500,9 +500,10 @@ async function applyUserSavedStateToArticles(userId: number, articleList: Articl
   );
 
   return articleList.map(article => {
+    const normalizedArticleUrl = normalizeArticleUrl(article.url);
     const savedByCurrentUser = savedArticleIds.has(article.id)
-      || Boolean(article.url && savedUrls.has(article.url))
-      || savedSourceTitles.has(`${article.source}\t${article.title}`)
+      || Boolean(normalizedArticleUrl && savedUrls.has(normalizedArticleUrl))
+      || (!normalizedArticleUrl && savedSourceTitles.has(`${article.source}\t${article.title}`))
       || (!BUILTIN_SOURCE_NAMES.has(article.source) && article.saved);
 
     return { ...article, saved: savedByCurrentUser };
@@ -595,24 +596,6 @@ function extractFeedIcon(parsed: Parser.Output<any>): string | undefined {
   }
   
   return undefined;
-}
-
-function stableArticleId(source: string, item: Parser.Item, idOffset: number, index: number) {
-  const key = [
-    source,
-    idOffset,
-    item.guid || '',
-    item.link || '',
-    item.title || '',
-    item.pubDate || '',
-    index
-  ].join('|');
-  let hash = 2166136261;
-  for (let i = 0; i < key.length; i += 1) {
-    hash ^= key.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return 1_000_000_000_000 + (hash >>> 0);
 }
 
 function getDefaultFeedLimit(source: string) {
@@ -838,28 +821,6 @@ const normalizeJsonStringArray = (value: unknown): string[] => {
     }
   }
   return [];
-};
-
-/**
- * Normalize article URL to avoid duplicate saves due to URL variations
- * - Removes query parameters (utm_source, etc.)
- * - Removes hash fragments
- * - Removes trailing slashes
- * - Converts to lowercase for case-insensitive comparison
- */
-const normalizeArticleUrl = (url: string | undefined): string | undefined => {
-  if (!url) return undefined;
-  try {
-    const parsed = new URL(url);
-    parsed.search = '';  // Remove query parameters
-    parsed.hash = '';    // Remove hash fragments
-    let normalized = parsed.href.replace(/\/$/, ''); // Remove trailing slash
-    // Keep protocol and domain case-sensitive, but normalize path
-    return normalized;
-  } catch {
-    // Invalid URL, return as-is
-    return url;
-  }
 };
 
 /**
@@ -5156,163 +5117,51 @@ const get36KrArticleId = (url?: string) => {
   return match?.[1] || null;
 };
 
-async function fetchRSSFeeds(): Promise<Article[]> {
+async function fetchRSSFeeds(maxItems: number): Promise<{
+  timelineArticles: Article[];
+  fullArticles: Article[];
+  refreshedSources: string[];
+}> {
   try {
-    const results = await Promise.allSettled([
-      parseWithRetry([
-          'rsshub://sspai/index'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://www.woshipm.com/feed',
-          'rsshub://woshipm/popular'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://36kr/hot-list',
-          'https://36kr.com/feed',
-          'rsshub://36kr/news'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://www.huxiu.com/rss/0.xml',
-          'rsshub://huxiu/article'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://plink.anyfeeder.com/weixin/AI_era'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://jike/topic/63579abb6724cc583b9bba9a'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://github.blog/feed/'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://twitter/user/sama'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://feed.xyzfm.space/dk4yh3pkpjp3'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://youtube/user/%40lexfridman',
-          'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://youtube/user/%40ycombinator',
-          'https://www.youtube.com/feeds/videos.xml?channel_id=UCcefcZRL2oaA_uBNeo5UOWg'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://youtube/user/@AndrejKarpathy',
-          'https://www.youtube.com/feeds/videos.xml?channel_id=UCYO_jab_esuFRV4b17AJtAw'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://aihot.virxact.com/feed.xml'
-        ], 20000, 2)
-    ]);
-    const sspaiArticles = results[0].status === 'fulfilled'
-      ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0, extractFeedIcon(results[0].value))
-      : [];
-    const woshipmArticles = results[1].status === 'fulfilled'
-      ? normalizeFeedItems(results[1].value.items, '人人都是产品经理', '产品运营', 1000, extractFeedIcon(results[1].value))
-      : [];
-    const krArticles = results[2].status === 'fulfilled'
-      ? normalizeFeedItems(results[2].value.items, '36氪', '创投商业', 2000, extractFeedIcon(results[2].value))
-      : [];
-    const huxiuArticles = results[3].status === 'fulfilled'
-      ? normalizeFeedItems(results[3].value.items, '虎嗅', '商业资讯', 3000, extractFeedIcon(results[3].value))
-      : [];
-    const zslrenArticles = results[4].status === 'fulfilled'
-      ? normalizeFeedItems(results[4].value.items, '数字生命卡兹克', '公众号', 4000, extractFeedIcon(results[4].value))
-      : [];
-    const xzyArticles = results[5].status === 'fulfilled'
-      ? normalizeFeedItems(results[5].value.items, '新智元', '公众号', 4500, extractFeedIcon(results[5].value))
-      : [];
-    const jikeArticles = results[6].status === 'fulfilled'
-      ? normalizeFeedItems(results[6].value.items, '即刻话题', 'Jike', 6000, extractFeedIcon(results[6].value))
-      : [];
-    const githubArticles = results[7].status === 'fulfilled'
-      ? normalizeFeedItems(results[7].value.items, 'GitHub Blog', 'Tech', 7000, extractFeedIcon(results[7].value))
-      : [];
-    const samaArticles = results[8].status === 'fulfilled'
-      ? normalizeFeedItems(results[8].value.items, 'Sam Altman', 'Twitter', 8000, extractFeedIcon(results[8].value))
-      : [];
-    const xyzfmArticles = results[9].status === 'fulfilled'
-      ? normalizeFeedItems(results[9].value.items, '张小珺商业访谈录', 'Podcast', 9000, extractFeedIcon(results[9].value))
-      : [];
-    const lexArticles = results[10].status === 'fulfilled'
-      ? normalizeFeedItems(results[10].value.items, 'Lex Fridman', 'Podcast', 10000, extractFeedIcon(results[10].value))
-      : [];
-    const ycArticles = results[11].status === 'fulfilled'
-      ? normalizeFeedItems(results[11].value.items, 'Y Combinator', 'YouTube', 11000, extractFeedIcon(results[11].value))
-      : [];
-    const karpathyArticles = results[12].status === 'fulfilled'
-      ? normalizeFeedItems(results[12].value.items, 'Andrej Karpathy', 'YouTube', 12000, extractFeedIcon(results[12].value))
-      : [];
-    const aiHotSelectedArticles = results[13].status === 'fulfilled'
-      ? normalizeFeedItems(results[13].value.items, 'AI HOT 精选', 'AI 资讯', 13000, extractFeedIcon(results[13].value))
-      : [];
-    logger.info({
-      module: "rss",
-      counts: {
-        sspai: sspaiArticles.length,
-        woshipm: woshipmArticles.length,
-        kr36: krArticles.length,
-        huxiu: huxiuArticles.length,
-        zslren: zslrenArticles.length,
-        xzy: xzyArticles.length,
-        jike: jikeArticles.length,
-        github: githubArticles.length,
-        sama: samaArticles.length,
-        xyzfm: xyzfmArticles.length,
-        lex: lexArticles.length,
-        yc: ycArticles.length,
-        karpathy: karpathyArticles.length,
-        aiHotSelected: aiHotSelectedArticles.length
-      }
-    }, "RSS feed counts");
-    const feedNames = [
-      'sspai',
-      'woshipm',
-      '36kr',
-      'huxiu',
-      'zslren',
-      'xzy',
-      'jike topic',
-      'GitHub Blog',
-      'Sam Altman Twitter',
-      '张小珺商业访谈录',
-      'Lex Fridman',
-      'Y Combinator',
-      'Andrej Karpathy',
-      'AI HOT 精选',
-    ];
-    results.forEach((result, index) => {
-      if (result.status === 'rejected') {
-        logger.error({ err: result.reason, module: "rss", feed: feedNames[index] }, "Failed to fetch RSS feed");
-      }
+    const results = await Promise.allSettled(
+      BUILTIN_RSS_FEEDS.map(feed => parseWithRetry([...feed.urls], 20000, 2)),
+    );
+    const collected = collectSettledFeedArticles(
+      BUILTIN_RSS_FEEDS,
+      results,
+      (parsed, feed) => normalizeFeedItems(
+        parsed.items,
+        feed.source,
+        feed.topic,
+        feed.idOffset,
+        extractFeedIcon(parsed),
+        { maxItems },
+      ),
+    );
+    logger.info({ module: "rss", counts: collected.counts }, "RSS feed counts");
+    collected.failures.forEach(({ definition, error }) => {
+      logger.error({ err: error, module: "rss", feed: definition.logName }, "Failed to fetch RSS feed");
     });
-    const merged = [
-      ...sspaiArticles,
-      ...woshipmArticles,
-      ...krArticles,
-      ...huxiuArticles,
-      ...zslrenArticles,
-      ...xzyArticles,
-      ...jikeArticles,
-      ...githubArticles,
-      ...samaArticles,
-      ...xyzfmArticles,
-      ...lexArticles,
-      ...ycArticles,
-      ...karpathyArticles,
-      ...aiHotSelectedArticles
-    ];
-    const ordered = rankArticles(merged);
-    return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
+    const timelineArticles = buildHomepageTimeline(collected.articles);
+    return {
+      timelineArticles: rankArticles(timelineArticles),
+      fullArticles: collected.articles,
+      refreshedSources: BUILTIN_RSS_FEEDS
+        .filter(feed => (collected.articlesBySource[feed.key]?.length ?? 0) > 0)
+        .map(feed => feed.source),
+    };
   } catch (error) {
-    logger.error({ err: error, module: "rss" }, "Failed to fetch RSS, falling back to mock data");
-    return [...MOCK_ARTICLES];
+    logger.error({ err: error, module: "rss" }, "Failed to fetch RSS, keeping cached data");
+    return { timelineArticles: [], fullArticles: [], refreshedSources: [] };
   }
+}
+
+function buildHomepageTimeline(fullArticles: Article[]): Article[] {
+  const selected = BUILTIN_RSS_FEEDS.flatMap(feed => fullArticles
+    .filter(article => article.source === feed.source || article.sourceAliases?.includes(feed.source))
+    .sort((a, b) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0))
+    .slice(0, getDefaultFeedLimit(feed.source)));
+  return rankArticles(mergeArticleSourceMemberships(selected));
 }
 
 async function startServer() {
@@ -5572,6 +5421,7 @@ async function startServer() {
   await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS citation_context TEXT`);
   await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS image_urls JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS content_hash TEXT`);
+  await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS normalized_url TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_articles_user ON saved_articles(user_id, saved_at DESC)`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_articles_unique ON saved_articles(user_id, url) WHERE url IS NOT NULL`);
 
@@ -6288,6 +6138,125 @@ async function startServer() {
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS evidence_role TEXT`);
   await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS raw_card_meta JSONB NOT NULL DEFAULT '{}'::jsonb`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_saved_article ON saved_cards(saved_article_id)`);
+  const normalizedUrlIndexIsUnique = Boolean((await pool.query(
+    `SELECT i.indisunique AS "isUnique"
+     FROM pg_class c
+     JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.relname = 'idx_saved_articles_normalized_url_unique' AND pg_table_is_visible(c.oid)`,
+  )).rows[0]?.isUnique);
+  const savedArticleUrlsNeedBackfill = Boolean((await pool.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM saved_articles
+       WHERE url IS NOT NULL AND normalized_url IS NULL
+     ) AS needed`,
+  )).rows[0]?.needed);
+  const normalizedUrlConstraintExists = Boolean((await pool.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM pg_constraint
+       WHERE conname = 'saved_articles_normalized_url_required'
+         AND conrelid = 'saved_articles'::regclass
+     ) AS present`,
+  )).rows[0]?.present);
+  if (!normalizedUrlIndexIsUnique || savedArticleUrlsNeedBackfill || !normalizedUrlConstraintExists) {
+    await runSchemaTransaction(async client => {
+      await client.query(`LOCK TABLE saved_articles IN SHARE ROW EXCLUSIVE MODE`);
+      await client.query(`DROP INDEX IF EXISTS idx_saved_articles_normalized_url_unique`);
+      const savedArticleUrlRows = (await client.query(
+        `SELECT id, url FROM saved_articles WHERE url IS NOT NULL`,
+      )).rows as Array<{ id: number; url: string }>;
+      const normalizedRows = savedArticleUrlRows
+        .map(row => ({ id: row.id, normalizedUrl: normalizeArticleUrl(row.url) }))
+        .filter((row): row is { id: number; normalizedUrl: string } => Boolean(row.normalizedUrl));
+      for (let offset = 0; offset < normalizedRows.length; offset += 500) {
+        const batch = normalizedRows.slice(offset, offset + 500);
+        await client.query(
+        `UPDATE saved_articles article
+         SET normalized_url = normalized.normalized_url
+         FROM UNNEST($1::bigint[], $2::text[]) AS normalized(id, normalized_url)
+         WHERE article.id = normalized.id`,
+        [batch.map(row => row.id), batch.map(row => row.normalizedUrl)],
+        );
+      }
+      await client.query(`
+      WITH ranked AS (
+        SELECT *, FIRST_VALUE(id) OVER (
+          PARTITION BY user_id, normalized_url ORDER BY saved_at DESC, id DESC
+        ) AS keep_id
+        FROM saved_articles
+        WHERE normalized_url IS NOT NULL
+      ), merged AS (
+        SELECT keep_id,
+               (array_agg(NULLIF(content, '') ORDER BY length(content) DESC, saved_at DESC)
+                 FILTER (WHERE content <> ''))[1] AS content,
+               (array_agg(NULLIF(excerpt, '') ORDER BY length(excerpt) DESC, saved_at DESC)
+                 FILTER (WHERE excerpt <> ''))[1] AS excerpt,
+               (array_agg(NULLIF(citation_context, '') ORDER BY length(citation_context) DESC, saved_at DESC)
+                 FILTER (WHERE citation_context IS NOT NULL AND citation_context <> ''))[1] AS citation_context,
+               (array_agg(image_urls ORDER BY jsonb_array_length(image_urls) DESC, saved_at DESC)
+                 FILTER (WHERE jsonb_typeof(image_urls) = 'array' AND jsonb_array_length(image_urls) > 0))[1] AS image_urls,
+               (array_agg(source_icon ORDER BY saved_at DESC)
+                 FILTER (WHERE source_icon IS NOT NULL))[1] AS source_icon,
+               MAX(published_at) AS published_at
+        FROM ranked
+        GROUP BY keep_id
+        HAVING COUNT(*) > 1
+      )
+      UPDATE saved_articles keep
+      SET content = COALESCE(merged.content, keep.content),
+          excerpt = COALESCE(merged.excerpt, keep.excerpt),
+          citation_context = COALESCE(merged.citation_context, keep.citation_context),
+          image_urls = COALESCE(merged.image_urls, keep.image_urls),
+          source_icon = COALESCE(keep.source_icon, merged.source_icon),
+          published_at = COALESCE(keep.published_at, merged.published_at)
+      FROM merged
+      WHERE keep.id = merged.keep_id
+    `);
+      await client.query(`
+      WITH duplicates AS (
+        SELECT id, FIRST_VALUE(id) OVER (
+          PARTITION BY user_id, normalized_url ORDER BY saved_at DESC, id DESC
+        ) AS keep_id
+        FROM saved_articles
+        WHERE normalized_url IS NOT NULL
+      )
+      UPDATE saved_cards card
+      SET saved_article_id = duplicates.keep_id
+      FROM duplicates
+      WHERE card.saved_article_id = duplicates.id AND duplicates.id <> duplicates.keep_id
+    `);
+      await client.query(`
+      WITH duplicates AS (
+        SELECT id, user_id, FIRST_VALUE(id) OVER (
+          PARTITION BY user_id, normalized_url ORDER BY saved_at DESC, id DESC
+        ) AS keep_id
+        FROM saved_articles
+        WHERE normalized_url IS NOT NULL
+      )
+      UPDATE write_canvas_nodes node
+      SET ref_id = duplicates.keep_id::text, updated_at = NOW()
+      FROM duplicates
+      WHERE node.kind = 'saved_article'
+        AND node.user_id = duplicates.user_id
+        AND node.ref_id = duplicates.id::text
+        AND duplicates.id <> duplicates.keep_id
+    `);
+      await client.query(`
+      WITH duplicates AS (
+        SELECT id, FIRST_VALUE(id) OVER (
+          PARTITION BY user_id, normalized_url ORDER BY saved_at DESC, id DESC
+        ) AS keep_id
+        FROM saved_articles
+        WHERE normalized_url IS NOT NULL
+      )
+      DELETE FROM saved_articles article
+      USING duplicates
+      WHERE article.id = duplicates.id AND duplicates.id <> duplicates.keep_id
+    `);
+      await client.query(`CREATE UNIQUE INDEX idx_saved_articles_normalized_url_unique ON saved_articles(user_id, normalized_url) WHERE normalized_url IS NOT NULL`);
+      await client.query(`ALTER TABLE saved_articles DROP CONSTRAINT IF EXISTS saved_articles_normalized_url_required`);
+      await client.query(`ALTER TABLE saved_articles ADD CONSTRAINT saved_articles_normalized_url_required CHECK (url IS NULL OR normalized_url IS NOT NULL)`);
+    });
+  }
   const contentHashIndexIsUnique = Boolean((await pool.query(
     `SELECT i.indisunique AS "isUnique"
      FROM pg_class c
@@ -6897,39 +6866,59 @@ async function startServer() {
     return res.json({ status: "ok", database: "connected" });
   }));
 
-  // In-memory database for prototype
-  let articles: Article[] = [];
+  // In-memory article cache, refreshed independently per source.
   const cachedArticles = await loadArticlesCache();
-  if (cachedArticles.length > 0) {
-    articles = cachedArticles;
-  } else {
-    articles = [...MOCK_ARTICLES];
-  }
+  let fullBuiltInArticles = sanitizeGlobalArticleCache(cachedArticles);
+  let articles = buildHomepageTimeline(fullBuiltInArticles);
+  let lastSuccessfulFeedRefreshSources = new Set<string>();
 
   // Load RSS feeds on startup
   logger.info({ module: "rss" }, "Fetching RSS feeds");
+  let initialFeedRefreshPending = true;
   const refreshFeeds = async () => {
     try {
-      const fresh = await fetchRSSFeeds();
-      logger.info({ module: "rss", freshCount: fresh.length }, "Fetched fresh articles");
+      const fresh = await fetchRSSFeeds(remoteRssMaxItems);
+      logger.info({
+        module: "rss",
+        timelineCount: fresh.timelineArticles.length,
+        fullCount: fresh.fullArticles.length,
+      }, "Fetched fresh articles");
+      lastSuccessfulFeedRefreshSources = new Set(fresh.refreshedSources);
 
-      // 只有当新数据不为空时才合并
-      if (fresh.length > 0) {
-        const withFallback = mergeWithSourceFallback(articles, fresh);
-        articles = mergeArticles(articles, rankArticles(withFallback));
-        await saveArticlesCache(articles);
-        logger.info({ module: "rss", articleCount: articles.length }, "Loaded articles");
+      if (fresh.fullArticles.length > 0) {
+        const fullWithFallback = mergeWithSourceFallback(fullBuiltInArticles, fresh.fullArticles);
+        fullBuiltInArticles = mergeArticles(fullBuiltInArticles, fullWithFallback);
+        articles = mergeArticles(articles, buildHomepageTimeline(fullBuiltInArticles));
+        await saveArticlesCache(fullBuiltInArticles);
+        logger.info({
+          module: "rss",
+          articleCount: articles.length,
+          fullArticleCount: fullBuiltInArticles.length,
+        }, "Loaded articles");
       } else {
         logger.info({ module: "rss" }, "No fresh articles fetched, keeping existing data");
       }
     } catch (error) {
+      lastSuccessfulFeedRefreshSources = new Set();
       logger.error({ err: error, module: "rss" }, "Failed to refresh feeds, keeping existing data");
     }
   };
+  let activeFeedRefresh: Promise<void> | null = null;
+  let lastFeedRefreshAt = 0;
+  const runFeedRefresh = () => {
+    if (activeFeedRefresh) return activeFeedRefresh;
+    activeFeedRefresh = refreshFeeds().finally(() => {
+      lastFeedRefreshAt = Date.now();
+      activeFeedRefresh = null;
+    });
+    return activeFeedRefresh;
+  };
   logger.info({ module: "rss", articleCount: articles.length }, "Using cached or fallback articles, refreshing in background");
-  refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds in background"));
+  runFeedRefresh()
+    .catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds in background"))
+    .finally(() => { initialFeedRefreshPending = false; });
   const feedRefreshTimer = setInterval(() => {
-    refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds"));
+    runFeedRefresh().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds"));
   }, 10 * 60 * 1000);
   feedRefreshTimer.unref();
 
@@ -8211,6 +8200,18 @@ async function startServer() {
   
   // Get all articles (global + user's private articles when logged in)
   app.get("/api/articles", asyncHandler(async (req, res) => {
+    res.setHeader("X-AtomFlow-RSS-Refreshing", initialFeedRefreshPending ? "true" : "false");
+    const requestedSource = typeof req.query.source === "string" ? req.query.source.trim() : "";
+    if (requestedSource && BUILTIN_SOURCE_NAMES.has(requestedSource)) {
+      const sourceArticles = fullBuiltInArticles
+        .filter(article => article.source === requestedSource || article.sourceAliases?.includes(requestedSource))
+        .sort((a, b) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0));
+      if (!req.session.userId) {
+        return res.json(sourceArticles.map(toArticleListItem));
+      }
+      const withSavedState = await applyUserSavedStateToArticles(req.session.userId, sourceArticles, pool);
+      return res.json(withSavedState.map(toArticleListItem));
+    }
     if (!req.session.userId) {
       return res.json(articles.map(toArticleListItem));
     }
@@ -8220,8 +8221,14 @@ async function startServer() {
       return res.json(withSavedState.map(toArticleListItem));
     }
     // Deduplicate: skip user articles whose URL already exists in global store
-    const globalUrls = new Set(articles.filter(a => a.url).map(a => a.url as string));
-    const uniqueUserArticles = userArticles.filter(a => !a.url || !globalUrls.has(a.url));
+    const globalUrls = new Set(articles.flatMap(article => {
+      const normalizedUrl = normalizeArticleUrl(article.url);
+      return normalizedUrl ? [normalizedUrl] : [];
+    }));
+    const uniqueUserArticles = userArticles.filter(article => {
+      const normalizedUrl = normalizeArticleUrl(article.url);
+      return !normalizedUrl || !globalUrls.has(normalizedUrl);
+    });
     const rankedArticles = rankArticles([...articles, ...uniqueUserArticles]);
     const withSavedState = await applyUserSavedStateToArticles(req.session.userId, rankedArticles, pool);
     return res.json(withSavedState.map(toArticleListItem));
@@ -8231,12 +8238,14 @@ async function startServer() {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
     const fullFeed = req.body?.full === true;
-    if (!source || !input) {
+    const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
+    if (!source || (!isBuiltin && !input)) {
       return res.status(400).json({ error: "source and input are required" });
     }
-    const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
     const userId = req.session.userId;
-    if (isBuiltin) return res.status(403).json({ error: "内置订阅源由服务器定时刷新" });
+    if (isBuiltin) {
+      return res.status(403).json({ error: "内置订阅源由服务器统一刷新" });
+    }
     try {
       await validatePublicHttpUrl(input, { allowedPorts: PUBLIC_WEB_PORTS });
       const resource = await fetchBoundedPublicResource(input, {
@@ -8269,7 +8278,7 @@ async function startServer() {
       let added = 0;
       for (const article of fetched) {
         if (!article.url) continue;
-        await pool.query(
+        const insertResult = await pool.query(
           `INSERT INTO user_articles
              (user_id, subscription_id, source, source_icon, topic, title, excerpt,
               content, url, audio_url, audio_duration, published_at, time_str)
@@ -8282,7 +8291,7 @@ async function startServer() {
             article.publishedAt ?? null, article.time
           ]
         );
-        added++;
+        added += insertResult.rowCount ?? 0;
       }
       return res.json({ success: true, added });
     } catch (error) {
@@ -8294,12 +8303,28 @@ async function startServer() {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
     const fullFeed = req.body?.full === true;
-    if (!source || !input) {
+    const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
+    if (!source || (!isBuiltin && !input)) {
       return res.status(400).json({ error: "source and input are required" });
     }
-    const isBuiltin = BUILTIN_SOURCE_NAMES.has(source);
     const userId = req.session.userId;
-    if (isBuiltin) return res.status(403).json({ error: "内置订阅源由服务器定时刷新" });
+    if (isBuiltin) {
+      const refreshCooldownMs = 60_000;
+      const retryAfterMs = Math.max(0, refreshCooldownMs - (Date.now() - lastFeedRefreshAt));
+      if (!activeFeedRefresh && retryAfterMs > 0) {
+        return res.status(202).json({
+          success: true,
+          refreshed: false,
+          retryAfterSeconds: Math.ceil(retryAfterMs / 1000),
+        });
+      }
+      await runFeedRefresh();
+      const refreshed = lastSuccessfulFeedRefreshSources.has(source);
+      const articleCount = fullBuiltInArticles.filter(
+        article => article.source === source || article.sourceAliases?.includes(source),
+      ).length;
+      return res.json({ success: true, refreshed, articleCount });
+    }
     try {
       await validatePublicHttpUrl(input, { allowedPorts: PUBLIC_WEB_PORTS });
       const resource = await fetchBoundedPublicResource(input, {
@@ -8332,7 +8357,7 @@ async function startServer() {
       let added = 0;
       for (const article of fetched) {
         if (!article.url) continue;
-        await pool.query(
+        const insertResult = await pool.query(
           `INSERT INTO user_articles
              (user_id, subscription_id, source, source_icon, topic, title, excerpt,
               content, url, audio_url, audio_duration, published_at, time_str)
@@ -8345,7 +8370,7 @@ async function startServer() {
             article.publishedAt ?? null, article.time
           ]
         );
-        added++;
+        added += insertResult.rowCount ?? 0;
       }
       return res.json({ success: true, added });
     } catch (error: any) {
@@ -8391,7 +8416,7 @@ async function startServer() {
   // Save an article (mark as saved and extract cards)
   app.post("/api/articles/:id/save", requireAuth, paidOperationLimiter, paidConcurrencyMiddleware, dailyPaidOperationBudgetMiddleware, articleSaveConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
-    let article = articles.find(a => a.id === articleId);
+    let article = articles.find(a => a.id === articleId) || fullBuiltInArticles.find(a => a.id === articleId);
     let isUserArticle = false;
 
     // If not in global store, check user_articles DB
@@ -8429,7 +8454,10 @@ async function startServer() {
     let existingSavedArticleId: number | null = null;
     if (normalizedUrl) {
       const existingSavedArticle = await pool.query(
-        'SELECT id FROM saved_articles WHERE user_id = $1 AND url = $2',
+        `SELECT id
+         FROM saved_articles
+         WHERE user_id = $1 AND normalized_url = $2
+         LIMIT 1`,
         [req.session.userId, normalizedUrl]
       );
       existingSavedArticleId = existingSavedArticle.rows[0]?.id ?? null;
@@ -8448,31 +8476,27 @@ async function startServer() {
 
     if (!existingCard) {
       // AI extraction BEFORE transaction (may take up to 45s, don't hold DB conn)
-      let cardsToSave = article.cards;
+      let cardsToSave: Array<Omit<AtomCard, 'id' | 'articleTitle' | 'articleId'>>;
 	      let articleCitationContext = buildDefaultArticleCitationContext(article);
 	      let origin: 'ai' | 'manual' = 'manual';
-	      let extractionSkills: WriteAgentSkillRecord[] = [];
-	      if (!cardsToSave || cardsToSave.length === 0) {
-	        extractionSkills = (await resolveWriteAgentSkills(pool, req.session.userId)).filter(skill => skill.type === "card_storage" || skill.type === "citation");
-	        const extracted = await extractKnowledgeWithAI(article, extractionSkills, () => markDailyAiBudgetProviderStarted(res));
-        const aiCards = extracted.cards;
-        if (extracted.articleCitationContext) {
-          articleCitationContext = extracted.articleCitationContext;
-        }
-        if (aiCards.length > 0) {
-          cardsToSave = aiCards;
-          origin = 'ai';
-        } else if (isAiFallbackDisabled()) {
-          return res.status(502).json({ error: "AI extraction failed", fallbackDisabled: true });
-        } else {
-          cardsToSave = buildCardsFromArticleContent(article);
-          // Mark fallback cards with a tag so users know they're lower quality
-          cardsToSave = cardsToSave.map(card => ({
-            ...card,
-            tags: [...(card.tags || []), '自动提取']
-          }));
-        }
-        article.cards = cardsToSave;
+	      const extractionSkills = (await resolveWriteAgentSkills(pool, req.session.userId)).filter(skill => skill.type === "card_storage" || skill.type === "citation");
+	      const extracted = await extractKnowledgeWithAI(article, extractionSkills, () => markDailyAiBudgetProviderStarted(res));
+      const aiCards = extracted.cards;
+      if (extracted.articleCitationContext) {
+        articleCitationContext = extracted.articleCitationContext;
+      }
+      if (aiCards.length > 0) {
+        cardsToSave = aiCards;
+        origin = 'ai';
+      } else if (isAiFallbackDisabled()) {
+        return res.status(502).json({ error: "AI extraction failed", fallbackDisabled: true });
+      } else {
+        cardsToSave = buildCardsFromArticleContent(article);
+        // Mark fallback cards with a tag so users know they're lower quality
+        cardsToSave = cardsToSave.map(card => ({
+          ...card,
+          tags: [...(card.tags || []), '自动提取']
+        }));
       }
 
       const newCards: AtomCard[] = cardsToSave.map(c => ({
@@ -8491,22 +8515,35 @@ async function startServer() {
         let savedArticleId: number | null = null;
         const normalizedUrl = normalizeArticleUrl(article.url);
         if (normalizedUrl) {
-          // URL exists: upsert using unique index (with normalized URL)
-          const savedArticleResult = await client.query(
-            `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, citation_context, image_urls, published_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-             ON CONFLICT (user_id, url) WHERE url IS NOT NULL
-             DO UPDATE SET title = EXCLUDED.title, content = EXCLUDED.content, excerpt = EXCLUDED.excerpt, source_icon = EXCLUDED.source_icon, citation_context = EXCLUDED.citation_context, image_urls = EXCLUDED.image_urls
-             RETURNING id`,
-            [
-              req.session.userId, article.title, normalizedUrl,
-              article.source, article.sourceIcon || null, article.topic,
-              article.excerpt, article.markdownContent || article.content || article.excerpt,
-              articleCitationContext,
-              JSON.stringify(articleImageUrls),
-              article.publishedAt || null
-            ]
-          );
+          const savedArticleResult = existingSavedArticleId
+            ? await client.query(
+              `UPDATE saved_articles
+               SET title = $1, url = $2, normalized_url = $2, source = $3, source_icon = $4, topic = $5,
+                   excerpt = $6, content = $7, citation_context = $8, image_urls = $9, published_at = $10
+               WHERE id = $11 AND user_id = $12
+               RETURNING id`,
+              [
+                article.title, normalizedUrl, article.source, article.sourceIcon || null, article.topic,
+                article.excerpt, article.markdownContent || article.content || article.excerpt,
+                articleCitationContext, JSON.stringify(articleImageUrls), article.publishedAt || null,
+                existingSavedArticleId, req.session.userId,
+              ],
+            )
+            : await client.query(
+              `INSERT INTO saved_articles (user_id, title, url, normalized_url, source, source_icon, topic, excerpt, content, citation_context, image_urls, published_at)
+               VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               ON CONFLICT (user_id, normalized_url) WHERE normalized_url IS NOT NULL
+               DO UPDATE SET title = EXCLUDED.title, content = EXCLUDED.content, excerpt = EXCLUDED.excerpt, source_icon = EXCLUDED.source_icon, citation_context = EXCLUDED.citation_context, image_urls = EXCLUDED.image_urls
+               RETURNING id`,
+              [
+                req.session.userId, article.title, normalizedUrl,
+                article.source, article.sourceIcon || null, article.topic,
+                article.excerpt, article.markdownContent || article.content || article.excerpt,
+                articleCitationContext,
+                JSON.stringify(articleImageUrls),
+                article.publishedAt || null
+              ],
+            );
           savedArticleId = savedArticleResult.rows[0]?.id ?? null;
         } else {
           // No URL: use content hash to detect duplicates
@@ -8598,8 +8635,6 @@ async function startServer() {
         client.release();
       }
     }
-    article.saved = true;
-
     // Also update saved flag in user_articles if this is a user article
     if (isUserArticle) {
       await pool.query(
@@ -8608,13 +8643,14 @@ async function startServer() {
       );
     }
 
-    res.json({ success: true, article });
+    res.json({ success: true, article: { ...article, saved: true } });
   }));
 
   // Fetch full content for an article
   app.get("/api/articles/:id/full", asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
-    let article: Article | undefined = articles.find(a => a.id === articleId);
+    const builtInArticle = articles.find(a => a.id === articleId) || fullBuiltInArticles.find(a => a.id === articleId);
+    let article: Article | undefined = builtInArticle ? { ...builtInArticle } : undefined;
 
     // If not in global store, check user_articles DB
     if (!article && req.session.userId) {
@@ -8653,13 +8689,19 @@ async function startServer() {
       article.readabilityUsed = false;
       article.fullFetched = true;
       
-      return res.json({ success: true, article });
+      const responseArticle = req.session.userId
+        ? (await applyUserSavedStateToArticles(req.session.userId, [article], pool))[0]
+        : article;
+      return res.json({ success: true, article: responseArticle });
     } catch (error) {
       logger.error({ err: error, module: "articles", articleId }, "Failed to process article content");
       article.markdownContent = article.content || article.excerpt || '暂无内容';
       article.readabilityUsed = false;
       article.fullFetched = true;
-      return res.json({ success: true, article });
+      const responseArticle = req.session.userId
+        ? (await applyUserSavedStateToArticles(req.session.userId, [article], pool))[0]
+        : article;
+      return res.json({ success: true, article: responseArticle });
     }
   }));
 
