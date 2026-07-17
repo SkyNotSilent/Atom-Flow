@@ -2,14 +2,52 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import React from "react";
+import React, { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
+import { JSDOM } from "jsdom";
 import sharp from "sharp";
 import { createServer } from "vite";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(testDir, "..");
 const assetPath = (name: string) => path.join(root, "public/assets/podcast", name);
+
+const installTemporaryDomGlobals = (dom: JSDOM) => {
+  const domWindow = dom.window;
+  const globals: Record<string, unknown> = {
+    window: domWindow,
+    document: domWindow.document,
+    navigator: domWindow.navigator,
+    HTMLElement: domWindow.HTMLElement,
+    HTMLDialogElement: domWindow.HTMLDialogElement,
+    Event: domWindow.Event,
+    MouseEvent: domWindow.MouseEvent,
+    Node: domWindow.Node,
+    getComputedStyle: domWindow.getComputedStyle.bind(domWindow),
+    IS_REACT_ACT_ENVIRONMENT: true,
+  };
+  const originalDescriptors = new Map<string, PropertyDescriptor | undefined>();
+
+  for (const [name, value] of Object.entries(globals)) {
+    originalDescriptors.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      writable: true,
+      value,
+    });
+  }
+
+  return () => {
+    for (const [name, descriptor] of originalDescriptors) {
+      if (descriptor) {
+        Object.defineProperty(globalThis, name, descriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, name);
+      }
+    }
+  };
+};
 
 const referenceMetadata = await sharp(
   path.join(root, "docs/superpowers/design-references/podcast-player-reference.png"),
@@ -289,6 +327,123 @@ try {
   }));
   assert.match(dialogHtml, /^<dialog/);
   assert.match(dialogHtml, /aria-labelledby=/);
+
+  const dom = new JSDOM(
+    "<!doctype html><html><body><button id=\"context-invoker\">打开上下文</button><div id=\"podcast-root\"></div></body></html>",
+    { url: "https://atomflow.test/" },
+  );
+  const restoreDomGlobals = installTemporaryDomGlobals(dom);
+  const dialogPrototype = dom.window.HTMLDialogElement.prototype;
+  const originalShowModal = Object.getOwnPropertyDescriptor(dialogPrototype, "showModal");
+  const originalClose = Object.getOwnPropertyDescriptor(dialogPrototype, "close");
+  let mountedRoot: Root | null = null;
+
+  try {
+    const invoker = dom.window.document.querySelector<HTMLButtonElement>("#context-invoker");
+    const container = dom.window.document.querySelector<HTMLDivElement>("#podcast-root");
+    assert.ok(invoker);
+    assert.ok(container);
+
+    let showModalCalls = 0;
+    let closeCalls = 0;
+    let focusBeforeShow: { focus: () => void } | null = null;
+    Object.defineProperty(dialogPrototype, "showModal", {
+      configurable: true,
+      writable: true,
+      value(this: HTMLDialogElement) {
+        showModalCalls += 1;
+        const activeElement = dom.window.document.activeElement;
+        focusBeforeShow = activeElement
+          && "focus" in activeElement
+          && typeof activeElement.focus === "function"
+          ? activeElement
+          : null;
+        this.setAttribute("open", "");
+        this.tabIndex = -1;
+        this.focus();
+      },
+    });
+    Object.defineProperty(dialogPrototype, "close", {
+      configurable: true,
+      writable: true,
+      value(this: HTMLDialogElement) {
+        closeCalls += 1;
+        this.removeAttribute("open");
+        focusBeforeShow?.focus();
+        this.dispatchEvent(new dom.window.Event("close"));
+      },
+    });
+
+    let onCloseCalls = 0;
+    const onClose = () => {
+      onCloseCalls += 1;
+    };
+    const renderDialog = async (open: boolean) => {
+      await act(async () => {
+        mountedRoot?.render(React.createElement(PodcastContextPanel, {
+          item,
+          variant: "dialog",
+          open,
+          onClose,
+        }));
+      });
+    };
+
+    invoker.focus();
+    assert.equal(dom.window.document.activeElement, invoker);
+    mountedRoot = createRoot(container);
+    await renderDialog(false);
+    const controlledDialog = container.querySelector<HTMLDialogElement>("dialog");
+    assert.ok(controlledDialog);
+    assert.equal(showModalCalls, 0);
+    assert.equal(closeCalls, 0);
+
+    await renderDialog(true);
+    assert.equal(showModalCalls, 1, "false -> true must call showModal exactly once");
+    assert.equal(controlledDialog.open, true);
+    assert.equal(dom.window.document.activeElement, controlledDialog);
+
+    await renderDialog(false);
+    assert.equal(closeCalls, 1, "true -> false must call close exactly once");
+    assert.equal(controlledDialog.open, false);
+    assert.equal(onCloseCalls, 0, "a controlled close must not call onClose");
+    assert.equal(dom.window.document.activeElement, invoker, "focus must return to the invoker");
+
+    await renderDialog(true);
+    assert.equal(showModalCalls, 2);
+    const cancelEvent = new dom.window.Event("cancel", { bubbles: false, cancelable: true });
+    await act(async () => {
+      controlledDialog.dispatchEvent(cancelEvent);
+    });
+    assert.equal(cancelEvent.defaultPrevented, true, "cancel must prevent the browser default");
+    assert.equal(onCloseCalls, 1, "cancel must notify the controlled parent exactly once");
+    assert.equal(closeCalls, 1, "cancel must wait for the controlled parent to close the dialog");
+    assert.equal(controlledDialog.open, true);
+
+    await renderDialog(false);
+    assert.equal(closeCalls, 2, "the parent close after cancel must close exactly once");
+    assert.equal(onCloseCalls, 1, "the parent rerender must not duplicate the cancel callback");
+    assert.equal(controlledDialog.open, false);
+    assert.equal(dom.window.document.activeElement, invoker, "focus must return after cancel closes");
+  } finally {
+    if (mountedRoot) {
+      await act(async () => {
+        mountedRoot?.unmount();
+      });
+    }
+    if (originalShowModal) {
+      Object.defineProperty(dialogPrototype, "showModal", originalShowModal);
+    } else {
+      Reflect.deleteProperty(dialogPrototype, "showModal");
+    }
+    if (originalClose) {
+      Object.defineProperty(dialogPrototype, "close", originalClose);
+    } else {
+      Reflect.deleteProperty(dialogPrototype, "close");
+    }
+    restoreDomGlobals();
+    dom.window.close();
+  }
 
   const railItems = [item, pendingItem];
   const railHtml = renderToStaticMarkup(React.createElement(PodcastCardRail, {
