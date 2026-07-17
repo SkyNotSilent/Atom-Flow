@@ -656,7 +656,7 @@ cp /var/folders/0r/_djw0jks3ys50q4khgvqb5440000gn/T/codex-clipboard-501d0bd6-d31
 sips -g pixelWidth -g pixelHeight docs/superpowers/design-references/podcast-player-reference.png
 ```
 
-Expected: the durable reference reports `616 × 948` pixels. Cataloged visible image assets are the black vinyl record, the editorial cover, and the waveform texture; the iPhone frame is reference chrome and must not appear in AtomFlow.
+Expected: the durable reference reports `622 × 948` pixels. Cataloged visible image assets are the black vinyl record, the editorial cover, and the waveform texture; the iPhone frame is reference chrome and must not appear in AtomFlow.
 
 - [ ] **Step 2: Generate the two missing production assets with ImageGen**
 
