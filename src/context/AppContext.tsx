@@ -7,6 +7,8 @@ export type WriteGraphView = 'all' | 'activated';
 
 interface AppState {
   articles: Article[];
+  isArticlesLoading: boolean;
+  articlesError: string | null;
   savedCards: AtomCard[];
   savedArticles: SavedArticle[];
   saveArticle: (articleId: number) => Promise<boolean>;
@@ -78,6 +80,8 @@ const AppContext = createContext<AppState | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [articles, setArticles] = useState<Article[]>([]);
+  const [isArticlesLoading, setIsArticlesLoading] = useState(true);
+  const [articlesError, setArticlesError] = useState<string | null>(null);
   const [savedCards, setSavedCards] = useState<AtomCard[]>([]);
   const [savedArticles, setSavedArticles] = useState<SavedArticle[]>([]);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -110,9 +114,20 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const saveStages = ['提取全文', '识别要点', '原子化拆分', '提炼入库'];
 
   const reloadArticles = async () => {
-    const articlesRes = await fetch('/api/articles');
-    if (articlesRes.ok) {
-      setArticles(await articlesRes.json());
+    setIsArticlesLoading(true);
+    setArticlesError(null);
+    try {
+      const articlesRes = await fetch('/api/articles');
+      if (!articlesRes.ok) {
+        throw new Error(`文章加载失败 (${articlesRes.status})`);
+      }
+      const payload = await articlesRes.json() as Article[];
+      setArticles(payload);
+    } catch (error) {
+      logger.error('Failed to reload articles', { error });
+      setArticlesError(error instanceof Error ? error.message : '文章加载失败');
+    } finally {
+      setIsArticlesLoading(false);
     }
   };
   
@@ -196,6 +211,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       } catch (error) {
         logger.error("Failed to fetch initial data", { error });
         setIsAuthLoading(false);
+        setIsArticlesLoading(false);
+        setArticlesError(previous => previous ?? '内容加载失败');
       }
     };
     fetchData();
@@ -757,7 +774,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   return (
     <AppContext.Provider value={{
-      articles, savedCards, savedArticles, saveArticle, addCards, addCard, updateCard, deleteCard,
+      articles, isArticlesLoading, articlesError, savedCards, savedArticles, saveArticle, addCards, addCard, updateCard, deleteCard,
       showToast, toastMsg, theme, toggleTheme,
       viewMode, setViewMode,
       readingArticle, setReadingArticle,
