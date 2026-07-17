@@ -141,6 +141,7 @@ CANVAS_PDF_MAX_PAGES=100
 ## Production Security And Scale
 
 - Production deploys use GitHub auto-deploy to Railway. Merge only after the GitHub checks pass, and **Wait for CI** before treating a change as deployable.
+- Every push to the remote repository can trigger a Railway deployment. After pushing or merging, monitor the Railway deployment and logs until it succeeds, `/api/health` passes, and the public URL has a basic smoke check. GitHub CI success alone is not deployment success; do not close deployment-related work before this verification.
 - Set `SESSION_SECRET` to a minimum of 32 random characters in production. Never use the example value or commit secrets.
 - Set `APP_URL` to the canonical public HTTPS URL and configure `ALLOWED_ORIGINS` to the exact browser origins that may call the app.
 - Railway must use `healthcheckPath: /api/health` with an explicit `healthcheckTimeout`; a deployment is not healthy until that check passes.
