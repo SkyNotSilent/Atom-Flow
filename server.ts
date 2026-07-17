@@ -8,7 +8,6 @@ import multer from "multer";
 import Parser from "rss-parser";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
-import createDOMPurify from "dompurify";
 import { promises as fs } from "fs";
 import { marked } from "marked";
 import path from "path";
@@ -59,12 +58,27 @@ import {
   sanitizeGlobalArticleCache,
   stableArticleId,
 } from "./src/server/rss.js";
+import {
+  buildFeedExcerpt,
+  buildContentSecurityDirectives,
+  contentToPlainText,
+  contentToPlainTextWithinBudget,
+  createPlainTextBudget,
+  normalizeEmailAddress,
+  normalizeTextExcerpt,
+  sanitizeRichHtml,
+  stripBareHtmlTagRemnants,
+  type PlainTextBudget,
+  urlMatchesHostname,
+} from "./src/server/contentSecurity.js";
 
 dotenv.config();
 
 const isProduction = process.env.NODE_ENV === "production";
 const DEV_SESSION_SECRET = "atomflow-dev-secret-change-in-prod";
 const PUBLIC_WEB_PORTS = new Set(["", "80", "443"]);
+const PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS = 250_000;
+const RSS_FEED_EXCERPT_SOURCE_BUDGET_CHARS = 64_000;
 const LEGAL_PLACEHOLDER_PATTERN = /\[(?:DEPLOYMENT_OPERATOR_NAME|DEPLOYMENT_OPERATOR_ADDRESS|SERVICE_CONTACT_EMAIL|PRIVACY_CONTACT_EMAIL|SECURITY_CONTACT_EMAIL|SERVICE_URL|DATA_HOSTING_REGION|TERMS_EFFECTIVE_DATE|GOVERNING_LAW|DISPUTE_FORUM|LOG_RETENTION_DAYS|BACKUP_RETENTION_DAYS|RIGHTS_REQUEST_RESPONSE_DAYS)\]/g;
 const LEGAL_DOCUMENTS = {
   privacy: "PRIVACY.md",
@@ -612,10 +626,20 @@ function normalizeFeedItems(
 ) {
   const maxItems = options?.maxItems === undefined ? getDefaultFeedLimit(source) : options.maxItems;
   const normalizedItems = maxItems === null ? items : items.slice(0, maxItems);
+  const excerptSourceCharsPerItem = Math.min(
+    512,
+    Math.max(64, Math.floor(RSS_FEED_EXCERPT_SOURCE_BUDGET_CHARS / Math.max(1, normalizedItems.length))),
+  );
   return normalizedItems.map((item, index) => {
     const rawContent = item['content:encoded'] || item.content || item.contentSnippet || '';
-    const formattedContent = source === '即刻话题' ? formatJikeContent(rawContent) : rawContent;
-    const excerpt = formattedContent.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').substring(0, 120) + '...';
+    const excerptText = buildFeedExcerpt(
+      rawContent,
+      item.contentSnippet,
+      item.title,
+      excerptSourceCharsPerItem,
+      120,
+    );
+    const excerpt = excerptText ? `${excerptText}...` : "";
     const topic = (item.categories && item.categories.length > 0) ? item.categories[0] : defaultTopic;
     let timeStr = '刚刚';
     const date = item.pubDate ? new Date(item.pubDate) : null;
@@ -654,16 +678,8 @@ function normalizeFeedItems(
 }
 
 const formatJikeContent = (rawContent: string) => {
-  const text = rawContent
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<\/div>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\u00a0/g, ' ')
-    .replace(/\r\n/g, '\n')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  if (!rawContent.includes('热门评论')) return rawContent;
+  const text = contentToPlainText(rawContent.slice(0, PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS), true);
 
   if (!text.includes('热门评论')) return rawContent;
 
@@ -726,10 +742,7 @@ const formatJikeContent = (rawContent: string) => {
 };
 
 const clean36KrTail = (content: string) => {
-  return (content || '')
-    .replace(/<!\[CDATA\[|\]\]>/g, '')
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
+  return contentToPlainText((content || '').slice(0, PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS), true)
     .replace(/^Published Time:.*$/gm, '')
     .replace(/^\s*Image\s*\d+(?::.*)?\s*$/gm, '')
     .replace(/^\s*.+?-36氪\s*$/gm, '')
@@ -754,26 +767,20 @@ const clean36KrTail = (content: string) => {
 const format36KrContent = (rawContent: string) => clean36KrTail(rawContent);
 
 const buildExcerptFromContent = (content: string, maxLength = 180) => {
-  const plain = (content || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/!\[[^\]]*\]\([^)]+\)/g, ' ')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    .replace(/[*_`>#-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const sourceLimit = Math.min(Math.max(maxLength * 8, 2048), PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS);
+  const plain = contentToPlainText((content || '').slice(0, sourceLimit));
   if (!plain) return '';
   if (plain.length <= maxLength) return plain;
   return `${plain.slice(0, maxLength)}...`;
 };
 
-const normalizePlainText = (content: string) => {
-  return (content || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/!\[[^\]]*\]\([^)]+\)/g, ' ')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    .replace(/[*_`>#-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+const normalizePlainText = (content: string, maxOutputChars = 12_000) => {
+  const boundedOutputChars = Math.max(1, Math.min(maxOutputChars, PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS));
+  const sourceLimit = Math.min(
+    Math.max(boundedOutputChars * 2, 2048),
+    PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS,
+  );
+  return contentToPlainText((content || '').slice(0, sourceLimit)).slice(0, boundedOutputChars);
 };
 
 const normalizeImageUrl = (url: string, baseUrl?: string) => {
@@ -1532,8 +1539,6 @@ const WRITE_CANVAS_MAX_VIEWPORT_BYTES = 8 * 1024;
 const AI_DRAFT_MAX_TOKENS = 2400;
 const AI_POLISH_MAX_TOKENS = 2400;
 const MIMO_MIN_STRUCTURED_OUTPUT_TOKENS = 4096;
-const draftSanitizer = createDOMPurify(new JSDOM("").window as unknown as Parameters<typeof createDOMPurify>[0]);
-
 const DRAFT_META_LINE_PATTERN = /^(?:正文草稿|正文章稿|标题建议|主标题|副标题|核心逻辑|写作思路|写作说明|素材对齐|观点对齐|观点的对齐|引用映射|节点映射|确定性引用映射|使用素材|参考素材|以下是|下面是)[:：\s]/;
 const DRAFT_META_HEADING_PATTERN = /^#{1,6}\s*(?:正文草稿|正文章稿|写作思路|写作说明|素材对齐|观点对齐|观点的对齐|引用映射|节点映射|确定性引用映射)\s*$/;
 
@@ -1577,7 +1582,7 @@ const stripLeadingTitleHeading = (markdown: string, title: string): string => {
 
 const renderAgentDraftMarkdownToHtml = (markdown: string): string => {
   const rawHtml = marked.parse(markdown, { async: false, gfm: true, breaks: false }) as string;
-  return draftSanitizer.sanitize(rawHtml);
+  return sanitizeRichHtml(rawHtml);
 };
 
 const prepareAgentDraftForNote = (rawDraft: string, title: string) => {
@@ -4061,6 +4066,17 @@ const assertCanvasAggregateContextWithinLimit = (
   return aggregateChars;
 };
 
+const createCanvasContextPlainTextBudget = (maxOutputChars: number) => createPlainTextBudget(
+  maxOutputChars,
+  Math.min(maxOutputChars * 2, PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS),
+);
+
+const normalizeCanvasContextText = (
+  content: string,
+  budget: PlainTextBudget,
+  maxOutputChars: number,
+) => contentToPlainTextWithinBudget(content || "", budget, maxOutputChars);
+
 const estimateCanvasInputTokens = (
   contexts: CanvasContextItem[],
   message: string,
@@ -4172,6 +4188,7 @@ const resolveCanvasOwnedNodeContext = async (
   userId: number,
   projectId: number,
   nodeId: number,
+  textBudget = createCanvasContextPlainTextBudget(WRITE_CANVAS_MAX_CONTEXT_CHARS),
 ): Promise<CanvasContextItem | null> => {
   const node = (await pool.query(
     `SELECT n.id, n.kind, n.title, n.summary, n.ref_id, n.document_id, n.content_type, n.meta,
@@ -4186,7 +4203,7 @@ const resolveCanvasOwnedNodeContext = async (
   const kind = normalizeCanvasNodeKind(node?.kind);
   if (!node || !kind) return null;
   if (node.document_id) {
-    const documentContext = await resolveCanvasDocumentContext(pool, userId, Number(node.document_id));
+    const documentContext = await resolveCanvasDocumentContext(pool, userId, Number(node.document_id), undefined, textBudget);
     if (documentContext) {
       return { nodeId: Number(node.id), kind, title: documentContext.title || node.title, text: documentContext.text };
     }
@@ -4195,7 +4212,7 @@ const resolveCanvasOwnedNodeContext = async (
     const documentId = Number(node.meta?.documentId);
     const sectionKey = typeof node.meta?.sectionKey === "string" ? node.meta.sectionKey : "";
     if (Number.isSafeInteger(documentId) && documentId > 0 && sectionKey) {
-      const sectionContext = await resolveCanvasDocumentContext(pool, userId, documentId, sectionKey);
+      const sectionContext = await resolveCanvasDocumentContext(pool, userId, documentId, sectionKey, textBudget);
       if (sectionContext) {
         return { nodeId: Number(node.id), kind, title: sectionContext.title || node.title, text: sectionContext.text };
       }
@@ -4204,7 +4221,11 @@ const resolveCanvasOwnedNodeContext = async (
   if (["asset_text", "asset_file", "asset_image", "result"].includes(kind)) {
     return {
       nodeId: Number(node.id), kind, title: node.title || "画布资料",
-      text: normalizePlainText([node.summary, node.content_text, node.extracted_text].filter(Boolean).join("\n")).slice(0, WRITE_CANVAS_MAX_CONTEXT_CHARS),
+      text: normalizeCanvasContextText(
+        [node.summary, node.content_text, node.extracted_text].filter(Boolean).join("\n"),
+        textBudget,
+        WRITE_CANVAS_MAX_CONTEXT_CHARS,
+      ),
       imageDataUrl: kind === "asset_image" && typeof node.data_url === "string" ? node.data_url : undefined,
       mimeType: node.mime_type || undefined,
     };
@@ -4214,20 +4235,20 @@ const resolveCanvasOwnedNodeContext = async (
       `SELECT title, source, url, citation_context, excerpt, content FROM saved_articles WHERE id = $1 AND user_id = $2`,
       [Number(node.ref_id), userId],
     )).rows[0];
-    if (article) return { nodeId: Number(node.id), kind, title: article.title || node.title, sourceLabel: article.source || article.url || undefined, text: normalizePlainText([article.citation_context, article.excerpt, article.content].filter(Boolean).join("\n")).slice(0, WRITE_CANVAS_MAX_CONTEXT_CHARS) };
+    if (article) return { nodeId: Number(node.id), kind, title: article.title || node.title, sourceLabel: article.source || article.url || undefined, text: normalizeCanvasContextText([article.citation_context, article.excerpt, article.content].filter(Boolean).join("\n"), textBudget, WRITE_CANVAS_MAX_CONTEXT_CHARS) };
   }
   if (kind === "atom_card" && node.ref_id) {
     const card = (await pool.query(
       `SELECT type, content, summary, context, original_quote, article_title FROM saved_cards WHERE id = $1 AND user_id = $2`,
       [node.ref_id, userId],
     )).rows[0];
-    if (card) return { nodeId: Number(node.id), kind, title: card.article_title || node.title || "原子卡", text: normalizePlainText([card.type, card.content, card.summary, card.context, card.original_quote].filter(Boolean).join("\n")).slice(0, WRITE_CANVAS_MAX_CONTEXT_CHARS) };
+    if (card) return { nodeId: Number(node.id), kind, title: card.article_title || node.title || "原子卡", text: normalizeCanvasContextText([card.type, card.content, card.summary, card.context, card.original_quote].filter(Boolean).join("\n"), textBudget, WRITE_CANVAS_MAX_CONTEXT_CHARS) };
   }
   if (kind === "note" && node.ref_id) {
     const note = (await pool.query(`SELECT title, content FROM notes WHERE id = $1 AND user_id = $2`, [Number(node.ref_id), userId])).rows[0];
-    if (note) return { nodeId: Number(node.id), kind, title: note.title || node.title || "笔记", text: normalizePlainText(note.content || "").slice(0, WRITE_CANVAS_MAX_CONTEXT_CHARS) };
+    if (note) return { nodeId: Number(node.id), kind, title: note.title || node.title || "笔记", text: normalizeCanvasContextText(note.content || "", textBudget, WRITE_CANVAS_MAX_CONTEXT_CHARS) };
   }
-  return { nodeId: Number(node.id), kind, title: node.title || "画布节点", text: normalizePlainText(node.summary || "").slice(0, WRITE_CANVAS_MAX_CONTEXT_CHARS) };
+  return { nodeId: Number(node.id), kind, title: node.title || "画布节点", text: normalizeCanvasContextText(node.summary || "", textBudget, WRITE_CANVAS_MAX_CONTEXT_CHARS) };
 };
 
 const parseCanvasExtractionItems = (output: string) => {
@@ -4381,7 +4402,7 @@ const runDocumentParserWorker = (kind: "pdf" | "docx", buffer: Buffer) => new Pr
   const timer = setTimeout(() => finish(() => reject(new Error("Document parsing timed out"))), 15_000);
   timer.unref();
   worker.once("message", (message: { ok?: boolean; text?: string; error?: string }) => {
-    if (message.ok) finish(() => resolve(normalizePlainText(message.text || "").slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH)));
+    if (message.ok) finish(() => resolve(normalizePlainText(message.text || "", WRITE_AGENT_MAX_MESSAGE_LENGTH)));
     else finish(() => reject(new Error(message.error || "Document parsing failed")));
   });
   worker.once("error", error => finish(() => reject(error)));
@@ -4697,6 +4718,7 @@ const resolveCanvasDocumentContext = async (
   userId: number,
   documentId: number,
   sectionKey?: string,
+  textBudget = createCanvasContextPlainTextBudget(WRITE_CANVAS_MAX_CONTEXT_CHARS),
 ) => {
   const row = (await pool.query(
     `SELECT d.title, d.summary,
@@ -4719,8 +4741,11 @@ const resolveCanvasDocumentContext = async (
   )).join("\n\n");
   return {
     title: sectionKey && typeof sections[0]?.heading === "string" ? sections[0].heading : row.title,
-    text: normalizePlainText([row.title, row.summary, sectionText].filter(Boolean).join("\n\n"))
-      .slice(0, WRITE_CANVAS_MAX_CONTEXT_CHARS),
+    text: normalizeCanvasContextText(
+      [row.title, row.summary, sectionText].filter(Boolean).join("\n\n"),
+      textBudget,
+      WRITE_CANVAS_MAX_CONTEXT_CHARS,
+    ),
   };
 };
 
@@ -4751,11 +4776,12 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
   )).rows;
 
   const items: CanvasContextItem[] = [];
+  const textBudget = createCanvasContextPlainTextBudget(WRITE_CANVAS_MAX_CONTEXT_CHARS);
   for (const row of sourceRows) {
     const kind = normalizeCanvasNodeKind(row.kind);
     if (!kind) continue;
     if (row.document_id) {
-      const documentContext = await resolveCanvasDocumentContext(pool, userId, Number(row.document_id));
+      const documentContext = await resolveCanvasDocumentContext(pool, userId, Number(row.document_id), undefined, textBudget);
       if (documentContext) {
         items.push({ nodeId: Number(row.id), kind, title: documentContext.title || row.title, text: documentContext.text });
       }
@@ -4765,7 +4791,7 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
       const documentId = Number(row.meta?.documentId);
       const sectionKey = typeof row.meta?.sectionKey === "string" ? row.meta.sectionKey : "";
       if (Number.isSafeInteger(documentId) && documentId > 0 && sectionKey) {
-        const sectionContext = await resolveCanvasDocumentContext(pool, userId, documentId, sectionKey);
+        const sectionContext = await resolveCanvasDocumentContext(pool, userId, documentId, sectionKey, textBudget);
         if (sectionContext) {
           items.push({ nodeId: Number(row.id), kind, title: sectionContext.title || row.title, text: sectionContext.text });
         }
@@ -4773,12 +4799,12 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
       continue;
     }
     if (["asset_text", "asset_file", "asset_image", "result"].includes(kind)) {
-      const text = normalizePlainText([
+      const text = normalizeCanvasContextText([
         row.content_text,
         row.extracted_text,
         row.summary,
         row.meta?.note,
-      ].filter(Boolean).join("\n")).slice(0, 12000);
+      ].filter(Boolean).join("\n"), textBudget, 12000);
       items.push({
         nodeId: Number(row.id),
         kind,
@@ -4802,7 +4828,7 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
           nodeId: Number(row.id),
           kind,
           title: article.title,
-          text: normalizePlainText([article.citation_context, article.excerpt, article.content].filter(Boolean).join("\n")).slice(0, 12000),
+          text: normalizeCanvasContextText([article.citation_context, article.excerpt, article.content].filter(Boolean).join("\n"), textBudget, 12000),
           sourceLabel: article.source || article.url || undefined
         });
       }
@@ -4822,14 +4848,14 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
           nodeId: Number(row.id),
           kind,
           title: `${card.type} · ${card.article_title || row.title || "原子卡"}`,
-          text: normalizePlainText([
+          text: normalizeCanvasContextText([
             `[${card.type}] ${card.content}`,
             card.summary,
             card.context,
             card.original_quote ? `原文摘录：${card.original_quote}` : "",
             card.citation_note ? `引用建议：${card.citation_note}` : "",
             card.tags ? `tags：${(typeof card.tags === "string" ? JSON.parse(card.tags) : card.tags).join("、")}` : "",
-          ].filter(Boolean).join("\n")).slice(0, 6000),
+          ].filter(Boolean).join("\n"), textBudget, 6000),
           sourceLabel: card.source || card.url || undefined
         });
       }
@@ -4847,19 +4873,13 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
           nodeId: Number(row.id),
           kind,
           title: note.title || row.title || "文章草稿",
-          text: normalizePlainText(note.content || "").slice(0, 12000),
+          text: normalizeCanvasContextText(note.content || "", textBudget, 12000),
           sourceLabel: "我的文章"
         });
       }
     }
   }
-  let remainingChars = WRITE_CANVAS_MAX_CONTEXT_CHARS;
-  return items.flatMap(item => {
-    if (remainingChars <= 0 && !item.imageDataUrl) return [];
-    const text = item.text.slice(0, Math.max(0, remainingChars));
-    remainingChars -= text.length;
-    return [{ ...item, text }];
-  });
+  return items;
 };
 
 const canvasModelSupportsImages = (model: string) => {
@@ -4979,8 +4999,9 @@ const extractKnowledgeWithAI = async (
 
   try {
     const plainContent = normalizePlainText(
-      article.markdownContent || article.content || article.excerpt
-    ).slice(0, 5200);
+      article.markdownContent || article.content || article.excerpt,
+      5200,
+    );
 
     if (plainContent.length < 30) return { cards: [] };
 
@@ -5057,7 +5078,7 @@ ${skillPrompt ? `\n本次入库必须遵循的 Skills：\n${skillPrompt}` : ""}
 };
 
 const isBlockedPageContent = (content: string) => {
-  const plain = (content || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const plain = normalizePlainText(content || '');
   return /requiring captcha|weixin official accounts platform|当前环境异常|环境异常|去验证|轻点两下取消赞|轻点两下取消在看|video mini program like/i.test(plain);
 };
 
@@ -5094,7 +5115,7 @@ const cleanWoshipmContent = (markdown: string, title: string) => {
 };
 
 const score36KrCandidate = (content: string) => {
-  const plain = (content || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const plain = normalizePlainText(content || '');
   let penalty = 0;
   if (plain.includes('关于36氪')) penalty += 3000;
   if (plain.includes('热门推荐')) penalty += 3000;
@@ -5108,7 +5129,7 @@ const score36KrCandidate = (content: string) => {
 };
 
 const is36KrArticle = (article: Article) => {
-  return article.source.includes('36') || Boolean(article.url && article.url.includes('36kr.com'));
+  return article.source.includes('36') || urlMatchesHostname(article.url, '36kr.com');
 };
 
 const get36KrArticleId = (url?: string) => {
@@ -6554,22 +6575,9 @@ async function startServer() {
   const remoteRssMaxItems = readBoundedEnvNumber(process.env.REMOTE_RSS_MAX_ITEMS, 500, 20, 1000);
 
   app.use(helmet({
-    contentSecurityPolicy: isProduction ? {
-      directives: {
-        defaultSrc: ["'self'"],
-        baseUri: ["'self'"],
-        connectSrc: ["'self'", "wss:"],
-        fontSrc: ["'self'", "data:"],
-        frameAncestors: ["'none'"],
-        frameSrc: ["'none'"],
-        imgSrc: ["'self'", "data:", "blob:", "https:"],
-        mediaSrc: ["'self'", "blob:", "data:", "https:"],
-        objectSrc: ["'none'"],
-        scriptSrc: ["'self'"],
-        styleSrc: ["'self'", "'unsafe-inline'"],
-        workerSrc: ["'self'", "blob:"],
-      },
-    } : false,
+    contentSecurityPolicy: {
+      directives: buildContentSecurityDirectives(isProduction),
+    },
     crossOriginEmbedderPolicy: false,
     strictTransportSecurity: isProduction ? undefined : false,
   }));
@@ -6623,6 +6631,8 @@ async function startServer() {
   }
   const sessionSecret = configuredSessionSecret || DEV_SESSION_SECRET;
   const PgSession = connectPgSimple(session);
+  // Exact Origin/Referer validation below is the CSRF control for every mutating API request.
+  // codeql[js/missing-token-validation]
   const sessionMiddleware = session({
     name: "atomflow.sid",
     store: pool ? new PgSession({ pool, createTableIfMissing: true }) : undefined,
@@ -6677,6 +6687,10 @@ async function startServer() {
   const uploadConcurrencyGuard = createUserConcurrencyGuard(
     readBoundedEnvNumber(process.env.CANVAS_UPLOAD_GLOBAL_CONCURRENCY, 4, 1, 20),
   );
+  const remoteFetchGlobalConcurrencyGuard = createUserConcurrencyGuard(
+    readBoundedEnvNumber(process.env.REMOTE_FETCH_GLOBAL_CONCURRENCY, 2, 1, 10),
+  );
+  const remoteFetchUserConcurrencyGuard = createUserConcurrencyGuard(1);
   const articleSaveConcurrencyGuard = createUserConcurrencyGuard(1);
   const canvasAgentConcurrencyGuard = createUserConcurrencyGuard(1);
   const paidConcurrencyMiddleware: express.RequestHandler = (req, res, next) => {
@@ -6711,6 +6725,40 @@ async function startServer() {
       }
       const leaseTimer = setTimeout(release, paidOperationLeaseMs);
       leaseTimer.unref();
+    });
+    next();
+  };
+  const remoteFetchConcurrencyMiddleware: express.RequestHandler = (req, res, next) => {
+    let releaseGlobal: (() => void) | undefined;
+    let releaseUser: (() => void) | undefined;
+    try {
+      releaseGlobal = remoteFetchGlobalConcurrencyGuard.acquire("global");
+      releaseUser = remoteFetchUserConcurrencyGuard.acquire(authenticatedUserKey(req));
+    } catch (error) {
+      releaseGlobal?.();
+      if (error instanceof ConcurrencyLimitError) {
+        res.setHeader("Retry-After", "5");
+        res.status(429).json({ error: "订阅源正在抓取，请稍后再试" });
+        return;
+      }
+      next(error);
+      return;
+    }
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      releaseUser?.();
+      releaseGlobal?.();
+    };
+    let processingStarted = false;
+    res.locals.beginRemoteFetchProcessing = () => {
+      processingStarted = true;
+      return releaseOnce;
+    };
+    res.once("finish", releaseOnce);
+    res.once("close", () => {
+      if (res.writableFinished || !processingStarted) releaseOnce();
     });
     next();
   };
@@ -6961,8 +7009,8 @@ async function startServer() {
   // --- Auth Routes ---
 
   app.post("/api/auth/send-code", verificationSendLimiter, verificationEmailLimiter, asyncHandler(async (req, res) => {
-    const email = (req.body?.email || '').trim().toLowerCase();
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    const email = normalizeEmailAddress(req.body?.email);
+    if (!email) {
       return res.status(400).json({ error: '请输入有效的邮箱地址' });
     }
     if (!smtpTransporter && !resend) {
@@ -7016,7 +7064,7 @@ async function startServer() {
   }));
 
   app.post("/api/auth/verify", verificationCheckIpLimiter, verificationCheckLimiter, asyncHandler(async (req, res) => {
-    const email = (req.body?.email || '').trim().toLowerCase();
+    const email = normalizeEmailAddress(req.body?.email);
     const code = (req.body?.code || '').trim();
     if (!email || !code) {
       return res.status(400).json({ error: '请输入邮箱和验证码' });
@@ -7069,9 +7117,9 @@ async function startServer() {
 
   // --- Password Registration ---
   app.post("/api/auth/register", verificationSendLimiter, verificationEmailLimiter, asyncHandler(async (req, res) => {
-    const email = (req.body?.email || '').trim().toLowerCase();
+    const email = normalizeEmailAddress(req.body?.email);
     const password = req.body?.password || '';
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    if (!email) {
       return res.status(400).json({ error: '请输入有效的邮箱地址' });
     }
     if (!password || password.length < 8) {
@@ -7137,7 +7185,7 @@ async function startServer() {
   }));
 
   app.post("/api/auth/register/verify", verificationCheckIpLimiter, verificationCheckLimiter, asyncHandler(async (req, res) => {
-    const email = (req.body?.email || '').trim().toLowerCase();
+    const email = normalizeEmailAddress(req.body?.email);
     const code = (req.body?.code || '').trim();
     if (!email || !code) {
       return res.status(400).json({ error: '请输入邮箱和验证码' });
@@ -7175,7 +7223,7 @@ async function startServer() {
   }));
 
   app.post("/api/auth/login-password", passwordLoginLimiter, passwordEmailLimiter, asyncHandler(async (req, res) => {
-    const email = (req.body?.email || '').trim().toLowerCase();
+    const email = normalizeEmailAddress(req.body?.email);
     const password = req.body?.password || '';
     if (!email || !password) {
       return res.status(400).json({ error: '请输入邮箱和密码' });
@@ -7840,7 +7888,7 @@ async function startServer() {
 
   // --- Reset password (forgot password: verify code + set new password, no auth) ---
   app.post("/api/auth/reset-password", verificationCheckIpLimiter, verificationCheckLimiter, asyncHandler(async (req, res) => {
-    const email = (req.body?.email || '').trim().toLowerCase();
+    const email = normalizeEmailAddress(req.body?.email);
     const code = (req.body?.code || '').trim();
     const password = req.body?.password || '';
     if (!email || !code) {
@@ -8234,7 +8282,7 @@ async function startServer() {
     return res.json(withSavedState.map(toArticleListItem));
   }));
 
-  app.post("/api/sources/fetch", requireAuth, remoteFetchLimiter, asyncHandler(async (req, res) => {
+  app.post("/api/sources/fetch", requireAuth, remoteFetchLimiter, remoteFetchConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
     const fullFeed = req.body?.full === true;
@@ -8246,6 +8294,9 @@ async function startServer() {
     if (isBuiltin) {
       return res.status(403).json({ error: "内置订阅源由服务器统一刷新" });
     }
+    const releaseRemoteFetchConcurrency = typeof res.locals.beginRemoteFetchProcessing === "function"
+      ? res.locals.beginRemoteFetchProcessing()
+      : () => undefined;
     try {
       await validatePublicHttpUrl(input, { allowedPorts: PUBLIC_WEB_PORTS });
       const resource = await fetchBoundedPublicResource(input, {
@@ -8296,10 +8347,12 @@ async function startServer() {
       return res.json({ success: true, added });
     } catch (error) {
       return res.status(502).json({ error: "failed to fetch source" });
+    } finally {
+      releaseRemoteFetchConcurrency();
     }
   }));
 
-  app.post("/api/sources/retry", requireAuth, remoteFetchLimiter, asyncHandler(async (req, res) => {
+  app.post("/api/sources/retry", requireAuth, remoteFetchLimiter, remoteFetchConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source.trim() : '';
     const input = typeof req.body?.input === 'string' ? req.body.input.trim() : '';
     const fullFeed = req.body?.full === true;
@@ -8308,22 +8361,29 @@ async function startServer() {
       return res.status(400).json({ error: "source and input are required" });
     }
     const userId = req.session.userId;
+    const releaseRemoteFetchConcurrency = typeof res.locals.beginRemoteFetchProcessing === "function"
+      ? res.locals.beginRemoteFetchProcessing()
+      : () => undefined;
     if (isBuiltin) {
-      const refreshCooldownMs = 60_000;
-      const retryAfterMs = Math.max(0, refreshCooldownMs - (Date.now() - lastFeedRefreshAt));
-      if (!activeFeedRefresh && retryAfterMs > 0) {
-        return res.status(202).json({
-          success: true,
-          refreshed: false,
-          retryAfterSeconds: Math.ceil(retryAfterMs / 1000),
-        });
+      try {
+        const refreshCooldownMs = 60_000;
+        const retryAfterMs = Math.max(0, refreshCooldownMs - (Date.now() - lastFeedRefreshAt));
+        if (!activeFeedRefresh && retryAfterMs > 0) {
+          return res.status(202).json({
+            success: true,
+            refreshed: false,
+            retryAfterSeconds: Math.ceil(retryAfterMs / 1000),
+          });
+        }
+        await runFeedRefresh();
+        const refreshed = lastSuccessfulFeedRefreshSources.has(source);
+        const articleCount = fullBuiltInArticles.filter(
+          article => article.source === source || article.sourceAliases?.includes(source),
+        ).length;
+        return res.json({ success: true, refreshed, articleCount });
+      } finally {
+        releaseRemoteFetchConcurrency();
       }
-      await runFeedRefresh();
-      const refreshed = lastSuccessfulFeedRefreshSources.has(source);
-      const articleCount = fullBuiltInArticles.filter(
-        article => article.source === source || article.sourceAliases?.includes(source),
-      ).length;
-      return res.json({ success: true, refreshed, articleCount });
     }
     try {
       await validatePublicHttpUrl(input, { allowedPorts: PUBLIC_WEB_PORTS });
@@ -8376,6 +8436,8 @@ async function startServer() {
     } catch (error: any) {
       logger.error({ err: error, module: "rss", source }, "Failed to retry source");
       return res.status(502).json({ error: "获取失败", details: error?.message || '未知错误' });
+    } finally {
+      releaseRemoteFetchConcurrency();
     }
   }));
 
@@ -9077,33 +9139,13 @@ async function startServer() {
     const toLang = targetLang === 'zh-CN' ? 'zh' : targetLang;
     const crypto = await import('crypto');
 
-    // Strip HTML and Markdown, returning plain text only
-    const HTML_TAGS_RE = '(?:p|div|span|li|ul|ol|br|hr|h[1-6]|em|strong|code|pre|blockquote|details|summary|figure|video|iframe|script|style|a|img|table|t[rdh]|thead|tbody|tfoot|section|article|header|footer|nav|aside|main)';
-    const stripMarkdown = (md: string): string => {
-      return md
-        .replace(/<!--[\s\S]*?-->/g, '')           // HTML comments
-        .replace(/<(script|style|iframe|figure|video|details|summary)[^>]*>[\s\S]*?<\/\1>/gi, '')  // block elements with content
-        .replace(/<[^>]*>/g, ' ')                  // remaining HTML tags (including CJK tag names like <详情>)
-        .replace(/&[a-zA-Z#\d]+;/g, ' ')          // HTML entities (&nbsp; &hellip; &amp; &rsquo; etc.)
-        // Bare tag remnants: "。p" "！p" ".p" at end of line, or "p" alone on a line
-        .replace(new RegExp(`(?<=[。！？.!?\\s])\\/?${HTML_TAGS_RE}\\s*$`, 'gmi'), '')
-        .replace(new RegExp(`^\\/?${HTML_TAGS_RE}\\s*$`, 'gmi'), '')
-        .replace(/!\[.*?\]\(.*?\)/g, '')           // MD images
-        .replace(/\[([^\]]*)\]\(.*?\)/g, '$1')    // MD links → label only
-        .replace(/```[\s\S]*?```/g, '')            // fenced code blocks
-        .replace(/`[^`]*`/g, '')                   // inline code
-        .replace(/^#{1,6}\s+/gm, '')               // headings
-        .replace(/(\*{1,3}|_{1,3})(.*?)\1/g, '$2') // bold / italic
-        .replace(/~~(.*?)~~/g, '$1')               // strikethrough
-        .replace(/^\s*[-*+>]\s+/gm, '')            // list bullets / blockquotes
-        .replace(/^\s*\d+\.\s+/gm, '')             // ordered list numbers
-        .replace(/\|/g, ' ')                       // table pipes
-        .replace(/\[[\d]+\]/g, '')                 // footnote refs
-        .replace(/[ \t]{2,}/g, ' ')               // collapse spaces
-        .replace(/\n[ \t]*\n/g, '\n\n')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
-    };
+    // Parse untrusted HTML/Markdown structurally before sending plain text upstream.
+    const stripMarkdown = (md: string): string => stripBareHtmlTagRemnants(
+      contentToPlainText(md, {
+        preserveLineBreaks: true,
+        dropContentTags: ["figure", "video", "details", "summary", "pre", "code"],
+      }),
+    );
 
     // Helper: call Baidu API for a single text
     const baiduTranslate = async (text: string): Promise<string> => {
@@ -9121,12 +9163,9 @@ async function startServer() {
 
     // Clean artifacts that Baidu introduces in translated output
     const cleanTranslation = (t: string): string => {
-      return t
+      return contentToPlainText(t, true)
         // Remove stray ；between Chinese words (from apostrophes like we're → 我们；重新)
         .replace(/(?<=[\u4e00-\u9fa5\w])；(?=[\u4e00-\u9fa5\w])/g, '')
-        // Remove leftover HTML/Markdown that Baidu left untouched
-        .replace(/<[^>]{0,60}>/g, '')
-        .replace(/&[a-zA-Z#\d]+;/g, '')
         // Remove bare URLs in parentheses: （https://...） or (https://...)
         .replace(/[（(]\s*https?:\/\/[^\s）)]+\s*[）)]/g, '')
         // Remove standalone URLs
@@ -10341,7 +10380,7 @@ async function startServer() {
           isImage ? "image" : "file",
           extractionError ? "failed" : "ready",
           title,
-          isImage ? "图片资料" : normalizePlainText(extractedText).slice(0, 180),
+          isImage ? "图片资料" : normalizeTextExcerpt(extractedText, 180),
           Number(assetRow.id),
           JSON.stringify(extractionError ? { extractionError } : {}),
           clampNumber(req.body?.x, 180, -100000, 100000),
@@ -10734,7 +10773,24 @@ async function startServer() {
     if (contextNodes.length !== contextNodeIds.length || invalidContextNode) {
       return res.status(400).json({ error: "contextNodeIds must reference active material, insight or document nodes in this project" });
     }
-    const contexts = await Promise.all(contextNodeIds.map(nodeId => resolveCanvasOwnedNodeContext(pool, req.session.userId, Number(group.project_id), nodeId)));
+    const largestSystemPromptChars = members.reduce((largest, member) => Math.max(
+      largest,
+      [member.system_prompt, group.shared_prompt].filter(Boolean).join("\n\n").length,
+    ), 0);
+    const contextTextBudget = createCanvasContextPlainTextBudget(Math.max(
+      0,
+      WRITE_CANVAS_MAX_AGGREGATE_CONTEXT_CHARS - message.length - largestSystemPromptChars,
+    ));
+    const contexts: Array<CanvasContextItem | null> = [];
+    for (const nodeId of contextNodeIds) {
+      contexts.push(await resolveCanvasOwnedNodeContext(
+        pool,
+        req.session.userId,
+        Number(group.project_id),
+        nodeId,
+        contextTextBudget,
+      ));
+    }
     if (contexts.some(context => !context)) return res.status(404).json({ error: "context node not found in this project" });
     const resolvedContexts = contexts.filter((context): context is CanvasContextItem => Boolean(context));
     try {

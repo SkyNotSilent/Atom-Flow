@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import path from "node:path";
+import express from "express";
+import helmet from "helmet";
 import { WebSocket } from "ws";
 import JSZip from "jszip";
 import {
@@ -18,11 +21,168 @@ import {
   validateDocxArchiveBounds,
   validatePublicHttpUrl,
 } from "../src/server/security.js";
+import {
+  buildFeedExcerpt,
+  buildContentSecurityDirectives,
+  contentToPlainText,
+  contentToPlainTextWithinBudget,
+  createPlainTextBudget,
+  normalizeEmailAddress,
+  normalizeTextExcerpt,
+  stripBareHtmlTagRemnants,
+  urlMatchesHostname,
+} from "../src/server/contentSecurity.js";
 
 assert.equal(readBoundedEnvNumber(undefined, 10, 1, 20), 10);
 assert.equal(readBoundedEnvNumber("15", 10, 1, 20), 15);
 assert.equal(readBoundedEnvNumber("999", 10, 1, 20), 20);
 assert.equal(readBoundedEnvNumber("invalid", 10, 1, 20), 10);
+
+assert.equal(
+  contentToPlainText('<script>alert(1)</script><style>body{display:none}</style><p>safe</p><!-- hidden -->'),
+  "safe",
+  "untrusted markup must be parsed and reduced to visible plain text",
+);
+assert.equal(
+  contentToPlainText('<script>alert(1)</script ><p>still safe</p>'),
+  "still safe",
+  "malformed script end tags must not bypass HTML sanitization",
+);
+assert.equal(contentToPlainText("# Heading\n\n[Label](https://example.com)"), "Heading Label");
+assert.equal(
+  contentToPlainText("<p>alpha</p><p>beta</p>"),
+  "alpha beta",
+  "block elements must retain a plain-text separator",
+);
+assert.equal(contentToPlainText("alpha<br>beta"), "alpha beta");
+assert.equal(contentToPlainText("<table><tr><td>alpha</td><td>beta</td></tr></table>"), "alpha beta");
+assert.equal(
+  contentToPlainText("before\n\n\n\nafter", true),
+  "before\n\nafter",
+  "plain-text line normalization must collapse repeated blank lines",
+);
+assert.equal(
+  contentToPlainText("keep <code>drop me</code> after", { dropContentTags: ["code"] }),
+  "keep after",
+  "translation normalization must be able to discard code content",
+);
+assert.equal(normalizeEmailAddress(" User@Example.COM "), "user@example.com");
+assert.equal(normalizeEmailAddress("foo..bar@example.com"), "foo..bar@example.com");
+assert.equal(normalizeEmailAddress("用户@例子.公司"), "用户@例子.公司");
+assert.equal(normalizeEmailAddress("not-an-email"), null);
+assert.equal(normalizeEmailAddress("user name@example.com"), null);
+assert.equal(normalizeEmailAddress(`${"a".repeat(317)}@x.y`), null);
+assert.equal(normalizeEmailAddress("user\u0000@example.com"), null);
+assert.equal(normalizeTextExcerpt("  alpha\n\t beta  ", 120), "alpha beta");
+assert.equal(normalizeTextExcerpt("x".repeat(1_000_000), 120).length, 120);
+assert.equal(
+  buildFeedExcerpt("<p>正文摘要来自 RSS 内容</p>", undefined, "回退标题", 512, 120),
+  "正文摘要来自 RSS 内容",
+  "feeds without contentSnippet must derive a bounded excerpt from content",
+);
+
+const rssExcerptStartedAt = performance.now();
+const rssExcerptSourceCharsPerItem = Math.floor(64_000 / 500);
+for (let index = 0; index < 500; index += 1) {
+  const excerpt = buildFeedExcerpt(
+    `<p>第 ${index} 条正文 ${"内容".repeat(2000)}</p><script>${"x".repeat(5000)}</script>`,
+    undefined,
+    `标题 ${index}`,
+    rssExcerptSourceCharsPerItem,
+    120,
+  );
+  assert.ok(excerpt.length <= 120);
+}
+assert.ok(
+  performance.now() - rssExcerptStartedAt < 2_000,
+  "500 bounded RSS excerpts must complete without a multi-second event-loop stall",
+);
+
+const contextBudget = createPlainTextBudget(120_000, 240_000);
+const contextOutputs: string[] = [];
+const contextNormalizationStartedAt = performance.now();
+for (let index = 0; index < 30; index += 1) {
+  contextOutputs.push(contentToPlainTextWithinBudget(
+    `<p>${"context ".repeat(20_000)}</p><script>${"ignored ".repeat(20_000)}</script>`,
+    contextBudget,
+    60_000,
+  ));
+}
+assert.ok(contextOutputs.reduce((total, value) => total + value.length, 0) <= 120_000);
+assert.equal(contextBudget.remainingSourceChars, 0, "all contexts must share one source parsing budget");
+assert.ok(
+  performance.now() - contextNormalizationStartedAt < 2_000,
+  "30 hostile contexts must be bounded by one aggregate parsing budget",
+);
+assert.equal(
+  stripBareHtmlTagRemnants("正文。p\np\n保留"),
+  "正文。\n保留",
+  "translation cleanup must remove incomplete HTML tag remnants",
+);
+assert.equal(urlMatchesHostname("https://news.36kr.com/p/123", "36kr.com"), true);
+assert.equal(urlMatchesHostname("https://36kr.com.evil.example/p/123", "36kr.com"), false);
+assert.equal(urlMatchesHostname("https://evil.example/36kr.com/p/123", "36kr.com"), false);
+
+const headerTestApp = express();
+headerTestApp.get("/production-headers", helmet({
+  contentSecurityPolicy: { directives: buildContentSecurityDirectives(true) },
+}), (_req, res) => res.sendStatus(204));
+headerTestApp.use(helmet({
+  contentSecurityPolicy: { directives: buildContentSecurityDirectives(false) },
+}));
+const headerAllowedOrigins = buildAllowedOrigins("https://atomflow.example", undefined);
+headerTestApp.use("/api", (req, res, next) => {
+  if (isAllowedMutationOrigin({
+    method: req.method,
+    path: req.path,
+    origin: req.get("origin") || undefined,
+    referer: req.get("referer") || undefined,
+    isAuthenticated: true,
+  }, headerAllowedOrigins)) {
+    next();
+    return;
+  }
+  res.status(403).json({ error: "untrusted origin" });
+});
+headerTestApp.get("/headers", (_req, res) => res.sendStatus(204));
+headerTestApp.post("/api/mutation", (_req, res) => res.sendStatus(204));
+const headerTestServer = createHttpServer(headerTestApp);
+await new Promise<void>((resolve, reject) => {
+  headerTestServer.once("error", reject);
+  headerTestServer.listen(0, "127.0.0.1", () => {
+    headerTestServer.off("error", reject);
+    resolve();
+  });
+});
+try {
+  const address = headerTestServer.address();
+  assert.ok(address && typeof address === "object");
+  const headerBase = `http://127.0.0.1:${address.port}`;
+  const headerResponse = await fetch(`${headerBase}/headers`);
+  const csp = headerResponse.headers.get("content-security-policy") || "";
+  assert.match(csp, /font-src 'self' data: https:\/\/fonts\.gstatic\.com/);
+  assert.match(csp, /style-src 'self' 'unsafe-inline' https:\/\/fonts\.googleapis\.com/);
+  assert.doesNotMatch(csp, /upgrade-insecure-requests/);
+  const productionHeaderResponse = await fetch(`${headerBase}/production-headers`);
+  const productionCsp = productionHeaderResponse.headers.get("content-security-policy") || "";
+  assert.match(productionCsp, /connect-src 'self';/);
+  assert.doesNotMatch(productionCsp, /connect-src[^;]*wss:/);
+  assert.match(productionCsp, /upgrade-insecure-requests/);
+  assert.doesNotMatch(productionCsp, /script-src[^;]*unsafe/);
+  const deniedMutation = await fetch(`${headerBase}/api/mutation`, {
+    method: "POST",
+    headers: { origin: "https://evil.example" },
+  });
+  assert.equal(deniedMutation.status, 403);
+  const allowedMutation = await fetch(`${headerBase}/api/mutation`, {
+    method: "POST",
+    headers: { origin: "https://atomflow.example" },
+  });
+  assert.equal(allowedMutation.status, 204);
+} finally {
+  headerTestServer.closeAllConnections();
+  await new Promise<void>((resolve, reject) => headerTestServer.close(error => error ? reject(error) : resolve()));
+}
 
 for (const address of [
   "0.0.0.0",
@@ -204,8 +364,12 @@ await assert.rejects(
 const root = process.cwd();
 const server = readFileSync(path.join(root, "server.ts"), "utf8");
 const securitySource = readFileSync(path.join(root, "src/server/security.ts"), "utf8");
+const contentSecuritySource = readFileSync(path.join(root, "src/server/contentSecurity.ts"), "utf8");
 const viteConfig = readFileSync(path.join(root, "vite.config.ts"), "utf8");
-const packageJson = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as { scripts?: { test?: string } };
+const packageJson = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as {
+  dependencies?: Record<string, string>;
+  scripts?: { test?: string };
+};
 assert.doesNotMatch(viteConfig, /GEMINI_API_KEY|process\.env\.[A-Z0-9_]+[^\n]*JSON\.stringify/, "Server API keys must never be injected into the browser bundle");
 assert.match(server, /import helmet from "helmet"/, "Helmet must protect HTTP responses");
 assert.match(server, /import compression from "compression"/, "Large JSON and static responses must be compressed");
@@ -214,6 +378,9 @@ assert.match(server, /app\.disable\(["']x-powered-by["']\)/, "Express fingerprin
 assert.match(server, /express\.json\(\{\s*limit:/, "JSON request size must be explicit");
 assert.match(server, /app\.use\(["']\/api["'], apiLimiter\)/, "API routes must have a general limiter");
 assert.match(server, /app\.use\(["']\/api["'], mutationOriginGuard\)/, "API mutations must enforce production origin policy");
+assert.match(server, /directives:\s*buildContentSecurityDirectives\(isProduction\)/, "Helmet CSP must use the tested shared directive builder");
+assert.match(server, /sameSite:\s*["']lax["']/, "Session cookies must retain same-site CSRF defense without breaking external navigation");
+assert.match(server, /codeql\[js\/missing-token-validation\]/, "The custom exact-origin CSRF control must document the CodeQL suppression");
 assert.match(server, /app\.get\(["']\/api\/health["']/, "Railway health endpoint must exist");
 assert.match(server, /const sessionMiddleware = session\(/, "HTTP and WebSocket paths must share one session parser");
 assert.match(server, /if \(isProduction && \(!process\.env\.SESSION_SECRET[\s\S]{0,220}configuredSessionSecret === DEV_SESSION_SECRET/, "Production must reject a missing or placeholder session secret");
@@ -223,6 +390,23 @@ assert.match(server, /app\.post\(["']\/api\/auth\/login-password["'], passwordLo
 assert.match(server, /app\.post\(["']\/api\/auth\/send-code["'], verificationSendLimiter,/, "Verification email sends must be limited");
 assert.match(server, /app\.post\(["']\/api\/sources\/fetch["'], requireAuth, remoteFetchLimiter,/, "Custom RSS fetch must require authentication and remote-fetch limits");
 assert.match(server, /app\.post\(["']\/api\/sources\/retry["'], requireAuth, remoteFetchLimiter,/, "RSS retry must require authentication and remote-fetch limits");
+assert.match(server, /app\.post\(["']\/api\/sources\/fetch["'], requireAuth, remoteFetchLimiter, remoteFetchConcurrencyMiddleware,/, "Custom RSS fetches must have global and per-user concurrency limits");
+assert.match(server, /app\.post\(["']\/api\/sources\/retry["'], requireAuth, remoteFetchLimiter, remoteFetchConcurrencyMiddleware,/, "RSS retries must have global and per-user concurrency limits");
+assert.match(server, /RSS_FEED_EXCERPT_SOURCE_BUDGET_CHARS = 64_000/, "RSS excerpt parsing must have a refresh-level source budget");
+assert.match(server, /buildFeedExcerpt\([\s\S]{0,180}excerptSourceCharsPerItem/, "RSS excerpts must use the bounded structured fallback");
+assert.doesNotMatch(server, /source === '即刻话题' \? formatJikeContent\(rawContent\)/, "RSS refresh must defer expensive Jike formatting until a single article is opened");
+assert.match(server, /PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS = 250_000/, "Main-thread rich-text normalization must have a hard source bound");
+assert.match(server, /Math\.max\(boundedOutputChars \* 2, 2048\)[\s\S]{0,180}contentToPlainText\(\(content \|\| ''\)\.slice\(0, sourceLimit\)\)/, "General plain-text normalization must slice according to the requested output before parsing");
+assert.match(contentSecuritySource, /compileHtmlToText/, "Plain-text HTML conversion must reuse the parser's compiled batch API");
+assert.match(contentSecuritySource, /plainTextConverterCache\.set\(cacheKey, converter\)/, "Compiled text converters must be cached");
+assert.match(server, /createCanvasContextPlainTextBudget[\s\S]{0,300}PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS/, "Canvas context parsing must cap aggregate source work");
+assert.match(server, /for \(const nodeId of contextNodeIds\)[\s\S]{0,300}contextTextBudget/, "Agent groups must resolve contexts against one shared budget");
+assert.equal(packageJson.dependencies?.["html-to-text"], "^10.0.0", "The maintained structured HTML-to-text parser must be a direct dependency");
+assert.match(server, /beginRemoteFetchProcessing/, "RSS concurrency ownership must transfer to the route task");
+const sourceFetchRoute = server.slice(server.indexOf('app.post("/api/sources/fetch"'), server.indexOf('app.post("/api/sources/retry"'));
+const sourceRetryRoute = server.slice(server.indexOf('app.post("/api/sources/retry"'), server.indexOf('app.delete("/api/sources/:source"'));
+assert.match(sourceFetchRoute, /finally \{\s*releaseRemoteFetchConcurrency\(\)/, "RSS fetch locks must release when processing actually ends");
+assert.match(sourceRetryRoute, /finally \{\s*releaseRemoteFetchConcurrency\(\)/, "RSS retry locks must release when processing actually ends");
 assert.match(server, /app\.delete\(["']\/api\/sources\/:source["'], requireAuth,/, "Subscription deletion must require authentication");
 assert.match(server, /app\.patch\(["']\/api\/sources\/rename["'], requireAuth,/, "Subscription rename must require authentication");
 assert.doesNotMatch(server, /app\.post\(["']\/api\/articles\/refresh-cache["']/, "Unused global cache mutation must not be publicly routable");

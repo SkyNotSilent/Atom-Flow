@@ -612,7 +612,10 @@ export const CanvasDocumentEditor: React.FC<CanvasDocumentEditorProps> = ({ node
 
   const applyScenario = () => {
     if (!document) return;
-    const hasWrittenContent = document.sections.some(section => section.heading.trim() || section.body.replace(/<[^>]+>/g, '').trim());
+    const hasWrittenContent = document.sections.some(section => {
+      const bodyText = new DOMParser().parseFromString(section.body, 'text/html').body.textContent || '';
+      return Boolean(section.heading.trim() || bodyText.trim());
+    });
     if (hasWrittenContent && !window.confirm('套用场景结构会替换当前大纲与正文，是否继续？')) return;
     const sections = createScenarioSections(document.scenario);
     setDocumentDraft({ ...document, sections });
