@@ -59,6 +59,7 @@ import {
   sanitizeGlobalArticleCache,
   stableArticleId,
 } from "./src/server/rss.js";
+import { detectArticleContentFormat } from "./src/utils/articleContent.js";
 import {
   buildFeedExcerpt,
   buildContentSecurityDirectives,
@@ -410,6 +411,7 @@ function mergeArticles(previous: Article[], next: Article[]): Article[] {
       cards: prev.cards,
       fullFetched: prev.fullFetched,
       markdownContent: prev.markdownContent,
+      contentFormat: prev.contentFormat || article.contentFormat,
       readabilityUsed: prev.readabilityUsed
     };
   });
@@ -671,6 +673,7 @@ function normalizeFeedItems(
       title: item.title || '无标题',
       excerpt,
       content: rawContent,
+      contentFormat: detectArticleContentFormat(rawContent),
       url: item.link,
       audioUrl,
       audioDuration,
@@ -8771,9 +8774,14 @@ async function startServer() {
     try {
       // 所有源都直接使用RSS内容，不进行网页抓取
       if (article.source === '即刻话题') {
-        article.markdownContent = formatJikeContent(article.content);
+        const formattedContent = formatJikeContent(article.content);
+        article.markdownContent = formattedContent;
+        article.contentFormat = formattedContent === article.content
+          ? detectArticleContentFormat(formattedContent)
+          : 'markdown';
       } else {
         article.markdownContent = article.content || article.excerpt || '暂无内容';
+        article.contentFormat = detectArticleContentFormat(article.markdownContent);
       }
       
       article.readabilityUsed = false;
@@ -8786,6 +8794,7 @@ async function startServer() {
     } catch (error) {
       logger.error({ err: error, module: "articles", articleId }, "Failed to process article content");
       article.markdownContent = article.content || article.excerpt || '暂无内容';
+      article.contentFormat = detectArticleContentFormat(article.markdownContent);
       article.readabilityUsed = false;
       article.fullFetched = true;
       const responseArticle = req.session.userId
@@ -9090,7 +9099,11 @@ async function startServer() {
       [req.params.id, req.session.userId]
     )).rows[0];
     if (!row) return res.status(404).json({ error: "Saved article not found" });
-    res.json({ ...row, sourceImages: normalizeJsonStringArray(row.sourceImages) });
+    res.json({
+      ...row,
+      contentFormat: detectArticleContentFormat(row.content || ''),
+      sourceImages: normalizeJsonStringArray(row.sourceImages),
+    });
   }));
 
   app.delete("/api/saved-articles/:id", requireAuth, asyncHandler(async (req, res) => {

@@ -40,6 +40,7 @@ export const KnowledgePage: React.FC = () => {
         citationContext: data.citationContext || sa.citationContext,
         content: data.content || sa.excerpt,
         markdownContent: data.content || undefined,
+        contentFormat: data.contentFormat,
         url: data.url || sa.url,
         fullFetched: true,
         cards: [],

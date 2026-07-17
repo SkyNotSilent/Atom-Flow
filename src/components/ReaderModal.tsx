@@ -7,6 +7,7 @@ import remarkGfm from 'remark-gfm';
 import { cn } from './Nav';
 import { getDisplaySource } from '../utils/articleDisplay';
 import { logger } from '../utils/logger';
+import { detectArticleContentFormat } from '../utils/articleContent';
 import { AtomFlowGalaxyIcon } from './AtomFlowGalaxyIcon';
 
 const LANG_OPTIONS = [
@@ -58,7 +59,23 @@ function isSafeArticleUrl(rawUrl: string): boolean {
   return /^(?:(?:https?|mailto|tel):[^\s]*|(?:\/{1,2}|\.\.?\/|#|\?)[^\s]*|[^\s:/?#]+(?:[/?#][^\s]*)?)$/i.test(url);
 }
 
-export function sanitizeArticleHtml(rawHtml: string): string {
+function proxyArticleImageUrl(rawUrl: string, articleUrl?: string): string | null {
+  const candidate = rawUrl.trim();
+  if (!candidate) return null;
+  try {
+    const absoluteUrl = candidate.startsWith('//')
+      ? new URL(`https:${candidate}`)
+      : articleUrl
+        ? new URL(candidate, articleUrl)
+        : new URL(candidate);
+    if (absoluteUrl.protocol !== 'http:' && absoluteUrl.protocol !== 'https:') return null;
+    return `/api/image-proxy?url=${encodeURIComponent(absoluteUrl.toString())}&referer=${encodeURIComponent(articleUrl || '')}`;
+  } catch {
+    return null;
+  }
+}
+
+export function sanitizeArticleHtml(rawHtml: string, articleUrl?: string): string {
   if (typeof window === 'undefined') return '';
   if (!articleDOMPurify) {
     articleDOMPurify = createDOMPurify(window);
@@ -68,8 +85,30 @@ export function sanitizeArticleHtml(rawHtml: string): string {
       }
     });
   }
-  return String(articleDOMPurify.sanitize(rawHtml, ARTICLE_HTML_SANITIZE_CONFIG));
+  const sanitizedHtml = String(articleDOMPurify.sanitize(rawHtml, ARTICLE_HTML_SANITIZE_CONFIG));
+  const template = window.document.createElement('template');
+  template.innerHTML = sanitizedHtml;
+  template.content.querySelectorAll('img').forEach(image => {
+    const proxiedSrc = proxyArticleImageUrl(image.getAttribute('src') || '', articleUrl);
+    if (proxiedSrc) image.setAttribute('src', proxiedSrc);
+    else image.removeAttribute('src');
+    image.setAttribute('loading', 'lazy');
+    image.setAttribute('referrerpolicy', 'no-referrer');
+  });
+  return template.innerHTML;
 }
+
+export function isArticleHtml(rawContent: string): boolean {
+  return Boolean(rawContent) && detectArticleContentFormat(rawContent) === 'html';
+}
+
+const SafeArticleHtml: React.FC<{ content: string; articleUrl?: string }> = ({ content, articleUrl }) => {
+  const sanitizedArticleContent = useMemo(
+    () => sanitizeArticleHtml(content, articleUrl),
+    [articleUrl, content],
+  );
+  return <div dangerouslySetInnerHTML={{ __html: sanitizedArticleContent }} />;
+};
 
 // Split text content into translatable segments (paragraphs / headings)
 function splitIntoSegments(text: string): string[] {
@@ -97,9 +136,11 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
   const displaySource = currentArticle ? getDisplaySource(currentArticle) : '未知来源';
   const shouldShowLoading = Boolean(currentArticle && !currentArticle.fullFetched && !currentArticle.content && !currentArticle.markdownContent);
   const isPodcast = currentArticle?.source === '张小珺商业访谈录' && currentArticle?.audioUrl;
-  const sanitizedArticleContent = useMemo(
-    () => sanitizeArticleHtml(currentArticle?.content || ''),
-    [currentArticle?.content],
+  const rawArticleContent = currentArticle?.markdownContent || currentArticle?.content || '';
+  const articleContentIsHtml = useMemo(
+    () => currentArticle?.contentFormat === 'html'
+      || (!currentArticle?.contentFormat && isArticleHtml(rawArticleContent)),
+    [currentArticle?.contentFormat, rawArticleContent],
   );
 
   useEffect(() => {
@@ -506,25 +547,29 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
                 <div>
                   {originalSegments.map((seg, i) => (
                     <div key={i} className="mb-6">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}
-                        components={{
-                          a: ({node, href, children, ...props}) => (
-                            <a {...props} href={href} className="text-accent hover:underline break-all" target="_blank" rel="noreferrer">{children}</a>
-                          ),
-                          img: ({node, src, onError, ...props}) => {
-                            let normalizedSrc = src || '';
-                            if (normalizedSrc.startsWith('//')) normalizedSrc = `https:${normalizedSrc}`;
-                            else if (normalizedSrc.startsWith('/')) {
-                              const articleHost = currentArticle?.url ? new URL(currentArticle.url).origin : '';
-                              normalizedSrc = articleHost ? `${articleHost}${normalizedSrc}` : normalizedSrc;
+                      {articleContentIsHtml || isArticleHtml(seg) ? (
+                        <SafeArticleHtml content={seg} articleUrl={currentArticle.url} />
+                      ) : (
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}
+                          components={{
+                            a: ({node, href, children, ...props}) => (
+                              <a {...props} href={href} className="text-accent hover:underline break-all" target="_blank" rel="noreferrer">{children}</a>
+                            ),
+                            img: ({node, src, onError, ...props}) => {
+                              let normalizedSrc = src || '';
+                              if (normalizedSrc.startsWith('//')) normalizedSrc = `https:${normalizedSrc}`;
+                              else if (normalizedSrc.startsWith('/')) {
+                                const articleHost = currentArticle?.url ? new URL(currentArticle.url).origin : '';
+                                normalizedSrc = articleHost ? `${articleHost}${normalizedSrc}` : normalizedSrc;
+                              }
+                              const proxySrc = normalizedSrc.startsWith('http')
+                                ? `/api/image-proxy?url=${encodeURIComponent(normalizedSrc)}&referer=${encodeURIComponent(currentArticle?.url || '')}`
+                                : normalizedSrc;
+                              return <img {...props} src={proxySrc} referrerPolicy="no-referrer" className="w-full rounded-xl my-4 object-cover bg-surface2" loading="lazy" onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />;
                             }
-                            const proxySrc = normalizedSrc.startsWith('http')
-                              ? `/api/image-proxy?url=${encodeURIComponent(normalizedSrc)}&referer=${encodeURIComponent(currentArticle?.url || '')}`
-                              : normalizedSrc;
-                            return <img {...props} src={proxySrc} referrerPolicy="no-referrer" className="w-full rounded-xl my-4 object-cover bg-surface2" loading="lazy" onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />;
-                          }
-                        }}
-                      >{seg}</ReactMarkdown>
+                          }}
+                        >{seg}</ReactMarkdown>
+                      )}
                       {translatedSegments[i] && (
                         <p className="mt-1 text-text2 text-[14px] sm:text-[15px] leading-[1.8]">
                           {translatedSegments[i]}
@@ -533,7 +578,9 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
                     </div>
                   ))}
                 </div>
-              ) : currentArticle.markdownContent ? (
+              ) : articleContentIsHtml ? (
+                <SafeArticleHtml content={rawArticleContent} articleUrl={currentArticle.url} />
+              ) : (
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   components={{
@@ -621,10 +668,8 @@ export const ReaderPane: React.FC<{ onClose?: () => void }> = () => {
                     }
                   }}
                 >
-                  {currentArticle.markdownContent}
+                  {rawArticleContent}
                 </ReactMarkdown>
-              ) : (
-                <div dangerouslySetInnerHTML={{ __html: sanitizedArticleContent }} />
               )}
             </div>
           )}

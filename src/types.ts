@@ -122,6 +122,7 @@ export interface Article {
   sourceImages?: string[];
   content: string;
   markdownContent?: string;
+  contentFormat?: 'html' | 'markdown' | 'text';
   url?: string;
   audioUrl?: string;
   audioDuration?: string;
