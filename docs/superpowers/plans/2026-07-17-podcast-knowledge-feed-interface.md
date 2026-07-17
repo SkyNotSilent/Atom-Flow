@@ -844,6 +844,7 @@ interface PodcastInsightPanelProps {
   item: PodcastPreviewItem;
   saving: boolean;
   savingLabel: string | null;
+  thoughtAction: React.ReactNode;
   onSave: () => void;
   onGenerate: () => void;
   onOpenContext: () => void;
@@ -865,7 +866,7 @@ interface PodcastCardRailProps {
 }
 ```
 
-`PodcastInsightPanel` must render `当前观点`, the real `summary`, and `基于 RSS 摘要`. It renders `打开原文` only when `sourceUrl` exists. If `isSaved`, render disabled `已在知识库`; otherwise render a save button only when `articleId` exists and show `savingLabel || "存入知识库"`. Embed `InspirationButton` with `label="说下我的想法"`, `articleTitle`, `articleId`, and `savedArticleId`.
+`PodcastInsightPanel` must render `当前观点`, the real `summary`, and `基于 RSS 摘要`. It renders `打开原文` only when `sourceUrl` exists. If `isSaved`, render disabled `已在知识库`; otherwise render a save button only when `articleId` exists and show `savingLabel || "存入知识库"`. Render the supplied `thoughtAction` node in the action row; the presentational component must not call `useAppContext` itself.
 
 Every external source link opens with `target="_blank"` and `rel="noreferrer noopener"` and includes the source/title in its accessible name.
 
@@ -1004,6 +1005,7 @@ const pageProps = {
   onLogin: () => undefined,
   onBack: () => undefined,
   onDiscover: () => undefined,
+  renderThoughtAction: () => React.createElement("button", { type: "button" }, "说下我的想法"),
   audioElement: React.createElement("audio", { hidden: true, preload: "metadata" }),
 };
 const pageHtml = renderToStaticMarkup(React.createElement(PodcastPageContent, pageProps));
@@ -1075,13 +1077,27 @@ export interface PodcastPageContentProps {
   onLogin: () => void;
   onBack: () => void;
   onDiscover: () => void;
+  renderThoughtAction: (item: PodcastPreviewItem) => React.ReactNode;
   audioElement?: React.ReactNode;
 }
 ```
 
 Import `../components/podcast/podcast.css` once at the top of `PodcastPage.tsx`; no child component should import it again.
 
-`PodcastPage` builds items with `buildPodcastPreviewItems`, filters them with `filterPodcastItems`, resolves the page gate, owns `filter`, `range`, reducer state, and context-drawer state, then passes one `audioElement` into `PodcastPageContent`. `PodcastPageContent` must remain fetch-free so the SSR test is deterministic.
+`PodcastPage` builds items with `buildPodcastPreviewItems`, filters them with `filterPodcastItems`, resolves the page gate, owns `filter`, `range`, reducer state, and context-drawer state, then passes one `audioElement` into `PodcastPageContent`. It also passes this exact knowledge-linked thought renderer:
+
+```tsx
+renderThoughtAction={item => (
+  <InspirationButton
+    label="说下我的想法"
+    articleTitle={item.title}
+    articleId={item.articleId}
+    savedArticleId={item.savedArticleId}
+  />
+)}
+```
+
+`PodcastPageContent` must remain fetch-free and AppContext-free so the SSR test is deterministic; it passes `renderThoughtAction(browseItem)` into `PodcastInsightPanel.thoughtAction`.
 
 - [ ] **Step 3: Implement the single audio controller**
 
