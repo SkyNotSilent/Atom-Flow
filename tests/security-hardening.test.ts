@@ -13,6 +13,7 @@ import {
   createPinnedLookup,
   createUserConcurrencyGuard,
   fetchBoundedPublicResource,
+  isAuthenticationPath,
   isAllowedMutationOrigin,
   isAllowedUploadSignature,
   isPrivateOrReservedIp,
@@ -32,11 +33,18 @@ import {
   stripBareHtmlTagRemnants,
   urlMatchesHostname,
 } from "../src/server/contentSecurity.js";
+import { installCsrfFetch } from "../src/utils/csrfFetch.js";
 
 assert.equal(readBoundedEnvNumber(undefined, 10, 1, 20), 10);
 assert.equal(readBoundedEnvNumber("15", 10, 1, 20), 15);
 assert.equal(readBoundedEnvNumber("999", 10, 1, 20), 20);
 assert.equal(readBoundedEnvNumber("invalid", 10, 1, 20), 10);
+assert.equal(isAuthenticationPath("/auth/login-password"), true);
+assert.equal(isAuthenticationPath("/auth/login-password/"), true);
+assert.equal(isAuthenticationPath("/AUTH/LOGIN-PASSWORD"), true);
+assert.equal(isAuthenticationPath("/auth"), true);
+assert.equal(isAuthenticationPath("/authentication/login-password"), false);
+assert.equal(isAuthenticationPath("/notes"), false);
 
 assert.equal(
   contentToPlainText('<script>alert(1)</script><style>body{display:none}</style><p>safe</p><!-- hidden -->'),
@@ -122,6 +130,57 @@ assert.equal(
 assert.equal(urlMatchesHostname("https://news.36kr.com/p/123", "36kr.com"), true);
 assert.equal(urlMatchesHostname("https://36kr.com.evil.example/p/123", "36kr.com"), false);
 assert.equal(urlMatchesHostname("https://evil.example/36kr.com/p/123", "36kr.com"), false);
+
+const originalWindow = globalThis.window;
+const csrfTokens = [
+  "first-csrf-token-value-with-more-than-32-characters",
+  "second-csrf-token-value-with-more-than-32-characters",
+];
+const csrfMutationHeaders: string[] = [];
+let csrfTokenRequests = 0;
+let rejectNextMutationToken = false;
+const browserBaseUrl = "https://atomflow.example";
+const browserFetch: typeof fetch = async (input, init) => {
+  const request = input instanceof Request
+    ? new Request(input, init)
+    : new Request(new URL(input.toString(), browserBaseUrl), init);
+  if (new URL(request.url).pathname === "/api/csrf-token") {
+    const token = csrfTokens[Math.min(csrfTokenRequests, csrfTokens.length - 1)];
+    csrfTokenRequests += 1;
+    return Response.json({ csrfToken: token });
+  }
+  csrfMutationHeaders.push(request.headers.get("x-csrf-token") || "");
+  if (rejectNextMutationToken) {
+    rejectNextMutationToken = false;
+    return new Response(null, { status: 403, headers: { "X-CSRF-Token-Invalid": "1" } });
+  }
+  return new Response(null, { status: 204 });
+};
+Object.defineProperty(globalThis, "window", {
+  configurable: true,
+  value: {
+    fetch: browserFetch,
+    location: { href: `${browserBaseUrl}/`, origin: browserBaseUrl },
+  },
+});
+try {
+  installCsrfFetch();
+  const firstMutation = await window.fetch("/api/notes", { method: "POST", body: "{}" });
+  assert.equal(firstMutation.status, 204);
+  assert.equal(csrfTokenRequests, 1);
+  assert.equal(csrfMutationHeaders[0], csrfTokens[0]);
+
+  rejectNextMutationToken = true;
+  const retriedMutation = await window.fetch("/api/notes", { method: "POST", body: "{}" });
+  assert.equal(retriedMutation.status, 204);
+  assert.equal(csrfTokenRequests, 2, "an invalid session token must trigger one token refresh");
+  assert.deepEqual(csrfMutationHeaders.slice(1), [csrfTokens[0], csrfTokens[1]]);
+} finally {
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: originalWindow,
+  });
+}
 
 const headerTestApp = express();
 headerTestApp.get("/production-headers", helmet({
@@ -365,6 +424,9 @@ const root = process.cwd();
 const server = readFileSync(path.join(root, "server.ts"), "utf8");
 const securitySource = readFileSync(path.join(root, "src/server/security.ts"), "utf8");
 const contentSecuritySource = readFileSync(path.join(root, "src/server/contentSecurity.ts"), "utf8");
+const csrfFetchSource = readFileSync(path.join(root, "src/utils/csrfFetch.ts"), "utf8");
+const mainSource = readFileSync(path.join(root, "src/main.tsx"), "utf8");
+const loggerSource = readFileSync(path.join(root, "src/utils/logger.ts"), "utf8");
 const viteConfig = readFileSync(path.join(root, "vite.config.ts"), "utf8");
 const packageJson = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as {
   dependencies?: Record<string, string>;
@@ -380,7 +442,17 @@ assert.match(server, /app\.use\(["']\/api["'], apiLimiter\)/, "API routes must h
 assert.match(server, /app\.use\(["']\/api["'], mutationOriginGuard\)/, "API mutations must enforce production origin policy");
 assert.match(server, /directives:\s*buildContentSecurityDirectives\(isProduction\)/, "Helmet CSP must use the tested shared directive builder");
 assert.match(server, /sameSite:\s*["']lax["']/, "Session cookies must retain same-site CSRF defense without breaking external navigation");
-assert.match(server, /codeql\[js\/missing-token-validation\]/, "The custom exact-origin CSRF control must document the CodeQL suppression");
+assert.match(server, /csrfToken\?: string/, "Session state must carry a server-generated CSRF token");
+assert.match(server, /app\.get\(["']\/api\/csrf-token["']/, "The browser must have a same-origin CSRF token bootstrap endpoint");
+assert.match(server, /app\.use\(["']\/api["'], csrfProtection\)/, "Every mutating API route must pass through CSRF token validation");
+assert.match(server, /!isAuthenticationPath\(req\.path\)/, "Anonymous authentication routes must use normalized CSRF path matching");
+assert.match(server, /submittedCsrfToken !== req\.session\.csrfToken/, "CSRF validation must compare the request header with the session token");
+assert.match(server, /randomBytes\(32\)\.toString\(["']base64url["']\)/, "CSRF tokens must use cryptographically secure randomness");
+assert.match(csrfFetchSource, /headers\.set\(["']X-CSRF-Token["']/, "Same-origin mutations must carry the CSRF token header");
+assert.match(csrfFetchSource, /\/api\/csrf-token/, "The fetch wrapper must bootstrap tokens from the server");
+assert.match(csrfFetchSource, /X-CSRF-Token-Invalid/, "The fetch wrapper must recover after session rotation invalidates a token");
+assert.match(mainSource, /installCsrfFetch\(\)/, "CSRF-aware fetch must be installed before the React app starts");
+assert.doesNotMatch(loggerSource, /sendBeacon/, "Client logging must not bypass the CSRF-aware fetch wrapper");
 assert.match(server, /app\.get\(["']\/api\/health["']/, "Railway health endpoint must exist");
 assert.match(server, /const sessionMiddleware = session\(/, "HTTP and WebSocket paths must share one session parser");
 assert.match(server, /if \(isProduction && \(!process\.env\.SESSION_SECRET[\s\S]{0,220}configuredSessionSecret === DEV_SESSION_SECRET/, "Production must reject a missing or placeholder session secret");

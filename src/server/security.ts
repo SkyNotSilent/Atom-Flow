@@ -24,6 +24,11 @@ export const readBoundedEnvNumber = (value: string | undefined, fallback: number
   return Math.min(max, Math.max(min, Math.round(parsed)));
 };
 
+export const isAuthenticationPath = (pathname: string) => {
+  const normalizedPath = pathname.toLowerCase().replace(/\/+$/, "");
+  return normalizedPath === "/auth" || normalizedPath.startsWith("/auth/");
+};
+
 const ipv4ToNumber = (address: string) => {
   const parts = address.split(".").map(Number);
   if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return null;

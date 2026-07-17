@@ -23,7 +23,7 @@ import { createServer, ServerResponse, type IncomingMessage } from "http";
 import { Worker } from "node:worker_threads";
 import { WebSocketServer, WebSocket as WsWebSocket } from "ws";
 import { gzipSync, gunzipSync } from "zlib";
-import { randomUUID, createHash, createHmac, randomInt } from "crypto";
+import { randomBytes, randomUUID, createHash, createHmac, randomInt } from "crypto";
 import { URL } from "url";
 import pino from "pino";
 import pinoHttp from "pino-http";
@@ -41,6 +41,7 @@ import {
   buildAllowedOrigins,
   createUserConcurrencyGuard,
   fetchBoundedPublicResource,
+  isAuthenticationPath,
   isAllowedMutationOrigin,
   isAllowedUploadSignature,
   readBoundedEnvNumber,
@@ -243,6 +244,7 @@ declare module "express-session" {
     userId?: number;
     email?: string;
     reauthenticatedAt?: number;
+    csrfToken?: string;
   }
 }
 
@@ -6631,8 +6633,6 @@ async function startServer() {
   }
   const sessionSecret = configuredSessionSecret || DEV_SESSION_SECRET;
   const PgSession = connectPgSimple(session);
-  // Exact Origin/Referer validation below is the CSRF control for every mutating API request.
-  // codeql[js/missing-token-validation]
   const sessionMiddleware = session({
     name: "atomflow.sid",
     store: pool ? new PgSession({ pool, createTableIfMissing: true }) : undefined,
@@ -6668,6 +6668,32 @@ async function startServer() {
     res.status(403).json({ error: "请求来源不受信任" });
   };
   app.use("/api", mutationOriginGuard);
+
+  const csrfProtection: express.RequestHandler = (req, res, next) => {
+    if (["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+      next();
+      return;
+    }
+    if (!req.session.userId && !isAuthenticationPath(req.path)) {
+      next();
+      return;
+    }
+    const submittedCsrfToken = req.get("x-csrf-token");
+    if (!submittedCsrfToken || submittedCsrfToken !== req.session.csrfToken) {
+      res.setHeader("X-CSRF-Token-Invalid", "1");
+      res.status(403).json({ error: "CSRF token is missing or invalid" });
+      return;
+    }
+    next();
+  };
+  app.use("/api", csrfProtection);
+  app.get("/api/csrf-token", (req, res) => {
+    if (!req.session.csrfToken) {
+      req.session.csrfToken = randomBytes(32).toString("base64url");
+    }
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ csrfToken: req.session.csrfToken });
+  });
 
   app.get("/legal/:document", asyncHandler(async (req, res) => {
     const document = req.params.document as keyof typeof LEGAL_DOCUMENTS;
@@ -6865,6 +6891,7 @@ async function startServer() {
   };
 
   const establishAuthenticatedSession = (req: express.Request, userId: number, email: string) => new Promise<void>((resolve, reject) => {
+    const csrfToken = req.session.csrfToken;
     req.session.regenerate(error => {
       if (error) {
         reject(error);
@@ -6873,6 +6900,7 @@ async function startServer() {
       req.session.userId = userId;
       req.session.email = email;
       req.session.reauthenticatedAt = Date.now();
+      req.session.csrfToken = csrfToken || randomBytes(32).toString("base64url");
       resolve();
     });
   });
