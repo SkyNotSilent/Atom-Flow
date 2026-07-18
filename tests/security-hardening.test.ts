@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { WebSocket } from "ws";
 import JSZip from "jszip";
@@ -291,8 +292,7 @@ const railwayConfig = JSON.parse(railway) as { deploy?: { drainingSeconds?: unkn
 const dockerfile = readFileSync(path.join(root, "Dockerfile"), "utf8");
 const nixpacks = readFileSync(path.join(root, "nixpacks.toml"), "utf8");
 const envExample = readFileSync(path.join(root, ".env.example"), "utf8");
-const agentsDoc = readFileSync(path.join(root, "AGENTS.md"), "utf8");
-const claudeDoc = readFileSync(path.join(root, "CLAUDE.md"), "utf8");
+const gitignore = readFileSync(path.join(root, ".gitignore"), "utf8");
 const deploymentDoc = readFileSync(path.join(root, "DEPLOYMENT.md"), "utf8");
 assert.match(railway, /"healthcheckPath"\s*:\s*"\/api\/health"/, "Railway must gate deployments on health");
 assert.match(railway, /"healthcheckTimeout"\s*:/, "Railway healthcheck timeout must be explicit");
@@ -310,7 +310,29 @@ assert.match(nixpacks, /nodejs[-_]22/, "Railway Nixpacks must use the documented
 const ciWorkflowPath = path.join(root, ".github/workflows/ci.yml");
 assert.equal(existsSync(ciWorkflowPath), true, "Wait for CI requires a real GitHub Actions workflow");
 const ciWorkflow = readFileSync(ciWorkflowPath, "utf8");
+const workflowDirectory = path.join(root, ".github/workflows");
+const allWorkflowContent = readdirSync(workflowDirectory, { recursive: true, encoding: "utf8" })
+  .filter(file => /\.ya?ml$/i.test(file))
+  .map(file => readFileSync(path.join(workflowDirectory, file), "utf8"))
+  .join("\n");
 assert.match(ciWorkflow, /npm test/, "CI must run the offline TypeScript regression suite");
+for (const variable of [
+  "RUN_REAL_SECURITY_TESTS",
+  "RUN_REAL_WRITE_AGENT_TESTS",
+  "RUN_REAL_CANVAS_TESTS",
+]) {
+  assert.match(ciWorkflow, new RegExp(`${variable}:\\s*[\"']?false[\"']?`), `${variable} must stay disabled in public CI`);
+  assert.doesNotMatch(allWorkflowContent, new RegExp(`${variable}\\s*(?::|=)\\s*[\"']?true[\"']?`, "i"), `${variable} must not be enabled by any public workflow`);
+}
+assert.doesNotMatch(allWorkflowContent, /secrets\.(?:TEST_EMAIL|TEST_PASSWORD|DATABASE_URL|AI_API_KEY|OPENAI_API_KEY)/i, "Public CI must not receive local or production test credentials");
+for (const localOnlyDocument of ["AGENTS.md", "CLAUDE.md", "CLOUD.md"]) {
+  assert.match(gitignore, new RegExp(`^${localOnlyDocument.replace(".", "\\.")}$`, "m"), `${localOnlyDocument} must remain local-only`);
+}
+const trackedLocalDocuments = execFileSync("git", ["ls-files", "--", "AGENTS.md", "CLAUDE.md", "CLOUD.md"], {
+  cwd: root,
+  encoding: "utf8",
+}).trim();
+assert.equal(trackedLocalDocuments, "", "Local agent and cloud documents must not be tracked by Git");
 for (const variable of [
   "APP_URL",
   "ALLOWED_ORIGINS",
@@ -343,16 +365,13 @@ for (const [variable, expected] of [
 ] as const) {
   assert.match(envExample, new RegExp(`^${variable}=${expected}$`, "m"), `.env.example ${variable} must match the server default`);
 }
-for (const [name, content] of [["AGENTS.md", agentsDoc], ["CLAUDE.md", claudeDoc]] as const) {
-  assert.match(content, /## Production Security And Scale/, `${name} must document the production security contract`);
-  assert.match(content, /GitHub auto-?deploy/i, `${name} must retain the GitHub to Railway deployment trigger`);
-  assert.match(content, /Cloudflare|WAF/, `${name} must identify the edge protection launch gate`);
-  assert.match(content, /Redis/, `${name} must identify the distributed rate-limit launch gate`);
-  assert.match(content, /object storage/i, `${name} must identify the upload storage launch gate`);
-  assert.match(content, /VITE_TLDRAW_LICENSE_KEY/, `${name} must document the production tldraw license gate`);
-}
 assert.doesNotMatch(deploymentDoc, /Start Command:\s*`?npm run dev/i, "production guides must not run the Vite development server");
 assert.match(deploymentDoc, /Wait for CI/i, "Railway autodeploy must wait for CI before production rollout");
+assert.match(deploymentDoc, /Railway[\s\S]{0,240}(?:部署状态和日志|deployment and logs)/i, "Railway deployment verification must include status and logs");
+assert.match(deploymentDoc, /Cloudflare|WAF/, "Public deployment guide must identify the edge protection launch gate");
+assert.match(deploymentDoc, /Redis/, "Public deployment guide must identify the distributed rate-limit launch gate");
+assert.match(deploymentDoc, /object storage|对象存储/i, "Public deployment guide must identify the upload storage launch gate");
+assert.match(deploymentDoc, /VITE_TLDRAW_LICENSE_KEY/, "Public deployment guide must document the production tldraw license gate");
 
 if (process.env.RUN_REAL_SECURITY_TESTS === "true") {
   const base = process.env.API_BASE || "http://localhost:1000";

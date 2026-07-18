@@ -9,6 +9,10 @@ coverage/
 .cache/
 .claude/settings.local.json
 .claude/worktrees/
+# Local agent instructions and cloud/test operating context. Keep these on each machine only.
+AGENTS.md
+CLAUDE.md
+CLOUD.md
 .playwright-mcp/
 docs/superpowers/
 docs/write-agent-skills-redesign.md

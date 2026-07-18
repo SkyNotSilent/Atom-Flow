@@ -16,7 +16,7 @@ AtomFlow 是一个全栈应用，包含：
 2. 连接 GitHub 仓库，启用 GitHub 自动部署到 Railway
 3. Railway 会自动读取 `railway.json`，并使用 `npm start` 启动服务
 4. 每次合并前 **Wait for CI**，确认 GitHub CI 全部通过后再触发部署
-5. 确认 `/api/health` 健康检查通过，部署完成后再绑定公网 URL
+5. 每次推送或合并到远程仓库后，监控 Railway 的部署状态和日志；只有部署成功、`/api/health` 通过并完成公网 URL 基础烟测后，才算发布完成。GitHub CI 通过不能替代 Railway 部署验证。
 
 ### 方案2：Render（免费）
 

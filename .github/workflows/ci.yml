@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+env:
+  NODE_ENV: test
+  RUN_REAL_SECURITY_TESTS: "false"
+  RUN_REAL_WRITE_AGENT_TESTS: "false"
+  RUN_REAL_CANVAS_TESTS: "false"
+
 jobs:
   verify:
     runs-on: ubuntu-latest
