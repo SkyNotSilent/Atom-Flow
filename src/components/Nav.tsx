@@ -2,18 +2,20 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut, Orbit, FileText, ChevronDown } from 'lucide-react';
+import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut, Orbit, FileText, ChevronDown, Headphones } from 'lucide-react';
 import { logger } from '../utils/logger';
 import { AtomFlowGalaxyIcon } from './AtomFlowGalaxyIcon';
 import { OFFICIAL_SOURCE_ICON_URLS } from '../data/sourceIcons';
+import type { AppTab } from '../types';
+import { requiresAuthenticatedAppTab } from '../utils/appTabs';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
 interface NavProps {
-  activeTab: 'feed' | 'knowledge' | 'write' | 'discover';
-  setActiveTab: (tab: 'feed' | 'knowledge' | 'write' | 'discover') => void;
+  activeTab: AppTab;
+  setActiveTab: (tab: AppTab) => void;
 }
 
 type SourceEntry = {
@@ -376,8 +378,8 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     }
   }, [sourceEntries, user, syncPreferences]);
 
-  const handleTabClick = (tab: 'feed' | 'knowledge' | 'write' | 'discover') => {
-    if ((tab === 'knowledge' || tab === 'write') && !user) {
+  const handleTabClick = (tab: AppTab) => {
+    if (requiresAuthenticatedAppTab(tab) && !user) {
       loginAndDo(() => setActiveTab(tab));
       return;
     }
@@ -1005,6 +1007,10 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
         </TabButton>
         <TabButton active={activeTab === 'knowledge'} onClick={() => handleTabClick('knowledge')} badge={savedCards.length} fullWidth>我的知识库</TabButton>
         <TabButton active={activeTab === 'write'} onClick={() => handleTabClick('write')} fullWidth>魔法写作</TabButton>
+        <TabButton active={activeTab === 'podcast'} onClick={() => handleTabClick('podcast')} fullWidth>
+          <Headphones size={14} className="inline mr-1" />
+          播客解读
+        </TabButton>
 
         {activeTab === 'feed' && (
           <div className="mt-6">

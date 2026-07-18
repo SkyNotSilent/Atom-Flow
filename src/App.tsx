@@ -13,8 +13,11 @@ import { DiscoverPage } from "./pages/DiscoverPage";
 import { ReaderPane } from "./components/ReaderModal";
 import { LoginModal } from "./components/LoginModal";
 import { ProfileModal } from "./components/ProfileModal";
+import type { AppTab } from "./types";
+import { isFullWidthAppTab } from "./utils/appTabs";
 
 const WritePage = React.lazy(() => import("./pages/WritePage").then(module => ({ default: module.WritePage })));
+const PodcastPage = React.lazy(() => import("./pages/PodcastPage").then(module => ({ default: module.PodcastPage })));
 
 class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
   state = { hasError: false };
@@ -47,11 +50,11 @@ class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { has
 }
 
 function AppContent() {
-  const [activeTab, setActiveTab] = useState<"feed" | "knowledge" | "write" | "discover">(
-    "feed",
-  );
+  const [activeTab, setActiveTab] = useState<AppTab>("feed");
   const { readingArticle, showLoginModal, setShowLoginModal, handleLoginSuccess, showProfileModal, setShowProfileModal } = useAppContext();
   const isWriteTab = activeTab === 'write';
+  const isPodcastTab = activeTab === "podcast";
+  const isFullWidthTab = isFullWidthAppTab(activeTab);
   const containerRef = useRef<HTMLDivElement>(null);
   const [navWidth, setNavWidth] = useState(260);
   const [centerWidth, setCenterWidth] = useState(560);
@@ -70,6 +73,13 @@ function AppContent() {
     window.addEventListener('resize', checkMobile);
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
+
+  useEffect(() => {
+    if (isFullWidthTab) {
+      setDragging(null);
+      setHoverCenterRightEdge(false);
+    }
+  }, [isFullWidthTab]);
 
   useEffect(() => {
     if (!dragging) return;
@@ -102,22 +112,22 @@ function AppContent() {
   }, [dragging, navWidth]);
 
   useEffect(() => {
-    if (dragging === "center-right") {
+    if (dragging === "center-right" && !isFullWidthTab) {
       document.body.style.cursor = "col-resize";
       return () => {
         document.body.style.cursor = "";
       };
     }
     document.body.style.cursor = "";
-  }, [dragging]);
+  }, [dragging, isFullWidthTab]);
 
   return (
     <div
       ref={containerRef}
       className="flex h-screen overflow-hidden bg-bg text-text-main font-sans"
-      style={{ cursor: hoverCenterRightEdge || dragging === "center-right" ? "col-resize" : undefined }}
+      style={{ cursor: !isFullWidthTab && (hoverCenterRightEdge || dragging === "center-right") ? "col-resize" : undefined }}
       onMouseMove={(event) => {
-        if (isMobile) return;
+        if (isMobile || isFullWidthTab) return;
         const container = containerRef.current;
         if (!container) return;
         const rect = container.getBoundingClientRect();
@@ -126,7 +136,7 @@ function AppContent() {
       }}
       onMouseLeave={() => setHoverCenterRightEdge(false)}
       onMouseDownCapture={(event) => {
-        if (isMobile || event.button !== 0) return;
+        if (isMobile || isFullWidthTab || event.button !== 0) return;
         const container = containerRef.current;
         if (!container) return;
         const rect = container.getBoundingClientRect();
@@ -174,13 +184,13 @@ function AppContent() {
       <div
         className={`
           flex flex-col overflow-hidden
-          ${isMobile ? 'flex-1' : isWriteTab ? 'flex-1 border-r border-border' : 'shrink-0 border-r border-border'}
-          ${isMobile && readingArticle ? 'hidden' : ''}
+          ${isMobile ? 'flex-1' : isFullWidthTab ? 'flex-1' : 'shrink-0 border-r border-border'}
+          ${isMobile && !isFullWidthTab && readingArticle ? 'hidden' : ''}
         `}
-        style={{ width: isMobile ? '100%' : isWriteTab ? undefined : centerWidth }}
+        style={{ width: isMobile ? '100%' : isFullWidthTab ? undefined : centerWidth }}
       >
         {/* 移动端顶部栏 */}
-        {isMobile && (
+        {isMobile && !isPodcastTab && (
           <div className="flex items-center gap-3 px-4 py-3 border-b border-border bg-surface">
             <button
               onClick={() => setMobileNavOpen(true)}
@@ -215,11 +225,19 @@ function AppContent() {
             )}
           </div>
         )}
+        {activeTab === "podcast" && (
+          <React.Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-text3">加载播客解读...</div>}>
+            <PodcastPage
+              onBack={() => setActiveTab("feed")}
+              onDiscover={() => setActiveTab("discover")}
+            />
+          </React.Suspense>
+        )}
         {activeTab === "discover" && <DiscoverPage />}
       </div>
 
       {/* 右侧阅读区 / 写作助手区 */}
-      {!isWriteTab && (
+      {!isFullWidthTab && (
         <div
           className={`
             ${isMobile ? 'fixed inset-0 z-30 bg-surface' : 'flex-1 min-w-[320px]'}

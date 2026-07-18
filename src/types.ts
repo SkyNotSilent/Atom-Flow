@@ -1,3 +1,5 @@
+export type AppTab = "feed" | "discover" | "knowledge" | "write" | "podcast";
+
 export interface User {
   id: number;
   email: string;
