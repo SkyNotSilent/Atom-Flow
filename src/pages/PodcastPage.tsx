@@ -18,6 +18,7 @@ import {
   createPodcastPlaybackState,
   parseAudioDuration,
   podcastPlaybackReducer,
+  type PodcastPlaybackAction,
   type PodcastPlaybackRate,
   type PodcastPlaybackState,
 } from "../components/podcast/podcastPlayback";
@@ -77,6 +78,72 @@ const FILTERS: Array<{ id: PodcastFilter; label: string }> = [
 ];
 
 const PLAYBACK_ERROR = "该音频暂时无法播放，请重试或打开原节目。";
+
+export interface PodcastAudioElementProps {
+  item?: PodcastPreviewItem;
+  continuousPlay: boolean;
+  onDispatch: (action: PodcastPlaybackAction) => void;
+  onPlayNext: (itemId: string) => void;
+}
+
+export const PodcastAudioElement = React.forwardRef<HTMLAudioElement, PodcastAudioElementProps>(
+  function PodcastAudioElement({ item, continuousPlay, onDispatch, onPlayNext }, ref) {
+    const audioRef = useRef<HTMLAudioElement>(null);
+    React.useImperativeHandle(ref, () => audioRef.current as HTMLAudioElement, []);
+
+    useEffect(() => {
+      const audio = audioRef.current;
+      return () => {
+        if (!audio || audio.isConnected) return;
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+      };
+    }, []);
+
+    return (
+      <audio
+        ref={audioRef}
+        hidden
+        preload="metadata"
+        src={item?.audioUrl}
+        onLoadStart={() => item && onDispatch({
+          type: "request_play",
+          itemId: item.id,
+          initialDuration: parseAudioDuration(item.audioDuration) ?? 0,
+        })}
+        onLoadedMetadata={event => {
+          if (!item) return;
+          const mediaDuration = event.currentTarget.duration;
+          onDispatch({
+            type: "loaded_metadata",
+            itemId: item.id,
+            duration: Number.isFinite(mediaDuration)
+              ? mediaDuration
+              : parseAudioDuration(item.audioDuration) ?? 0,
+          });
+        }}
+        onPlaying={() => item && onDispatch({ type: "playing", itemId: item.id })}
+        onPause={() => item && onDispatch({ type: "paused", itemId: item.id })}
+        onTimeUpdate={event => item && onDispatch({
+          type: "time_update",
+          itemId: item.id,
+          currentTime: event.currentTarget.currentTime,
+        })}
+        onEnded={() => {
+          if (!item) return;
+          onDispatch({ type: "ended", itemId: item.id });
+          if (continuousPlay) onPlayNext(item.id);
+        }}
+        onError={() => item && onDispatch({
+          type: "error",
+          itemId: item.id,
+          message: PLAYBACK_ERROR,
+        })}
+      />
+    );
+  },
+);
 
 const isInteractiveTarget = (target: EventTarget | null) =>
   target instanceof Element && Boolean(target.closest(
@@ -211,7 +278,11 @@ export function PodcastPageContent({
 
   const rangeLabel = range === "today" ? "今天" : "过去 3 天";
   const stateButtonClass = "min-h-11 rounded-full border border-border bg-surface px-5 text-sm font-semibold text-text-main transition-colors hover:border-accent hover:text-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent";
-  const compactActiveControls = activeItem?.audioUrl && activeItem.id !== browseItem?.id ? (
+  const stageControlsVisible = gate === "ready"
+    && Boolean(browseItem)
+    && (filter === "for_you" || filteredItems.length > 0);
+  const compactActiveControls = activeItem?.audioUrl
+    && (!stageControlsVisible || activeItem.id !== browseItem?.id) ? (
     <section
       className="sticky bottom-3 z-20 rounded-2xl border border-border bg-surface p-3 shadow-lg"
       aria-label="正在播放的节目"
@@ -328,8 +399,6 @@ export function PodcastPageContent({
             />
           </div>
 
-          {compactActiveControls}
-
           <div className="flex flex-wrap items-center justify-between gap-3">
             <button
               type="button"
@@ -407,7 +476,7 @@ export function PodcastPageContent({
                 <button
                   key={value}
                   type="button"
-                  className={`min-h-9 rounded-full px-3 text-xs font-semibold ${range === value ? "bg-accent text-bg" : "text-text2"}`}
+                  className={`min-h-11 rounded-full px-3 text-xs font-semibold ${range === value ? "bg-accent text-bg" : "text-text2"}`}
                   aria-pressed={range === value}
                   onClick={() => onRangeChange(value)}
                 >
@@ -450,8 +519,8 @@ export function PodcastPageContent({
             </button>
           </aside>
         )}
-        {!browseItem && compactActiveControls}
         {content}
+        {compactActiveControls}
       </div>
     </main>
   );
@@ -658,30 +727,13 @@ export function PodcastPage({ onBack, onDiscover }: PodcastPageProps) {
         />
       )}
       audioElement={(
-        <audio
+        <PodcastAudioElement
+          key={activeItem?.id ?? "idle"}
           ref={audioRef}
-          hidden
-          preload="metadata"
-          src={activeItem?.audioUrl}
-          onLoadStart={() => activeItem && dispatch({ type: "request_play", itemId: activeItem.id, initialDuration: parseAudioDuration(activeItem.audioDuration) ?? 0 })}
-          onLoadedMetadata={event => {
-            if (!activeItem) return;
-            const mediaDuration = event.currentTarget.duration;
-            dispatch({
-              type: "loaded_metadata",
-              itemId: activeItem.id,
-              duration: Number.isFinite(mediaDuration) ? mediaDuration : parseAudioDuration(activeItem.audioDuration) ?? 0,
-            });
-          }}
-          onPlaying={() => activeItem && dispatch({ type: "playing", itemId: activeItem.id })}
-          onPause={() => activeItem && dispatch({ type: "paused", itemId: activeItem.id })}
-          onTimeUpdate={event => activeItem && dispatch({ type: "time_update", itemId: activeItem.id, currentTime: event.currentTarget.currentTime })}
-          onEnded={() => {
-            if (!activeItem) return;
-            dispatch({ type: "ended", itemId: activeItem.id });
-            if (playback.continuousPlay) playNextNativeAfter(activeItem.id);
-          }}
-          onError={() => activeItem && dispatch({ type: "error", itemId: activeItem.id, message: PLAYBACK_ERROR })}
+          item={activeItem}
+          continuousPlay={playback.continuousPlay}
+          onDispatch={dispatch}
+          onPlayNext={playNextNativeAfter}
         />
       )}
     />

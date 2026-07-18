@@ -8,7 +8,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
 import { createServer } from "vite";
 import type { PodcastPreviewItem } from "../src/components/podcast/podcastPreview";
-import { createPodcastPlaybackState } from "../src/components/podcast/podcastPlayback";
+import {
+  createPodcastPlaybackState,
+  type PodcastPlaybackAction,
+} from "../src/components/podcast/podcastPlayback";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(testDir, "..");
@@ -69,6 +72,8 @@ const createTouchPointerEvent = (
 try {
   const pageModule = await vite.ssrLoadModule("/src/pages/PodcastPage.tsx") as Record<string, unknown>;
   const PodcastPageContent = pageModule.PodcastPageContent as React.ComponentType<Record<string, unknown>>;
+  const PodcastAudioElement = pageModule.PodcastAudioElement as React.ElementType | undefined;
+  assert.ok(PodcastAudioElement, "PodcastPage must export its source-scoped audio controller");
 
   const items: PodcastPreviewItem[] = [
     {
@@ -148,6 +153,12 @@ try {
   assert.match(pageHtml, /深度播客/);
   assert.match(pageHtml, /连续播放/);
   assert.match(pageHtml, /aria-pressed="false"[^>]*>连续播放|aria-pressed="false"[^>]*>[^<]*<[^>]+>[^<]*连续播放/);
+  assert.equal(
+    (pageHtml.match(/min-h-11 rounded-full px-3 text-xs font-semibold/g) || []).length,
+    2,
+    "both date-range buttons must expose a 44px minimum touch target",
+  );
+  assert.doesNotMatch(pageHtml, /min-h-9 rounded-full px-3/);
   assert.match(pageHtml, /基于 RSS 摘要/);
   assert.match(pageHtml, /说下我的想法/);
   assert.doesNotMatch(pageHtml, /AI 已生成|完整逐字稿/);
@@ -195,6 +206,32 @@ try {
   assert.match(generatedEmptyWithActiveAudioHtml, /正在播放的节目/);
   assert.match(generatedEmptyWithActiveAudioHtml, /暂停真实播客/);
 
+  const cachedActivePlayback = {
+    ...createPodcastPlaybackState(items[0].id),
+    activeItemId: items[0].id,
+    status: "playing" as const,
+  };
+  for (const [gate, stateLabel] of [
+    ["signed_out", "登录后生成你的播客知识流"],
+    ["auth_loading", "正在确认登录状态"],
+    ["error", "内容加载失败"],
+  ] as const) {
+    const nonStageHtml = renderToStaticMarkup(React.createElement(PodcastPageContent, {
+      ...pageProps,
+      gate,
+      articlesError: gate === "error" ? "cached refresh failed" : null,
+      playback: cachedActivePlayback,
+    }));
+    assert.match(nonStageHtml, new RegExp(stateLabel));
+    assert.equal((nonStageHtml.match(/<audio/g) || []).length, 1);
+    assert.equal((nonStageHtml.match(/正在播放的节目/g) || []).length, 1);
+    assert.match(nonStageHtml, /暂停真实播客/);
+    assert.ok(
+      nonStageHtml.indexOf(stateLabel) < nonStageHtml.indexOf('aria-label="正在播放的节目"'),
+      "the sticky active controls must follow the current page state in DOM order",
+    );
+  }
+
   const dom = new JSDOM("<!doctype html><html><body><div id=\"podcast-page-root\"></div></body></html>", {
     url: "https://atomflow.test/",
   });
@@ -202,6 +239,14 @@ try {
   const pointerCaptureDescriptor = Object.getOwnPropertyDescriptor(
     dom.window.HTMLElement.prototype,
     "setPointerCapture",
+  );
+  const mediaPauseDescriptor = Object.getOwnPropertyDescriptor(
+    dom.window.HTMLMediaElement.prototype,
+    "pause",
+  );
+  const mediaLoadDescriptor = Object.getOwnPropertyDescriptor(
+    dom.window.HTMLMediaElement.prototype,
+    "load",
   );
   let mountedRoot: Root | null = null;
 
@@ -213,11 +258,125 @@ try {
     });
     const container = dom.window.document.querySelector<HTMLDivElement>("#podcast-page-root");
     assert.ok(container);
+
+    const strictPauseNodes: HTMLMediaElement[] = [];
+    const strictLoadNodes: HTMLMediaElement[] = [];
+    Object.defineProperties(dom.window.HTMLMediaElement.prototype, {
+      pause: {
+        configurable: true,
+        value(this: HTMLMediaElement) { strictPauseNodes.push(this); },
+      },
+      load: {
+        configurable: true,
+        value(this: HTMLMediaElement) { strictLoadNodes.push(this); },
+      },
+    });
+    mountedRoot = createRoot(container);
+    await act(async () => {
+      mountedRoot?.render(React.createElement(
+        React.StrictMode,
+        null,
+        React.createElement(PodcastAudioElement, {
+          item: items[0],
+          continuousPlay: false,
+          onDispatch: () => undefined,
+          onPlayNext: () => undefined,
+        }),
+      ));
+    });
+    const strictLiveAudio = container.querySelector<HTMLAudioElement>("audio");
+    assert.ok(strictLiveAudio);
+    assert.equal(strictPauseNodes.length, 0, "StrictMode effect replay must not pause a connected audio node");
+    assert.equal(strictLoadNodes.length, 0, "StrictMode effect replay must not reset a connected audio node");
+    assert.equal(strictLiveAudio.hasAttribute("src"), true, "StrictMode replay must preserve the live source");
+    await act(async () => {
+      mountedRoot?.unmount();
+    });
+    assert.deepEqual(strictPauseNodes, [strictLiveAudio], "a real StrictMode root unmount must stop the audio once");
+    assert.deepEqual(strictLoadNodes, [strictLiveAudio], "a real StrictMode root unmount must release the audio once");
+    assert.equal(strictLiveAudio.hasAttribute("src"), false);
+    mountedRoot = null;
+
+    const replacementItem: PodcastPreviewItem = {
+      ...items[0],
+      id: "article:13",
+      articleId: 13,
+      title: "替换播客",
+      audioUrl: "https://cdn.example.com/replacement.mp3",
+    };
+    const audioDispatches: PodcastPlaybackAction[] = [];
+    const continuousNextIds: string[] = [];
+    const renderAudio = async (item: PodcastPreviewItem) => {
+      await act(async () => {
+        mountedRoot?.render(React.createElement(PodcastAudioElement, {
+          key: item.id,
+          item,
+          continuousPlay: true,
+          onDispatch: (action: PodcastPlaybackAction) => { audioDispatches.push(action); },
+          onPlayNext: (itemId: string) => { continuousNextIds.push(itemId); },
+        }));
+      });
+    };
+
+    mountedRoot = createRoot(container);
+    await renderAudio(items[0]);
+    const oldAudio = container.querySelector<HTMLAudioElement>("audio");
+    assert.ok(oldAudio);
+    let oldPauseCalls = 0;
+    let oldLoadCalls = 0;
+    Object.defineProperties(oldAudio, {
+      pause: { configurable: true, value: () => { oldPauseCalls += 1; } },
+      load: { configurable: true, value: () => { oldLoadCalls += 1; } },
+    });
+    await renderAudio(replacementItem);
+    const currentAudio = container.querySelector<HTMLAudioElement>("audio");
+    assert.ok(currentAudio);
+    assert.notEqual(currentAudio, oldAudio, "a source change must remount the audio event generation");
+    assert.equal(oldPauseCalls, 1, "switching sources must stop the detached audio node");
+    assert.equal(oldAudio.hasAttribute("src"), false, "switching sources must release the old source");
+    assert.equal(oldLoadCalls, 1, "switching sources must reset the detached media resource");
+    audioDispatches.length = 0;
+    continuousNextIds.length = 0;
+
+    for (const eventType of ["pause", "error", "timeupdate", "ended"] as const) {
+      oldAudio.dispatchEvent(new dom.window.Event(eventType, { bubbles: true }));
+    }
+    assert.deepEqual(audioDispatches, [], "events from an unmounted source must be ignored");
+    assert.deepEqual(continuousNextIds, [], "an old ended event must not advance continuous play");
+
+    currentAudio.currentTime = 42;
+    for (const eventType of ["pause", "error", "timeupdate", "ended"] as const) {
+      currentAudio.dispatchEvent(new dom.window.Event(eventType, { bubbles: true }));
+    }
+    assert.deepEqual(
+      audioDispatches.map(action => [action.type, "itemId" in action ? action.itemId : null]),
+      [
+        ["paused", replacementItem.id],
+        ["error", replacementItem.id],
+        ["time_update", replacementItem.id],
+        ["ended", replacementItem.id],
+      ],
+      "the current audio generation must dispatch only its captured item id",
+    );
+    assert.deepEqual(continuousNextIds, [replacementItem.id]);
+
+    let currentPauseCalls = 0;
+    let currentLoadCalls = 0;
+    Object.defineProperties(currentAudio, {
+      pause: { configurable: true, value: () => { currentPauseCalls += 1; } },
+      load: { configurable: true, value: () => { currentLoadCalls += 1; } },
+    });
+    await act(async () => {
+      mountedRoot?.unmount();
+    });
+    assert.equal(currentPauseCalls, 1, "unmounting the controller must stop the current audio node");
+    assert.equal(currentAudio.hasAttribute("src"), false, "unmounting must release the current source");
+    assert.equal(currentLoadCalls, 1, "unmounting must reset the current media resource");
+    mountedRoot = createRoot(container);
     let browseCalls = 0;
     let toggleCalls = 0;
     let previousCalls = 0;
     let nextCalls = 0;
-    mountedRoot = createRoot(container);
     await act(async () => {
       mountedRoot?.render(React.createElement(PodcastPageContent, {
         ...pageProps,
@@ -267,6 +426,16 @@ try {
       Object.defineProperty(dom.window.HTMLElement.prototype, "setPointerCapture", pointerCaptureDescriptor);
     } else {
       Reflect.deleteProperty(dom.window.HTMLElement.prototype, "setPointerCapture");
+    }
+    if (mediaPauseDescriptor) {
+      Object.defineProperty(dom.window.HTMLMediaElement.prototype, "pause", mediaPauseDescriptor);
+    } else {
+      Reflect.deleteProperty(dom.window.HTMLMediaElement.prototype, "pause");
+    }
+    if (mediaLoadDescriptor) {
+      Object.defineProperty(dom.window.HTMLMediaElement.prototype, "load", mediaLoadDescriptor);
+    } else {
+      Reflect.deleteProperty(dom.window.HTMLMediaElement.prototype, "load");
     }
     restoreDomGlobals();
     dom.window.close();
