@@ -5,6 +5,10 @@ import {
   filterPodcastItems,
   resolvePodcastPageGate,
 } from "../src/components/podcast/podcastPreview";
+import { JSDOM } from "jsdom";
+
+const dom = new JSDOM("");
+Object.defineProperty(globalThis, "DOMParser", { value: dom.window.DOMParser, configurable: true });
 
 const now = new Date(2026, 6, 17, 12, 0, 0).getTime();
 const baseArticle = (patch: Partial<Article>): Article => ({
@@ -74,6 +78,14 @@ assert.equal(native?.kind, "native_episode");
 assert.equal(native?.audioUrl, "https://cdn.example.com/episode.mp3");
 assert.equal(native?.audioDuration, "25:12");
 assert.equal(native?.contextBasis, "rss_summary");
+
+const hostileSummary = buildPodcastPreviewItems([
+  baseArticle({
+    id: 13,
+    excerpt: '<p>safe &amp;lt;tag&amp;gt;</p><script>steal()</script><style>body{display:none}</style><p>tail</p>',
+  }),
+], [])[0]?.summary;
+assert.equal(hostileSummary, 'safe &lt;tag&gt; tail', 'summary parsing must drop executable content and decode entities exactly once');
 
 const matched = items.find(item => item.articleId === 12);
 assert.equal(matched?.kind, "native_episode");

@@ -27,6 +27,15 @@ import { normalizeBillingPlans } from '../billing/catalog';
 export type WriteWorkspaceMode = 'graph' | 'articles' | 'skills';
 export type WriteGraphView = 'all' | 'activated';
 const RSS_REFRESH_RETRY_DELAYS_MS = [1500, 3000, 6000, 12000, 24000] as const;
+const BILLING_SYNC_CHANNEL = 'atomflow:billing-sync';
+
+const notifyBillingAccessChanged = () => {
+  window.dispatchEvent(new Event('atomflow:billing-access-changed'));
+  if (typeof BroadcastChannel !== 'function') return;
+  const channel = new BroadcastChannel(BILLING_SYNC_CHANNEL);
+  channel.postMessage({ type: 'billing-access-changed' });
+  channel.close();
+};
 
 export type BillingState =
   | { phase: 'idle' | 'loading'; status: null }
@@ -720,8 +729,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (pendingIsConfirmed && checkoutStateRef.current.phase === 'pending') {
         clearPendingCheckoutConfirmation(scope.userId!);
         updateCheckoutState({ phase: 'idle', error: null });
-        window.localStorage.setItem('atomflow:billing-sync', `${Date.now()}:${status.access}`);
-        window.dispatchEvent(new Event('atomflow:billing-access-changed'));
+        notifyBillingAccessChanged();
       }
       if (status.access !== 'none' && previousAccess === 'none') await loadNotes();
       return status;
@@ -752,9 +760,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (confirmed) {
         updateCheckoutState({ phase: 'idle', error: null });
         if (userRef.current) clearPendingCheckoutConfirmation(userRef.current.id);
-        window.localStorage.setItem('atomflow:billing-sync', `${Date.now()}:${status.access}`);
         showToast(mode === 'payment_recovery' ? '付款信息已更新' : '魔法写作 Pro 已开通');
-        window.dispatchEvent(new Event('atomflow:billing-access-changed'));
+        notifyBillingAccessChanged();
         return;
       }
       if (Date.now() - startedAt >= 90_000) {
@@ -973,14 +980,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   useEffect(() => {
     if (!user) return;
     const refresh = () => { void refreshBillingStatus(); };
-    const handleStorage = (event: StorageEvent) => {
-      if (event.key === 'atomflow:billing-sync') refresh();
-    };
+    const channel = typeof BroadcastChannel === 'function'
+      ? new BroadcastChannel(BILLING_SYNC_CHANNEL)
+      : null;
     const handleFocus = () => refresh();
-    window.addEventListener('storage', handleStorage);
+    channel?.addEventListener('message', refresh);
+    window.addEventListener('atomflow:billing-access-changed', refresh);
     window.addEventListener('focus', handleFocus);
     return () => {
-      window.removeEventListener('storage', handleStorage);
+      channel?.removeEventListener('message', refresh);
+      channel?.close();
+      window.removeEventListener('atomflow:billing-access-changed', refresh);
       window.removeEventListener('focus', handleFocus);
     };
   }, [refreshBillingStatus, user]);

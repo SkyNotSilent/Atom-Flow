@@ -1,5 +1,6 @@
 import type { Article, SavedArticle } from "../../types";
 import { getDisplaySource } from "../../utils/articleDisplay";
+import { htmlToPlainText } from "../../utils/htmlToPlainText";
 
 export type PodcastFilter = "for_you" | "short" | "quick" | "deep";
 export type PodcastDateRange = "today" | "three_days";
@@ -45,18 +46,7 @@ const previewItemId = (article: Article, source: string) =>
   `article:${article.id}:${encodeURIComponent(itemKey(article.url, source, article.title))}`;
 
 const textSummary = (value?: string) => {
-  const text = normalize(value)
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/\s+/g, " ")
-    .trim();
+  const text = htmlToPlainText(normalize(value));
   return text || "该来源没有提供可展示的 RSS 摘要。";
 };
 

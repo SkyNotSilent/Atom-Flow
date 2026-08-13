@@ -1,7 +1,7 @@
 import type { BillingPendingIntent } from '../types';
 
-const STORAGE_KEY = 'atomflow:billing-pending-intent:v1';
 const MAX_AGE_MS = 30 * 60 * 1000;
+let pendingIntent: StoredBillingIntent | null = null;
 
 export interface StoredBillingIntent {
   version: 1;
@@ -35,6 +35,8 @@ const sanitizeIntent = (value: unknown): BillingPendingIntent | null => {
 export const createBillingRequestId = () => crypto.randomUUID();
 
 export const storeBillingIntent = (intent: BillingPendingIntent, userId: number | null): StoredBillingIntent => {
+  const sanitizedIntent = sanitizeIntent(intent);
+  if (!sanitizedIntent) throw new TypeError('Unsupported billing intent');
   const now = Date.now();
   const stored: StoredBillingIntent = {
     version: 1,
@@ -42,58 +44,38 @@ export const storeBillingIntent = (intent: BillingPendingIntent, userId: number 
     requestId: createBillingRequestId(),
     createdAt: now,
     expiresAt: now + MAX_AGE_MS,
-    intent,
+    intent: sanitizedIntent,
   };
-  try {
-    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(stored));
-  } catch {
-    // The immediate login action still works when session storage is blocked.
-  }
+  pendingIntent = stored;
   return stored;
 };
 
 export const readBillingIntent = (currentUserId: number | null): StoredBillingIntent | null => {
-  try {
-    const raw = window.sessionStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<StoredBillingIntent>;
-    const intent = sanitizeIntent(parsed.intent);
-    if (parsed.version !== 1 || !intent || typeof parsed.requestId !== 'string' || !parsed.requestId || !Number.isFinite(parsed.expiresAt)) {
-      window.sessionStorage.removeItem(STORAGE_KEY);
-      return null;
-    }
-    if (Number(parsed.expiresAt) <= Date.now()) {
-      window.sessionStorage.removeItem(STORAGE_KEY);
-      return null;
-    }
-    if (parsed.userId !== null && parsed.userId !== currentUserId) {
-      window.sessionStorage.removeItem(STORAGE_KEY);
-      return null;
-    }
-    return { ...parsed, version: 1, userId: parsed.userId ?? null, intent } as StoredBillingIntent;
-  } catch {
-    window.sessionStorage.removeItem(STORAGE_KEY);
+  const stored = pendingIntent;
+  if (!stored) return null;
+  if (stored.expiresAt <= Date.now()) {
+    pendingIntent = null;
     return null;
   }
+  if (stored.userId !== null && stored.userId !== currentUserId) {
+    pendingIntent = null;
+    return null;
+  }
+  return stored;
 };
 
 export const bindBillingIntentToUser = (userId: number): StoredBillingIntent | null => {
   const stored = readBillingIntent(userId);
   if (!stored) return null;
   const bound = { ...stored, userId };
-  try {
-    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(bound));
-  } catch {
-    return stored;
-  }
+  pendingIntent = bound;
   return bound;
 };
 
 export const clearBillingIntent = (requestId?: string) => {
   if (!requestId) {
-    window.sessionStorage.removeItem(STORAGE_KEY);
+    pendingIntent = null;
     return;
   }
-  const current = readBillingIntent(null);
-  if (!current || current.requestId === requestId) window.sessionStorage.removeItem(STORAGE_KEY);
+  if (!pendingIntent || pendingIntent.requestId === requestId) pendingIntent = null;
 };

@@ -32,6 +32,7 @@ import { CanvasAgentGroupPanel } from '../components/write-canvas/CanvasAgentGro
 import { CanvasNodeCard } from '../components/write-canvas/CanvasNodeCard';
 import type { CanvasNodeAction } from '../components/write-canvas/CanvasNodeAddMenu';
 import type { CitationAction, CitationCapture } from '../components/ReaderModal';
+import { htmlToPlainText } from '../utils/htmlToPlainText';
 import type {
   Article,
   AtomCard,
@@ -2339,7 +2340,7 @@ export const MagicWritingCanvas: React.FC = () => {
     kind: 'note',
     refId: note.id,
     title: note.title || '未命名文章',
-    summary: note.content.replace(/<[^>]+>/g, '').slice(0, 180),
+    summary: htmlToPlainText(note.content).slice(0, 180),
     ...getViewportPlacement(320, 200),
   });
 

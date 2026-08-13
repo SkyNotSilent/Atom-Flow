@@ -22,7 +22,6 @@ import {
 
 const root = process.cwd();
 const read = (file: string) => readFileSync(path.join(root, file), 'utf8');
-const STORAGE_KEY = 'atomflow:billing-pending-intent:v1';
 
 test('billing status normalizer accepts the canonical server DTO and legacy client aliases', () => {
   const context = read('src/context/AppContext.tsx');
@@ -37,9 +36,13 @@ test('billing status normalizer accepts the canonical server DTO and legacy clie
     'the server hasWritingHistory field must preserve legacy read-only UX');
   assert.match(profile, /scheduledCancelAt \?\? billingState\.status\.currentPeriodEnd/,
     'Profile must display the scheduled cancellation date instead of an unrelated renewal date');
+  assert.doesNotMatch(context, /localStorage\.setItem\(['"]atomflow:billing-sync/,
+    'billing access synchronization must not persist account state in cleartext browser storage');
+  assert.match(context, /new BroadcastChannel\(BILLING_SYNC_CHANNEL\)/,
+    'billing access synchronization should use an ephemeral cross-tab channel');
 });
 
-test('post-login billing intents are session-scoped, user-bound and whitelisted', () => {
+test('post-login billing intents are memory-scoped, user-bound and whitelisted', () => {
   const dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost:1000' });
   Object.defineProperty(globalThis, 'window', { value: dom.window, configurable: true });
 
@@ -60,14 +63,11 @@ test('post-login billing intents are session-scoped, user-bound and whitelisted'
   clearBillingIntent(podcast.requestId);
   assert.equal(readBillingIntent(41), null, 'a successfully executed request must be consumed once');
 
-  dom.window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify({
-    version: 1,
-    userId: null,
-    requestId: 'malicious',
-    expiresAt: Date.now() + 60_000,
-    intent: { kind: 'redirect', url: 'https://evil.example' },
-  }));
-  assert.equal(readBillingIntent(null), null, 'arbitrary redirects must never be accepted');
+  assert.throws(
+    () => storeBillingIntent({ kind: 'redirect', url: 'https://evil.example' } as never, null),
+    /Unsupported billing intent/,
+    'arbitrary redirects must never be accepted',
+  );
 });
 
 test('checkout confirmation survives refresh only for the same signed-in account', () => {
