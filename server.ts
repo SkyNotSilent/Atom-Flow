@@ -113,9 +113,11 @@ const legalReplacementValues = (appUrl?: string) => ({
 });
 
 const validateProductionLegalConfiguration = (appUrl?: string, billingEnabled = false) => {
-  if (!isProduction) return;
+  // Keep the public application deployable while paid billing is deliberately
+  // disabled. The complete operator/refund policy becomes a hard startup gate
+  // only when the Live checkout is actually enabled.
+  if (!isProduction || !billingEnabled) return;
   const missing = Object.entries(legalReplacementValues(appUrl))
-    .filter(([key]) => billingEnabled || key !== "REFUND_CONTACT_EMAIL")
     .filter(([, value]) => !value || /\[|replace-|your-domain\.example|^your\b|^applicable\b|railway deployment/i.test(value))
     .map(([key]) => key);
   if (missing.length > 0) {
