@@ -83,7 +83,8 @@ const checks: Check[] = [
     run: () => {
       assert(existsSync(frontendLoggerPath), "src/utils/logger.ts should exist");
       const logger = readFileSync(frontendLoggerPath, "utf-8");
-      assert(/sendBeacon/.test(logger), "frontend logger should use sendBeacon");
+      assert(/fetch\(["']\/api\/log["']/.test(logger), "frontend logger should use the CSRF-aware fetch wrapper");
+      assert(!/sendBeacon/.test(logger), "frontend logger should not bypass CSRF protection with sendBeacon");
       assert(/\/api\/log/.test(logger), "frontend logger should report to /api/log");
     },
   },

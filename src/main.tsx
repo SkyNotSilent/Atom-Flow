@@ -3,6 +3,9 @@ import { createRoot } from "react-dom/client";
 import App from "./App.tsx";
 import "./index.css";
 import { captureGlobalError } from "./utils/logger";
+import { installCsrfFetch } from "./utils/csrfFetch";
+
+installCsrfFetch();
 
 window.onerror = (message, source, lineno, colno, error) => {
   captureGlobalError("Unhandled window error", error, { message: String(message), source, lineno, colno });

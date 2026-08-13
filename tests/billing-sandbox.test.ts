@@ -26,15 +26,29 @@ test('real Sandbox checkout, idempotency, status and Portal smoke', { skip: !ena
     [email],
   )).rows;
   assert.equal(localAccount.length, 1, 'TEST_EMAIL must identify exactly one account in the isolated local database');
+  const csrf = await fetch(`${baseUrl}/api/csrf-token`, { cache: 'no-store' });
+  if (!csrf.ok) assert.fail(`CSRF bootstrap failed (${csrf.status}): ${await csrf.text()}`);
+  const bootstrapCookie = csrf.headers.get('set-cookie')?.split(';')[0];
+  assert.ok(bootstrapCookie, 'the CSRF bootstrap must receive a session cookie');
+  const csrfPayload = await csrf.json() as { csrfToken?: string };
+  assert.match(csrfPayload.csrfToken || '', /^[A-Za-z0-9_-]{32,}$/);
   const login = await fetch(`${baseUrl}/api/auth/login-password`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: bootstrapCookie,
+      'X-CSRF-Token': csrfPayload.csrfToken || '',
+    },
     body: JSON.stringify({ email, password: required('TEST_PASSWORD') }),
   });
   if (!login.ok) assert.fail(`login failed (${login.status}): ${await login.text()}`);
-  const cookie = login.headers.get('set-cookie')?.split(';')[0];
+  const cookie = login.headers.get('set-cookie')?.split(';')[0] || bootstrapCookie;
   assert.ok(cookie, 'the isolated test account must receive a session cookie');
-  const headers = { 'Content-Type': 'application/json', Cookie: cookie };
+  const headers = {
+    'Content-Type': 'application/json',
+    Cookie: cookie,
+    'X-CSRF-Token': csrfPayload.csrfToken || '',
+  };
 
   const status = await fetch(`${baseUrl}/api/billing/status`, { headers, cache: 'no-store' });
   if (!status.ok) assert.fail(`billing status failed (${status.status}): ${await status.text()}`);
@@ -75,16 +89,61 @@ test('real Sandbox checkout, idempotency, status and Portal smoke', { skip: !ena
   }
 });
 
-test('configured Paddle Sandbox webhook simulations complete', { skip: !enabled }, async () => {
+const expectedSimulationScenarios = [
+  {
+    name: 'AtomFlow checkout success',
+    type: 'subscription_creation',
+    outcomes: {
+      'subscription.created': ['quarantined', 'subscription product or price is not allowed'],
+      'subscription.activated': ['quarantined', 'subscription product or price is not allowed'],
+      'transaction.completed': ['quarantined', 'transaction does not reference a known checkout attempt or subscription'],
+    },
+  },
+  {
+    name: 'AtomFlow payment failure',
+    type: 'transaction.payment_failed',
+    outcomes: {
+      'transaction.payment_failed': ['quarantined', 'transaction does not reference a known checkout attempt or subscription'],
+    },
+  },
+  {
+    name: 'AtomFlow renewal failure',
+    type: 'subscription.past_due',
+    outcomes: {
+      'subscription.past_due': ['quarantined', 'subscription product or price is not allowed'],
+    },
+  },
+  {
+    name: 'AtomFlow cancellation',
+    type: 'subscription_cancellation',
+    outcomes: {
+      'subscription.updated': ['quarantined', 'subscription product or price is not allowed'],
+      'subscription.canceled': ['quarantined', 'subscription product or price is not allowed'],
+    },
+  },
+  {
+    name: 'AtomFlow refund',
+    type: 'adjustment.updated',
+    outcomes: {
+      'adjustment.updated': ['ignored', null],
+    },
+  },
+] as const;
+
+test('configured Paddle Sandbox simulations exercise the exact webhook security scenarios', { skip: !enabled }, async () => {
   assert.equal(process.env.PADDLE_ENVIRONMENT, 'sandbox', 'simulation runs must never target Live');
   const simulationIds = required('PADDLE_SANDBOX_SIMULATION_IDS').split(',').map(value => value.trim()).filter(Boolean);
-  assert.ok(simulationIds.length >= 5, 'configure simulations for success, payment failure, renewal failure, cancellation, and refund');
+  assert.equal(simulationIds.length, expectedSimulationScenarios.length, 'configure exactly the approved Sandbox simulation scenarios');
   assert.equal(new Set(simulationIds).size, simulationIds.length, 'Sandbox simulation IDs must be unique');
   const databaseUrl = validateLocalPostgresUrl(required('DATABASE_URL'));
   const paddle = new Paddle(required('PADDLE_API_KEY'), { environment: Environment.sandbox });
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
-    for (const simulationId of simulationIds) {
+    for (const [index, simulationId] of simulationIds.entries()) {
+      const expected = expectedSimulationScenarios[index];
+      const simulation = await paddle.simulations.get(simulationId);
+      assert.equal(simulation.name, expected.name, `Sandbox simulation ${simulationId} has the wrong scenario name`);
+      assert.equal(simulation.type, expected.type, `Sandbox simulation ${simulationId} has the wrong scenario type`);
       const created = await paddle.simulationRuns.create(simulationId);
       let current = created;
       const deadline = Date.now() + 60_000;
@@ -94,30 +153,48 @@ test('configured Paddle Sandbox webhook simulations complete', { skip: !enabled 
       }
       assert.equal(current.status, 'completed', `Sandbox simulation ${simulationId} did not complete`);
       assert.ok((current.events?.length || 0) > 0, `Sandbox simulation ${simulationId} emitted no webhook events`);
-      assert.ok(current.events?.every(event => event.status === 'success'), `Sandbox simulation ${simulationId} did not deliver every event successfully`);
-      const eventIds = (current.events || []).map(event => event.payload?.event_id).filter((value): value is string => typeof value === 'string');
-      assert.equal(eventIds.length, current.events?.length, `Sandbox simulation ${simulationId} did not expose stable event IDs`);
+      const failedEvents = (current.events || []).filter(event => !['success', 'aborted'].includes(event.status));
+      assert.equal(failedEvents.length, 0, `Sandbox simulation ${simulationId} had failed webhook deliveries`);
+      const deliveredEvents = (current.events || []).filter(event => event.status === 'success');
+      assert.ok(deliveredEvents.length > 0, `Sandbox simulation ${simulationId} delivered no subscribed events`);
+      assert.deepEqual(
+        deliveredEvents.map(event => event.eventType).sort(),
+        Object.keys(expected.outcomes).sort(),
+        `Sandbox simulation ${simulationId} delivered an unexpected event set`,
+      );
+      const eventIds = deliveredEvents.map(event => {
+        if (typeof event.request?.body !== 'string') return null;
+        try {
+          const envelope = JSON.parse(event.request.body) as { event_id?: unknown };
+          return typeof envelope.event_id === 'string' ? envelope.event_id : null;
+        } catch {
+          return null;
+        }
+      }).filter((value): value is string => typeof value === 'string');
+      assert.equal(eventIds.length, deliveredEvents.length, `Sandbox simulation ${simulationId} did not expose stable event IDs`);
 
-      let received: Array<{ event_id: string; processing_status: string }> = [];
+      let received: Array<{ event_id: string; event_type: string; processing_status: string; error_message: string | null }> = [];
       const webhookDeadline = Date.now() + 30_000;
       while (Date.now() < webhookDeadline) {
         received = (await pool.query(
-          `SELECT event_id, processing_status
+          `SELECT event_id, event_type, processing_status, error_message
            FROM billing_webhook_events
            WHERE environment = 'sandbox' AND event_id = ANY($1::text[])`,
           [eventIds],
         )).rows;
         if (
           received.length === eventIds.length
-          && received.every(row => ['processed', 'ignored'].includes(row.processing_status))
+          && received.every(row => ['processed', 'ignored', 'quarantined'].includes(row.processing_status))
         ) break;
         await new Promise(resolve => setTimeout(resolve, 500));
       }
       assert.equal(received.length, eventIds.length, `Sandbox simulation ${simulationId} did not reach AtomFlow webhook inbox`);
-      assert.ok(
-        received.every(row => ['processed', 'ignored'].includes(row.processing_status)),
-        `Sandbox simulation ${simulationId} did not finish AtomFlow webhook processing`,
-      );
+      for (const row of received) {
+        const outcome = expected.outcomes[row.event_type as keyof typeof expected.outcomes];
+        assert.ok(outcome, `Sandbox simulation ${simulationId} delivered unexpected event ${row.event_type}`);
+        assert.equal(row.processing_status, outcome[0], `${row.event_type} reached the wrong AtomFlow terminal state`);
+        assert.equal(row.error_message, outcome[1], `${row.event_type} reached the wrong AtomFlow security reason`);
+      }
     }
   } finally {
     await pool.end();

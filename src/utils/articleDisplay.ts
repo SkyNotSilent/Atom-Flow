@@ -23,6 +23,7 @@ export const sourceMatches = (article: Article, selectedSource: string) => {
   if (display === selected) return true;
   const raw = normalizeSource(article.source);
   if (raw === selected) return true;
+  if (article.sourceAliases?.some(source => normalizeSource(source) === selected)) return true;
   if (selected === '人人都是产品经理' && article.url?.includes('woshipm.com')) return true;
   if (selected === '36氪' && article.url?.includes('36kr.com')) return true;
   if (selected === '虎嗅' && article.url?.includes('huxiu.com')) return true;

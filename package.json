@@ -23,7 +23,7 @@
     "test:rss:cache": "node --import tsx --test --test-concurrency=1 tests/rss-cache.test.ts",
     "lint": "tsc --noEmit",
     "test:migrations": "node --import tsx --test --test-concurrency=1 tests/database-migrations.test.ts tests/database-migrations.integration.test.ts",
-    "test": "node --import tsx --test --test-concurrency=1 tests/rss-runtime.test.ts tests/security-hardening.test.ts tests/compliance-disclosures.test.ts tests/billing-config.test.ts tests/billing-access.test.ts tests/billing-runtime.test.ts tests/billing-contract.test.ts tests/billing-frontend.test.ts tests/billing-sandbox-setup.test.ts tests/billing-sandbox.test.ts tests/reader-sanitization.test.ts tests/reading-article-race.test.ts tests/frontend-reliability.test.ts tests/logging.test.ts tests/avatar.test.ts tests/knowledge-deduplication.test.ts tests/agent-draft-export.test.ts tests/write-agent-intent.test.ts tests/write-agent-sse.test.ts tests/write-agent-api.test.ts tests/write-canvas-api.test.ts tests/canvas-document-validation.test.ts tests/canvas-create-article-requests.test.ts tests/canvas-project-target.test.ts tests/write-focused-workspace.test.ts tests/podcast-preview.test.ts tests/podcast-playback-state.test.ts tests/podcast-interface.test.ts tests/podcast-page.test.ts tests/podcast-navigation.test.ts"
+    "test": "node --import tsx --test --test-concurrency=1 tests/rss-runtime.test.ts tests/security-hardening.test.ts tests/compliance-disclosures.test.ts tests/billing-config.test.ts tests/billing-access.test.ts tests/billing-runtime.test.ts tests/billing-contract.test.ts tests/billing-frontend.test.ts tests/billing-sandbox-setup.test.ts tests/billing-sandbox.test.ts tests/reader-sanitization.test.ts tests/reading-article-race.test.ts tests/frontend-reliability.test.ts tests/logging.test.ts tests/rss-source-resilience.test.ts tests/avatar.test.ts tests/knowledge-deduplication.test.ts tests/agent-draft-export.test.ts tests/write-agent-intent.test.ts tests/write-agent-sse.test.ts tests/write-agent-api.test.ts tests/write-canvas-api.test.ts tests/write-canvas-ai-api.test.ts tests/write-canvas-ui.test.ts tests/canvas-document-validation.test.ts tests/canvas-create-article-requests.test.ts tests/canvas-project-target.test.ts tests/canvas-document-export.test.ts tests/canvas-agent-group-ui.test.ts tests/canvas-document-autosave.test.ts tests/write-focused-workspace.test.ts tests/podcast-preview.test.ts tests/podcast-playback-state.test.ts tests/podcast-interface.test.ts tests/podcast-page.test.ts tests/podcast-navigation.test.ts"
   },
   "dependencies": {
     "@langchain/core": "^1.1.44",
@@ -62,6 +62,7 @@
     "express-rate-limit": "^8.5.2",
     "express-session": "^1.19.0",
     "helmet": "^8.2.0",
+    "html-to-text": "^10.0.0",
     "jsdom": "^26.1.0",
     "jszip": "^3.10.1",
     "lucide-react": "^0.546.0",
@@ -91,6 +92,7 @@
     "@types/connect-pg-simple": "^7.0.3",
     "@types/express": "^4.17.21",
     "@types/express-session": "^1.18.2",
+    "@types/html-to-text": "^9.0.4",
     "@types/node": "^22.14.0",
     "@types/pdf-parse": "^1.1.5",
     "@types/pg": "^8.20.0",

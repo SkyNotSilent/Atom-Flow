@@ -70,6 +70,7 @@ const expectBillingError = async (promise: Promise<unknown>, code: string, statu
 
 test('checkout idempotency rejects a reused requestId with a different plan', async () => {
   const pool = fakePool(async sql => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK' || sql.includes('pg_advisory_xact_lock')) return emptyResult();
     if (sql.includes('pg_advisory_lock')) return emptyResult();
     if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
     if (sql.includes('SELECT 1 FROM billing_subscriptions')) return emptyResult();
@@ -79,6 +80,7 @@ test('checkout idempotency rejects a reused requestId with a different plan', as
     throw new Error(`unexpected query: ${sql}`);
   });
   const service = new BillingService(pool, config, logger);
+  injectPaddle(service, validCatalogApi());
   await expectBillingError(
     service.createCheckout(7, 'reader@example.test', 'pro_yearly', '00000000-0000-4000-8000-000000000001'),
     'BILLING_IDEMPOTENCY_CONFLICT',
@@ -88,40 +90,101 @@ test('checkout idempotency rejects a reused requestId with a different plan', as
 
 test('a completed checkout remains pending until its subscription is confirmed', async () => {
   const pool = fakePool(async sql => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK' || sql.includes('pg_advisory_xact_lock')) return emptyResult();
     if (sql.includes('pg_advisory_lock')) return emptyResult();
     if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
     if (sql.includes('SELECT 1 FROM billing_subscriptions')) return emptyResult();
     if (sql.includes('request_id = $3')) return emptyResult();
-    if (sql.includes("status IN ('creating', 'reconciling', 'draft', 'completed')")) {
-      return { rows: [{ transactionId: 'txn_paid', planCode: 'pro_monthly', status: 'completed' }] };
+    if (sql.includes("a.status IN ('creating', 'reconciling', 'draft', 'completed')")) {
+      return { rows: [{ id: 'attempt-paid', transactionId: 'txn_paid', customerId: 'ctm_1', planCode: 'pro_monthly', status: 'completed' }] };
     }
+    if (sql.includes('SET status = $1, error_code = $2')) return emptyResult();
     throw new Error(`unexpected query: ${sql}`);
   });
   const service = new BillingService(pool, config, logger);
+  injectPaddle(service, {
+    ...validCatalogApi(),
+    transactions: { get: async () => ({
+      id: 'txn_paid', status: 'completed', customerId: 'ctm_1', subscriptionId: null,
+      items: [{ price: { id: 'pri_monthly', productId: 'pro_sandbox' }, quantity: 1 }],
+      customData: { atomflow_user_id: '7', checkout_attempt_id: 'attempt-paid', plan_code: 'pro_monthly' },
+    }) },
+  });
   await expectBillingError(
     service.createCheckout(7, 'reader@example.test', 'pro_monthly', '00000000-0000-4000-8000-000000000002'),
     'BILLING_CHECKOUT_PENDING',
-    409,
+    503,
   );
+});
+
+test('a reusable draft is verified remotely before it is returned', async () => {
+  let failedStatus = '';
+  let attemptStatus = 'draft';
+  let transactionCreated = false;
+  const pool = fakePool(async (sql, params) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK' || sql.includes('pg_advisory_xact_lock')) return emptyResult();
+    if (sql.includes('SELECT 1 FROM billing_subscriptions')) return emptyResult();
+    if (sql.includes('request_id = $3')) {
+      return { rows: [{
+        id: 'attempt-draft',
+        transactionId: attemptStatus === 'draft' ? 'txn_wrong' : null,
+        customerId: 'ctm_1',
+        billingCustomerId: 11,
+        planCode: 'pro_monthly',
+        status: attemptStatus,
+      }] };
+    }
+    if (sql.includes('SET status = $1, error_code = $2')) {
+      failedStatus = String(params[0]);
+      attemptStatus = failedStatus;
+      return emptyResult();
+    }
+    if (sql.includes("status IN ('payment_failed', 'failed', 'refunded')")) {
+      attemptStatus = 'creating';
+      return emptyResult();
+    }
+    if (sql.includes('FROM billing_customers WHERE')) return { rows: [{ billingCustomerId: 11, customerId: 'ctm_1' }] };
+    if (sql.includes('SET billing_customer_id')) return emptyResult();
+    if (sql.includes("status = 'draft'")) return emptyResult();
+    throw new Error(`unexpected query: ${sql}`);
+  });
+  const service = new BillingService(pool, config, logger);
+  injectPaddle(service, {
+    ...validCatalogApi(),
+    transactions: {
+      get: async () => ({
+        id: 'txn_wrong', status: 'draft', customerId: 'ctm_1', subscriptionId: null,
+        items: [{ price: { id: 'pri_yearly', productId: 'pro_sandbox' }, quantity: 1 }],
+        customData: { atomflow_user_id: '7', checkout_attempt_id: 'attempt-draft', plan_code: 'pro_monthly' },
+      }),
+      create: async () => { transactionCreated = true; return { id: 'txn_fresh' }; },
+    },
+  });
+
+  const result = await service.createCheckout(7, 'reader@example.test', 'pro_monthly', '00000000-0000-4000-8000-000000000012');
+  assert.deepEqual(result, { transactionId: 'txn_fresh', reused: false });
+  assert.equal(failedStatus, 'payment_failed');
+  assert.equal(transactionCreated, true);
 });
 
 test('a timed-out Paddle create recovers the transaction by checkout attempt custom data', async () => {
   let attemptId = '';
   let recoveredStatus = '';
   const pool = fakePool(async (sql, params) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK' || sql.includes('pg_advisory_xact_lock')) return emptyResult();
     if (sql.includes('pg_advisory_lock')) return emptyResult();
     if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
     if (sql.includes('SELECT 1 FROM billing_subscriptions')) return emptyResult();
     if (sql.includes('request_id = $3')) return emptyResult();
-    if (sql.includes("status IN ('creating', 'reconciling', 'draft', 'completed')")) return emptyResult();
+    if (sql.includes("a.status IN ('creating', 'reconciling', 'draft', 'completed')")) return emptyResult();
     if (sql.includes('INSERT INTO billing_checkout_attempts')) {
       attemptId = String(params[0]);
       return emptyResult();
     }
-    if (sql.includes('FROM billing_customers WHERE')) return { rows: [{ id: 11, paddleCustomerId: 'ctm_1' }] };
+    if (sql.includes('FROM billing_customers WHERE')) return { rows: [{ billingCustomerId: 11, customerId: 'ctm_1' }] };
     if (sql.includes('SET billing_customer_id')) return emptyResult();
-    if (sql.includes('SET paddle_transaction_id = $1, status = $2')) {
-      recoveredStatus = String(params[1]);
+    if (sql.includes('SET status = $1, error_code = $2')) {
+      recoveredStatus = String(params[0]);
       return emptyResult();
     }
     throw new Error(`unexpected query: ${sql}`);
@@ -150,11 +213,12 @@ test('a mismatched remote Paddle price blocks a new checkout before any attempt 
   let attemptCreated = false;
   let transactionCreated = false;
   const pool = fakePool(async sql => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK' || sql.includes('pg_advisory_xact_lock')) return emptyResult();
     if (sql.includes('pg_advisory_lock')) return emptyResult();
     if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
     if (sql.includes('SELECT 1 FROM billing_subscriptions')) return emptyResult();
     if (sql.includes('request_id = $3')) return emptyResult();
-    if (sql.includes("status IN ('creating', 'reconciling', 'draft', 'completed')")) return emptyResult();
+    if (sql.includes("a.status IN ('creating', 'reconciling', 'draft', 'completed')")) return emptyResult();
     if (sql.includes('INSERT INTO billing_checkout_attempts')) {
       attemptCreated = true;
       return emptyResult();
@@ -338,6 +402,7 @@ test('unknown subscription ownership is quarantined instead of granting access',
 test('account deletion stops when authoritative Paddle cancellation fails', async () => {
   let deleted = false;
   const pool = fakePool(async sql => {
+    if (sql.includes('pg_advisory_xact_lock')) return emptyResult();
     if (sql.includes('pg_advisory_lock')) return emptyResult();
     if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
     if (sql === 'BEGIN' || sql === 'ROLLBACK' || sql === 'COMMIT') return emptyResult();
@@ -369,6 +434,7 @@ test('account deletion never cancels an unrelated Paddle product', async () => {
   let canceled = false;
   let deleted = false;
   const pool = fakePool(async sql => {
+    if (sql.includes('pg_advisory_xact_lock')) return emptyResult();
     if (sql.includes('pg_advisory_lock')) return emptyResult();
     if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
     if (sql === 'BEGIN' || sql === 'ROLLBACK' || sql === 'COMMIT') return emptyResult();
@@ -404,10 +470,45 @@ test('account deletion never cancels an unrelated Paddle product', async () => {
   assert.equal(deleted, true);
 });
 
+test('account deletion quarantines a mixed subscription instead of canceling the whole contract', async () => {
+  let canceled = false;
+  let deleted = false;
+  const pool = fakePool(async sql => {
+    if (sql.includes('pg_advisory_xact_lock') || sql === 'BEGIN' || sql === 'ROLLBACK' || sql === 'COMMIT') return emptyResult();
+    if (sql.includes('AS owned_billing_customers')) return { rows: [{ environment: 'sandbox', paddleCustomerId: 'ctm_shared' }] };
+    throw new Error(`unexpected query: ${sql}`);
+  });
+  const service = new BillingService(pool, config, logger);
+  injectPaddle(service, {
+    subscriptions: {
+      list: () => (async function* () {
+        yield {
+          id: 'sub_mixed', status: 'active', customerId: 'ctm_shared',
+          items: [
+            { price: { id: 'pri_monthly', productId: 'pro_sandbox' }, quantity: 1 },
+            { price: { id: 'pri_other', productId: 'pro_other' }, quantity: 1 },
+          ],
+          updatedAt: '2026-08-11T00:00:00.000Z', customData: {},
+        };
+      })(),
+      cancel: async () => { canceled = true; return {}; },
+    },
+  });
+
+  await expectBillingError(
+    service.deleteAccountUnderBillingLock(7, async () => undefined, async () => { deleted = true; }),
+    'BILLING_CANCELLATION_FAILED',
+    503,
+  );
+  assert.equal(canceled, false);
+  assert.equal(deleted, false);
+});
+
 test('account deletion fails closed for an unrecognized price on the AtomFlow product', async () => {
   let canceled = false;
   let deleted = false;
   const pool = fakePool(async sql => {
+    if (sql.includes('pg_advisory_xact_lock')) return emptyResult();
     if (sql.includes('pg_advisory_lock')) return emptyResult();
     if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
     if (sql === 'BEGIN' || sql === 'ROLLBACK' || sql === 'COMMIT') return emptyResult();
@@ -446,6 +547,7 @@ test('account deletion blocks cross-environment billing identities before any Pa
   let paddleCalled = false;
   let deleted = false;
   const pool = fakePool(async sql => {
+    if (sql.includes('pg_advisory_xact_lock')) return emptyResult();
     if (sql.includes('pg_advisory_lock')) return emptyResult();
     if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
     if (sql === 'BEGIN' || sql === 'ROLLBACK' || sql === 'COMMIT') return emptyResult();

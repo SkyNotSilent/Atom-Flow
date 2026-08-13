@@ -16,6 +16,30 @@ assert.doesNotMatch(server, /CREATE TABLE IF NOT EXISTS users/, "Web startup mus
 assert.match(server, /schemaReady = await verifyDatabaseSchema\(pool\)/, "Web startup must verify the schema marker");
 assert.match(migrations, /pg_advisory_lock\(hashtext\('atomflow-schema-migration'\)\)/, "Migrations must hold the shared advisory lock");
 assert.match(migrations, /runSchemaMigrationOnce\("20260811_billing_schema_v1"/, "Billing rewrites must be a one-time transaction");
+assert.match(migrations, /runSchemaMigrationOnce\("20260813_creative_canvas_schema_v2"/, "Creative canvas schema changes must be a one-time transaction");
+assert.match(migrations, /runSchemaMigrationOnce\("20260813_creative_canvas_compatibility_v3"/, "Creative canvas compatibility repairs must run after the first rollout marker");
+assert.match(migrations, /runSchemaMigrationOnce\("20260813_saved_articles_normalized_url_v2"/, "Normalized URL repairs must run even if the first rollout marker already exists");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS ai_budget_reservations/, "Durable paid-operation reservations must be created by pre-deploy migrations");
+for (const table of [
+  "write_canvas_agent_groups",
+  "write_canvas_agent_group_members",
+  "write_canvas_agent_batches",
+  "write_canvas_agent_runs",
+  "write_canvas_documents",
+  "write_canvas_document_versions",
+  "write_canvas_document_sections",
+]) {
+  assert.match(migrations, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`), `${table} must be created by pre-deploy migrations`);
+}
+for (const column of ["node_role", "content_type", "origin", "status", "business_ref", "document_id"]) {
+  assert.match(migrations, new RegExp(`write_canvas_nodes ADD COLUMN IF NOT EXISTS ${column}`), `write_canvas_nodes.${column} must be migrated idempotently`);
+}
+assert.match(migrations, /write_canvas_agent_groups_current_batch_owner_fkey/, "Agent-group batch leases must be tenant scoped");
+assert.match(migrations, /write_canvas_documents_current_version_owner_fkey/, "Document versions must be tenant scoped");
+assert.match(migrations, /Duplicate canvas Agent-group nodes require an explicit backed-up maintenance migration/, "Canvas deduplication must require an explicit maintenance migration");
+assert.match(migrations, /SET node_role = COALESCE\(node_role,[\s\S]*content_type = COALESCE\(content_type,[\s\S]*origin = COALESCE\(origin,[\s\S]*status = COALESCE\(status,/, "Partial canvas semantic upgrades must preserve populated fields");
+assert.match(migrations, /Legacy canvas asset references multiple projects[\s\S]*explicit backed-up maintenance migration/, "Ambiguous legacy canvas assets must fail before project backfill");
+assert.match(migrations, /indisunique AS "isUnique"[\s\S]*indisvalid AS "isValid"[\s\S]*idx_saved_articles_normalized_url_unique/, "The normalized URL index must be structurally verified");
 assert.match(migrations, /HAVING COUNT\(\*\) > 1[\s\S]*?explicit backed-up maintenance migration/, "Duplicate article cleanup must require a maintenance migration");
 assert.match(migrations, /indisvalid AS "isValid"[\s\S]*?indisready AS "isReady"[\s\S]*?pg_get_indexdef/, "Existing unique indexes must be valid, ready, and structurally verified");
 assert.doesNotMatch(migrations, /DELETE FROM saved_articles/, "Automatic pre-deploy must not delete saved articles");

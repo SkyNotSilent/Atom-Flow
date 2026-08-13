@@ -61,8 +61,10 @@ test('Paddle webhook preserves the raw body and bypasses only the browser Origin
   assert.match(service, /ON CONFLICT \(environment, event_id\) DO NOTHING/, 'webhook replay must be idempotent');
   assert.match(service, /atomflow-billing-event:\$\{this\.config\.environment\}:\$\{eventId\}/,
     'webhook event advisory locks must be environment-scoped');
-  assert.match(service, /atomflow-billing-adjustment:\$\{this\.config\.environment\}:\$\{adjustmentIdentity\}/,
-    'refund advisory locks must be environment-scoped');
+  assert.doesNotMatch(service, /atomflow-billing-adjustment:\$\{adjustmentIdentity\}/,
+    'refund processing must never use a cross-environment advisory lock');
+  assert.match(service, /processAdjustmentEvent[\s\S]*?atomflow-billing-event:\$\{this\.config\.environment\}:\$\{eventId\}/,
+    'refund finalization must reuse the environment-scoped webhook event lock');
   assert.match(service, /last_event_occurred_at IS NULL[\s\S]*?last_event_occurred_at <= EXCLUDED\.last_event_occurred_at/, 'subscription webhooks must reject stale occurred_at updates');
   assert.match(service, /payload\.status === "approved" && payload\.action === "refund" && payload\.type === "full"/);
   assert.match(service, /subscriptions\.cancel\(subscriptionId, \{ effectiveFrom: "immediately" \}\)/, 'approved full refunds must immediately cancel the subscription');

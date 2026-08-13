@@ -90,6 +90,32 @@ const normalizeItemIds = (value: unknown, config?: BillingConfig) => {
   };
 };
 
+const normalizeItems = (value: unknown) => (Array.isArray(value) ? value.filter(isRecord) : []).map(item => {
+  const price = isRecord(item.price) ? item.price : null;
+  const product = isRecord(item.product) ? item.product : null;
+  return {
+    priceId: asString(item.price_id) || asString(item.priceId) || asString(price?.id) || "",
+    productId: asString(item.product_id) || asString(item.productId) || asString(price?.product_id) || asString(price?.productId) || asString(product?.id) || "",
+    quantity: typeof item.quantity === "number" ? item.quantity : Number(item.quantity ?? 1),
+  };
+});
+
+/**
+ * Destructive subscription operations are only safe for the one-item contract
+ * AtomFlow created. Selecting a matching item from a mixed Paddle subscription
+ * is not sufficient: canceling that subscription would also cancel unrelated
+ * products bundled into the same contract.
+ */
+const hasExclusiveAtomFlowItem = (value: unknown, config: BillingConfig, expectedPriceId?: string) => {
+  const record = isRecord(value) ? value : null;
+  const items = normalizeItems(record?.items);
+  return items.length === 1
+    && items[0].quantity === 1
+    && items[0].productId === config.productId
+    && config.allowedPriceIds.has(items[0].priceId)
+    && (!expectedPriceId || items[0].priceId === expectedPriceId);
+};
+
 const normalizeSubscription = (value: unknown, config?: BillingConfig): NormalizedSubscription | null => {
   if (!isRecord(value)) return null;
   const id = asString(value.id);
@@ -338,189 +364,245 @@ export class BillingService {
     if (!uuidPattern.test(requestId)) throw new BillingError(400, "INVALID_REQUEST_ID", "requestId 必须是 UUID");
     const paddle = this.requirePaddle();
     const priceId = this.config.priceIds[planCode];
-    const client = await this.pool.connect();
-    const lockKey = `atomflow-billing-user:${userId}`;
-    try {
-      await client.query(`SELECT pg_advisory_lock(hashtext($1))`, [lockKey]);
-      const active = (await client.query(
-        `SELECT 1 FROM billing_subscriptions
-         WHERE environment = $1 AND user_id = $2 AND quarantined_at IS NULL
-           AND status IN ('active', 'trialing', 'past_due', 'paused') LIMIT 1`,
-        [this.config.environment, userId],
-      )).rowCount;
-      if (active) throw new BillingError(409, "BILLING_ALREADY_ACTIVE", "当前账户已有有效订阅");
+    await this.assertConfiguredCatalogValid();
 
-      const attempt = (await client.query(
-        `SELECT id, paddle_transaction_id AS "transactionId", plan_code AS "planCode", status
-         FROM billing_checkout_attempts
-         WHERE environment = $1 AND user_id = $2 AND request_id = $3`,
-        [this.config.environment, userId, requestId],
-      )).rows[0] as JsonRecord | undefined;
-      if (attempt) {
-        if (attempt.planCode !== planCode) {
+    type ClaimedAttempt = {
+      id: string;
+      planCode: BillingPlanCode;
+      status: string;
+      transactionId: string | null;
+      customerId: string | null;
+      billingCustomerId: string | number | null;
+      create: boolean;
+    };
+
+    const claimAttempt = async (): Promise<ClaimedAttempt> => {
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`atomflow-billing-user:${userId}`]);
+        const active = (await client.query(
+          `SELECT 1 FROM billing_subscriptions
+           WHERE environment = $1 AND user_id = $2 AND quarantined_at IS NULL
+             AND status IN ('active', 'trialing', 'past_due', 'paused') LIMIT 1`,
+          [this.config.environment, userId],
+        )).rowCount;
+        if (active) throw new BillingError(409, "BILLING_ALREADY_ACTIVE", "当前账户已有有效订阅");
+
+        const selectAttempt = `SELECT a.id, a.paddle_transaction_id AS "transactionId", a.plan_code AS "planCode", a.status,
+                 a.billing_customer_id AS "billingCustomerId", c.paddle_customer_id AS "customerId"
+          FROM billing_checkout_attempts a
+          LEFT JOIN billing_customers c ON c.environment = a.environment AND c.id = a.billing_customer_id`;
+        let attempt = (await client.query(
+          `${selectAttempt} WHERE a.environment = $1 AND a.user_id = $2 AND a.request_id = $3`,
+          [this.config.environment, userId, requestId],
+        )).rows[0] as JsonRecord | undefined;
+        if (attempt && attempt.planCode !== planCode) {
           throw new BillingError(409, "BILLING_IDEMPOTENCY_CONFLICT", "同一 requestId 不能用于不同套餐");
         }
-        if (attempt.status === "draft" && attempt.transactionId) {
-          return { transactionId: String(attempt.transactionId), reused: true };
+        if (attempt?.status === "confirmed") {
+          throw new BillingError(409, "BILLING_ALREADY_ACTIVE", "当前账户已有有效订阅");
         }
-        if (attempt.status === "confirmed") throw new BillingError(409, "BILLING_ALREADY_ACTIVE", "当前账户已有有效订阅");
-        throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "结账状态正在确认中，请稍后重试");
-      } else {
-        const pending = (await client.query(
-          `SELECT paddle_transaction_id AS "transactionId", plan_code AS "planCode", status
-           FROM billing_checkout_attempts
-          WHERE environment = $1 AND user_id = $2 AND status IN ('creating', 'reconciling', 'draft', 'completed')
-           ORDER BY created_at DESC LIMIT 1`,
-          [this.config.environment, userId],
-        )).rows[0] as JsonRecord | undefined;
-        if (pending?.transactionId && pending.planCode === planCode && pending.status === "draft") {
-          return { transactionId: String(pending.transactionId), reused: true };
+        if (!attempt) {
+          attempt = (await client.query(
+            `${selectAttempt}
+             WHERE a.environment = $1 AND a.user_id = $2
+               AND a.status IN ('creating', 'reconciling', 'draft', 'completed')
+             ORDER BY a.created_at DESC LIMIT 1`,
+            [this.config.environment, userId],
+          )).rows[0] as JsonRecord | undefined;
         }
-        if (pending?.transactionId && pending.status === "draft" && pending.planCode !== planCode) {
-          try {
-            const remote = await paddle.transactions.get(String(pending.transactionId));
-            if (remote.status !== "draft" && remote.status !== "ready" && remote.status !== "canceled") {
-              throw new Error(`transaction is ${remote.status}`);
-            }
-            if (remote.status !== "canceled") {
-              await paddle.transactions.update(String(pending.transactionId), { status: "canceled" });
-            }
-            await client.query(
-              `UPDATE billing_checkout_attempts
-               SET status = 'payment_failed', error_code = 'PLAN_CHANGED', updated_at = NOW()
-               WHERE environment = $1 AND user_id = $2 AND paddle_transaction_id = $3 AND status = 'draft'`,
-              [this.config.environment, userId, pending.transactionId],
-            );
-          } catch (error) {
-            this.logger.warn({ err: error, module: "billing-checkout", userId, transactionId: pending.transactionId }, "Failed to close the previous draft checkout");
+        if (attempt) {
+          const status = String(attempt.status);
+          if (status === "draft" || status === "completed") {
+            if (!attempt.transactionId) throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "结账状态正在确认中，请稍后重试");
+            await client.query("COMMIT");
+            return {
+              id: String(attempt.id), planCode: attempt.planCode as BillingPlanCode, status,
+              transactionId: String(attempt.transactionId), customerId: asString(attempt.customerId),
+              billingCustomerId: attempt.billingCustomerId as string | number | null, create: false,
+            };
+          }
+          if (status === "creating" || status === "reconciling") {
             throw new BillingError(409, "BILLING_CHECKOUT_PENDING", "当前已有结账正在处理中");
           }
-        } else if (pending) {
-          throw new BillingError(409, "BILLING_CHECKOUT_PENDING", "当前已有结账正在处理中");
+          // A terminal remote transaction may be replaced while retaining the
+          // request id as the idempotency identity.
+          await client.query(
+            `UPDATE billing_checkout_attempts
+             SET status = 'creating', paddle_transaction_id = NULL, error_code = NULL,
+                 recovery_attempt_count = 0, next_recovery_at = NOW(), updated_at = NOW()
+             WHERE environment = $1 AND id = $2 AND user_id = $3
+               AND status IN ('payment_failed', 'failed', 'refunded')`,
+            [this.config.environment, attempt.id, userId],
+          );
+        } else {
+          attempt = { id: randomUUID(), planCode, status: "creating" };
+          await client.query(
+            `INSERT INTO billing_checkout_attempts
+               (id, environment, user_id, request_id, plan_code, status)
+             VALUES ($1, $2, $3, $4, $5, 'creating')`,
+            [attempt.id, this.config.environment, userId, requestId, planCode],
+          );
         }
+        const customer = (await client.query(
+          `SELECT id AS "billingCustomerId", paddle_customer_id AS "customerId"
+           FROM billing_customers WHERE environment = $1 AND user_id = $2`,
+          [this.config.environment, userId],
+        )).rows[0] as JsonRecord | undefined;
+        await client.query("COMMIT");
+        return {
+          id: String(attempt.id), planCode, status: "creating", transactionId: null,
+          customerId: asString(customer?.customerId),
+          billingCustomerId: customer?.billingCustomerId as string | number | null,
+          create: true,
+        };
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    };
+
+    const markAttempt = async (attemptId: string, status: string, errorCode: string, transactionId?: string) => {
+      await this.pool.query(
+        `UPDATE billing_checkout_attempts
+         SET status = $1, error_code = $2,
+             paddle_transaction_id = COALESCE($3, paddle_transaction_id), updated_at = NOW()
+         WHERE environment = $4 AND id = $5 AND user_id = $6
+           AND status IN ('creating', 'reconciling', 'draft', 'completed')`,
+        [status, errorCode, transactionId || null, this.config.environment, attemptId, userId],
+      );
+    };
+
+    for (let pass = 0; pass < 3; pass += 1) {
+      const claim = await claimAttempt();
+      if (!claim.create && claim.transactionId) {
+        let remote: Awaited<ReturnType<typeof paddle.transactions.get>>;
+        try {
+          remote = await paddle.transactions.get(claim.transactionId);
+        } catch (error) {
+          this.logger.warn({ err: error, module: "billing-checkout", userId, transactionId: claim.transactionId }, "Unable to verify reusable checkout");
+          throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "结账状态暂时无法确认，请稍后重试");
+        }
+        const custom = getCustomData(remote.customData);
+        const owned = remote.id === claim.transactionId
+          && Boolean(claim.customerId) && remote.customerId === claim.customerId
+          && custom.atomflow_user_id === String(userId)
+          && custom.checkout_attempt_id === claim.id
+          && custom.plan_code === claim.planCode
+          && hasExclusiveAtomFlowItem(remote, this.config, this.config.priceIds[claim.planCode]);
+        const completed = remote.status === "completed" || remote.status === "paid" || remote.status === "billed";
+        const resumable = remote.status === "draft" || remote.status === "ready";
+        if (owned && completed) {
+          await markAttempt(claim.id, "completed", "PADDLE_SUBSCRIPTION_PENDING", remote.id);
+          if (remote.subscriptionId) {
+            try {
+              const subscription = await paddle.subscriptions.get(remote.subscriptionId);
+              if (!hasExclusiveAtomFlowItem(subscription, this.config, this.config.priceIds[claim.planCode])) {
+                throw new Error("completed transaction has a mixed or unexpected subscription item set");
+              }
+              const db = await this.pool.connect();
+              try {
+                await db.query("BEGIN");
+                const result = await this.upsertTrustedSubscription(db, normalizeSubscription(subscription, this.config), new Date(subscription.updatedAt).toISOString(), true);
+                if (!result.ok) throw new Error(result.reason);
+                await db.query("COMMIT");
+              } catch (error) {
+                await db.query("ROLLBACK").catch(() => undefined);
+                throw error;
+              } finally {
+                db.release();
+              }
+              throw new BillingError(409, "BILLING_ALREADY_ACTIVE", "当前账户已有有效订阅");
+            } catch (error) {
+              if (error instanceof BillingError) throw error;
+              this.logger.warn({ err: error, module: "billing-checkout", userId, attemptId: claim.id }, "Completed checkout subscription is still reconciling");
+            }
+          }
+          throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "付款状态正在确认中，请稍后重试");
+        }
+        if (owned && resumable && claim.planCode === planCode) {
+          return { transactionId: remote.id, reused: true };
+        }
+        if (owned && resumable && claim.planCode !== planCode) {
+          try {
+            await paddle.transactions.update(remote.id, { status: "canceled" });
+          } catch (error) {
+            this.logger.warn({ err: error, module: "billing-checkout", userId, transactionId: remote.id }, "Failed to close the previous draft checkout");
+            throw new BillingError(409, "BILLING_CHECKOUT_PENDING", "当前已有结账正在处理中");
+          }
+        }
+        await markAttempt(claim.id, "payment_failed", owned ? "PADDLE_TRANSACTION_STALE" : "PADDLE_TRANSACTION_MISMATCH", remote.id);
+        continue;
       }
 
-      await this.assertConfiguredCatalogValid();
-
-      const attemptId = randomUUID();
-      await client.query(
-        `INSERT INTO billing_checkout_attempts
-           (id, environment, user_id, request_id, plan_code, status)
-         VALUES ($1, $2, $3, $4, $5, 'creating')`,
-        [attemptId, this.config.environment, userId, requestId, planCode],
-      );
-
-      let customer = (await client.query(
-        `SELECT id, paddle_customer_id AS "paddleCustomerId"
-         FROM billing_customers WHERE environment = $1 AND user_id = $2`,
-        [this.config.environment, userId],
-      )).rows[0] as JsonRecord | undefined;
-      if (!customer) {
-        let paddleCustomerId: string | null = null;
+      let customerId = claim.customerId;
+      let billingCustomerId = claim.billingCustomerId;
+      if (!customerId) {
         try {
           const candidates = paddle.customers.list({ email: [email], perPage: 50 });
           for await (const candidate of candidates) {
             if (getCustomData(candidate.customData).atomflow_user_id === String(userId)) {
-              paddleCustomerId = candidate.id;
+              customerId = candidate.id;
               break;
             }
           }
-          if (!paddleCustomerId) {
-            paddleCustomerId = (await paddle.customers.create({
-              email,
-              customData: { atomflow_user_id: String(userId) },
-            })).id;
+          if (!customerId) {
+            customerId = (await paddle.customers.create({ email, customData: { atomflow_user_id: String(userId) } })).id;
           }
         } catch (error) {
-          await client.query(
-            `UPDATE billing_checkout_attempts
-             SET status = 'reconciling', error_code = 'PADDLE_CUSTOMER_UNCERTAIN', next_recovery_at = NOW(), updated_at = NOW()
-             WHERE environment = $1 AND id = $2`,
-            [this.config.environment, attemptId],
-          );
-          this.logger.error({ err: error, module: "billing-checkout", userId, attemptId }, "Paddle customer creation is uncertain");
+          await markAttempt(claim.id, "reconciling", "PADDLE_CUSTOMER_UNCERTAIN");
+          this.logger.error({ err: error, module: "billing-checkout", userId, attemptId: claim.id }, "Paddle customer creation is uncertain");
           throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "结账创建状态正在确认中，请稍后重试");
         }
-        customer = (await client.query(
+        const stored = (await this.pool.query(
           `INSERT INTO billing_customers (environment, paddle_customer_id, user_id)
            VALUES ($1, $2, $3)
            ON CONFLICT (environment, user_id) WHERE user_id IS NOT NULL DO UPDATE
            SET paddle_customer_id = EXCLUDED.paddle_customer_id, updated_at = NOW()
-           RETURNING id, paddle_customer_id AS "paddleCustomerId"`,
-          [this.config.environment, paddleCustomerId, userId],
+           RETURNING id, paddle_customer_id AS "customerId"`,
+          [this.config.environment, customerId, userId],
         )).rows[0];
+        billingCustomerId = stored.id;
+        customerId = String(stored.customerId);
       }
-      await client.query(
+      await this.pool.query(
         `UPDATE billing_checkout_attempts SET billing_customer_id = $1, updated_at = NOW()
-         WHERE environment = $2 AND id = $3`,
-        [customer.id, this.config.environment, attemptId],
+         WHERE environment = $2 AND id = $3 AND user_id = $4 AND status = 'creating'`,
+        [billingCustomerId, this.config.environment, claim.id, userId],
       );
 
       try {
         const transaction = await paddle.transactions.create({
-          items: [{ priceId, quantity: 1 }],
-          customerId: String(customer.paddleCustomerId),
-          status: "draft",
-          customData: {
-            atomflow_user_id: String(userId),
-            checkout_attempt_id: attemptId,
-            plan_code: planCode,
-          },
+          items: [{ priceId, quantity: 1 }], customerId,
+          customData: { atomflow_user_id: String(userId), checkout_attempt_id: claim.id, plan_code: planCode },
         });
-        await client.query(
+        await this.pool.query(
           `UPDATE billing_checkout_attempts
            SET paddle_transaction_id = $1, status = 'draft', error_code = NULL, updated_at = NOW()
-           WHERE environment = $2 AND id = $3`,
-          [transaction.id, this.config.environment, attemptId],
+           WHERE environment = $2 AND id = $3 AND user_id = $4 AND status = 'creating'`,
+          [transaction.id, this.config.environment, claim.id, userId],
         );
         return { transactionId: transaction.id, reused: false };
       } catch (error) {
-        const recovered = await this.recoverTransaction(String(customer.paddleCustomerId), attemptId).catch(() => null);
+        const recovered = await this.recoverTransaction(customerId, claim.id).catch(() => null);
         if (recovered) {
           const completed = recovered.status === "completed" || recovered.status === "paid" || recovered.status === "billed";
           const resumable = recovered.status === "draft" || recovered.status === "ready";
-          const recoveredStatus = completed
-            ? "completed"
-            : recovered.status === "canceled" ? "payment_failed"
-              : resumable ? "draft" : "reconciling";
-          await client.query(
-            `UPDATE billing_checkout_attempts SET paddle_transaction_id = $1, status = $2, error_code = NULL, updated_at = NOW()
-             WHERE environment = $3 AND id = $4`,
-            [recovered.id, recoveredStatus, this.config.environment, attemptId],
-          );
-          if (completed) {
-            if (recovered.subscriptionId) {
-              try {
-                const remote = await paddle.subscriptions.get(recovered.subscriptionId);
-                const result = await this.upsertTrustedSubscription(client, normalizeSubscription(remote, this.config), new Date(remote.updatedAt).toISOString(), true);
-                if (!result.ok) throw new Error(result.reason);
-              } catch (recoveryError) {
-                this.logger.warn({ err: recoveryError, module: "billing-checkout", userId, attemptId }, "Completed checkout subscription is still reconciling");
-                throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "付款状态正在确认中，请稍后重试");
-              }
-              throw new BillingError(409, "BILLING_ALREADY_ACTIVE", "当前账户已有有效订阅");
-            }
-            throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "付款状态正在确认中，请稍后重试");
-          }
-          if (recoveredStatus === "payment_failed") {
-            throw new BillingError(502, "BILLING_CHECKOUT_FAILED", "结账交易已取消，请重新发起结账");
-          }
-          if (recoveredStatus === "reconciling") {
-            throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "结账状态正在确认中，请稍后重试");
-          }
-          return { transactionId: recovered.id, reused: true };
+          const recoveredStatus = completed ? "completed" : recovered.status === "canceled" ? "payment_failed" : resumable ? "draft" : "reconciling";
+          await markAttempt(claim.id, recoveredStatus, recoveredStatus === "reconciling" ? "PADDLE_TRANSACTION_UNCERTAIN" : "", recovered.id);
+          if (resumable) return { transactionId: recovered.id, reused: true };
+          if (completed) throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "付款状态正在确认中，请稍后重试");
+          if (recoveredStatus === "payment_failed") throw new BillingError(502, "BILLING_CHECKOUT_FAILED", "结账交易已取消，请重新发起结账");
         }
-        await client.query(
-          `UPDATE billing_checkout_attempts SET status = 'reconciling', error_code = 'PADDLE_TRANSACTION_UNCERTAIN', next_recovery_at = NOW(), updated_at = NOW()
-           WHERE environment = $1 AND id = $2`,
-          [this.config.environment, attemptId],
-        );
-        this.logger.error({ err: error, module: "billing-checkout", userId, attemptId }, "Paddle checkout creation failed");
+        await markAttempt(claim.id, "reconciling", "PADDLE_TRANSACTION_UNCERTAIN");
+        this.logger.error({ err: error, module: "billing-checkout", userId, attemptId: claim.id }, "Paddle checkout creation failed");
         throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "结账创建状态正在确认中，请稍后重试");
       }
-    } finally {
-      await this.releaseAdvisoryClient(client, lockKey);
     }
+    throw new BillingError(503, "BILLING_CHECKOUT_PENDING", "结账状态正在确认中，请稍后重试");
   }
 
   private async recoverTransaction(customerId: string, attemptId: string, expectedTransactionId?: string | null) {
@@ -557,77 +639,82 @@ export class BillingService {
     prepareLocalDeletion: (client: pg.PoolClient) => Promise<void>,
     deleteLocalAccount: (client: pg.PoolClient) => Promise<void>,
   ) {
-    const client = await this.pool.connect();
     const lockKey = `atomflow-billing-user:${userId}`;
+    const loadCustomers = async (client: pg.PoolClient) => (await client.query(
+      `SELECT environment, paddle_customer_id AS "paddleCustomerId"
+       FROM (
+         SELECT environment, paddle_customer_id FROM billing_customers WHERE user_id = $1
+         UNION
+         SELECT environment, paddle_customer_id FROM billing_subscriptions WHERE user_id = $1
+       ) AS owned_billing_customers
+       ORDER BY environment, paddle_customer_id`,
+      [userId],
+    )).rows as JsonRecord[];
+
+    // Claim the local deletion intent with a short transaction. The network
+    // phase below deliberately owns neither a pg client nor an advisory lock.
+    const claimClient = await this.pool.connect();
+    let customers: JsonRecord[];
     try {
-      await client.query(`SELECT pg_advisory_lock(hashtext($1))`, [lockKey]);
-      await client.query("BEGIN");
-      await prepareLocalDeletion(client);
-      const customers = (await client.query(
-        `SELECT environment, paddle_customer_id AS "paddleCustomerId"
-         FROM (
-           SELECT environment, paddle_customer_id
-           FROM billing_customers
-           WHERE user_id = $1
-           UNION
-           SELECT environment, paddle_customer_id
-           FROM billing_subscriptions
-           WHERE user_id = $1
-         ) AS owned_billing_customers`,
-        [userId],
-      )).rows as JsonRecord[];
-      if (customers.length > 0) {
-        if (!this.config.enabled) {
-          throw new BillingError(503, "BILLING_DISABLED_ACCOUNT_REVIEW_REQUIRED", "检测到历史账单资料，收费关闭期间不能自动注销，请联系支持");
-        }
-        if (customers.some(customer => customer.environment !== this.config.environment)) {
-          throw new BillingError(503, "BILLING_CROSS_ENVIRONMENT_REVIEW_REQUIRED", "检测到其他环境的历史订阅，请联系支持完成注销");
-        }
-        const paddle = this.requirePaddle();
-        try {
-          for (const customer of customers) {
-            const remoteSubscriptions = paddle.subscriptions.list({
-              customerId: [String(customer.paddleCustomerId)],
-              status: ["active", "trialing", "past_due", "paused"],
-              perPage: 200,
-            });
-            for await (const remote of remoteSubscriptions) {
-              if (String(remote.customerId) !== String(customer.paddleCustomerId)) {
-                throw new Error(`Unable to verify active subscription ${remote.id}`);
-              }
-              const normalizedRemote = normalizeSubscription(remote, this.config);
-              if (!normalizedRemote) {
-                throw new Error(`Unable to inspect active subscription ${remote.id}`);
-              }
-              if (normalizedRemote.productId !== this.config.productId) {
-                // A Paddle customer may buy products other than AtomFlow Magic
-                // Writing. Deleting the AtomFlow account must not cancel them.
-                continue;
-              }
-              if (!this.config.allowedPriceIds.has(normalizedRemote.priceId)) {
-                // A same-product price that is not in the current or explicit
-                // legacy allowlist needs manual review; silently leaving it paid
-                // or canceling an unrecognized contract are both unsafe.
-                throw new Error(`Unable to verify AtomFlow price for active subscription ${remote.id}`);
-              }
-              const canceled = remote.status === "canceled"
-                ? remote
-                : await paddle.subscriptions.cancel(remote.id, { effectiveFrom: "immediately" });
-              await client.query(
-                `UPDATE billing_subscriptions
-                 SET status = 'canceled', scheduled_change = NULL, updated_at = NOW()
-                 WHERE environment = $1 AND paddle_subscription_id = $2`,
-                [this.config.environment, remote.id],
-              );
-              const normalizedCanceled = normalizeSubscription(canceled, this.config);
-              const result = await this.upsertTrustedSubscription(client, normalizedCanceled, new Date(canceled.updatedAt).toISOString(), true);
-              if (!result.ok) throw new Error(result.reason);
+      await claimClient.query("BEGIN");
+      await claimClient.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKey]);
+      await prepareLocalDeletion(claimClient);
+      customers = await loadCustomers(claimClient);
+      await claimClient.query("COMMIT");
+    } catch (error) {
+      await claimClient.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      claimClient.release();
+    }
+
+    if (customers.length > 0) {
+      if (!this.config.enabled) {
+        throw new BillingError(503, "BILLING_DISABLED_ACCOUNT_REVIEW_REQUIRED", "检测到历史账单资料，收费关闭期间不能自动注销，请联系支持");
+      }
+      if (customers.some(customer => customer.environment !== this.config.environment)) {
+        throw new BillingError(503, "BILLING_CROSS_ENVIRONMENT_REVIEW_REQUIRED", "检测到其他环境的历史订阅，请联系支持完成注销");
+      }
+      const paddle = this.requirePaddle();
+      try {
+        for (const customer of customers) {
+          const remoteSubscriptions = paddle.subscriptions.list({
+            customerId: [String(customer.paddleCustomerId)],
+            status: ["active", "trialing", "past_due", "paused"], perPage: 200,
+          });
+          for await (const remote of remoteSubscriptions) {
+            if (String(remote.customerId) !== String(customer.paddleCustomerId)) {
+              throw new Error(`Unable to verify active subscription ${remote.id}`);
+            }
+            const normalizedRemote = normalizeSubscription(remote, this.config);
+            if (!normalizedRemote) throw new Error(`Unable to inspect active subscription ${remote.id}`);
+            if (!hasExclusiveAtomFlowItem(remote, this.config)) {
+              const containsAtomFlowItem = normalizeItems(remote.items).some(item => (
+                item.productId === this.config.productId
+              ));
+              if (containsAtomFlowItem) throw new Error(`Mixed-product subscription ${remote.id} requires manual review`);
+              continue;
+            }
+            const canceled = await paddle.subscriptions.cancel(remote.id, { effectiveFrom: "immediately" });
+            if (!hasExclusiveAtomFlowItem(canceled, this.config)) {
+              throw new Error(`Cancellation returned a mixed or unexpected subscription ${remote.id}`);
             }
           }
-        } catch (error) {
-          this.logger.error({ err: error, module: "billing-delete", userId }, "Failed authoritative subscription cancellation before account deletion");
-          throw new BillingError(503, "BILLING_CANCELLATION_FAILED", "订阅暂时无法确认取消，账户尚未删除，请稍后重试");
         }
+      } catch (error) {
+        this.logger.error({ err: error, module: "billing-delete", userId }, "Failed authoritative subscription cancellation before account deletion");
+        throw new BillingError(503, "BILLING_CANCELLATION_FAILED", "订阅暂时无法确认取消，账户尚未删除，请稍后重试");
+      }
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKey]);
+      await prepareLocalDeletion(client);
+      const currentCustomers = await loadCustomers(client);
+      if (JSON.stringify(currentCustomers) !== JSON.stringify(customers)) {
+        throw new BillingError(409, "BILLING_ACCOUNT_CHANGED", "注销期间账单资料已变更，请重试");
       }
       await client.query(
         `UPDATE billing_webhook_events
@@ -641,7 +728,7 @@ export class BillingService {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      await this.releaseAdvisoryClient(client, lockKey);
+      client.release();
     }
   }
 
@@ -676,22 +763,34 @@ export class BillingService {
       let attempt = scannedAttempt;
       const userId = Number(attempt.userId);
       if (!Number.isSafeInteger(userId) || !attempt.email) continue;
-      const client = await this.pool.connect();
       const lockKey = `atomflow-billing-user:${userId}`;
       let confirmedPayment = attempt.status === "completed";
+      const claimClient = await this.pool.connect();
       try {
-        await client.query(`SELECT pg_advisory_lock(hashtext($1))`, [lockKey]);
-        const currentAttempt = (await client.query(
+        await claimClient.query("BEGIN");
+        await claimClient.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [lockKey]);
+        const currentAttempt = (await claimClient.query(
           `SELECT status, recovery_attempt_count AS "recoveryAttemptCount"
            FROM billing_checkout_attempts
            WHERE environment = $1 AND id = $2`,
           [this.config.environment, attempt.id],
         )).rows[0] as JsonRecord | undefined;
-        if (!currentAttempt || !["creating", "reconciling", "completed"].includes(String(currentAttempt.status))) continue;
+        if (!currentAttempt || !["creating", "reconciling", "completed"].includes(String(currentAttempt.status))) {
+          await claimClient.query("ROLLBACK");
+          continue;
+        }
         attempt = { ...attempt, ...currentAttempt };
         confirmedPayment = attempt.status === "completed";
+        await claimClient.query("COMMIT");
+      } catch (error) {
+        await claimClient.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        claimClient.release();
+      }
+
+      try {
         let customerId = asString(attempt.paddleCustomerId);
-        let billingCustomerId = attempt.billingCustomerId;
         if (!customerId) {
           const candidates = this.requirePaddle().customers.list({ email: [String(attempt.email)], perPage: 50 });
           for await (const candidate of candidates) {
@@ -701,7 +800,7 @@ export class BillingService {
             }
           }
           if (customerId) {
-            const customer = (await client.query(
+            const customer = (await this.pool.query(
               `INSERT INTO billing_customers (environment, paddle_customer_id, user_id)
                VALUES ($1, $2, $3)
                ON CONFLICT (environment, user_id) WHERE user_id IS NOT NULL DO UPDATE
@@ -709,11 +808,10 @@ export class BillingService {
                RETURNING id`,
               [this.config.environment, customerId, userId],
             )).rows[0];
-            billingCustomerId = customer.id;
-            await client.query(
+            await this.pool.query(
               `UPDATE billing_checkout_attempts SET billing_customer_id = $1
                WHERE environment = $2 AND id = $3 AND status IN ('creating', 'reconciling', 'completed')`,
-              [billingCustomerId, this.config.environment, attempt.id],
+              [customer.id, this.config.environment, attempt.id],
             );
           }
         }
@@ -726,7 +824,7 @@ export class BillingService {
             ? "completed"
             : recovered.status === "canceled" ? "payment_failed"
               : resumable ? "draft" : "reconciling";
-          await client.query(
+          await this.pool.query(
             `UPDATE billing_checkout_attempts
              SET paddle_transaction_id = $1, status = $2, error_code = NULL, updated_at = NOW()
              WHERE environment = $3 AND id = $4 AND status IN ('creating', 'reconciling', 'completed')`,
@@ -734,11 +832,21 @@ export class BillingService {
           );
           if (recovered.subscriptionId) {
             const remote = await this.requirePaddle().subscriptions.get(recovered.subscriptionId);
-            const result = await this.upsertTrustedSubscription(client, normalizeSubscription(remote, this.config), remote.updatedAt, true);
-            if (!result.ok) throw new Error(result.reason);
+            const db = await this.pool.connect();
+            try {
+              await db.query("BEGIN");
+              const result = await this.upsertTrustedSubscription(db, normalizeSubscription(remote, this.config), remote.updatedAt, true);
+              if (!result.ok) throw new Error(result.reason);
+              await db.query("COMMIT");
+            } catch (error) {
+              await db.query("ROLLBACK").catch(() => undefined);
+              throw error;
+            } finally {
+              db.release();
+            }
           } else if (confirmedPayment || recoveredStatus === "reconciling") {
             const count = Number(attempt.recoveryAttemptCount || 0) + 1;
-            await client.query(
+            await this.pool.query(
               `UPDATE billing_checkout_attempts
                SET recovery_attempt_count = $1,
                    next_recovery_at = NOW() + ($2 * INTERVAL '1 second'),
@@ -752,7 +860,7 @@ export class BillingService {
         const count = Number(attempt.recoveryAttemptCount || 0) + 1;
         const terminal = !confirmedPayment && count >= 8;
         const delaySeconds = Math.min(3600, 5 * (2 ** Math.min(count, 10)));
-        await client.query(
+        await this.pool.query(
           `UPDATE billing_checkout_attempts
            SET status = $1, recovery_attempt_count = $2,
                next_recovery_at = NOW() + ($3 * INTERVAL '1 second'),
@@ -763,15 +871,13 @@ export class BillingService {
       } catch (error) {
         this.logger.warn({ err: error, module: "billing-checkout-recovery", attemptId: attempt.id }, "Checkout recovery attempt failed");
         const count = Number(attempt.recoveryAttemptCount || 0) + 1;
-        await client.query(
+        await this.pool.query(
           `UPDATE billing_checkout_attempts
            SET status = $1, recovery_attempt_count = $2,
                next_recovery_at = NOW() + ($3 * INTERVAL '1 second'), error_code = $4, updated_at = NOW()
            WHERE environment = $5 AND id = $6 AND status IN ('creating', 'reconciling', 'completed')`,
           [confirmedPayment ? "completed" : "reconciling", count, Math.min(3600, 5 * (2 ** Math.min(count, 10))), count >= 8 ? "PADDLE_RECOVERY_MANUAL_REVIEW" : "PADDLE_RECOVERY_RETRY", this.config.environment, attempt.id],
         ).catch(() => undefined);
-      } finally {
-        await this.releaseAdvisoryClient(client, lockKey);
       }
     }
   }
@@ -913,7 +1019,7 @@ export class BillingService {
   }
 
   private async finalizeWebhookEvent(
-    client: pg.PoolClient,
+    client: pg.Pool | pg.PoolClient,
     eventId: string,
     status: "processed" | "ignored" | "quarantined",
     errorMessage: string | null,
@@ -928,29 +1034,20 @@ export class BillingService {
   }
 
   private async processAdjustmentEvent(eventId: string, payload: JsonRecord, occurredAt: string) {
-    const client = await this.pool.connect();
     const transactionId = asString(payload.transactionId);
     let subscriptionId = asString(payload.subscriptionId);
     const isApprovedFullRefund = payload.status === "approved" && payload.action === "refund" && payload.type === "full";
     const paddle = isApprovedFullRefund ? this.requirePaddle() : null;
-    let lockKey: string | null = null;
-    let acquired = false;
     try {
       if (paddle && !subscriptionId && transactionId) {
         subscriptionId = (await paddle.transactions.get(transactionId)).subscriptionId;
       }
-      const adjustmentIdentity = subscriptionId || transactionId;
-      lockKey = adjustmentIdentity ? `atomflow-billing-adjustment:${this.config.environment}:${adjustmentIdentity}` : null;
-      if (lockKey) {
-        await client.query(`SELECT pg_advisory_lock(hashtext($1))`, [lockKey]);
-        acquired = true;
-      }
       if (!isApprovedFullRefund) {
-        await this.finalizeWebhookEvent(client, eventId, "ignored", null);
+        await this.finalizeWebhookEvent(this.pool, eventId, "ignored", null);
         return;
       }
 
-      const attempt = transactionId ? (await client.query(
+      const attempt = transactionId ? (await this.pool.query(
       `SELECT id, user_id AS "userId", billing_customer_id AS "billingCustomerId",
               plan_code AS "planCode", status,
               last_adjustment_occurred_at AS "lastAdjustmentOccurredAt"
@@ -958,16 +1055,16 @@ export class BillingService {
        WHERE environment = $1 AND paddle_transaction_id = $2`,
       [this.config.environment, transactionId],
     )).rows[0] as JsonRecord | undefined : undefined;
-      const subscription = subscriptionId ? (await client.query(
+      const subscription = subscriptionId ? (await this.pool.query(
       `SELECT id, user_id AS "userId", billing_customer_id AS "billingCustomerId",
               paddle_customer_id AS "paddleCustomerId",
               last_adjustment_occurred_at AS "lastAdjustmentOccurredAt"
        FROM billing_subscriptions
        WHERE environment = $1 AND paddle_subscription_id = $2`,
       [this.config.environment, subscriptionId],
-    )).rows[0] as JsonRecord | undefined : undefined;
+      )).rows[0] as JsonRecord | undefined : undefined;
       if (!attempt && !subscription) {
-        await this.finalizeWebhookEvent(client, eventId, "quarantined", "adjustment does not reference a known transaction or subscription");
+        await this.finalizeWebhookEvent(this.pool, eventId, "quarantined", "adjustment does not reference a known transaction or subscription");
         return;
       }
       const latestCursor = [attempt?.lastAdjustmentOccurredAt, subscription?.lastAdjustmentOccurredAt]
@@ -977,7 +1074,7 @@ export class BillingService {
       })
       .reduce((latest, value) => Math.max(latest, value), Number.NEGATIVE_INFINITY);
       if (latestCursor >= new Date(occurredAt).getTime()) {
-        await this.finalizeWebhookEvent(client, eventId, "ignored", "stale adjustment event");
+        await this.finalizeWebhookEvent(this.pool, eventId, "ignored", "stale adjustment event");
         return;
       }
 
@@ -986,13 +1083,14 @@ export class BillingService {
       const normalizedRemote = normalizeSubscription(remote, this.config);
       if (
         !normalizedRemote
+        || !hasExclusiveAtomFlowItem(remote, this.config)
         || normalizedRemote.productId !== this.config.productId
         || !this.config.allowedPriceIds.has(normalizedRemote.priceId)
       ) {
-        await this.finalizeWebhookEvent(client, eventId, "quarantined", "refund subscription product or price is not allowed");
+        await this.finalizeWebhookEvent(this.pool, eventId, "quarantined", "refund subscription product or price is not allowed");
         return;
       }
-      const knownCustomer = (await client.query(
+      const knownCustomer = (await this.pool.query(
         `SELECT id, user_id AS "userId"
          FROM billing_customers
          WHERE environment = $1 AND paddle_customer_id = $2`,
@@ -1018,7 +1116,7 @@ export class BillingService {
         && normalizedRemote.customData.checkout_attempt_id === String(attempt.id)
       );
       if (!existingOwnershipMatches && !attemptOwnershipMatches) {
-        await this.finalizeWebhookEvent(client, eventId, "quarantined", "refund subscription ownership is unknown or mismatched");
+        await this.finalizeWebhookEvent(this.pool, eventId, "quarantined", "refund subscription ownership is unknown or mismatched");
         return;
       }
       const canceled = normalizedRemote?.status === "canceled"
@@ -1027,6 +1125,7 @@ export class BillingService {
       const canceledSubscription = normalizeSubscription(canceled, this.config);
       if (!canceledSubscription) throw new Error("Refund cancellation returned an incomplete subscription");
 
+      const client = await this.pool.connect();
       try {
         await client.query("BEGIN");
         await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`atomflow-billing-event:${this.config.environment}:${eventId}`]);
@@ -1053,10 +1152,11 @@ export class BillingService {
       } catch (error) {
         await client.query("ROLLBACK").catch(() => undefined);
         throw error;
+      } finally {
+        client.release();
       }
-    } finally {
-      if (acquired && lockKey) await this.releaseAdvisoryClient(client, lockKey);
-      else client.release();
+    } catch (error) {
+      throw error;
     }
   }
 
@@ -1315,35 +1415,51 @@ export class BillingService {
   async reconcileSubscriptions() {
     if (!this.config.enabled) return;
     const paddle = this.requirePaddle();
-    const lockClient = await this.pool.connect();
     const lockKey = `atomflow-billing-reconcile:${this.config.environment}`;
-    let acquired = false;
+    const claimClient = await this.pool.connect();
+    let subscriptions: JsonRecord[] = [];
     try {
-      const locked = (await lockClient.query(
-        `SELECT pg_try_advisory_lock(hashtext($1)) AS locked`,
+      await claimClient.query("BEGIN");
+      const locked = (await claimClient.query(
+        `SELECT pg_try_advisory_xact_lock(hashtext($1)) AS locked`,
         [lockKey],
       )).rows[0]?.locked === true;
-      if (!locked) return;
-      acquired = true;
-      const subscriptions = (await lockClient.query(
+      if (!locked) {
+        await claimClient.query("ROLLBACK");
+        return;
+      }
+      subscriptions = (await claimClient.query(
         `SELECT paddle_subscription_id AS id FROM billing_subscriptions
          WHERE environment = $1 AND quarantined_at IS NULL`,
         [this.config.environment],
       )).rows;
-      for (const row of subscriptions) {
+      await claimClient.query("COMMIT");
+    } catch (error) {
+      await claimClient.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      claimClient.release();
+    }
+    for (const row of subscriptions) {
+      try {
+        const remote = await paddle.subscriptions.get(String(row.id));
+        const client = await this.pool.connect();
         try {
-          const remote = await paddle.subscriptions.get(String(row.id));
-          const result = await this.upsertTrustedSubscription(lockClient, normalizeSubscription(remote, this.config), new Date(remote.updatedAt).toISOString(), true);
+          await client.query("BEGIN");
+          const result = await this.upsertTrustedSubscription(client, normalizeSubscription(remote, this.config), new Date(remote.updatedAt).toISOString(), true);
           if (!result.ok) {
             this.logger.warn({ module: "billing-reconcile", subscriptionId: row.id, reason: result.reason }, "Subscription reconciliation rejected remote state");
           }
+          await client.query("COMMIT");
         } catch (error) {
-          this.logger.warn({ err: error, module: "billing-reconcile", subscriptionId: row.id }, "Subscription reconciliation failed");
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        } finally {
+          client.release();
         }
+      } catch (error) {
+        this.logger.warn({ err: error, module: "billing-reconcile", subscriptionId: row.id }, "Subscription reconciliation failed");
       }
-    } finally {
-      if (acquired) await this.releaseAdvisoryClient(lockClient, lockKey);
-      else lockClient.release();
     }
   }
 }

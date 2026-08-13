@@ -9,6 +9,7 @@ import { OFFICIAL_SOURCE_ICON_URLS } from '../data/sourceIcons';
 import type { AppTab } from '../types';
 import { requiresAuthenticatedAppTab } from '../utils/appTabs';
 import { getProxiedFaviconUrl } from '../utils/proxiedMedia';
+import { sourceMatches } from '../utils/articleDisplay';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -75,6 +76,7 @@ const BASE_SOURCES: Array<{ name: string; color: string; rssUrl?: string }> = [
   { name: 'Y Combinator', color: '#FF0000', rssUrl: 'rsshub://youtube/user/%40ycombinator' },
   { name: 'Andrej Karpathy', color: '#FF0000', rssUrl: 'rsshub://youtube/user/@AndrejKarpathy' }
 ];
+const BUILTIN_SOURCE_NAMES = new Set(BASE_SOURCES.map(source => source.name));
 
 const baseSourceByName = new Map(BASE_SOURCES.map(item => [item.name, item]));
 const AI_HOT_SOURCE_CONFIG = BASE_SOURCES.filter(source => source.name.startsWith('AI HOT'));
@@ -274,7 +276,7 @@ const loadEntriesFromStorage = (): NavEntry[] => {
 
 export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const {
-    articles, savedCards, savedArticles, theme, toggleTheme, setActiveSource, showToast, reloadArticles, activeSource,
+    articles, savedCards, savedArticles, theme, toggleTheme, setActiveSource, showToast, reloadArticles, loadSourceArticles, activeSource,
 	    knowledgeTypeFilter, setKnowledgeTypeFilter, setKnowledgeSourceFilter,
 	    user, loginAndDo, logout, setShowProfileModal, syncPreferences,
 	    requestBillingIntent,
@@ -868,7 +870,19 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     if (suppressClickRef.current) return;
     setActiveSource(source.name);
     setActiveTab('feed');
-    const hasArticles = articles.some(article => article.source === source.name);
+    const hasArticles = articles.some(article => sourceMatches(article, source.name));
+    if (BUILTIN_SOURCE_NAMES.has(source.name)) {
+      try {
+        setLoadingSourceId(source.id);
+        await loadSourceArticles(source.name);
+      } catch (error) {
+        logger.error('Failed to load built-in source', { error, source: source.name });
+        showToast('信息源加载失败，请稍后重试');
+      } finally {
+        setLoadingSourceId(null);
+      }
+      return;
+    }
     const shouldFetchFullFeed = Boolean(source.rssUrl && !fullyFetchedSourceIds.has(source.id));
     if ((!shouldFetchFullFeed && hasArticles) || !source.rssUrl || loadingSourceId === source.id) return;
     try {

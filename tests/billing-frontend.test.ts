@@ -24,6 +24,21 @@ const root = process.cwd();
 const read = (file: string) => readFileSync(path.join(root, file), 'utf8');
 const STORAGE_KEY = 'atomflow:billing-pending-intent:v1';
 
+test('billing status normalizer accepts the canonical server DTO and legacy client aliases', () => {
+  const context = read('src/context/AppContext.tsx');
+  const profile = read('src/components/ProfileModal.tsx');
+  assert.match(context, /currentPeriodEnd[\s\S]*?current_period_end[\s\S]*?currentPeriodEndsAt[\s\S]*?current_period_ends_at/,
+    'the server currentPeriodEndsAt field must reach the Profile renewal date');
+  assert.match(context, /scheduledChange[\s\S]*?scheduled_change[\s\S]*?action === 'cancel'/,
+    'a Paddle scheduled cancellation must reach the Profile cancellation state');
+  assert.match(context, /effectiveAt[\s\S]*?effective_at[\s\S]*?currentPeriodEnd/,
+    'scheduled cancellation should use its effective date and safely fall back to the period end');
+  assert.match(context, /hasLegacyWriteData[\s\S]*?has_legacy_write_data[\s\S]*?hasWritingHistory[\s\S]*?has_writing_history/,
+    'the server hasWritingHistory field must preserve legacy read-only UX');
+  assert.match(profile, /scheduledCancelAt \?\? billingState\.status\.currentPeriodEnd/,
+    'Profile must display the scheduled cancellation date instead of an unrelated renewal date');
+});
+
 test('post-login billing intents are session-scoped, user-bound and whitelisted', () => {
   const dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost:1000' });
   Object.defineProperty(globalThis, 'window', { value: dom.window, configurable: true });
@@ -159,15 +174,19 @@ test('billing recovery UX fails closed and always offers an explicit way forward
   const context = read('src/context/AppContext.tsx');
   const gate = read('src/components/billing/MagicWriteAccessGate.tsx');
   const paywall = read('src/components/billing/MagicWritePaywall.tsx');
+  const paddleClient = read('src/billing/paddle.ts');
   const profile = read('src/components/ProfileModal.tsx');
 
   assert.doesNotMatch(paywall, /fallbackPlans/, 'a failed catalog request must never create payable fallback prices');
   assert.match(context, /retryBillingConfirmation/, 'timed-out payment confirmation needs an explicit retry action');
   assert.match(gate, /重新检查开通状态/);
   assert.match(gate, /登录 \/ 注册/, 'closing the initial sign-in modal must not strand a deep-linked visitor');
+  assert.match(gate, /checkoutState\.phase === 'error'[\s\S]*?checkoutState\.error/, 'read-only checkout errors must remain visible while retry buttons are enabled');
   assert.match(profile, /status\.enabled/, 'billing-disabled accounts must not be presented as paid subscribers');
   assert.match(profile, /checkoutState\.error/, 'checkout errors started from Profile must be visible in Profile');
   assert.match(profile, /hasBillingCustomer/, 'canceled or legacy read-only customers must retain Portal access');
+  assert.match(paddleClient, /if \(paddle\.Initialize\) paddle\.Initialize\(options\)/, 'Paddle.Initialize must keep the Paddle object as its method receiver');
+  assert.match(paddleClient, /else if \(paddle\.Setup\) paddle\.Setup\(options\)/, 'legacy Paddle.Setup must keep the Paddle object as its method receiver');
 
   const unavailable = renderToStaticMarkup(React.createElement(MagicWritePaywall, {
     plans: [],

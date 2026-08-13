@@ -259,7 +259,7 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
                 </p>
                 {billingState.phase === 'ready' && billingState.status.enabled && billingState.status.currentPeriodEnd ? (
                   <p className="mt-1 text-[10px] text-[#918575]">
-                    {billingState.status.scheduledCancelAt ? '将于' : '下次续费'} {new Date(billingState.status.currentPeriodEnd).toLocaleDateString('zh-CN')}{billingState.status.scheduledCancelAt ? ' 到期' : ''}
+                    {billingState.status.scheduledCancelAt ? '将于' : '下次续费'} {new Date(billingState.status.scheduledCancelAt ?? billingState.status.currentPeriodEnd).toLocaleDateString('zh-CN')}{billingState.status.scheduledCancelAt ? ' 到期' : ''}
                   </p>
                 ) : null}
                 {billingState.phase === 'ready' && billingState.status.enabled && billingState.status.paymentActionRequired ? <p className="mt-1 text-[11px] font-semibold text-[#A44835]">请更新付款方式</p> : null}
@@ -291,7 +291,6 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
             {checkoutState.phase === 'pending' ? <button type="button" onClick={retryBillingConfirmation} className="mt-2 min-h-10 w-full rounded-xl border border-[#CFC0A8] bg-white text-[11px] font-semibold text-[#285F98]">重新检查开通状态</button> : null}
             {checkoutState.error ? <p className="mt-2 text-[11px] leading-5 text-[#A44835]" aria-live="polite">{checkoutState.error}</p> : null}
           </section>
-
           <div className="mt-5 border-t border-border pt-4">
             <button
               onClick={() => void handleExport()}

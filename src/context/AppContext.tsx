@@ -26,6 +26,7 @@ import { normalizeBillingPlans } from '../billing/catalog';
 
 export type WriteWorkspaceMode = 'graph' | 'articles' | 'skills';
 export type WriteGraphView = 'all' | 'activated';
+const RSS_REFRESH_RETRY_DELAYS_MS = [1500, 3000, 6000, 12000, 24000] as const;
 
 export type BillingState =
   | { phase: 'idle' | 'loading'; status: null }
@@ -48,6 +49,8 @@ interface AppState {
   articles: Article[];
   isArticlesLoading: boolean;
   articlesError: string | null;
+  articlesLoaded: boolean;
+  sourceArticles: Record<string, Article[]>;
   savedCards: AtomCard[];
   savedArticles: SavedArticle[];
   saveArticle: (articleId: number, identity?: ArticleIdentity) => Promise<boolean>;
@@ -66,6 +69,7 @@ interface AppState {
   activeSource: string | null;
   setActiveSource: (source: string | null) => void;
   reloadArticles: () => Promise<void>;
+  loadSourceArticles: (source: string) => Promise<Article[]>;
   isSavingArticle: (articleId: number) => boolean;
   getSavingStageText: (articleId: number) => string | null;
   knowledgeTypeFilter: string;
@@ -139,6 +143,10 @@ export function mergeSavedReadingArticle(
     : current;
 }
 
+const readNullableString = (value: unknown): string | null => (
+  typeof value === 'string' && value.trim() ? value : null
+);
+
 const normalizeBillingStatus = (payload: unknown): BillingStatus | null => {
   if (!payload || typeof payload !== 'object') return null;
   const root = payload as Record<string, unknown>;
@@ -151,14 +159,37 @@ const normalizeBillingStatus = (payload: unknown): BillingStatus | null => {
     : null;
   const rawPlan = value.planCode ?? value.plan_code;
   const planCode = rawPlan === 'pro_monthly' || rawPlan === 'pro_yearly' ? rawPlan : null;
+  const currentPeriodEnd = readNullableString(
+    value.currentPeriodEnd
+      ?? value.current_period_end
+      ?? value.currentPeriodEndsAt
+      ?? value.current_period_ends_at,
+  );
+  const scheduledChange = value.scheduledChange ?? value.scheduled_change;
+  const scheduledChangeValue = scheduledChange && typeof scheduledChange === 'object'
+    ? scheduledChange as Record<string, unknown>
+    : null;
+  const isScheduledCancellation = scheduledChangeValue?.action === 'cancel';
+  const scheduledCancelAt = readNullableString(
+    value.scheduledCancelAt
+      ?? value.scheduled_cancel_at
+      ?? (isScheduledCancellation
+        ? scheduledChangeValue?.effectiveAt ?? scheduledChangeValue?.effective_at ?? currentPeriodEnd
+        : null),
+  );
   return {
     enabled: value.enabled !== false,
     access,
     subscriptionStatus,
     planCode,
-    currentPeriodEnd: typeof (value.currentPeriodEnd ?? value.current_period_end) === 'string' ? String(value.currentPeriodEnd ?? value.current_period_end) : null,
-    scheduledCancelAt: typeof (value.scheduledCancelAt ?? value.scheduled_cancel_at) === 'string' ? String(value.scheduledCancelAt ?? value.scheduled_cancel_at) : null,
-    hasLegacyWriteData: Boolean(value.hasLegacyWriteData ?? value.has_legacy_write_data),
+    currentPeriodEnd,
+    scheduledCancelAt,
+    hasLegacyWriteData: Boolean(
+      value.hasLegacyWriteData
+        ?? value.has_legacy_write_data
+        ?? value.hasWritingHistory
+        ?? value.has_writing_history,
+    ),
     hasBillingCustomer: Boolean(value.hasBillingCustomer ?? value.has_billing_customer),
     paymentActionRequired: Boolean(value.paymentActionRequired ?? value.payment_action_required ?? subscriptionStatus === 'past_due'),
   };
@@ -179,6 +210,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [articles, setArticles] = useState<Article[]>([]);
   const [isArticlesLoading, setIsArticlesLoading] = useState(true);
   const [articlesError, setArticlesError] = useState<string | null>(null);
+  const [articlesLoaded, setArticlesLoaded] = useState(false);
+  const [sourceArticles, setSourceArticles] = useState<Record<string, Article[]>>({});
   const [savedCards, setSavedCards] = useState<AtomCard[]>([]);
   const [savedArticles, setSavedArticles] = useState<SavedArticle[]>([]);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -223,6 +256,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const restoredPendingUserRef = useRef<number | null>(null);
   const userRef = useRef<User | null>(null);
   const accountEpochRef = useRef(0);
+  const articleRetryTimerRef = useRef<number | null>(null);
+  const sourceRetryTimersRef = useRef<Map<string, number>>(new Map());
   const quickOpenMode = false;
 
   const updateCheckoutState = useCallback((nextState: CheckoutState) => {
@@ -268,6 +303,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setArticles([]);
     setIsArticlesLoading(false);
     setArticlesError(null);
+    setArticlesLoaded(false);
+    setSourceArticles({});
+    if (articleRetryTimerRef.current !== null) {
+      window.clearTimeout(articleRetryTimerRef.current);
+      articleRetryTimerRef.current = null;
+    }
+    sourceRetryTimersRef.current.forEach(timer => window.clearTimeout(timer));
+    sourceRetryTimersRef.current.clear();
     setSavedCards([]);
     setSavedArticles([]);
     setNotes([]);
@@ -315,10 +358,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
-  const reloadArticles = async () => {
+  const reloadArticles = async (retryAttempt = 0): Promise<void> => {
     const accountScope = captureAccountScope();
     setIsArticlesLoading(true);
     setArticlesError(null);
+    let retryScheduled = articleRetryTimerRef.current !== null;
     try {
       const articlesRes = await fetch('/api/articles');
       if (!articlesRes.ok) {
@@ -327,14 +371,77 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const payload = await articlesRes.json() as Article[];
       if (!isAccountScopeCurrent(accountScope)) return;
       setArticles(payload);
+      const retryPending = payload.length === 0
+        && articlesRes.headers.get('X-AtomFlow-RSS-Refreshing') === 'true';
+      if (retryPending && retryAttempt < RSS_REFRESH_RETRY_DELAYS_MS.length) {
+        retryScheduled = true;
+        if (articleRetryTimerRef.current === null) {
+          articleRetryTimerRef.current = window.setTimeout(() => {
+            articleRetryTimerRef.current = null;
+            void reloadArticles(retryAttempt + 1).catch(error => logger.error('Failed to retry article loading', { error }));
+          }, RSS_REFRESH_RETRY_DELAYS_MS[retryAttempt]);
+        }
+      } else {
+        retryScheduled = false;
+      }
     } catch (error) {
       if (!isAccountScopeCurrent(accountScope)) return;
       logger.error('Failed to reload articles', { error });
       setArticlesError(error instanceof Error ? error.message : '文章加载失败');
+      retryScheduled = false;
     } finally {
-      if (isAccountScopeCurrent(accountScope)) setIsArticlesLoading(false);
+      if (isAccountScopeCurrent(accountScope) && !retryScheduled) {
+        if (articleRetryTimerRef.current !== null) {
+          window.clearTimeout(articleRetryTimerRef.current);
+          articleRetryTimerRef.current = null;
+        }
+        setArticlesLoaded(true);
+        setIsArticlesLoading(false);
+      }
     }
   };
+
+  const loadSourceArticles = async (source: string, retryAttempt = 0): Promise<Article[]> => {
+    const response = await fetch(`/api/articles?source=${encodeURIComponent(source)}`, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`Failed to load source: ${response.status}`);
+    }
+    const nextArticles = await response.json() as Article[];
+    const existingTimer = sourceRetryTimersRef.current.get(source);
+    const refreshPending = response.headers.get('X-AtomFlow-RSS-Refreshing') === 'true';
+    if (nextArticles.length > 0) {
+      setSourceArticles(current => ({ ...current, [source]: nextArticles }));
+    }
+    if (refreshPending && retryAttempt < RSS_REFRESH_RETRY_DELAYS_MS.length && existingTimer === undefined) {
+      const timer = window.setTimeout(() => {
+        sourceRetryTimersRef.current.delete(source);
+        void loadSourceArticles(source, retryAttempt + 1).catch(error => logger.error('Failed to retry source loading', { error, source }));
+      }, RSS_REFRESH_RETRY_DELAYS_MS[retryAttempt]);
+      sourceRetryTimersRef.current.set(source, timer);
+    } else if (!refreshPending && existingTimer !== undefined) {
+      window.clearTimeout(existingTimer);
+      sourceRetryTimersRef.current.delete(source);
+    }
+
+    return nextArticles;
+  };
+
+  const updateSourceArticleCache = (articleId: number, patch: Partial<Article>) => {
+    setSourceArticles(current => Object.fromEntries(
+      Object.entries(current).map(([source, sourceItems]) => [
+        source,
+        sourceItems.map(item => item.id === articleId ? { ...item, ...patch } : item),
+      ]),
+    ));
+  };
+
+  useEffect(() => () => {
+    if (articleRetryTimerRef.current !== null) {
+      window.clearTimeout(articleRetryTimerRef.current);
+    }
+    sourceRetryTimersRef.current.forEach(timer => window.clearTimeout(timer));
+    sourceRetryTimersRef.current.clear();
+  }, []);
   
   const setReadingArticle = useCallback(async (article: Article | null) => {
     const requestId = ++readingRequestRef.current;
@@ -391,6 +498,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           const data = await res.json() as { article: Article };
           if (requestId !== readingRequestRef.current) return;
           setArticles(prev => prev.map(a => matchesArticleIdentity(a, article) ? data.article : a));
+          updateSourceArticleCache(article.id, data.article);
           setReadingArticleState(data.article);
           return;
         }
@@ -415,6 +523,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
                 const data = await retryRes.json() as { article: Article };
                 if (requestId !== readingRequestRef.current) return;
                 setArticles((prev: Article[]) => prev.map(a => matchesArticleIdentity(a, matched) ? data.article : a));
+                updateSourceArticleCache(matched.id, data.article);
                 setReadingArticleState(data.article);
               }
             }
@@ -1275,6 +1384,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           if (!isCurrentAccount()) return false;
           setArticles(prev => prev.map(a => matchesArticleIdentity(a, resolvedArticle) ? fullData.article : a));
           setReadingArticleState(current => matchesArticleIdentity(current, resolvedArticle) ? fullData.article : current);
+          updateSourceArticleCache(resolvedArticleId, fullData.article);
         }
       }
       setSaveProgress([articleId, resolvedArticleId], saveStages[1]);
@@ -1295,6 +1405,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         const saveData = await res.json().catch(() => null);
         if (!isCurrentAccount()) return false;
         const savedArticleFromResponse = saveData?.article as Article | undefined;
+        updateSourceArticleCache(resolvedArticleId, { ...savedArticleFromResponse, saved: true });
+        if (resolvedArticleId !== articleId) {
+          updateSourceArticleCache(articleId, { ...savedArticleFromResponse, saved: true });
+        }
         setSaveProgress([articleId, resolvedArticleId], saveStages[3]);
         // Refresh data to get the new cards and updated article state
         const [articlesRes, cardsRes, savedArticlesRes] = await Promise.all([
@@ -1462,6 +1576,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     bindBillingIntentToUser(userData.id);
     setBillingState({ phase: 'loading', status: null });
     const billingRequestId = ++billingStatusRequestRef.current;
+    setSourceArticles({});
     try {
       const [cardsRes, status] = await Promise.all([
         fetch('/api/cards'),
@@ -1562,12 +1677,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   return (
     <AppContext.Provider value={{
-      articles, isArticlesLoading, articlesError, savedCards, savedArticles, saveArticle, addCards, addCard, updateCard, deleteCard,
+      articles, isArticlesLoading, articlesError, articlesLoaded, sourceArticles, savedCards, savedArticles, saveArticle, addCards, addCard, updateCard, deleteCard,
       showToast, toastMsg, theme, toggleTheme,
       viewMode, setViewMode,
       readingArticle, setReadingArticle,
       activeSource, setActiveSource,
-      reloadArticles,
+      reloadArticles, loadSourceArticles,
       reloadNotes,
       isSavingArticle,
       getSavingStageText,

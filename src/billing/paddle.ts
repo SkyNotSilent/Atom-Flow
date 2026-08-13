@@ -96,14 +96,18 @@ const initializePaddleClient = async (onEvent?: (event: PaddleEvent) => void) =>
   try {
     const paddle = await loadPaddle();
     if (!initializedToken) {
-      const initialize = paddle.Initialize || paddle.Setup;
-      if (!initialize) throw new Error('Paddle.js 初始化接口不可用');
       paddle.Environment?.set(environment);
-      initialize({
+      const options = {
         token,
         eventCallback: dispatch,
         checkout: { settings: DEFAULT_CHECKOUT_SETTINGS },
-      });
+      };
+      // Paddle.js methods read internal state from their owning Paddle object.
+      // Calling a detached Initialize/Setup function loses that receiver and
+      // fails inside Paddle.js with "Cannot read ... _setup".
+      if (paddle.Initialize) paddle.Initialize(options);
+      else if (paddle.Setup) paddle.Setup(options);
+      else throw new Error('Paddle.js 初始化接口不可用');
       initializedToken = token;
       initializedEnvironment = environment;
     } else if (initializedToken !== token || initializedEnvironment !== environment) {

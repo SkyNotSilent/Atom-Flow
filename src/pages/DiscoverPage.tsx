@@ -100,20 +100,6 @@ export const DiscoverPage: React.FC = () => {
     setLoadingSources(prev => new Set(prev).add(source.name));
     
     try {
-      const response = await fetch('/api/sources/fetch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          source: source.name,
-          input: source.url,
-          color: source.color
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to add source');
-      }
-
       // 更新 localStorage
       const stored = localStorage.getItem('atomflow:source-layout:v1');
       const parsed = stored ? JSON.parse(stored) : { version: 2, entries: [] };
@@ -141,6 +127,7 @@ export const DiscoverPage: React.FC = () => {
       window.dispatchEvent(new Event('atomflow:source-layout-changed'));
       await reloadArticles();
       showToast(`已添加 ${source.name}`);
+      window.dispatchEvent(new Event('atomflow:preferences-loaded'));
     } catch (error) {
       logger.error('Failed to add source', { error, source: source.name });
       showToast('添加失败，请稍后重试');
