@@ -12,7 +12,7 @@ import {
 	  WriteAgentSkill
 	} from '../types';
 import { cn } from '../components/Nav';
-import { AlertCircle, Check, CheckCircle2, ChevronDown, Copy, Edit3, FileText, Image as ImageIcon, Loader2, MoreHorizontal, Palette, Plus, RotateCcw, Tag, ThumbsDown, ThumbsUp, Trash2, Volume2, Wand2, X, ZoomIn, ZoomOut } from 'lucide-react';
+import { AlertCircle, Check, CheckCircle2, ChevronDown, Copy, Edit3, FileText, Image as ImageIcon, Loader2, MoreHorizontal, Palette, PanelRightOpen, Plus, RotateCcw, Tag, ThumbsDown, ThumbsUp, Trash2, Volume2, Wand2, X, ZoomIn, ZoomOut } from 'lucide-react';
 import { NotesPanel } from '../components/NotesPanel';
 import { MagicWritingCanvas } from './MagicWritingCanvas';
 import { AtomFlowGalaxyIcon } from '../components/AtomFlowGalaxyIcon';
@@ -20,6 +20,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { prepareAgentDraftForNote } from '../utils/agentDraftExport';
 import { getWriteAgentRunPhase, parseWriteAgentSseChunk } from '../utils/writeAgentRun';
+import { FocusedWriteShell } from '../components/write-workspace/FocusedWriteShell';
+import { ArticleModeCitationReader } from '../components/write-workspace/ArticleModeCitationReader';
 
 type GraphArticle = {
   id: string;
@@ -64,6 +66,9 @@ type SimNode = {
 };
 
 type AssistantMessage = WriteAgentMessage;
+
+const createClientRequestId = () => globalThis.crypto?.randomUUID?.()
+  || `request-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
 
 type AssistantMeta = NonNullable<WriteAgentMessage['meta']> & {
   uiBlocks?: Array<Record<string, unknown>>;
@@ -142,6 +147,7 @@ const GRAPH_WIDTH = 920;
 const GRAPH_HEIGHT = 640;
 const NODE_ORBIT_RADIUS = 82;
 const GRAPH_MARGIN = NODE_ORBIT_RADIUS + 48;
+const USE_LEGACY_WRITE_WORKSPACE = import.meta.env.VITE_LEGACY_WRITE_WORKSPACE === 'true';
 const GRAPH_CARD_COLORS: Record<AtomCard['type'], { main: string; bg: string; darkBg: string }> = {
   '观点': { main: '#8C5EAE', bg: '#F6EEFF', darkBg: 'rgba(140, 94, 174, 0.18)' },
   '数据': { main: '#5B9B79', bg: '#EEF8F1', darkBg: 'rgba(91, 155, 121, 0.18)' },
@@ -672,10 +678,11 @@ const getErrorMessageFromResponse = async (response: Response, fallback: string)
   return fallback;
 };
 
-export const WritePage: React.FC = () => {
+const WritePageCore: React.FC = () => {
   const {
     showToast,
     user,
+    readingArticle,
     loginAndDo,
     savedCards,
     savedArticles,
@@ -705,7 +712,13 @@ export const WritePage: React.FC = () => {
     createWriteAgentSkill,
     updateWriteAgentSkill,
     deleteWriteAgentSkill
+	    , billingState
 	  } = useAppContext();
+
+  const canWrite = billingState.phase === 'ready' && billingState.status.access === 'full';
+
+  const legacyGraphActive = USE_LEGACY_WRITE_WORKSPACE && writeWorkspaceMode === 'graph';
+  const legacyAssistantActive = writeWorkspaceMode === 'articles' || legacyGraphActive;
 
   const [isRecalling, setIsRecalling] = useState(false);
   const [isGeneratingDraft, setIsGeneratingDraft] = useState(false);
@@ -737,6 +750,15 @@ export const WritePage: React.FC = () => {
       content: '我是 Skills 助手。你不用写 prompt，直接描述你想要的写作风格、引用习惯或表达边界；当我判断适合沉淀成风格 Skill 时，会在对话下方给你一个“创建风格 Skill”的确认。'
     }
   ]);
+
+  useEffect(() => {
+    if (canWrite) return;
+    assistantStreamAbortControllerRef.current?.abort();
+    assistantStreamAbortControllerRef.current = null;
+    setIsAssistantThinking(false);
+    setIsRecalling(false);
+    setIsGeneratingDraft(false);
+  }, [canWrite]);
   const [zoom, setZoom] = useState(1);
   const [graphPositions, setGraphPositions] = useState<Record<string, { x: number; y: number }>>({});
   const [draggedNodeId, setDraggedNodeId] = useState<string | null>(null);
@@ -744,6 +766,23 @@ export const WritePage: React.FC = () => {
   const [showBackgroundDrawer, setShowBackgroundDrawer] = useState(false);
   const [showChatHistory, setShowChatHistory] = useState(false);
   const [showSkillHistory, setShowSkillHistory] = useState(false);
+  const [articleContextTab, setArticleContextTab] = useState<'assistant' | 'original'>('assistant');
+  const [mobileContextOpen, setMobileContextOpen] = useState(false);
+  const createArticleRequestIdsRef = useRef(new Map<string, string>());
+  const assistantStreamAbortControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    const controller = assistantStreamAbortControllerRef.current;
+    assistantStreamAbortControllerRef.current = null;
+    controller?.abort();
+  }, []);
+
+  useEffect(() => {
+    if (writeWorkspaceMode === 'articles' && readingArticle) {
+      setArticleContextTab('original');
+      if (typeof window !== 'undefined' && window.innerWidth < 1280) setMobileContextOpen(true);
+    }
+  }, [readingArticle?.id, writeWorkspaceMode]);
 
   const applyThreadState = useCallback((state?: WriteAgentThreadState | null) => {
     if (!state) return;
@@ -816,7 +855,8 @@ export const WritePage: React.FC = () => {
   const visibleCards = savedCards;
   const selectedCards = useMemo(() => visibleCards.filter(card => selectedCardIds.includes(card.id)), [visibleCards, selectedCardIds]);
 
-  const articleGroups = useMemo(() => {
+  const articleGroups = useMemo<Array<{ id: string; articleTitle: string; articleId?: number; cards: AtomCard[] }>>(() => {
+    if (!legacyGraphActive) return [];
     const grouped = new Map<string, { articleTitle: string; articleId?: number; cards: AtomCard[] }>();
     visibleCards.forEach(card => {
       const key = getArticleNodeId(card);
@@ -832,9 +872,10 @@ export const WritePage: React.FC = () => {
       });
     });
     return Array.from(grouped.entries()).map(([id, group]) => ({ id, ...group }));
-  }, [visibleCards]);
+  }, [legacyGraphActive, visibleCards]);
 
-  const graph = useMemo(() => {
+  const graph = useMemo<{ articles: GraphArticle[]; cards: GraphCardNode[]; links: GraphLink[] }>(() => {
+    if (!legacyGraphActive) return { articles: [], cards: [], links: [] };
     const centerX = GRAPH_WIDTH / 2;
     const centerY = GRAPH_HEIGHT / 2;
     const visibleArticleGroups = articleGroups.filter(group => group.cards.length > 0);
@@ -953,9 +994,16 @@ export const WritePage: React.FC = () => {
     links.push(...selectSparseLinks(articleCandidates, 2));
 
     return { articles, cards, links };
-  }, [articleGroups, selectedCardIds, selectedCards, visibleCards, writeGraphView]);
+  }, [articleGroups, legacyGraphActive, selectedCardIds, selectedCards, visibleCards, writeGraphView]);
 
   useEffect(() => {
+    if (!legacyGraphActive) {
+      simulationNodesRef.current = [];
+      simulationHeatRef.current = 0;
+      lastStepAtRef.current = null;
+      setGraphPositions({});
+      return;
+    }
     const nextNodes: SimNode[] = [
       ...graph.articles.map(article => {
         const existing = simulationNodesRef.current.find(node => node.id === article.id);
@@ -994,9 +1042,17 @@ export const WritePage: React.FC = () => {
     simulationHeatRef.current = Math.max(simulationHeatRef.current, 0.55);
     lastStepAtRef.current = null;
     setGraphPositions(Object.fromEntries(nextNodes.map(node => [node.id, { x: node.x, y: node.y }])));
-  }, [graph]);
+  }, [graph, legacyGraphActive]);
 
   useEffect(() => {
+    if (!legacyGraphActive) {
+      if (simulationFrameRef.current !== null) {
+        window.cancelAnimationFrame(simulationFrameRef.current);
+        simulationFrameRef.current = null;
+      }
+      lastStepAtRef.current = null;
+      return;
+    }
     const step = (timestamp: number) => {
       const nodes = simulationNodesRef.current;
       if (!nodes.length) {
@@ -1130,10 +1186,11 @@ export const WritePage: React.FC = () => {
     lastStepAtRef.current = null;
     simulationFrameRef.current = window.requestAnimationFrame(step);
     return () => {
-      if (simulationFrameRef.current) window.cancelAnimationFrame(simulationFrameRef.current);
+      if (simulationFrameRef.current !== null) window.cancelAnimationFrame(simulationFrameRef.current);
+      simulationFrameRef.current = null;
       lastStepAtRef.current = null;
     };
-  }, [graph.links]);
+  }, [graph.links, legacyGraphActive]);
 
   useEffect(() => {
     setSelectedCardIds(prev => prev.filter(id => visibleCards.some(card => card.id === id)));
@@ -1235,6 +1292,7 @@ export const WritePage: React.FC = () => {
   };
   const activatedSourceArticles = useMemo<NoteSourceReference[]>(() => buildSourceArticles(activatedCards), [activatedCards, savedArticles]);
 	  useEffect(() => {
+	    if (!legacyAssistantActive) return;
 	    const ensureThread = async () => {
 	      const threads = await loadAssistantThreads('chat');
 	      if (!assistantThreadId && threads[0]?.id) {
@@ -1244,12 +1302,12 @@ export const WritePage: React.FC = () => {
 	      }
 	    };
 	    void ensureThread();
-	  }, [assistantThreadId, hydrateThreadMessages, loadAssistantThreads, setAssistantThreadId]);
+	  }, [assistantThreadId, hydrateThreadMessages, legacyAssistantActive, loadAssistantThreads, setAssistantThreadId]);
 
 	  useEffect(() => {
-	    if (!assistantThreadId) return;
+	    if (!legacyAssistantActive || !assistantThreadId) return;
 	    void hydrateThreadMessages(assistantThreadId);
-	  }, [assistantThreadId, hydrateThreadMessages]);
+	  }, [assistantThreadId, hydrateThreadMessages, legacyAssistantActive]);
 
   useEffect(() => {
     if (writeActivatedNodeIds.length === 0 && writeGraphView === 'activated') {
@@ -1266,6 +1324,10 @@ export const WritePage: React.FC = () => {
   };
 
   const handleRecall = async (promptOverride?: string): Promise<AtomCard[]> => {
+    if (!canWrite) {
+      showToast('当前为只读模式，不能召回新素材');
+      return [];
+    }
     const prompt = (promptOverride ?? writeFocusedTopic).trim();
     if (!prompt) return [];
 
@@ -1339,7 +1401,19 @@ export const WritePage: React.FC = () => {
     });
   };
 
-  const appendAssistantResult = async (data: any) => {
+  const appendAssistantResult = async (data: any, requestController: AbortController) => {
+    const assertCurrentRequest = () => {
+      requestController.signal.throwIfAborted();
+      if (assistantStreamAbortControllerRef.current !== requestController) {
+        throw new DOMException('The request was superseded', 'AbortError');
+      }
+    };
+
+    assertCurrentRequest();
+    if (data.note?.id) {
+      await reloadNotes();
+      assertCurrentRequest();
+    }
     if (data.threadId) {
       const nextThreadId = Number(data.threadId);
       setAssistantThreadId(nextThreadId);
@@ -1375,15 +1449,16 @@ export const WritePage: React.FC = () => {
     }
     if (data.note?.id) {
       window.localStorage.setItem('atomflow:open-note-id', String(data.note.id));
-      await reloadNotes();
       setWriteWorkspaceMode('articles');
       window.dispatchEvent(new Event('atomflow:open-note'));
       showToast(`已创建文章《${data.note.title || '未命名文章'}》`);
     }
+    assertCurrentRequest();
     void loadAssistantThreads('chat');
   };
 
-  const readAgentStream = async (response: Response) => {
+  const readAgentStream = async (response: Response, signal: AbortSignal) => {
+    signal.throwIfAborted();
     const reader = response.body?.getReader();
     if (!reader) throw new Error('浏览器不支持流式响应');
     const decoder = new TextDecoder();
@@ -1391,6 +1466,7 @@ export const WritePage: React.FC = () => {
     let finalPayload: any = null;
 
     const handleEvent = async (raw: string) => {
+      signal.throwIfAborted();
       const parsed = parseWriteAgentSseChunk(raw);
       if (!parsed) return;
       const { event, payload } = parsed;
@@ -1441,19 +1517,28 @@ export const WritePage: React.FC = () => {
       }
     };
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split('\n\n');
+    const handleBufferedEvents = async (includeTail = false) => {
+      const parts = buffer.split(/\r?\n\r?\n/);
       buffer = parts.pop() || '';
+      if (includeTail && buffer.trim()) {
+        parts.push(buffer);
+        buffer = '';
+      }
       for (const part of parts) {
         await handleEvent(part);
       }
+    };
+
+    while (true) {
+      signal.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal.throwIfAborted();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      await handleBufferedEvents();
     }
-    if (buffer.trim()) {
-      await handleEvent(buffer);
-    }
+    buffer += decoder.decode();
+    await handleBufferedEvents(true);
     if (!finalPayload) throw new Error('Agent 没有返回最终结果');
     return finalPayload;
   };
@@ -1465,6 +1550,7 @@ export const WritePage: React.FC = () => {
     cards?: AtomCard[];
     appendUserMessage?: boolean;
   }) => {
+    if (!canWrite) return showToast('当前为只读模式，不能调用写作助手');
     const prompt = input.message.trim();
     if (!prompt) return;
     if (!user) {
@@ -1473,6 +1559,10 @@ export const WritePage: React.FC = () => {
       });
       return;
     }
+
+    assistantStreamAbortControllerRef.current?.abort();
+    const requestController = new AbortController();
+    assistantStreamAbortControllerRef.current = requestController;
 
     const cardsToUse = input.cards || [];
     const activatedIds = cardsToUse.length > 0
@@ -1483,6 +1573,13 @@ export const WritePage: React.FC = () => {
     const activationSummary = cardsToUse.length > 0
       ? buildActivationSummary(cardsToUse)
       : writeActivationSummary;
+    const creationRequestKey = input.action === 'create_article'
+      ? `${assistantThreadId || 'new'}:${prompt}:${[...activatedIds].sort().join(',')}`
+      : null;
+    const requestId = creationRequestKey
+      ? createArticleRequestIdsRef.current.get(creationRequestKey) || createClientRequestId()
+      : undefined;
+    if (creationRequestKey && requestId) createArticleRequestIdsRef.current.set(creationRequestKey, requestId);
 
     if (input.appendUserMessage !== false) {
       setAssistantMessages(prev => [...prev, { id: `user-${Date.now()}`, role: 'user' as const, content: prompt }]);
@@ -1509,8 +1606,10 @@ export const WritePage: React.FC = () => {
 	          selectedStyleSkillId,
 	          selectedSkillIds,
 	          selectedCardIds: activatedIds.length > 0 ? activatedIds : undefined,
-	          action: input.action
-        })
+	          action: input.action,
+	          requestId,
+        }),
+        signal: requestController.signal,
       });
 
       if (!response.ok) {
@@ -1518,18 +1617,29 @@ export const WritePage: React.FC = () => {
           response,
           response.status === 401 ? '请先登录后再使用写作助手' : '助手暂时不可用，请稍后再试'
         );
+        requestController.signal.throwIfAborted();
+        if (assistantStreamAbortControllerRef.current !== requestController) {
+          throw new DOMException('The request was superseded', 'AbortError');
+        }
         showToast(errorMessage);
         return;
       }
 
-      const data = await readAgentStream(response);
-      await appendAssistantResult(data);
+      const data = await readAgentStream(response, requestController.signal);
+      requestController.signal.throwIfAborted();
+      await appendAssistantResult(data, requestController);
+      requestController.signal.throwIfAborted();
+      if (creationRequestKey && data.note?.id) createArticleRequestIdsRef.current.delete(creationRequestKey);
       setAgentRunState(null);
     } catch (error) {
+      if (requestController.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return;
       setAgentRunState(prev => prev ? { ...prev, status: 'error', collapsed: true, message: error instanceof Error ? error.message : '思考中断' } : prev);
       showToast(error instanceof Error && error.message ? error.message : '网络错误');
     } finally {
-      setIsAssistantThinking(false);
+      if (assistantStreamAbortControllerRef.current === requestController) {
+        assistantStreamAbortControllerRef.current = null;
+        setIsAssistantThinking(false);
+      }
     }
   };
 
@@ -1538,6 +1648,7 @@ export const WritePage: React.FC = () => {
   };
 
   const handleGenerateDraft = async (cardOverride?: AtomCard[]) => {
+    if (!canWrite) return showToast('当前为只读模式');
     if (!user) {
       loginAndDo(() => {
         void handleGenerateDraft();
@@ -2089,6 +2200,7 @@ export const WritePage: React.FC = () => {
     });
   };
   const saveSkillDraft = async () => {
+    if (!canWrite) return showToast('当前为只读模式');
     if (!skillDraft.name.trim() || !skillDraft.prompt.trim()) {
       showToast('先填写 Skill 名称和规则');
       return;
@@ -2110,6 +2222,7 @@ export const WritePage: React.FC = () => {
     }
   };
   const handleSkillsAssistantSend = async () => {
+    if (!canWrite) return showToast('当前为只读模式，不能生成 Skill');
     const text = skillsAssistantInput.trim();
     if (!text) return;
 
@@ -2308,7 +2421,10 @@ export const WritePage: React.FC = () => {
     const chatThreads = assistantThreads.filter(t => t.thread_type === 'chat');
 
     return (
-    <aside className="hidden min-h-0 w-[360px] shrink-0 overflow-hidden rounded-[28px] border border-border bg-surface xl:flex xl:flex-col">
+    <aside className={cn(
+      'atomflow-write-context fixed inset-y-0 right-0 z-[150] flex min-h-0 w-[min(100vw,420px)] shrink-0 flex-col overflow-hidden border-l border-border bg-surface shadow-2xl transition-transform xl:static xl:w-[var(--write-context-width,420px)] xl:translate-x-0 xl:shadow-none',
+      mobileContextOpen ? 'atomflow-write-context-mobile-open translate-x-0' : 'translate-x-full pointer-events-none xl:pointer-events-auto',
+    )}>
       <div className="border-b border-border px-5 py-4">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
@@ -2322,7 +2438,13 @@ export const WritePage: React.FC = () => {
 	          >
 	            <Plus size={14} />
 	          </button>
+	          <button type="button" onClick={() => setMobileContextOpen(false)} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-text3 hover:bg-surface2 xl:hidden" aria-label="关闭上下文栏"><X size={15} /></button>
 	        </div>
+
+        <div className="mt-3 grid grid-cols-2 rounded-xl bg-surface2 p-1">
+          <button type="button" onClick={() => setArticleContextTab('assistant')} className={cn('rounded-lg px-3 py-1.5 text-[11px]', articleContextTab === 'assistant' ? 'bg-surface font-medium text-accent shadow-sm' : 'text-text3')}>助手</button>
+          <button type="button" onClick={() => setArticleContextTab('original')} className={cn('rounded-lg px-3 py-1.5 text-[11px]', articleContextTab === 'original' ? 'bg-surface font-medium text-accent shadow-sm' : 'text-text3')}>原文</button>
+        </div>
 
         {/* Thread History Section */}
         <div className="mt-3">
@@ -2403,6 +2525,7 @@ export const WritePage: React.FC = () => {
       </div>
       <div className="border-t border-border p-4">
         <textarea
+          disabled={!canWrite}
           value={assistantInput}
           onChange={(event) => setAssistantInput(event.target.value)}
           onKeyDown={(event) => {
@@ -2416,26 +2539,41 @@ export const WritePage: React.FC = () => {
         />
         <button
           onClick={() => void handleAssistantSend()}
-          disabled={!assistantInput.trim() || isRecalling || isAssistantThinking}
+          disabled={!canWrite || !assistantInput.trim() || isRecalling || isAssistantThinking}
           className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-accent px-4 py-3 text-[13px] font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
         >
           <AtomFlowGalaxyIcon size={14} />
           {user ? '发送' : '登录后使用写作助手'}
         </button>
       </div>
+      {articleContextTab === 'original' ? (
+        <div className="absolute inset-0 z-20 flex min-h-0 flex-col bg-surface">
+          <div className="relative grid grid-cols-2 border-b border-border bg-surface2 p-2 pr-12">
+            <button type="button" onClick={() => setArticleContextTab('assistant')} className="rounded-lg px-3 py-2 text-[11px] text-text3 hover:text-accent">助手</button>
+            <button type="button" className="rounded-lg bg-surface px-3 py-2 text-[11px] font-medium text-accent shadow-sm">原文</button>
+            <button type="button" onClick={() => setMobileContextOpen(false)} className="absolute right-2 top-2 flex h-8 w-8 items-center justify-center rounded-lg text-text3 hover:bg-surface xl:hidden" aria-label="关闭原文栏"><X size={15} /></button>
+          </div>
+          <div className="min-h-0 flex-1">
+            <ArticleModeCitationReader active={writeWorkspaceMode === 'articles'} />
+          </div>
+        </div>
+      ) : null}
     </aside>
     );
   };
 
   const renderSkillsAssistantAside = () => (
-    <aside className="hidden min-h-0 w-[380px] shrink-0 overflow-hidden rounded-[28px] border border-border bg-surface xl:flex xl:flex-col">
+    <aside className={cn(
+      'atomflow-write-context fixed inset-y-0 right-0 z-[150] flex min-h-0 w-[min(100vw,420px)] shrink-0 flex-col overflow-hidden border-l border-border bg-surface shadow-2xl transition-transform xl:static xl:w-[var(--write-context-width,420px)] xl:translate-x-0 xl:shadow-none',
+      mobileContextOpen ? 'atomflow-write-context-mobile-open translate-x-0' : 'translate-x-full pointer-events-none xl:pointer-events-auto',
+    )}>
       <div className="border-b border-border px-5 py-4">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             <div className="text-[15px] font-semibold text-text-main">Skills 助手</div>
             <div className="mt-1 truncate text-[12px] text-text3">把你的写作偏好沉淀成风格 Skill</div>
           </div>
-          <AtomFlowGalaxyIcon size={18} />
+          <div className="flex items-center gap-2"><AtomFlowGalaxyIcon size={18} /><button type="button" onClick={() => setMobileContextOpen(false)} className="flex h-8 w-8 items-center justify-center rounded-lg text-text3 hover:bg-surface2 xl:hidden" aria-label="关闭 Skills 助手"><X size={15} /></button></div>
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
@@ -2484,6 +2622,7 @@ export const WritePage: React.FC = () => {
       </div>
       <div className="border-t border-border p-4">
         <textarea
+          disabled={!canWrite}
           value={skillsAssistantInput}
           onChange={event => setSkillsAssistantInput(event.target.value)}
           onKeyDown={event => {
@@ -2497,7 +2636,7 @@ export const WritePage: React.FC = () => {
         />
         <button
           onClick={() => void handleSkillsAssistantSend()}
-          disabled={!skillsAssistantInput.trim()}
+          disabled={!canWrite || !skillsAssistantInput.trim()}
           className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-accent px-4 py-3 text-[13px] font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
         >
           <AtomFlowGalaxyIcon size={14} />
@@ -2508,8 +2647,8 @@ export const WritePage: React.FC = () => {
   );
 
   const renderSkillsWorkspace = () => (
-    <div className="flex h-full min-h-0 gap-4 bg-bg">
-      <div id="page-write" className="flex h-full min-h-0 flex-1 flex-col overflow-hidden rounded-[28px] border border-border bg-surface">
+    <div className="relative flex h-full min-h-0 bg-bg">
+      <div id="page-write" className="flex h-full min-h-0 flex-1 flex-col overflow-hidden border-r border-border bg-surface">
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           <div className="space-y-5">
             <section className="rounded-2xl border border-border bg-bg px-4 py-3">
@@ -2836,26 +2975,41 @@ export const WritePage: React.FC = () => {
           </div>
         </div>
       </div>
+      {mobileContextOpen ? <button type="button" aria-label="关闭 Skills 助手" onClick={() => setMobileContextOpen(false)} className="fixed inset-0 z-[140] bg-black/30 xl:hidden" /> : null}
+      <button type="button" onClick={() => setMobileContextOpen(true)} className="absolute bottom-4 right-4 z-[80] flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-[11px] font-medium text-accent shadow-lg xl:hidden"><PanelRightOpen size={15} />Skills 助手</button>
       {renderSkillsAssistantAside()}
     </div>
   );
 
-	  if (writeWorkspaceMode === 'articles') {
-	    return (
-      <div className="flex h-full min-h-0 gap-4 bg-bg">
-        <div id="page-write" className="flex h-full min-h-0 flex-1 flex-col overflow-hidden rounded-[28px] border border-border bg-surface">
+  const articlesWorkspace = (
+      <div className="relative flex h-full min-h-0 bg-bg">
+        <div id="page-write" className="flex h-full min-h-0 flex-1 flex-col overflow-hidden border-r border-border bg-surface">
           <NotesPanel />
         </div>
+        {mobileContextOpen ? <button type="button" aria-label="关闭文章上下文" onClick={() => setMobileContextOpen(false)} className="fixed inset-0 z-[140] bg-black/30 xl:hidden" /> : null}
+        <button type="button" onClick={() => setMobileContextOpen(true)} className="absolute bottom-4 right-4 z-[80] flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-[11px] font-medium text-accent shadow-lg xl:hidden"><PanelRightOpen size={15} />助手 / 原文</button>
         {renderAssistantAside()}
       </div>
-	    );
-	  }
+  );
 
-  if (writeWorkspaceMode === 'skills') {
-    return renderSkillsWorkspace();
+  if (!USE_LEGACY_WRITE_WORKSPACE) {
+    return (
+      <>
+        <div className={cn('h-full min-h-0', writeWorkspaceMode === 'articles' ? 'block' : 'hidden')} aria-hidden={writeWorkspaceMode !== 'articles'}>
+          {articlesWorkspace}
+        </div>
+        <div className={cn('h-full min-h-0', writeWorkspaceMode === 'skills' ? 'block' : 'hidden')} aria-hidden={writeWorkspaceMode !== 'skills'}>
+          {renderSkillsWorkspace()}
+        </div>
+      </>
+    );
   }
 
-  if (import.meta.env.VITE_LEGACY_WRITE_WORKSPACE === 'true') {
+  if (writeWorkspaceMode === 'articles') return articlesWorkspace;
+
+  if (writeWorkspaceMode === 'skills') return renderSkillsWorkspace();
+
+	  if (USE_LEGACY_WRITE_WORKSPACE) {
 	  return (
     <div className="flex h-full min-h-0 gap-4 bg-bg">
       <div id="page-write" className="flex h-full min-h-0 flex-1 flex-col overflow-hidden rounded-[30px] border border-[#E7DAC0] bg-[#FBF7EF] shadow-[0_20px_48px_rgba(150,120,78,0.1)]">
@@ -3346,5 +3500,33 @@ export const WritePage: React.FC = () => {
   );
   }
 
-  return <MagicWritingCanvas />;
+	  return null;
+};
+
+export const WritePage: React.FC<{ onExit?: () => void }> = ({ onExit }) => {
+  const { user, writeWorkspaceMode } = useAppContext();
+  const ownerKey = user?.id ?? 'guest';
+
+  return (
+    <FocusedWriteShell key={`write-shell-${ownerKey}`} onExit={onExit}>
+      <div
+        className={cn(
+          'h-full min-h-0',
+          writeWorkspaceMode === 'graph' && !USE_LEGACY_WRITE_WORKSPACE ? 'block' : 'hidden',
+        )}
+        aria-hidden={writeWorkspaceMode !== 'graph' || USE_LEGACY_WRITE_WORKSPACE}
+      >
+        <MagicWritingCanvas key={`canvas-${ownerKey}`} />
+      </div>
+      <div
+        className={cn(
+          'h-full min-h-0',
+          writeWorkspaceMode === 'graph' && !USE_LEGACY_WRITE_WORKSPACE ? 'hidden' : 'block',
+        )}
+        aria-hidden={writeWorkspaceMode === 'graph' && !USE_LEGACY_WRITE_WORKSPACE}
+      >
+        <WritePageCore key={`write-core-${ownerKey}`} />
+      </div>
+    </FocusedWriteShell>
+  );
 };

@@ -11,7 +11,7 @@ assert.equal(isFullWidthAppTab("feed"), false);
 assert.equal(isFullWidthAppTab("discover"), false);
 assert.equal(isFullWidthAppTab("knowledge"), false);
 assert.equal(isFullWidthAppTab("write"), true);
-assert.equal(isFullWidthAppTab("podcast"), true);
+assert.equal(isFullWidthAppTab("podcast"), false);
 
 assert.equal(requiresAuthenticatedAppTab("feed"), false);
 assert.equal(requiresAuthenticatedAppTab("discover"), false);
@@ -47,7 +47,11 @@ assert.match(
   /const PodcastPage = React\.lazy\(\(\) => import\(["']\.\/pages\/PodcastPage["']\)/,
   "PodcastPage must remain code-split",
 );
-assert.match(appSource, /const \[activeTab, setActiveTab\] = useState<AppTab>\(["']feed["']\);/);
+assert.match(
+  appSource,
+  /const \[activeTab, setActiveTab\] = useState<AppTab>\(\(\) => \{[\s\S]*?URLSearchParams\(window\.location\.search\)[\s\S]*?=== ["']write["'] \? ["']write["'] : ["']feed["'];[\s\S]*?\}\);/,
+  "the approved Paddle payment-link return may open only the whitelisted write view",
+);
 assert.match(appSource, /const isPodcastTab = activeTab === ["']podcast["'];/);
 assert.match(appSource, /const isFullWidthTab = isFullWidthAppTab\(activeTab\);/);
 
@@ -57,8 +61,8 @@ assert.ok(podcastRouteStart >= 0 && discoverRouteStart > podcastRouteStart, "pod
 const podcastRoute = appSource.slice(podcastRouteStart, discoverRouteStart);
 assert.match(podcastRoute, /<React\.Suspense/);
 assert.match(podcastRoute, /<PodcastPage/);
-assert.match(podcastRoute, /onBack=\{\(\) => setActiveTab\(["']feed["']\)\}/);
-assert.match(podcastRoute, /onDiscover=\{\(\) => setActiveTab\(["']discover["']\)\}/);
+assert.match(podcastRoute, /onBack=\{\(\) => \{\s*setReadingArticle\(null\);\s*setActiveTab\(["']feed["']\);\s*\}\}/);
+assert.match(podcastRoute, /onDiscover=\{\(\) => \{\s*setReadingArticle\(null\);\s*setActiveTab\(["']discover["']\);\s*\}\}/);
 assert.doesNotMatch(podcastRoute, /\bp-4\b/, "PodcastPage owns its edge-to-edge spacing");
 
 assert.match(
@@ -77,15 +81,30 @@ assert.match(
   "document cursor must also respect full-width workspaces",
 );
 assert.match(appSource, /\$\{isMobile \? ["']flex-1["'] : isFullWidthTab \? ["']flex-1["'] : ["']shrink-0 border-r border-border["']\}/);
-assert.match(appSource, /\$\{isMobile && !isFullWidthTab && readingArticle \? ["']hidden["'] : ["']["']\}/);
+assert.match(appSource, /\$\{isMobile && !isFullWidthTab && readingArticle && !isPodcastTab \? ["']hidden["'] : ["']["']\}/);
 assert.match(appSource, /style=\{\{ width: isMobile \? ["']100%["'] : isFullWidthTab \? undefined : centerWidth \}\}/);
-assert.match(appSource, /\{isMobile && !isPodcastTab && \(/);
+assert.match(appSource, /\{isMobile && !isPodcastTab && (?:!isWriteTab && )?\(/);
 assert.match(appSource, /\{!isFullWidthTab && \(\s*<div[\s\S]*?<ReaderPane/);
+assert.match(
+  appSource,
+  /\$\{isMobile && \(!readingArticle \|\| isPodcastTab\) \? ["']hidden["'] : ["']["']\}/,
+  "mobile podcast keeps the player visible instead of immediately replacing it with ReaderPane",
+);
+assert.match(
+  appSource,
+  /if \(isMobile && isPodcastTab && tab !== ["']podcast["']\) \{\s*setReadingArticle\(null\);\s*\}/,
+  "leaving podcast on mobile must clear its synchronized ReaderPane article",
+);
 
 const writingIndex = navSource.indexOf("魔法写作");
 const podcastIndex = navSource.indexOf("播客解读");
 assert.ok(writingIndex >= 0 && podcastIndex > writingIndex, "播客解读 must follow 魔法写作");
 assert.match(navSource, /Headphones size=\{14\}/);
+assert.match(
+  navSource,
+  /aria-label=\{theme === ['"]dark['"] \? ['"]切换至浅色主题['"] : ['"]切换至深色主题['"]\}/,
+  "the theme switch must expose its destination to assistive technology",
+);
 assert.match(
   navSource,
   /<TabButton active=\{activeTab === ["']podcast["']\} onClick=\{\(\) => handleTabClick\(["']podcast["']\)\} fullWidth>/,
@@ -94,10 +113,10 @@ assert.match(
 assert.match(navSource, /const handleTabClick = \(tab: AppTab\) => \{/);
 assert.match(
   navSource,
-  /if \(requiresAuthenticatedAppTab\(tab\) && !user\) \{\s*loginAndDo\(\(\) => setActiveTab\(tab\)\);\s*return;/,
+  /if \(requiresAuthenticatedAppTab\(tab\) && !user\) \{[\s\S]*?if \(tab === ['"]write['"]\) \{[\s\S]*?requestBillingIntent\(\{ kind: ['"]open_write['"] \}\);[\s\S]*?return;[\s\S]*?\}[\s\S]*?loginAndDo\(\(\) => setActiveTab\(tab\)\);[\s\S]*?return;/,
 );
 assert.doesNotMatch(navSource, /tab === ["']knowledge["'] \|\| tab === ["']write["']/);
-assert.doesNotMatch(navSource, /activeTab === ["']podcast["'] && \(/, "podcast filters stay inside PodcastPage");
+assert.doesNotMatch(navSource, /activeTab === ["']podcast["'] && \(/, "podcast-specific controls stay inside PodcastPage");
 assert.match(packageSource, /tests\/podcast-navigation\.test\.ts/);
 
-console.log("PASS: podcast is an authenticated full-width app workspace");
+console.log("PASS: podcast is an authenticated three-column app view");

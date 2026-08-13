@@ -1,5 +1,5 @@
 import type React from "react";
-import { BookOpen, Database, FileAudio, PanelRightOpen } from "lucide-react";
+import { BookOpen, Database, FileAudio, PanelsTopLeft } from "lucide-react";
 import type { PodcastPreviewItem } from "./podcastPreview";
 
 interface PodcastInsightPanelProps {
@@ -9,7 +9,7 @@ interface PodcastInsightPanelProps {
   thoughtAction: React.ReactNode;
   onSave: () => void;
   onGenerate: () => void;
-  onOpenContext: () => void;
+  onAddToCanvas?: (item: PodcastPreviewItem) => void;
 }
 
 export function PodcastInsightPanel({
@@ -19,7 +19,7 @@ export function PodcastInsightPanel({
   thoughtAction,
   onSave,
   onGenerate,
-  onOpenContext,
+  onAddToCanvas,
 }: PodcastInsightPanelProps) {
   return (
     <section className="podcast-insight-panel" aria-labelledby={`podcast-insight-${item.id}`}>
@@ -60,11 +60,13 @@ export function PodcastInsightPanel({
             生成解读
           </button>
         )}
+        {onAddToCanvas && (
+          <button type="button" onClick={() => onAddToCanvas(item)}>
+            <PanelsTopLeft aria-hidden="true" size={16} />
+            添加到画布
+          </button>
+        )}
         {thoughtAction}
-        <button type="button" onClick={onOpenContext}>
-          <PanelRightOpen aria-hidden="true" size={16} />
-          查看上下文
-        </button>
       </div>
     </section>
   );

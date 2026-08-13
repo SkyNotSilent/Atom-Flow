@@ -8,6 +8,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
 import sharp from "sharp";
 import { createServer } from "vite";
+import type { PodcastPreviewItem } from "../src/components/podcast/podcastPreview";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(testDir, "..");
@@ -64,6 +65,25 @@ assert.equal(coverMetadata.width! * 5, coverMetadata.height! * 4);
 assert.ok(coverMetadata.width! >= 800, "fallback cover must remain high-resolution");
 
 const waveformPath = assetPath("waveform-mask.png");
+const podcastCss = readFileSync(
+  path.join(root, "src/components/podcast/podcast.css"),
+  "utf8",
+);
+assert.match(
+  podcastCss,
+  /\.podcast-stage\s*\{[\s\S]*?min-height:\s*540px;/,
+  "desktop stage must keep the player controls inside the first 900px viewport",
+);
+assert.match(
+  podcastCss,
+  /@media \(max-width: 640px\)[\s\S]*?\.podcast-stage\s*\{[\s\S]*?min-height:\s*560px;/,
+  "mobile stage must preserve the reference composition without pushing controls too far below the fold",
+);
+assert.match(
+  podcastCss,
+  /\.podcast-stage \.podcast-stage-title\s*\{[\s\S]*?font-size:\s*clamp\(24px, 2\.4vw, 34px\);/,
+  "desktop titles must fit the immersive stage without orphaning one character",
+);
 const waveformMetadata = await sharp(waveformPath).metadata();
 assert.equal(waveformMetadata.width, 1776);
 assert.equal(waveformMetadata.height, 222);
@@ -194,7 +214,7 @@ try {
   assert.match(customCoverHtml, /src="\/assets\/podcast\/vinyl-record\.png"/);
   assert.match(customCoverHtml, /podcast-vinyl--playing/);
   assert.match(customCoverHtml, /alt="" aria-hidden="true"/);
-  assert.match(customCoverHtml, /src="https:\/\/images\.example\.com\/episode-cover\.jpg"/);
+  assert.match(customCoverHtml, /src="\/api\/image-proxy\?url=https%3A%2F%2Fimages\.example\.com%2Fepisode-cover\.jpg"/);
   assert.match(customCoverHtml, /alt="真实播客 封面"/);
 
   const fallbackCoverHtml = renderToStaticMarkup(React.createElement(PodcastCover, {
@@ -213,7 +233,6 @@ try {
     controls: React.createElement("span", { "data-controls-slot": "true" }, "播放器控件"),
     onPrevious: noop,
     onNext: noop,
-    onOpenContext: noop,
   }));
   assert.match(stageHtml, /aria-live="polite">真实播客，第 2 条，共 4 条/);
   const visibleStageHtml = stageHtml.slice(stageHtml.indexOf("<section"));
@@ -233,7 +252,7 @@ try {
     priorMarkerIndex = markerIndex;
   }
   assert.match(stageHtml, /aria-label="下一条"/);
-  assert.match(stageHtml, /aria-label="查看真实播客的内容上下文"/);
+  assert.doesNotMatch(stageHtml, /内容上下文/);
   const pendingStageHtml = renderToStaticMarkup(React.createElement(PodcastStage, {
     item: pendingItem,
     index: 0,
@@ -242,7 +261,6 @@ try {
     controls: null,
     onPrevious: noop,
     onNext: noop,
-    onOpenContext: noop,
   }));
   assert.match(pendingStageHtml, /文章待解读/);
   assert.doesNotMatch(pendingStageHtml, /AI 解读/);
@@ -259,7 +277,6 @@ try {
     thoughtAction,
     onSave: noop,
     onGenerate: noop,
-    onOpenContext: noop,
   };
   const insightHtml = renderToStaticMarkup(React.createElement(PodcastInsightPanel, insightProps));
   assert.match(insightHtml, /基于 RSS 摘要/);
@@ -269,6 +286,14 @@ try {
   assert.match(insightHtml, />存入知识库</);
   assert.doesNotMatch(insightHtml, />生成解读</);
   assertSafeExternalLink(insightHtml, "打开产品沉思录的《真实播客》原文");
+  assert.doesNotMatch(insightHtml, /查看上下文/);
+  assert.doesNotMatch(insightHtml, /添加到画布/);
+
+  const canvasInsightHtml = renderToStaticMarkup(React.createElement(PodcastInsightPanel, {
+    ...insightProps,
+    onAddToCanvas: (_item: PodcastPreviewItem) => undefined,
+  }));
+  assert.match(canvasInsightHtml, /添加到画布/);
 
   const savingInsightHtml = renderToStaticMarkup(React.createElement(PodcastInsightPanel, {
     ...insightProps,
@@ -312,6 +337,11 @@ try {
   assert.match(sidebarHtml, /这是 RSS 摘要。/);
   assert.match(sidebarHtml, /基于 RSS 摘要/);
   assert.match(sidebarHtml, /尚无 AI 章节与逐字稿/);
+  assert.doesNotMatch(
+    sidebarHtml,
+    /关闭内容上下文/,
+    "the persistent desktop context panel must not expose a no-op close control",
+  );
   const hiddenSidebarHtml = renderToStaticMarkup(React.createElement(PodcastContextPanel, {
     item,
     variant: "sidebar",
@@ -327,6 +357,7 @@ try {
   }));
   assert.match(dialogHtml, /^<dialog/);
   assert.match(dialogHtml, /aria-labelledby=/);
+  assert.match(dialogHtml, /关闭内容上下文/);
 
   const dom = new JSDOM(
     "<!doctype html><html><body><button id=\"context-invoker\">打开上下文</button><div id=\"podcast-root\"></div></body></html>",
@@ -540,13 +571,15 @@ try {
   assert.match(compactControlsHtml, /真实播客/);
   assert.match(compactControlsHtml, /产品沉思录/);
   assert.match(compactControlsHtml, /aria-label="暂停真实播客"/);
-  assert.doesNotMatch(compactControlsHtml, /type="range"|快退 15 秒|快进 15 秒|播放速度/);
+  assert.match(compactControlsHtml, /type="range"/);
+  assert.match(compactControlsHtml, /快退 15 秒|快进 15 秒|播放速度/);
   const compactErrorHtml = renderControls({
     compact: true,
     status: "error",
     error: "迷你播放器失败",
   });
-  assert.match(compactErrorHtml, /role="alert">迷你播放器失败/);
+  assert.match(compactErrorHtml, /role="alert"[\s\S]*?迷你播放器失败/);
+  assert.match(compactErrorHtml, />重试播放</);
 
   const allControlsHtml = [
     pendingControlsHtml,
@@ -586,8 +619,8 @@ try {
   assert.match(contextSource, /event\.preventDefault\(\)/);
   assert.doesNotMatch(contextSource, /<dialog[\s\S]*?onClose=\{onClose\}/);
 
-  assert.match(css, /width: min\(52vw, 390px\)/);
-  assert.match(css, /width: min\(72vw, 280px\)/);
+  assert.match(css, /width: min\(48vw, 260px\)/);
+  assert.match(css, /width: min\(72vw, 240px\)/);
   assert.match(css, /animation: podcast-vinyl-spin 18s linear infinite/);
   assert.match(css, /prefers-reduced-motion/);
   assert.match(css, /waveform-mask\.png/);
@@ -597,6 +630,7 @@ try {
   assert.match(css, /\.podcast-control-link:focus-visible/);
   assert.match(css, /\.podcast-controls button:focus-visible/);
   assert.match(css, /\.podcast-rail-navigation\s*\{[\s\S]*?width: 44px/);
+  assert.match(css, /\.podcast-card\s*\{[\s\S]*?min-height: 68px/);
   assert.match(
     css,
     /\.podcast-control-primary,\s*\.podcast-control-round,\s*\.podcast-rate-button\s*\{[^}]*border: 1px solid var\(--theme-border\);[^}]*background: var\(--theme-surface\);[^}]*color: var\(--theme-text-main\);/,

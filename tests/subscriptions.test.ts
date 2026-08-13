@@ -14,6 +14,8 @@ import { lookup } from 'node:dns/promises';
 const BASE = process.env.API_BASE ?? 'http://localhost:1000';
 const EMAIL = process.env.TEST_EMAIL?.trim();
 const PASSWORD = process.env.TEST_PASSWORD;
+const ALLOW_DEV_PROXY_FAKE_IP = process.env.NODE_ENV !== 'production'
+  && process.env.ALLOW_DEV_PROXY_FAKE_IP === 'true';
 if (!EMAIL || !PASSWORD) throw new Error('Set TEST_EMAIL and TEST_PASSWORD before running subscription integration tests');
 
 // A real public RSS feed for testing (no RSSHub required)
@@ -86,7 +88,7 @@ async function testAddCustomSubscription() {
   if (r.status === 502) {
     const hostname = new URL(TEST_RSS_URL).hostname;
     const addresses = await lookup(hostname, { all: true, verbatim: true });
-    if (addresses.length > 0 && addresses.every(({ address }) => /^198\.(18|19)\./.test(address))) {
+    if (!ALLOW_DEV_PROXY_FAKE_IP && addresses.length > 0 && addresses.every(({ address }) => /^198\.(18|19)\./.test(address))) {
       remoteFetchSkipReason = '本机网络把公网 DNS 映射到 198.18.0.0/15，安全 SSRF 规则按预期拒绝了测试源';
       throw new SkippedTest(remoteFetchSkipReason);
     }

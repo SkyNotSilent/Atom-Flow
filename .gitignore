@@ -18,6 +18,7 @@ docs/superpowers/
 docs/write-agent-skills-redesign.md
 docs/README_INTERNAL.md
 output/
+artifacts/
 IMPLEMENTATION_SUMMARY.md
 TEST_REPORT.md
 TEST_SKILL_GENERATION.md

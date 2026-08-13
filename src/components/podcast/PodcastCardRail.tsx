@@ -1,5 +1,6 @@
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import type { PodcastPreviewItem } from "./podcastPreview";
+import { getProxiedImageUrl } from "../../utils/proxiedMedia";
 
 interface PodcastCardRailProps {
   items: PodcastPreviewItem[];
@@ -41,7 +42,7 @@ export function PodcastCardRail({
               onClick={() => onSelect(item.id)}
             >
               <img
-                src={item.imageUrl || "/assets/podcast/editorial-fallback-cover.png"}
+                src={getProxiedImageUrl(item.imageUrl) || "/assets/podcast/editorial-fallback-cover.png"}
                 alt=""
                 aria-hidden="true"
               />

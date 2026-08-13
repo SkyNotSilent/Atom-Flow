@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, type ReactNode, type SyntheticEvent } from "react";
+import { useEffect, useId, useRef, type SyntheticEvent } from "react";
 import { X } from "lucide-react";
 import type { PodcastPreviewItem } from "./podcastPreview";
 
@@ -12,10 +12,10 @@ interface PodcastContextPanelProps {
 interface ContextContentProps {
   item: PodcastPreviewItem;
   headingId: string;
-  onClose: () => void;
+  closeAction?: () => void;
 }
 
-function ContextContent({ item, headingId, onClose }: ContextContentProps) {
+function ContextContent({ item, headingId, closeAction }: ContextContentProps) {
   return (
     <>
       <header className="podcast-context-header">
@@ -23,9 +23,11 @@ function ContextContent({ item, headingId, onClose }: ContextContentProps) {
           <p className="podcast-panel-kicker">内容上下文</p>
           <h2 id={headingId}>{item.title}</h2>
         </div>
-        <button type="button" onClick={onClose} aria-label="关闭内容上下文">
-          <X aria-hidden="true" size={18} />
-        </button>
+        {closeAction && (
+          <button type="button" onClick={closeAction} aria-label="关闭内容上下文">
+            <X aria-hidden="true" size={18} />
+          </button>
+        )}
       </header>
       <dl className="podcast-context-facts">
         <div><dt>来源</dt><dd>{item.source}</dd></div>
@@ -56,14 +58,10 @@ export function PodcastContextPanel({ item, variant, open, onClose }: PodcastCon
     if (!open && dialog.open) dialog.close();
   }, [open, variant]);
 
-  const content: ReactNode = (
-    <ContextContent item={item} headingId={headingId} onClose={onClose} />
-  );
-
   if (variant === "sidebar") {
     return (
       <aside className="podcast-context-panel" aria-labelledby={headingId} hidden={!open}>
-        {content}
+        <ContextContent item={item} headingId={headingId} />
       </aside>
     );
   }
@@ -80,7 +78,7 @@ export function PodcastContextPanel({ item, variant, open, onClose }: PodcastCon
       aria-labelledby={headingId}
       onCancel={handleCancel}
     >
-      {content}
+      <ContextContent item={item} headingId={headingId} closeAction={onClose} />
     </dialog>
   );
 }

@@ -8,6 +8,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
 import { createServer } from "vite";
 import type { PodcastPreviewItem } from "../src/components/podcast/podcastPreview";
+import type { PodcastPlaybackContextValue } from "../src/components/podcast/PodcastPlaybackProvider";
+import type { Article } from "../src/types";
 import {
   createPodcastPlaybackState,
   type PodcastPlaybackAction,
@@ -71,9 +73,26 @@ const createTouchPointerEvent = (
 
 try {
   const pageModule = await vite.ssrLoadModule("/src/pages/PodcastPage.tsx") as Record<string, unknown>;
+  const providerModule = await vite.ssrLoadModule(
+    "/src/components/podcast/PodcastPlaybackProvider.tsx",
+  ) as Record<string, unknown>;
   const PodcastPageContent = pageModule.PodcastPageContent as React.ComponentType<Record<string, unknown>>;
-  const PodcastAudioElement = pageModule.PodcastAudioElement as React.ElementType | undefined;
+  const resolvePodcastSourceArticle = pageModule.resolvePodcastSourceArticle as (
+    item: PodcastPreviewItem | undefined,
+    articles: Array<Record<string, unknown>>,
+    savedArticles: Array<Record<string, unknown>>,
+  ) => Record<string, unknown> | null;
+  const PodcastAudioElement = providerModule.PodcastAudioElement as React.ElementType | undefined;
+  const PodcastPlaybackProvider = providerModule.PodcastPlaybackProvider as React.ElementType | undefined;
+  const PodcastArticleAudioControls = providerModule.PodcastArticleAudioControls as React.ElementType | undefined;
+  const usePodcastPlayback = providerModule.usePodcastPlayback as (() => PodcastPlaybackContextValue) | undefined;
+  const usePodcastFullPlayerPresence = providerModule.usePodcastFullPlayerPresence as (() => void) | undefined;
   assert.ok(PodcastAudioElement, "PodcastPage must export its source-scoped audio controller");
+  assert.ok(PodcastPlaybackProvider, "podcast playback must expose a root-mountable provider");
+  assert.ok(PodcastArticleAudioControls, "Reader audio controls must use the root playback provider");
+  assert.ok(usePodcastPlayback);
+  assert.ok(usePodcastFullPlayerPresence);
+  assert.ok(resolvePodcastSourceArticle, "PodcastPage must expose source-article resolution for ReaderPane sync");
 
   const items: PodcastPreviewItem[] = [
     {
@@ -140,17 +159,28 @@ try {
     onBack: () => undefined,
     onDiscover: () => undefined,
     renderThoughtAction: () => React.createElement("button", { type: "button" }, "说下我的想法"),
-    audioElement: React.createElement("audio", { hidden: true, preload: "metadata" }),
+  };
+  const readerAudioArticle: Article = {
+    id: 11,
+    saved: false,
+    source: "产品沉思录",
+    topic: "产品",
+    time: "今天 09:30",
+    title: "真实播客",
+    excerpt: "这是 RSS 摘要。",
+    content: "正文",
+    url: "https://example.com/podcast",
+    audioUrl: "https://cdn.example.com/episode.mp3",
+    audioDuration: "25:12",
+    fullFetched: true,
+    cards: [],
   };
   const pageHtml = renderToStaticMarkup(React.createElement(PodcastPageContent, pageProps));
 
-  assert.equal((pageHtml.match(/<audio/g) || []).length, 1);
-  assert.match(pageHtml, /preload="metadata"/);
+  assert.equal((pageHtml.match(/<audio/g) || []).length, 0, "the page must not own the global audio node");
   assert.match(pageHtml, /播客解读/);
-  assert.match(pageHtml, /为你生成/);
-  assert.match(pageHtml, /短知识卡/);
-  assert.match(pageHtml, /主题速听/);
-  assert.match(pageHtml, /深度播客/);
+  assert.doesNotMatch(pageHtml, /为你生成|短知识卡|主题速听|深度播客/);
+  assert.doesNotMatch(pageHtml, /浏览：待解读文章|内容上下文|查看上下文/);
   assert.match(pageHtml, /连续播放/);
   assert.match(pageHtml, /aria-pressed="false"[^>]*>连续播放|aria-pressed="false"[^>]*>[^<]*<[^>]+>[^<]*连续播放/);
   assert.equal(
@@ -162,6 +192,87 @@ try {
   assert.match(pageHtml, /基于 RSS 摘要/);
   assert.match(pageHtml, /说下我的想法/);
   assert.doesNotMatch(pageHtml, /AI 已生成|完整逐字稿/);
+
+  const sourceArticle = {
+    id: 11,
+    title: "真实播客",
+    url: "https://example.com/podcast",
+  };
+  assert.equal(resolvePodcastSourceArticle(items[0], [sourceArticle], []), sourceArticle);
+  const sameNumericIdArticle = {
+    id: 11,
+    title: "另一个来源的同 ID 文章",
+    url: "https://example.com/other",
+  };
+  assert.equal(
+    resolvePodcastSourceArticle(items[0], [sameNumericIdArticle, sourceArticle], []),
+    sourceArticle,
+    "ReaderPane sync must prefer the source URL when article ids collide",
+  );
+  const urlLessPodcastItem = {
+    ...items[1],
+    id: "article:22:url-less",
+    articleId: 22,
+    sourceUrl: undefined,
+    source: "正确来源",
+    title: "无链接文章",
+  };
+  const wrongUrlLessArticle = { id: 22, source: "错误来源", title: "另一篇文章" };
+  const expectedUrlLessArticle = { id: 22, source: "正确来源", title: "无链接文章" };
+  assert.equal(
+    resolvePodcastSourceArticle(urlLessPodcastItem, [wrongUrlLessArticle, expectedUrlLessArticle], []),
+    expectedUrlLessArticle,
+    "URL-less podcast sources must use source and title before a colliding numeric id",
+  );
+  const savedSource = resolvePodcastSourceArticle(
+    {
+      ...items[1],
+      id: "saved:41",
+      articleId: undefined,
+      savedArticleId: 41,
+      origin: "saved",
+      sourceUrl: "https://example.com/saved",
+    },
+    [],
+    [{
+      id: 41,
+      title: "收藏原文",
+      url: "https://example.com/saved",
+      source: "知识库",
+      topic: "产品",
+      excerpt: "收藏摘要",
+      content: "收藏全文",
+      audioUrl: "https://cdn.example.com/saved-reader.mp3",
+      audioDuration: "36:10",
+      savedAt: "2026-07-17T00:00:00.000Z",
+    }],
+  );
+  assert.equal(savedSource?.title, "收藏原文");
+  assert.equal(savedSource?.content, "收藏全文");
+  assert.equal(savedSource?.fullFetched, true);
+  assert.equal(savedSource?.audioUrl, "https://cdn.example.com/saved-reader.mp3");
+  assert.equal(savedSource?.audioDuration, "36:10");
+
+  const savedMetadataOnly = resolvePodcastSourceArticle(
+    {
+      ...items[1],
+      id: "saved:42",
+      articleId: undefined,
+      savedArticleId: 42,
+      origin: "saved",
+    },
+    [],
+    [{
+      id: 42,
+      title: "待拉取收藏全文",
+      source: "知识库",
+      topic: "产品",
+      excerpt: "这只是摘要，不能充当全文",
+      savedAt: "2026-07-17T00:00:00.000Z",
+    }],
+  );
+  assert.equal(savedMetadataOnly?.content, "", "saved-list excerpts must never masquerade as full article content");
+  assert.equal(savedMetadataOnly?.fullFetched, false, "saved-only metadata must remain eligible for full-content hydration");
 
   for (const [gate, label] of [
     ["loading", "正在整理今天的可收听内容"],
@@ -185,27 +296,6 @@ try {
   assert.match(cachedErrorHtml, /重新加载/);
   assert.match(cachedErrorHtml, /真实播客/);
 
-  const generatedEmptyHtml = renderToStaticMarkup(React.createElement(PodcastPageContent, {
-    ...pageProps,
-    filter: "short",
-    filteredItems: [],
-  }));
-  assert.match(generatedEmptyHtml, /这一层还没有已生成内容/);
-  assert.match(generatedEmptyHtml, /回到为你生成/);
-
-  const generatedEmptyWithActiveAudioHtml = renderToStaticMarkup(React.createElement(PodcastPageContent, {
-    ...pageProps,
-    filter: "short",
-    filteredItems: [],
-    playback: {
-      ...createPodcastPlaybackState(null),
-      activeItemId: items[0].id,
-      status: "playing",
-    },
-  }));
-  assert.match(generatedEmptyWithActiveAudioHtml, /正在播放的节目/);
-  assert.match(generatedEmptyWithActiveAudioHtml, /暂停真实播客/);
-
   const cachedActivePlayback = {
     ...createPodcastPlaybackState(items[0].id),
     activeItemId: items[0].id,
@@ -223,7 +313,7 @@ try {
       playback: cachedActivePlayback,
     }));
     assert.match(nonStageHtml, new RegExp(stateLabel));
-    assert.equal((nonStageHtml.match(/<audio/g) || []).length, 1);
+    assert.equal((nonStageHtml.match(/<audio/g) || []).length, 0);
     assert.equal((nonStageHtml.match(/正在播放的节目/g) || []).length, 1);
     assert.match(nonStageHtml, /暂停真实播客/);
     assert.ok(
@@ -248,6 +338,10 @@ try {
     dom.window.HTMLMediaElement.prototype,
     "load",
   );
+  const mediaPlayDescriptor = Object.getOwnPropertyDescriptor(
+    dom.window.HTMLMediaElement.prototype,
+    "play",
+  );
   let mountedRoot: Root | null = null;
 
   try {
@@ -269,6 +363,10 @@ try {
       load: {
         configurable: true,
         value(this: HTMLMediaElement) { strictLoadNodes.push(this); },
+      },
+      play: {
+        configurable: true,
+        value() { return Promise.resolve(); },
       },
     });
     mountedRoot = createRoot(container);
@@ -373,26 +471,18 @@ try {
     assert.equal(currentAudio.hasAttribute("src"), false, "unmounting must release the current source");
     assert.equal(currentLoadCalls, 1, "unmounting must reset the current media resource");
     mountedRoot = createRoot(container);
-    let browseCalls = 0;
     let toggleCalls = 0;
     let previousCalls = 0;
     let nextCalls = 0;
     await act(async () => {
       mountedRoot?.render(React.createElement(PodcastPageContent, {
         ...pageProps,
-        onBrowse: () => { browseCalls += 1; },
         onToggle: () => { toggleCalls += 1; },
         onPrevious: () => { previousCalls += 1; },
         onNext: () => { nextCalls += 1; },
       }));
     });
 
-    const pendingCard = container.querySelector<HTMLButtonElement>('button[aria-label="浏览：待解读文章"]');
-    assert.ok(pendingCard);
-    await act(async () => {
-      pendingCard.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
-    });
-    assert.equal(browseCalls, 1, "browsing a card must call only the browse action");
     assert.equal(toggleCalls, 0, "browsing a card must never request playback");
 
     const dispatchSwipe = async (target: Element, pointerId: number) => {
@@ -416,6 +506,194 @@ try {
     await dispatchSwipe(cover, 13);
     assert.equal(nextCalls, 1, "the dedicated cover zone must support vertical swipe navigation");
     assert.equal(previousCalls, 0);
+
+    await act(async () => {
+      mountedRoot?.unmount();
+    });
+    mountedRoot = null;
+
+    let playbackController: PodcastPlaybackContextValue | null = null;
+    function PlaybackProbe() {
+      playbackController = usePodcastPlayback();
+      return React.createElement("span", { "data-playback-probe": true }, "playback probe");
+    }
+    function FullPlayerPresence() {
+      usePodcastFullPlayerPresence();
+      return React.createElement("span", { "data-full-player": true }, "full player");
+    }
+    const currentController = () => {
+      assert.ok(playbackController, "the provider probe must expose its controller");
+      return playbackController;
+    };
+    const renderProvider = async (
+      fullPlayerVisible: boolean,
+      ownerIdentity: string | number | null | undefined = 101,
+    ) => {
+      await act(async () => {
+        mountedRoot?.render(React.createElement(
+          PodcastPlaybackProvider,
+          { showMiniPlayer: true, ownerIdentity },
+          React.createElement(
+            React.Fragment,
+            null,
+            React.createElement(PlaybackProbe),
+            React.createElement(PodcastArticleAudioControls, { article: readerAudioArticle }),
+            fullPlayerVisible ? React.createElement(FullPlayerPresence) : null,
+          ),
+        ));
+      });
+    };
+
+    mountedRoot = createRoot(container);
+    await renderProvider(true);
+    assert.equal(container.querySelectorAll("audio").length, 1, "the provider owns exactly one media node");
+    assert.ok(
+      container.querySelector('[aria-label="\u6587\u7ae0\u97f3\u9891\uff1a\u771f\u5b9e\u64ad\u5ba2"]'),
+      "the regular Reader surface must expose controls without owning a second media element",
+    );
+
+    await act(async () => {
+      currentController().setQueue([items[0]]);
+      assert.equal(currentController().toggle(items[0]), true);
+    });
+    const persistentAudio = container.querySelector<HTMLAudioElement>("audio");
+    assert.ok(persistentAudio);
+    assert.match(persistentAudio.src, /episode\.mp3$/);
+    assert.equal(
+      container.querySelector('[aria-label="\u5168\u5c40\u64ad\u5ba2\u64ad\u653e\u5668"]'),
+      null,
+      "the mini player stays hidden while the full player is mounted",
+    );
+
+    Object.defineProperty(persistentAudio, "duration", { configurable: true, value: 1512 });
+    persistentAudio.currentTime = 42;
+    await act(async () => {
+      persistentAudio.dispatchEvent(new dom.window.Event("loadedmetadata", { bubbles: true }));
+      persistentAudio.dispatchEvent(new dom.window.Event("playing", { bubbles: true }));
+      persistentAudio.dispatchEvent(new dom.window.Event("timeupdate", { bubbles: true }));
+    });
+    assert.equal(currentController().playback.status, "playing");
+    assert.equal(currentController().playback.currentTime, 42);
+
+    await act(async () => {
+      currentController().browse(items[1].id);
+    });
+    assert.equal(currentController().playback.browseItemId, items[1].id);
+    assert.equal(
+      currentController().playback.activeItemId,
+      items[0].id,
+      "browsing a pending item must not replace the playing source",
+    );
+
+    await renderProvider(false);
+    const audioAfterPageUnmount = container.querySelector<HTMLAudioElement>("audio");
+    assert.equal(
+      audioAfterPageUnmount,
+      persistentAudio,
+      "unmounting the full page must preserve the provider-owned media node",
+    );
+    const miniPlayer = container.querySelector<HTMLElement>('[aria-label="\u5168\u5c40\u64ad\u5ba2\u64ad\u653e\u5668"]');
+    assert.ok(miniPlayer, "navigation away must reveal the global mini player");
+    assert.match(miniPlayer.textContent || "", /\u771f\u5b9e\u64ad\u5ba2/);
+    assert.equal(
+      miniPlayer.querySelector<HTMLInputElement>('input[type="range"]')?.value,
+      "42",
+      "the mini player must retain playback progress",
+    );
+    const collapseMiniPlayer = miniPlayer.querySelector<HTMLButtonElement>('[aria-label="\u6536\u8d77\u8ff7\u4f60\u64ad\u653e\u5668"]');
+    assert.ok(collapseMiniPlayer, "the cross-page mini player must be collapsible");
+    await act(async () => {
+      collapseMiniPlayer.click();
+    });
+    const collapsedMiniPlayer = container.querySelector<HTMLElement>('[aria-label="\u5168\u5c40\u64ad\u5ba2\u64ad\u653e\u5668"]');
+    assert.equal(collapsedMiniPlayer?.dataset.collapsed, "true");
+    assert.equal(container.querySelector("audio"), persistentAudio, "collapsing controls must not replace or stop the media node");
+    const expandMiniPlayer = collapsedMiniPlayer?.querySelector<HTMLButtonElement>('[aria-label="\u5c55\u5f00\u8ff7\u4f60\u64ad\u653e\u5668"]');
+    assert.ok(expandMiniPlayer);
+    await act(async () => {
+      expandMiniPlayer.click();
+    });
+    assert.equal(
+      container.querySelector<HTMLInputElement>('[aria-label="\u5168\u5c40\u64ad\u5ba2\u64ad\u653e\u5668"] input[type="range"]')?.value,
+      "42",
+      "expanding the mini player must reveal the unchanged playback progress",
+    );
+
+    await act(async () => {
+      currentController().setRate(1.5);
+      currentController().seek(90);
+    });
+    assert.equal(persistentAudio.playbackRate, 1.5);
+    assert.equal(persistentAudio.currentTime, 90);
+    assert.equal(currentController().playback.currentTime, 90);
+    let pendingAccepted = true;
+    await act(async () => {
+      pendingAccepted = currentController().toggle(items[1]);
+    });
+    assert.equal(pendingAccepted, false, "a summary-only item must never enter a fake playback state");
+    assert.equal(currentController().playback.activeItemId, items[0].id);
+
+    const nextNativeItem: PodcastPreviewItem = {
+      ...items[0],
+      id: "article:13:continuous",
+      articleId: 13,
+      title: "\u8fde\u7eed\u64ad\u653e下一集",
+      audioUrl: "https://cdn.example.com/next.mp3",
+    };
+    await act(async () => {
+      currentController().setQueue([items[0], items[1], nextNativeItem]);
+      currentController().setContinuousPlay(true);
+    });
+    await act(async () => {
+      persistentAudio.dispatchEvent(new dom.window.Event("ended", { bubbles: true }));
+      await Promise.resolve();
+    });
+    const nextAudio = container.querySelector<HTMLAudioElement>("audio");
+    assert.ok(nextAudio);
+    assert.notEqual(nextAudio, persistentAudio);
+    assert.match(nextAudio.src, /next\.mp3$/);
+    assert.equal(currentController().playback.activeItemId, nextNativeItem.id);
+
+    await act(async () => {
+      nextAudio.dispatchEvent(new dom.window.Event("error", { bubbles: true }));
+    });
+    assert.equal(currentController().playback.status, "error");
+    assert.match(container.textContent || "", /\u8be5\u97f3\u9891\u6682\u65f6\u65e0\u6cd5\u64ad\u653e/);
+    await act(async () => {
+      currentController().retry();
+      await Promise.resolve();
+    });
+    assert.equal(currentController().playback.status, "loading");
+
+    let logoutPauseCalls = 0;
+    Object.defineProperty(nextAudio, "pause", {
+      configurable: true,
+      value: () => { logoutPauseCalls += 1; },
+    });
+    nextAudio.currentTime = 27;
+    await renderProvider(false, null);
+    assert.ok(logoutPauseCalls >= 1, "logout must immediately pause the provider-owned media node");
+    assert.equal(currentController().activeItem, undefined, "logout must not retain another user's active episode");
+    assert.deepEqual(currentController().queue, [], "logout must clear the user-scoped continuous-play queue");
+    assert.equal(currentController().playback.activeItemId, null);
+    assert.equal(currentController().playback.browseItemId, null);
+    assert.equal(currentController().playback.currentTime, 0);
+    assert.equal(currentController().playback.duration, 0);
+    assert.equal(currentController().playback.status, "idle");
+    assert.equal(currentController().playback.playbackRate, 1);
+    assert.equal(currentController().playback.continuousPlay, false);
+    assert.equal(
+      container.querySelector('[aria-label="\u5168\u5c40\u64ad\u5ba2\u64ad\u653e\u5668"]'),
+      null,
+      "the signed-out surface must not expose the previous user's episode metadata",
+    );
+    const signedOutAudio = container.querySelector<HTMLAudioElement>("audio");
+    assert.ok(signedOutAudio);
+    assert.equal(signedOutAudio.hasAttribute("src"), false);
+
+    await renderProvider(false, 202);
+    assert.equal(currentController().activeItem, undefined, "a new account must start with an empty playback session");
+    assert.deepEqual(currentController().queue, []);
   } finally {
     if (mountedRoot) {
       await act(async () => {
@@ -437,11 +715,16 @@ try {
     } else {
       Reflect.deleteProperty(dom.window.HTMLMediaElement.prototype, "load");
     }
+    if (mediaPlayDescriptor) {
+      Object.defineProperty(dom.window.HTMLMediaElement.prototype, "play", mediaPlayDescriptor);
+    } else {
+      Reflect.deleteProperty(dom.window.HTMLMediaElement.prototype, "play");
+    }
     restoreDomGlobals();
     dom.window.close();
   }
 
-  console.log("PASS: podcast page mounts one audio element and exposes honest states");
+  console.log("PASS: podcast playback persists globally with one audio element and honest states");
 } finally {
   await vite.close();
 }

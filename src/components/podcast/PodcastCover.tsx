@@ -1,4 +1,5 @@
 import type { PodcastPreviewItem } from "./podcastPreview";
+import { getProxiedImageUrl } from "../../utils/proxiedMedia";
 
 interface PodcastCoverProps {
   item: PodcastPreviewItem;
@@ -6,7 +7,7 @@ interface PodcastCoverProps {
 }
 
 export function PodcastCover({ item, isPlaying }: PodcastCoverProps) {
-  const cover = item.imageUrl || "/assets/podcast/editorial-fallback-cover.png";
+  const cover = getProxiedImageUrl(item.imageUrl) || "/assets/podcast/editorial-fallback-cover.png";
   return (
     <div className="podcast-cover-stack">
       <img

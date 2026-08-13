@@ -6,11 +6,11 @@ import { Check, LayoutGrid, List } from 'lucide-react';
 import { InspirationButton } from '../components/InspirationButton';
 import { getDisplaySource, sourceMatches } from '../utils/articleDisplay';
 import { AtomFlowGalaxyIcon } from '../components/AtomFlowGalaxyIcon';
+import { resolveFeedPageState } from '../utils/feedState';
 
 export const FeedPage: React.FC = () => {
-  const { articles, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText, showToast, reloadArticles, viewMode, setViewMode } = useAppContext();
+  const { articles, isArticlesLoading, articlesError, setReadingArticle, activeSource, saveArticle, isSavingArticle, getSavingStageText, showToast, reloadArticles, viewMode, setViewMode } = useAppContext();
   const [showSrcModal, setShowSrcModal] = useState(false);
-  const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [isRetrying, setIsRetrying] = useState(false);
   const [currentDate, setCurrentDate] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -53,13 +53,6 @@ export const FeedPage: React.FC = () => {
     'Y Combinator': 'rsshub://youtube/user/%40ycombinator',
     'Andrej Karpathy': 'rsshub://youtube/user/@AndrejKarpathy'
   };
-
-  // 检测初始加载状态
-  React.useEffect(() => {
-    if (articles.length > 0) {
-      setIsInitialLoading(false);
-    }
-  }, [articles]);
 
   const handleRetrySource = async () => {
     if (!activeSource || isRetrying) return;
@@ -138,6 +131,11 @@ export const FeedPage: React.FC = () => {
     }
     return rankArticles(articles);
   }, [articles, activeSource]);
+  const pageState = resolveFeedPageState({
+    isLoading: isArticlesLoading,
+    error: articlesError,
+    itemCount: filteredArticles.length,
+  });
 
   // 切换信息源时滚动到顶部
   useEffect(() => {
@@ -146,7 +144,7 @@ export const FeedPage: React.FC = () => {
 
   const handleSave = async (article: Article) => {
     if (article.saved || isSavingArticle(article.id)) return;
-    await saveArticle(article.id);
+    await saveArticle(article.id, article);
   };
 
   return (
@@ -154,14 +152,14 @@ export const FeedPage: React.FC = () => {
       <div className="mb-4 sm:mb-6 flex items-center justify-between">
         <div>
           <h1 className="font-serif text-[18px] sm:text-[20px] font-bold text-text-main">{activeSource || '今日推送'}</h1>
-          {isInitialLoading && filteredArticles.length === 0 ? (
+          {pageState === 'loading' ? (
             <div className="flex items-center gap-2 mt-1">
               <AtomFlowGalaxyIcon animated size={14} />
               <p className="text-[11px] sm:text-[12px] text-accent">正在聚合信息源，请稍等...</p>
             </div>
-          ) : activeSource && filteredArticles.length === 0 ? (
+          ) : pageState === 'error' ? (
             <div className="flex items-center gap-2 mt-1">
-              <p className="text-[11px] sm:text-[12px] text-red-500">获取信息源失败，点击下方重试</p>
+              <p className="text-[11px] sm:text-[12px] text-red-500">{articlesError || '内容加载失败'}</p>
             </div>
           ) : (
             <p className="text-[11px] sm:text-[12px] text-text3 mt-1">{currentDate} · 已聚合 {filteredArticles.length} 篇内容</p>
@@ -177,31 +175,38 @@ export const FeedPage: React.FC = () => {
         </div>
       </div>
 
-      {isInitialLoading && filteredArticles.length === 0 ? (
+      {pageState === 'loading' ? (
         <div className="flex flex-col items-center justify-center py-20">
           <AtomFlowGalaxyIcon animated className="mb-4" size={64} />
           <p className="text-text2 text-[15px] font-medium mb-2">正在聚合信息源</p>
           <p className="text-text3 text-[13px]">首次加载可能需要几秒钟...</p>
         </div>
-      ) : filteredArticles.length === 0 ? (
-        activeSource ? (
-          <div className="flex flex-col items-center justify-center py-20">
-            <div className="text-[48px] mb-4 opacity-20">⚠️</div>
-            <p className="text-text2 text-[15px] font-medium mb-2">获取信息源失败</p>
+      ) : pageState === 'error' ? (
+        <div className="flex flex-col items-center justify-center py-20">
+          <div className="text-[48px] mb-4 opacity-20">⚠️</div>
+          <p className="text-text2 text-[15px] font-medium mb-2">内容加载失败</p>
+          <p className="max-w-md text-center text-text3 text-[13px]">{articlesError || '请稍后重试'}</p>
+          <button
+            onClick={() => void reloadArticles()}
+            className="mt-4 px-4 py-2 bg-accent text-white rounded-lg text-[13px] font-medium hover:bg-accent/90 transition-colors"
+          >
+            重新加载
+          </button>
+        </div>
+      ) : pageState === 'empty' ? (
+        <div className="flex flex-col items-center justify-center py-20">
+          <div className="text-[48px] mb-4 opacity-20">📭</div>
+          <p className="text-text2 text-[15px] font-medium mb-2">{activeSource ? '该信息源暂无内容' : '暂无内容'}</p>
+          {activeSource && SOURCE_RSS_MAP[activeSource] && (
             <button
               onClick={handleRetrySource}
               disabled={isRetrying}
               className="mt-4 px-4 py-2 bg-accent text-white rounded-lg text-[13px] font-medium hover:bg-accent/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {isRetrying ? '正在重试...' : '点击重试'}
+              {isRetrying ? '正在重试...' : '重新获取'}
             </button>
-          </div>
-        ) : (
-          <div className="flex flex-col items-center justify-center py-20">
-            <div className="text-[48px] mb-4 opacity-20">📭</div>
-            <p className="text-text3 text-[14px]">暂无内容</p>
-          </div>
-        )
+          )}
+        </div>
       ) : (
         <div className="flex flex-col gap-2.5">
         {viewMode === 'card' ? filteredArticles.map(article => (

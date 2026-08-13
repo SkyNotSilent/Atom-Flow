@@ -107,7 +107,11 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
         origin: 'manual',
         savedArticleId,
       };
-      await addCard(card);
+      const succeeded = await addCard(card);
+      if (!succeeded) {
+        showToast('保存失败，请重试');
+        return;
+      }
       showToast('灵感已记录 ✨');
       handleClose();
     } catch {

@@ -13,7 +13,7 @@ import {
   Unlink,
   X,
 } from 'lucide-react';
-import type { WriteCanvasEdge, WriteCanvasMessage, WriteCanvasNode } from '../../types';
+import type { WriteCanvasEdge, WriteCanvasMessage, WriteCanvasNode, WriteSkillSelection } from '../../types';
 
 type InspectorTab = 'chat' | 'context' | 'settings';
 
@@ -24,6 +24,15 @@ export type AgentDraft = {
   temperature: number;
   topP: number;
   maxTokens: number;
+  skillConfig: WriteSkillSelection;
+};
+
+export type CanvasRecallCandidate = {
+  cardId: string;
+  type?: string;
+  title: string;
+  preview: string;
+  requiresConfirmation?: boolean;
 };
 
 type CanvasInspectorProps = {
@@ -36,13 +45,20 @@ type CanvasInspectorProps = {
   onClose: () => void;
   onAgentInputChange: (value: string) => void;
   onSendAgentMessage: () => void;
+  onCreateArticle: () => void;
   onRemoveEdge: (edge: WriteCanvasEdge) => void;
   onSaveAgent: (data: AgentDraft) => void;
   onSaveTemplate: (data: AgentDraft) => void;
   onSaveMessage: (message: WriteCanvasMessage) => void;
+  savingMessageKeys?: ReadonlySet<string>;
+  savedMessageKeys?: ReadonlySet<string>;
   onOpenAddContext: (agentNodeId: number) => void;
   onConnectToAgent: (sourceNodeId: number, agentNodeId: number) => void;
   onDeleteNode: (node: WriteCanvasNode) => void;
+  recallCandidates?: CanvasRecallCandidate[];
+  onAddRecallCandidate?: (candidate: CanvasRecallCandidate) => void;
+  embedded?: boolean;
+  readOnly?: boolean;
 };
 
 const nodeKindLabel: Record<WriteCanvasNode['kind'], string> = {
@@ -51,6 +67,8 @@ const nodeKindLabel: Record<WriteCanvasNode['kind'], string> = {
   asset_image: '图片资料',
   saved_article: '收藏文章',
   atom_card: '原子卡',
+  citation: '文章引用',
+  podcast_episode: '播客单集',
   note: '文章草稿',
   agent: 'Agent',
   result: '输出结果',
@@ -66,13 +84,20 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
   onClose,
   onAgentInputChange,
   onSendAgentMessage,
+  onCreateArticle,
   onRemoveEdge,
   onSaveAgent,
   onSaveTemplate,
   onSaveMessage,
+  savingMessageKeys = new Set(),
+  savedMessageKeys = new Set(),
   onOpenAddContext,
   onConnectToAgent,
   onDeleteNode,
+  recallCandidates = [],
+  onAddRecallCandidate,
+  embedded = false,
+  readOnly = false,
 }) => {
   const [tab, setTab] = useState<InspectorTab>('chat');
   const [targetAgentNodeId, setTargetAgentNodeId] = useState<number | null>(null);
@@ -100,7 +125,9 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
     <aside
       data-testid="canvas-inspector"
       onPointerDown={event => event.stopPropagation()}
-      className="absolute inset-0 z-[80] flex w-full flex-col overflow-hidden border-0 bg-[#FCFCFA]/98 shadow-[0_24px_72px_rgba(29,32,38,0.18)] backdrop-blur md:inset-y-4 md:left-auto md:right-4 md:w-[380px] md:rounded-[8px] md:border md:border-[#D8D7D2]"
+      className={embedded
+        ? 'flex h-full min-h-0 w-full flex-col overflow-hidden bg-[#FCFCFA]'
+        : 'absolute inset-0 z-[80] flex w-full flex-col overflow-hidden border-0 bg-[#FCFCFA]/98 shadow-[0_24px_72px_rgba(29,32,38,0.18)] backdrop-blur md:inset-y-4 md:left-auto md:right-4 md:w-[380px] md:rounded-[8px] md:border md:border-[#D8D7D2]'}
     >
       <header className="border-b border-[#E7E6E1] px-4 py-4">
         <div className="flex items-start gap-3">
@@ -137,24 +164,52 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    {messages.map(message => (
-                      <div key={message.id} className={`rounded-[7px] px-3 py-2.5 text-[12px] leading-5 ${message.role === 'assistant' ? 'border border-[#E2E0DB] bg-white text-[#33373D]' : 'ml-8 bg-[#E7F0FF] text-[#245A9F]'}`}>
-                        <div className="whitespace-pre-wrap">{message.content}</div>
-                        {message.role === 'assistant' ? (
-                          <button type="button" onClick={() => onSaveMessage(message)} className="mt-2 inline-flex items-center gap-1 rounded-[5px] border border-[#DAD8D2] bg-[#FAFAF8] px-2 py-1 text-[10px] font-medium text-[#555A61] hover:border-[#8FB5F2] hover:text-[#185ABD]">
-                            <Plus size={11} /> 保存到画布
-                          </button>
-                        ) : null}
-                      </div>
-                    ))}
+                    {messages.map(message => {
+                      const messageKey = `${node.agent?.id || 0}:${message.id}`;
+                      const isSavingMessage = savingMessageKeys.has(messageKey);
+                      const isSavedMessage = savedMessageKeys.has(messageKey);
+                      return (
+                        <div key={message.id} className={`rounded-[7px] px-3 py-2.5 text-[12px] leading-5 ${message.role === 'assistant' ? 'border border-[#E2E0DB] bg-white text-[#33373D]' : 'ml-8 bg-[#E7F0FF] text-[#245A9F]'}`}>
+                          <div className="whitespace-pre-wrap">{message.content}</div>
+                          {message.role === 'assistant' ? (
+                            <>
+                              <MessageTrace meta={message.meta} />
+                              <button type="button" disabled={readOnly || isSavingMessage || isSavedMessage} onClick={() => onSaveMessage(message)} className="mt-2 inline-flex items-center gap-1 rounded-[5px] border border-[#DAD8D2] bg-[#FAFAF8] px-2 py-1 text-[10px] font-medium text-[#555A61] hover:border-[#8FB5F2] hover:text-[#185ABD] disabled:cursor-default disabled:opacity-60">
+                                <Plus size={11} /> {isSavingMessage ? '保存中…' : isSavedMessage ? '已保存' : '保存到画布'}
+                              </button>
+                            </>
+                          ) : null}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
+                {recallCandidates.length > 0 ? (
+                  <section className="mt-4 rounded-[7px] border border-[#E1D5BD] bg-[#FFF9ED] p-3">
+                    <div className="text-[10px] font-semibold text-[#735C31]">全库候选素材</div>
+                    <div className="mt-1 text-[10px] leading-4 text-[#927C55]">候选尚未授权。点击后会先加入画布并建立上下文连接，只影响下一轮生成。</div>
+                    <div className="mt-3 space-y-2">
+                      {recallCandidates.map(candidate => (
+                        <div key={candidate.cardId} className="rounded-[6px] border border-[#E6D9C0] bg-white p-2.5">
+                          <div className="text-[10px] font-semibold text-[#4D4437]">{candidate.type ? `${candidate.type} · ` : ''}{candidate.title}</div>
+                          <div className="mt-1 line-clamp-3 text-[10px] leading-4 text-[#7C7162]">{candidate.preview}</div>
+                          <button type="button" disabled={readOnly} onClick={() => onAddRecallCandidate?.(candidate)} className="mt-2 inline-flex items-center gap-1 rounded-[5px] bg-[#205FA8] px-2 py-1.5 text-[10px] font-medium text-white disabled:opacity-45"><Link2 size={11} />加入画布并连接</button>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                ) : null}
               </div>
               <div className="border-t border-[#E7E6E1] bg-white p-3">
-                <textarea value={agentInput} onChange={event => onAgentInputChange(event.target.value)} className="h-24 w-full resize-none rounded-[7px] border border-[#DCDAD4] px-3 py-2 text-[12px] leading-5 text-[#30343A] outline-none focus:border-[#78A5EB] focus:ring-2 focus:ring-[#DCEAFF]" placeholder={connectedEdges.length ? '基于已连接上下文提问或生成…' : '先到“上下文”添加资料…'} />
-                <button type="button" onClick={onSendAgentMessage} disabled={!agentInput.trim() || isAgentRunning} className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-[6px] bg-[#1F6FEB] px-3 py-2 text-[12px] font-medium text-white hover:bg-[#195FC9] disabled:opacity-50">
-                  <Send size={14} /> {isAgentRunning ? '生成中…' : '发送'}
-                </button>
+                <textarea disabled={readOnly} value={agentInput} onChange={event => onAgentInputChange(event.target.value)} className="h-24 w-full resize-none rounded-[7px] border border-[#DCDAD4] px-3 py-2 text-[12px] leading-5 text-[#30343A] outline-none focus:border-[#78A5EB] focus:ring-2 focus:ring-[#DCEAFF] disabled:bg-[#F1EFEA]" placeholder={readOnly ? '只读模式' : connectedEdges.length ? '基于已连接上下文提问或生成…' : '先到“上下文”添加资料…'} />
+                <div className="mt-2 grid grid-cols-[1fr_auto] gap-2">
+                  <button type="button" onClick={onSendAgentMessage} disabled={readOnly || !agentInput.trim() || isAgentRunning} className="inline-flex items-center justify-center gap-2 rounded-[6px] bg-[#1F6FEB] px-3 py-2 text-[12px] font-medium text-white hover:bg-[#195FC9] disabled:opacity-50">
+                    <Send size={14} /> {isAgentRunning ? '生成中…' : '发送'}
+                  </button>
+                  <button type="button" onClick={onCreateArticle} disabled={readOnly || !agentInput.trim() || isAgentRunning} className="inline-flex items-center justify-center gap-1.5 rounded-[6px] border border-[#AFC3DD] bg-[#EDF4FD] px-3 py-2 text-[11px] font-medium text-[#245D9E] hover:bg-[#E1EDFA] disabled:opacity-50">
+                    <FileText size={13} />创建文章
+                  </button>
+                </div>
                 <p className="mt-2 text-center text-[10px] leading-4 text-[#858990]">
                   发送后，消息和已连接资料会交给实例配置的 AI 服务商处理。{' '}
                   <a href="/legal/privacy" target="_blank" rel="noreferrer" className="hover:text-[#1F6FEB]">隐私说明</a>
@@ -170,7 +225,7 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
                   <h3 className="text-[12px] font-semibold text-[#30343A]">已连接上下文</h3>
                   <p className="mt-1 text-[10px] text-[#858990]">删除连接后，下一次生成不再引用该资料。</p>
                 </div>
-                <button type="button" onClick={() => onOpenAddContext(node.id)} className="inline-flex items-center gap-1.5 rounded-[6px] bg-[#20242A] px-2.5 py-1.5 text-[11px] font-medium text-white hover:bg-black">
+                <button type="button" disabled={readOnly} onClick={() => onOpenAddContext(node.id)} className="inline-flex items-center gap-1.5 rounded-[6px] bg-[#20242A] px-2.5 py-1.5 text-[11px] font-medium text-white hover:bg-black disabled:opacity-45">
                   <Plus size={12} /> 添加上下文
                 </button>
               </div>
@@ -181,7 +236,7 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
                     <div key={edge.id} className="flex items-center gap-2 rounded-[7px] border border-[#E2E0DB] bg-white px-3 py-2.5">
                       <FileText size={14} className="shrink-0 text-[#5E7FA9]" />
                       <div className="min-w-0 flex-1 truncate text-[11px] text-[#41464D]">{source?.title || `节点 ${edge.sourceNodeId}`}</div>
-                      <button type="button" onClick={() => onRemoveEdge(edge)} className="flex h-7 w-7 items-center justify-center rounded-[5px] text-[#94989E] hover:bg-[#FCEBE9] hover:text-[#C44337]" title="断开上下文">
+                      <button type="button" disabled={readOnly} onClick={() => onRemoveEdge(edge)} className="flex h-7 w-7 items-center justify-center rounded-[5px] text-[#94989E] hover:bg-[#FCEBE9] hover:text-[#C44337] disabled:opacity-35" title="断开上下文">
                         <Unlink size={13} />
                       </button>
                     </div>
@@ -193,7 +248,7 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
 
           {tab === 'settings' ? (
             <div className="min-h-0 flex-1 overflow-y-auto p-4">
-              <div className="space-y-3">
+              <fieldset disabled={readOnly} className="space-y-3 disabled:opacity-60">
                 <Field label="Agent 名称"><input value={draft.title} onChange={event => setDraft(current => ({ ...current, title: event.target.value }))} className="canvas-field" /></Field>
                 <Field label="模型"><input value={draft.model} onChange={event => setDraft(current => ({ ...current, model: event.target.value }))} className="canvas-field" /></Field>
                 <div className="grid grid-cols-2 gap-3">
@@ -202,12 +257,12 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
                 </div>
                 <NumberField label="Max tokens" value={draft.maxTokens} min={128} max={8000} step={128} onChange={maxTokens => setDraft(current => ({ ...current, maxTokens }))} />
                 <Field label="系统提示词"><textarea value={draft.systemPrompt} onChange={event => setDraft(current => ({ ...current, systemPrompt: event.target.value }))} className="canvas-field h-36 resize-none leading-5" /></Field>
-              </div>
-              <div className="mt-4 flex gap-2">
+              </fieldset>
+              {!readOnly ? <div className="mt-4 flex gap-2">
                 <button type="button" onClick={() => onSaveAgent(draft)} className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-[6px] bg-[#1F6FEB] px-3 py-2 text-[11px] font-medium text-white hover:bg-[#195FC9]"><Save size={13} />保存设置</button>
                 <button type="button" onClick={() => onSaveTemplate(draft)} className="inline-flex items-center justify-center gap-1.5 rounded-[6px] border border-[#D8D6D0] bg-white px-3 py-2 text-[11px] font-medium text-[#4D5259] hover:border-[#8FB5F2]"><Bot size={13} />保存模板</button>
-              </div>
-              <DeleteNodeButton onClick={() => onDeleteNode(node)} />
+              </div> : null}
+              {!readOnly ? <DeleteNodeButton onClick={() => onDeleteNode(node)} /> : null}
             </div>
           ) : null}
         </>
@@ -219,7 +274,7 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
               {node.asset?.extractedText || node.asset?.contentText || node.summary || '这个节点没有可预览文本。'}
             </div>
 
-            <section className="mt-5">
+            {!readOnly ? <section className="mt-5">
               <h3 className="text-[12px] font-semibold text-[#30343A]">连接到 Agent</h3>
               {agentNodes.length > 0 ? (
                 <div className="mt-2 flex gap-2">
@@ -240,8 +295,8 @@ export const CanvasInspector: React.FC<CanvasInspectorProps> = ({
                   })}
                 </div>
               ) : null}
-            </section>
-            <DeleteNodeButton onClick={() => onDeleteNode(node)} />
+            </section> : null}
+            {!readOnly ? <DeleteNodeButton onClick={() => onDeleteNode(node)} /> : null}
           </div>
         </div>
       )}
@@ -256,6 +311,7 @@ const toAgentDraft = (node: WriteCanvasNode): AgentDraft => ({
   temperature: node.agent?.temperature ?? 0.55,
   topP: node.agent?.topP ?? 1,
   maxTokens: node.agent?.maxTokens ?? 1200,
+  skillConfig: node.agent?.skillConfig || { mode: 'inherit', inherit: true, skillIds: [] },
 });
 
 const InspectorTabButton: React.FC<{ active: boolean; icon: React.ReactNode; onClick: () => void; children: React.ReactNode }> = ({ active, icon, onClick, children }) => (
@@ -269,6 +325,32 @@ const NumberField: React.FC<{ label: string; value: number; min: number; max: nu
 );
 
 const EmptyState: React.FC<{ text: string }> = ({ text }) => <div className="mt-3 rounded-[7px] border border-dashed border-[#DCDAD4] px-3 py-5 text-center text-[11px] text-[#92969C]">{text}</div>;
+
+const MessageTrace: React.FC<{ meta?: Record<string, unknown> }> = ({ meta }) => {
+  if (!meta) return null;
+  const trace = Array.isArray(meta.graphTrace)
+    ? meta.graphTrace.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    : [];
+  const skillSnapshots = Array.isArray(meta.skillSnapshots)
+    ? meta.skillSnapshots.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    : [];
+  const sources = meta.sources && typeof meta.sources === 'object' ? meta.sources as Record<string, unknown> : null;
+  const sourceCount = sources
+    ? ['cards', 'articles', 'quotes', 'images'].reduce((count, key) => count + (Array.isArray(sources[key]) ? sources[key].length : 0), 0)
+    : 0;
+  if (trace.length === 0 && skillSnapshots.length === 0 && sourceCount === 0) return null;
+  return (
+    <details className="mt-2 rounded-[5px] border border-[#E3E0DA] bg-[#FAF9F6] px-2.5 py-2 text-[10px] text-[#71757B]">
+      <summary className="cursor-pointer font-medium text-[#5B6067]">执行轨迹 · {trace.length || 0} 步{sourceCount ? ` · ${sourceCount} 条来源` : ''}</summary>
+      {trace.length > 0 ? (
+        <ol className="mt-2 space-y-1">
+          {trace.map((item, index) => <li key={`${String(item.node || 'step')}-${index}`}>{index + 1}. {String(item.label || item.node || '处理写作任务')}</li>)}
+        </ol>
+      ) : null}
+      {skillSnapshots.length > 0 ? <div className="mt-2 border-t border-[#E7E3DC] pt-2">Skills：{skillSnapshots.map(item => String(item.name || '')).filter(Boolean).join('、')}</div> : null}
+    </details>
+  );
+};
 
 const DeleteNodeButton: React.FC<{ onClick: () => void }> = ({ onClick }) => (
   <button type="button" onClick={onClick} className="mt-6 inline-flex items-center gap-1.5 text-[11px] font-medium text-[#B34439] hover:text-[#D13A2E]"><Trash2 size={13} />删除节点</button>

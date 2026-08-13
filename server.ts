@@ -30,7 +30,7 @@ import { URL } from "url";
 import pino from "pino";
 import pinoHttp from "pino-http";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
-import { Agent, OpenAIProvider, Runner, setTracingDisabled, tool } from "@openai/agents";
+import { Agent, OpenAIProvider, Runner, setTracingDisabled, tool, type AgentInputItem } from "@openai/agents";
 import { z } from "zod";
 import {
   classifyWriteAgentIntent,
@@ -50,23 +50,56 @@ import {
   validateDocxArchiveBounds,
   validatePublicHttpUrl,
 } from "./src/server/security.js";
+import { canChangePassword, isRecentAuthentication } from "./src/server/accountSecurity.js";
+import { extractCardsForUser } from "./src/server/articleCardExtraction.js";
+import {
+  extractCanvasBusinessLayouts,
+  hasEmbeddedCanvasMedia,
+  readCanvasDocumentSchemaVersion,
+} from "./src/server/canvasDocument.js";
+import { findArticleByIdentity, normalizeArticleUrl } from "./src/utils/articleIdentity.js";
+import { citationArticleIdentity } from "./src/utils/citationIdentity.js";
+import { loadBillingConfig, isBillingPlanCode } from "./src/server/billing/config.js";
+import { BillingService } from "./src/server/billing/service.js";
+import { BillingError } from "./src/server/billing/types.js";
+import {
+  RSS_MAX_CONCURRENCY,
+  RssRuntimeController,
+  type RssRuntimeAlert,
+  type RssRuntimeEvent,
+} from "./src/server/rssRuntime.js";
+import {
+  DATABASE_SCHEMA_VERSION,
+  WRITE_CANVAS_AGENT_RUN_MAX_ATTEMPTS,
+  createDatabasePool,
+  verifyDatabaseSchema,
+} from "./src/server/databaseMigrations.js";
+import {
+  RSS_ARTICLE_CONTENT_MAX_BYTES,
+  RSS_GLOBAL_ARTICLE_LIMIT,
+  RssArticleCache,
+  truncateUtf8,
+} from "./src/server/rssCache.js";
 
 dotenv.config();
 
 const isProduction = process.env.NODE_ENV === "production";
 const DEV_SESSION_SECRET = "atomflow-dev-secret-change-in-prod";
 const PUBLIC_WEB_PORTS = new Set(["", "80", "443"]);
-const LEGAL_PLACEHOLDER_PATTERN = /\[(?:DEPLOYMENT_OPERATOR_NAME|DEPLOYMENT_OPERATOR_ADDRESS|SERVICE_CONTACT_EMAIL|PRIVACY_CONTACT_EMAIL|SECURITY_CONTACT_EMAIL|SERVICE_URL|DATA_HOSTING_REGION|TERMS_EFFECTIVE_DATE|GOVERNING_LAW|DISPUTE_FORUM|LOG_RETENTION_DAYS|BACKUP_RETENTION_DAYS|RIGHTS_REQUEST_RESPONSE_DAYS)\]/g;
+const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LEGAL_PLACEHOLDER_PATTERN = /\[(?:DEPLOYMENT_OPERATOR_NAME|DEPLOYMENT_OPERATOR_ADDRESS|SERVICE_CONTACT_EMAIL|REFUND_CONTACT_EMAIL|PRIVACY_CONTACT_EMAIL|SECURITY_CONTACT_EMAIL|SERVICE_URL|DATA_HOSTING_REGION|TERMS_EFFECTIVE_DATE|GOVERNING_LAW|DISPUTE_FORUM|LOG_RETENTION_DAYS|BACKUP_RETENTION_DAYS|RIGHTS_REQUEST_RESPONSE_DAYS)\]/g;
 const LEGAL_DOCUMENTS = {
   privacy: "PRIVACY.md",
   terms: "TERMS.md",
   security: "SECURITY.md",
+  refunds: "REFUNDS.md",
 } as const;
 
 const legalReplacementValues = (appUrl?: string) => ({
   DEPLOYMENT_OPERATOR_NAME: process.env.DEPLOYMENT_OPERATOR_NAME || "",
   DEPLOYMENT_OPERATOR_ADDRESS: process.env.DEPLOYMENT_OPERATOR_ADDRESS || "",
   SERVICE_CONTACT_EMAIL: process.env.SERVICE_CONTACT_EMAIL || "",
+  REFUND_CONTACT_EMAIL: process.env.REFUND_CONTACT_EMAIL || "",
   PRIVACY_CONTACT_EMAIL: process.env.PRIVACY_CONTACT_EMAIL || "",
   SECURITY_CONTACT_EMAIL: process.env.SECURITY_CONTACT_EMAIL || "",
   SERVICE_URL: process.env.SERVICE_URL || appUrl || "",
@@ -79,9 +112,10 @@ const legalReplacementValues = (appUrl?: string) => ({
   RIGHTS_REQUEST_RESPONSE_DAYS: process.env.RIGHTS_REQUEST_RESPONSE_DAYS || "",
 });
 
-const validateProductionLegalConfiguration = (appUrl?: string) => {
+const validateProductionLegalConfiguration = (appUrl?: string, billingEnabled = false) => {
   if (!isProduction) return;
   const missing = Object.entries(legalReplacementValues(appUrl))
+    .filter(([key]) => billingEnabled || key !== "REFUND_CONTACT_EMAIL")
     .filter(([, value]) => !value || /\[|replace-|your-domain\.example|^your\b|^applicable\b|railway deployment/i.test(value))
     .map(([key]) => key);
   if (missing.length > 0) {
@@ -113,6 +147,7 @@ const logger = pino({
     paths: [
       "req.headers.authorization",
       "req.headers.cookie",
+      "req.headers.paddle-signature",
       "req.url",
       "req.query",
       "req.body",
@@ -245,6 +280,11 @@ const RSSHUB_BASES = Array.from(new Set([
   'https://rsshub.app'
 ].filter(Boolean))) as string[];
 const CACHE_FILE = path.join(process.cwd(), ".cache", "articles.json");
+const rssArticleCache = new RssArticleCache<Article>(
+  CACHE_FILE,
+  RSS_GLOBAL_ARTICLE_LIMIT,
+  RSS_ARTICLE_CONTENT_MAX_BYTES,
+);
 
 function expandFeedUrls(url: string) {
   if (url.startsWith('rsshub://')) {
@@ -254,21 +294,24 @@ function expandFeedUrls(url: string) {
   return [url];
 }
 
-async function parseFirstAvailable(urls: string[]) {
+async function parseFirstAvailable(urls: string[], signal?: AbortSignal) {
   let lastError: unknown;
   for (const url of urls) {
+    if (signal?.aborted) throw signal.reason;
     const expanded = expandFeedUrls(url);
     // RSSHub 镜像多，每个给 5s；直连源只有 1 个 URL，给 10s
     const perCandidateTimeout = expanded.length > 1 ? 5000 : 10000;
     for (const candidate of expanded) {
+      if (signal?.aborted) throw signal.reason;
       try {
-        const parsed = await parseBoundedFeedCandidate(candidate, perCandidateTimeout);
+        const parsed = await parseBoundedFeedCandidate(candidate, perCandidateTimeout, signal);
         const itemCount = parsed.items?.length ?? 0;
         if (itemCount > 0) {
           return parsed;
         }
         lastError = new Error(`Feed has 0 items: ${candidate}`);
       } catch (error) {
+        if (signal?.aborted) throw signal.reason;
         lastError = error;
       }
     }
@@ -276,14 +319,16 @@ async function parseFirstAvailable(urls: string[]) {
   throw lastError;
 }
 
-async function parseFreshestAvailable(urls: string[]) {
+async function parseFreshestAvailable(urls: string[], signal?: AbortSignal) {
   let latest: { parsed: Parser.Output<any>, newestAt: number, itemCount: number } | null = null;
   let lastError: unknown;
   for (const url of urls) {
+    if (signal?.aborted) throw signal.reason;
     const expanded = expandFeedUrls(url);
     for (const candidate of expanded) {
+      if (signal?.aborted) throw signal.reason;
       try {
-        const parsed = await parseBoundedFeedCandidate(candidate, 2500);
+        const parsed = await parseBoundedFeedCandidate(candidate, 2500, signal);
         const items = parsed.items || [];
         const itemCount = items.length;
         if (itemCount === 0) continue;
@@ -295,6 +340,7 @@ async function parseFreshestAvailable(urls: string[]) {
           latest = { parsed, newestAt, itemCount };
         }
       } catch (error) {
+        if (signal?.aborted) throw signal.reason;
         lastError = error;
       }
     }
@@ -303,11 +349,12 @@ async function parseFreshestAvailable(urls: string[]) {
   throw lastError || new Error('No feed available');
 }
 
-async function parseBoundedFeedCandidate(candidate: string, timeoutMs: number) {
+async function parseBoundedFeedCandidate(candidate: string, timeoutMs: number, signal?: AbortSignal) {
   const resource = await fetchBoundedPublicResource(candidate, {
     timeoutMs,
     maxBytes: 3 * 1024 * 1024,
     maxRedirects: 3,
+    signal,
     headers: {
       "User-Agent": "AtomFlow/1.0 RSS Reader",
       "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
@@ -319,32 +366,68 @@ async function parseBoundedFeedCandidate(candidate: string, timeoutMs: number) {
   return parser.parseString(resource.body.toString("utf8"));
 }
 
-async function parseWithRetry(urls: string[], timeoutMs: number, retries: number) {
-  let lastError: unknown;
-  for (let i = 0; i < retries; i += 1) {
+type FullArticleResourceFetcher = typeof fetchBoundedPublicResource;
+
+const fetchReadableArticleContent = async (
+  rawUrl: string,
+  fetchResource: FullArticleResourceFetcher = fetchBoundedPublicResource,
+): Promise<string | null> => {
+  const resource = await fetchResource(rawUrl, {
+    timeoutMs: 10_000,
+    maxBytes: 3 * 1024 * 1024,
+    maxRedirects: 3,
+    allowedPorts: PUBLIC_WEB_PORTS,
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; AtomFlow/1.0; +https://github.com/)",
+      "Accept": "text/html, application/xhtml+xml;q=0.9",
+    },
+  });
+  if (resource.status < 200 || resource.status >= 300) return null;
+
+  const contentType = (resource.headers.get("content-type") || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  if (contentType !== "text/html" && contentType !== "application/xhtml+xml") return null;
+
+  const dom = new JSDOM(resource.body.toString("utf8"), {
+    url: resource.url.toString(),
+  });
+  const readable = new Readability(dom.window.document).parse();
+  const content = readable?.content?.trim();
+  return content || null;
+};
+
+const buildFullArticleView = async (
+  article: Article,
+  fetchResource: FullArticleResourceFetcher = fetchBoundedPublicResource,
+): Promise<Article> => {
+  const cachedFullContent = article.markdownContent?.trim();
+  const fallbackContent = cachedFullContent || (article.source === '即刻话题'
+    ? formatJikeContent(article.content)
+    : article.content || article.excerpt || '暂无内容');
+  let markdownContent = fallbackContent;
+  let readabilityUsed = Boolean(article.readabilityUsed || (article.fullFetched && cachedFullContent));
+
+  if (article.url) {
     try {
-      return await withTimeout(parseFirstAvailable(urls), timeoutMs);
+      const readableContent = await fetchReadableArticleContent(article.url, fetchResource);
+      if (readableContent) {
+        markdownContent = readableContent;
+        readabilityUsed = true;
+      }
     } catch (error) {
-      lastError = error;
+      logger.warn({ err: error, module: "articles", articleId: article.id }, "Full article fetch failed; using RSS content");
     }
   }
-  throw lastError;
-}
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms);
-    promise
-      .then(result => {
-        clearTimeout(timer);
-        resolve(result);
-      })
-      .catch(error => {
-        clearTimeout(timer);
-        reject(error);
-      });
-  });
-}
+  return {
+    ...article,
+    markdownContent,
+    readabilityUsed,
+    fullFetched: true,
+  };
+};
 
 const ALLOWED_IMAGE_HOST_SUFFIXES = [
   "sspai.com",
@@ -378,7 +461,7 @@ function mergeArticles(previous: Article[], next: Article[]): Article[] {
       ...article,
       id: prev.id,
       saved: prev.saved,
-      cards: prev.cards,
+      cards: [],
       fullFetched: prev.fullFetched,
       markdownContent: prev.markdownContent,
       readabilityUsed: prev.readabilityUsed
@@ -408,21 +491,11 @@ function mergeWithSourceFallback(previous: Article[], next: Article[]) {
 }
 
 async function loadArticlesCache() {
-  try {
-    const raw = await fs.readFile(CACHE_FILE, "utf-8");
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
-      return parsed as Article[];
-    }
-    return [];
-  } catch {
-    return [];
-  }
+  return rssArticleCache.load();
 }
 
 async function saveArticlesCache(articles: Article[]) {
-  await fs.mkdir(path.dirname(CACHE_FILE), { recursive: true });
-  await fs.writeFile(CACHE_FILE, JSON.stringify(articles), "utf-8");
+  await rssArticleCache.save(articles);
 }
 
 // Built-in source names — these are globally shared and never stored per-user
@@ -553,7 +626,7 @@ function rankArticles(articles: Article[]) {
     rest.splice(pos, 0, promotedLow[i]);
   }
   const combined = [...rest, ...remainingLow];
-  
+
   // 增加随机性：一半文章按优先级排序，一半随机打乱
   const halfPoint = Math.floor(combined.length / 2);
   const prioritized = combined.slice(0, halfPoint);
@@ -632,7 +705,8 @@ function normalizeFeedItems(
   return normalizedItems.map((item, index) => {
     const rawContent = item['content:encoded'] || item.content || item.contentSnippet || '';
     const formattedContent = source === '即刻话题' ? formatJikeContent(rawContent) : rawContent;
-    const excerpt = formattedContent.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').substring(0, 120) + '...';
+    const boundedContent = truncateUtf8(formattedContent, RSS_ARTICLE_CONTENT_MAX_BYTES);
+    const excerpt = boundedContent.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').substring(0, 120) + '...';
     const topic = (item.categories && item.categories.length > 0) ? item.categories[0] : defaultTopic;
     let timeStr = '刚刚';
     const date = item.pubDate ? new Date(item.pubDate) : null;
@@ -661,7 +735,7 @@ function normalizeFeedItems(
       publishedAt,
       title: item.title || '无标题',
       excerpt,
-      content: rawContent,
+      content: boundedContent,
       url: item.link,
       audioUrl,
       audioDuration,
@@ -805,6 +879,31 @@ const normalizeImageUrl = (url: string, baseUrl?: string) => {
   }
 };
 
+const decodeHtmlAttributeEntities = (value: string) => value.replace(
+  /&(?:#(\d+)|#x([\da-f]+)|(amp|quot|apos|lt|gt));/gi,
+  (match, decimal: string | undefined, hexadecimal: string | undefined, named: string | undefined) => {
+    if (decimal || hexadecimal) {
+      const codePoint = Number.parseInt(decimal || hexadecimal || '', decimal ? 10 : 16);
+      if (Number.isSafeInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff) {
+        try {
+          return String.fromCodePoint(codePoint);
+        } catch {
+          return match;
+        }
+      }
+      return match;
+    }
+    const namedEntities: Record<string, string> = {
+      amp: '&',
+      quot: '"',
+      apos: "'",
+      lt: '<',
+      gt: '>',
+    };
+    return namedEntities[(named || '').toLowerCase()] || match;
+  },
+);
+
 const extractImageUrlsFromArticle = (article: Pick<Article, "content" | "markdownContent" | "url">, limit = 12) => {
   const content = `${article.markdownContent || ""}\n${article.content || ""}`;
   const urls = new Set<string>();
@@ -818,10 +917,10 @@ const extractImageUrlsFromArticle = (article: Pick<Article, "content" | "markdow
     add(match[1]);
   }
   for (const match of content.matchAll(/<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi)) {
-    add(match[1]);
+    add(decodeHtmlAttributeEntities(match[1]));
   }
   for (const match of content.matchAll(/\b(?:src|data-src|data-original)=["']([^"']+)["']/gi)) {
-    add(match[1]);
+    add(decodeHtmlAttributeEntities(match[1]));
   }
 
   return Array.from(urls).slice(0, limit);
@@ -838,28 +937,6 @@ const normalizeJsonStringArray = (value: unknown): string[] => {
     }
   }
   return [];
-};
-
-/**
- * Normalize article URL to avoid duplicate saves due to URL variations
- * - Removes query parameters (utm_source, etc.)
- * - Removes hash fragments
- * - Removes trailing slashes
- * - Converts to lowercase for case-insensitive comparison
- */
-const normalizeArticleUrl = (url: string | undefined): string | undefined => {
-  if (!url) return undefined;
-  try {
-    const parsed = new URL(url);
-    parsed.search = '';  // Remove query parameters
-    parsed.hash = '';    // Remove hash fragments
-    let normalized = parsed.href.replace(/\/$/, ''); // Remove trailing slash
-    // Keep protocol and domain case-sensitive, but normalize path
-    return normalized;
-  } catch {
-    // Invalid URL, return as-is
-    return url;
-  }
 };
 
 /**
@@ -927,6 +1004,10 @@ type WritingCardInput = {
   sourceImages?: string[];
   publishedAt?: number;
   savedAt?: string;
+  canvasNodeId?: number;
+  captureId?: string;
+  citationPrefix?: string;
+  citationSuffix?: string;
 };
 
 type WritingOutlineSection = {
@@ -977,6 +1058,8 @@ const WRITE_CANVAS_NODE_KINDS = [
   "asset_image",
   "saved_article",
   "atom_card",
+  "citation",
+  "podcast_episode",
   "note",
   "agent",
   "result",
@@ -989,9 +1072,31 @@ type CanvasContextItem = {
   kind: WriteCanvasNodeKind;
   title: string;
   text: string;
+  refId?: string;
   imageDataUrl?: string;
   mimeType?: string;
   sourceLabel?: string;
+  sourceUrl?: string;
+  sourceExcerpt?: string;
+  sourceContext?: string;
+  originalQuote?: string;
+  articleId?: number;
+  savedArticleId?: number;
+  captureId?: string;
+  citationPrefix?: string;
+  citationSuffix?: string;
+};
+
+type WriteCanvasSkillConfig = {
+  mode: "inherit" | "override";
+  inherit: boolean;
+  skillIds: Array<number | string>;
+  primaryStyleSkillId?: number | string;
+};
+
+type WriteCanvasDocumentSnapshot = {
+  store: Record<string, unknown>;
+  schema?: Record<string, unknown>;
 };
 
 const WRITE_CANVAS_MAX_NODES_PER_PROJECT = readBoundedEnvNumber(process.env.CANVAS_MAX_NODES_PER_PROJECT, 500, 50, 5000);
@@ -1000,7 +1105,19 @@ const WRITE_CANVAS_MAX_PROJECTS_PER_USER = readBoundedEnvNumber(process.env.CANV
 const WRITE_CANVAS_MAX_CONTEXT_ITEMS = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_ITEMS, 30, 5, 100);
 const WRITE_CANVAS_MAX_CONTEXT_CHARS = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_CHARS, 60000, 10000, 250000);
 const WRITE_CANVAS_MAX_CONTEXT_IMAGE_BYTES = readBoundedEnvNumber(process.env.CANVAS_MAX_CONTEXT_IMAGE_MB, 12, 1, 40) * 1024 * 1024;
-
+const WRITE_CANVAS_DOCUMENT_MAX_BYTES = 2 * 1024 * 1024;
+const WRITE_CANVAS_DOCUMENT_MAX_RECORDS = 5000;
+const WRITE_CANVAS_MAX_SKILL_IDS = 32;
+const WRITE_CANVAS_CLONE_MAX_ROWS = 10_000;
+const WRITE_CANVAS_CLONE_MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+const WRITE_CANVAS_CLONE_MAX_METADATA_BYTES = 8 * 1024 * 1024;
+const WRITE_CANVAS_CLONE_METADATA_BATCH_SIZE = 250;
+const WRITE_CANVAS_LEGACY_THREAD_MIGRATION_MAX_BYTES = readBoundedEnvNumber(
+  process.env.CANVAS_LEGACY_THREAD_MIGRATION_MAX_MB,
+  1,
+  1,
+  16,
+) * 1024 * 1024;
 type WriteAgentSkillType = "card_storage" | "citation" | "writing" | "style";
 type WriteAgentSkillScenario = "storage" | "citation" | "drafting" | "style";
 
@@ -1052,11 +1169,18 @@ type WriteAgentSourcesRecord = {
     url?: string;
     citationContext?: string;
     imageUrls?: string[];
+    canvasNodeId?: number;
+    captureId?: string;
   }>;
   quotes: Array<{
     cardId: string;
     articleTitle?: string;
     quote: string;
+    sourceUrl?: string;
+    canvasNodeId?: number;
+    captureId?: string;
+    prefix?: string;
+    suffix?: string;
   }>;
   images: Array<{
     id: string;
@@ -1262,8 +1386,8 @@ const getBaselineWriteAgentSkills = (types?: WriteAgentSkillType[]) => {
   return SYSTEM_WRITE_AGENT_SKILLS.filter(skill => skill.isBaseline && (!allowed || allowed.has(skill.type)));
 };
 
-const fetchWriteAgentSkills = async (pool: pg.Pool, userId: number, typeFilter?: WriteAgentSkillType): Promise<WriteAgentSkillRecord[]> => {
-  const rows = (await pool.query(
+const fetchWriteAgentSkills = async (database: pg.Pool | pg.PoolClient, userId: number, typeFilter?: WriteAgentSkillType): Promise<WriteAgentSkillRecord[]> => {
+  const rows = (await database.query(
     `SELECT id, name, type, description, prompt, examples, constraints, is_default AS "isDefault",
             created_at AS "createdAt", updated_at AS "updatedAt"
      FROM write_style_skills
@@ -1313,20 +1437,25 @@ const resolveWriteStyleSkill = async (
     || SYSTEM_WRITE_STYLE_SKILLS[0];
 };
 
-const resolveWriteAgentSkills = async (
-  pool: pg.Pool,
-  userId: number,
+const resolveWriteAgentSkillsFromAvailable = (
+  skills: WriteAgentSkillRecord[],
   selectedSkillIds?: Array<number | string>,
   selectedStyleSkillId?: number | string
-): Promise<WriteAgentSkillRecord[]> => {
-  const skills = await fetchWriteAgentSkills(pool, userId);
+): WriteAgentSkillRecord[] => {
   const selectedSet = new Set((selectedSkillIds || []).map(id => String(id)));
+  const primaryStyleKey = selectedStyleSkillId !== undefined && selectedStyleSkillId !== null
+    ? String(selectedStyleSkillId)
+    : null;
   if (selectedStyleSkillId !== undefined && selectedStyleSkillId !== null) {
-    selectedSet.add(String(selectedStyleSkillId));
+    selectedSet.add(primaryStyleKey!);
   }
   const selected = skills.filter(skill => selectedSet.has(String(skill.id)) && !isBaselineSkill(skill));
   const result: WriteAgentSkillRecord[] = [];
   getBaselineWriteAgentSkills().forEach(skill => result.push(skill));
+  const primaryStyle = primaryStyleKey
+    ? selected.find(skill => skill.type === "style" && String(skill.id) === primaryStyleKey)
+    : undefined;
+  if (primaryStyle) result.push(primaryStyle);
   selected.forEach(skill => {
     if (!result.some(item => String(item.id) === String(skill.id))) result.push(skill);
   });
@@ -1336,6 +1465,28 @@ const resolveWriteAgentSkills = async (
     || skills.find(skill => skill.type === "style");
   if (!hasStyle && fallbackStyle) result.push(fallbackStyle);
   return result;
+};
+
+const selectPrimaryWriteStyleSkill = (
+  skills: WriteAgentSkillRecord[],
+  primaryStyleSkillId?: number | string,
+) => {
+  if (primaryStyleSkillId !== undefined && primaryStyleSkillId !== null) {
+    const primaryKey = String(primaryStyleSkillId);
+    const explicitPrimary = skills.find(skill => skill.type === "style" && String(skill.id) === primaryKey);
+    if (explicitPrimary) return explicitPrimary;
+  }
+  return skills.find(skill => skill.type === "style");
+};
+
+const resolveWriteAgentSkills = async (
+  pool: pg.Pool,
+  userId: number,
+  selectedSkillIds?: Array<number | string>,
+  selectedStyleSkillId?: number | string
+): Promise<WriteAgentSkillRecord[]> => {
+  const skills = await fetchWriteAgentSkills(pool, userId);
+  return resolveWriteAgentSkillsFromAvailable(skills, selectedSkillIds, selectedStyleSkillId);
 };
 
 const buildAgentSkillSnapshot = (skill: WriteAgentSkillRecord) => ({
@@ -1382,7 +1533,7 @@ const sanitizeWritingCards = (cards: unknown[]): WritingCardInput[] => {
       type: card.type as AtomCard["type"],
       content: card.content.trim().slice(0, 520),
       summary: typeof card.summary === "string" ? card.summary.trim().slice(0, 180) : undefined,
-      originalQuote: typeof card.originalQuote === "string" ? card.originalQuote.trim().slice(0, 260) : undefined,
+      originalQuote: typeof card.originalQuote === "string" ? card.originalQuote.trim().slice(0, 2000) : undefined,
       context: typeof card.context === "string" ? card.context.trim().slice(0, 360) : undefined,
       citationNote: typeof card.citationNote === "string" ? card.citationNote.trim().slice(0, 220) : undefined,
       evidenceRole: typeof card.evidenceRole === "string" ? card.evidenceRole.trim().slice(0, 40) : undefined,
@@ -1396,7 +1547,13 @@ const sanitizeWritingCards = (cards: unknown[]): WritingCardInput[] => {
       sourceContext: typeof card.sourceContext === "string" ? card.sourceContext.trim().slice(0, 700) : undefined,
       sourceImages: normalizeJsonStringArray(card.sourceImages).slice(0, 8),
       publishedAt: typeof card.publishedAt === "number" ? card.publishedAt : undefined,
-      savedAt: typeof card.savedAt === "string" ? card.savedAt : undefined
+      savedAt: typeof card.savedAt === "string" ? card.savedAt : undefined,
+      canvasNodeId: typeof card.canvasNodeId === "number" && Number.isSafeInteger(card.canvasNodeId)
+        ? card.canvasNodeId
+        : undefined,
+      captureId: typeof card.captureId === "string" ? card.captureId.slice(0, 128) : undefined,
+      citationPrefix: typeof card.citationPrefix === "string" ? card.citationPrefix.slice(-120) : undefined,
+      citationSuffix: typeof card.citationSuffix === "string" ? card.citationSuffix.slice(0, 120) : undefined,
     });
   }
   return normalizedCards;
@@ -1748,6 +1905,15 @@ const summarizeAgentMessages = (messages: Array<{ role: string; content: string 
   return compact.slice(0, 1200);
 };
 
+const summarizeCanvasUserInstructions = (messages: Array<{ role: string; content: string }>) => {
+  const compact = messages
+    .filter(message => message.role === "user")
+    .slice(-10)
+    .map(message => `用户：${normalizePlainText(message.content).slice(0, 120)}`)
+    .join(" | ");
+  return compact.slice(0, 1200);
+};
+
 const inferThreadTitle = (input: string) => normalizePlainText(input).slice(0, 24) || '新的写作会话';
 
 const getRecentThreadMessages = async (pool: pg.Pool, threadId: number, limit = 16) => {
@@ -1770,6 +1936,30 @@ const getRecentThreadMessages = async (pool: pg.Pool, threadId: number, limit = 
       sourceCollapsed: row.role === 'assistant' ? (row.meta?.sourceCollapsed ?? true) : row.meta?.sourceCollapsed
     },
     created_at: row.created_at
+  }));
+};
+
+const getRecentCanvasUserInstructions = async (
+  database: pg.Pool | pg.PoolClient,
+  threadId: number,
+  limit = 10,
+  beforeMessageId?: number,
+) => {
+  const rows = (await database.query(
+    `SELECT id, role, content, meta, created_at
+     FROM write_agent_messages
+     WHERE thread_id = $1 AND role = 'user'
+       AND ($3::bigint IS NULL OR id < $3)
+     ORDER BY created_at DESC, id DESC
+     LIMIT $2`,
+    [threadId, limit, beforeMessageId ?? null],
+  )).rows;
+  return rows.reverse().map(row => ({
+    id: Number(row.id),
+    role: "user" as const,
+    content: row.content as string,
+    meta: row.meta || {},
+    created_at: row.created_at,
   }));
 };
 
@@ -2137,7 +2327,7 @@ const runWriteAgentGraph = async (
     }, (_state, update) => `thread=${update.threadId}; cards=${update.dbCards?.length || 0}`))
     .addNode("load_effective_skills", withTrace("load_effective_skills", async state => {
       const agentSkills = await resolveWriteAgentSkills(pool, state.userId, state.mergedState?.selectedSkillIds, state.mergedState?.selectedStyleSkillId);
-      const styleSkill = agentSkills.find(skill => skill.type === "style")
+      const styleSkill = selectPrimaryWriteStyleSkill(agentSkills, state.mergedState?.selectedStyleSkillId)
         || await resolveWriteStyleSkill(pool, state.userId, state.mergedState?.selectedStyleSkillId);
       const userCount = agentSkills.filter(skill => skill.visibility === "user").length;
       await input.onStep?.({
@@ -2285,7 +2475,7 @@ const runWriteAgentGraph = async (
 		              { role: "user", content: buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(state.recalledCards), evidenceMap, state.styleSkill, state.agentSkills) }
             ], 0.38, 1800);
 
-            if (generatedDraftText.trim()) {
+            if (generatedDraftText.trim() && state.isCreateArticle) {
               const preparedDraft = prepareAgentDraftForNote(generatedDraftText, generatedPlan.title);
               await input.onStep?.({
                 type: "partial_status",
@@ -2625,7 +2815,17 @@ const writeAgentInputGuardrail = {
   name: "write-agent-input-size",
   runInParallel: false,
   execute: async ({ input }) => {
-    const text = typeof input === "string" ? input : JSON.stringify(input);
+    const text = typeof input === "string"
+      ? input
+      : input.flatMap(item => {
+        if (!isPlainRecord(item) || item.role !== "user") return [];
+        const content = item.content;
+        if (typeof content === "string") return [content];
+        if (!Array.isArray(content)) return [];
+        return content.flatMap(part => isPlainRecord(part) && part.type === "input_text" && typeof part.text === "string"
+          ? [part.text]
+          : []);
+      }).join("\n");
     return {
       tripwireTriggered: text.trim().length === 0 || text.length > WRITE_AGENT_MAX_MESSAGE_LENGTH,
       outputInfo: { length: text.length }
@@ -2655,22 +2855,65 @@ const runOpenAIWriteAgentRuntime = async (
     message: string;
     isCreateArticle: boolean;
     userState: WriteAgentState;
+    threadType?: "chat" | "skill" | "canvas";
+    authorizedCards?: WritingCardInput[];
+    authorizedImages?: string[];
+    agentSystemPrompt?: string;
+    model?: string;
+    temperature?: number;
+    topP?: number;
+    maxTokens?: number;
     runId?: string;
+    creationKey?: string;
+    requestKey?: string;
+    signal?: AbortSignal;
+    onProviderBoundary?: () => void | Promise<void>;
+    onBeforeProvider?: () => void | Promise<void>;
     onStep?: (event: { type: string; node?: string; message?: string; data?: unknown }) => void | Promise<void>;
   }
 ): Promise<WriteAgentGraphState> => {
-  const config = getOpenAIWriteAgentConfig();
-  if (!config) throw new Error("OpenAI writing agent is not configured: set OPENAI_API_KEY and OPENAI_MODEL");
+  const isCanvasRun = input.threadType === "canvas";
+  const baseConfig = getOpenAIWriteAgentConfig();
+  if (!baseConfig) throw new Error("OpenAI writing agent is not configured: set OPENAI_API_KEY and OPENAI_MODEL");
+  const config = input.model
+    ? { ...baseConfig, model: normalizeAiModelName(input.model) }
+    : baseConfig;
+  const runtimeModelSettings = {
+    temperature: clampNumber(input.temperature, 0.55, 0, 2),
+    topP: clampNumber(input.topP, 1, 0.01, 1),
+    maxTokens: Math.round(clampNumber(input.maxTokens, 1200, 128, getCanvasAgentMaxOutputTokens())),
+  };
 
   const runId = input.runId || randomUUID();
   const runStartedAt = Date.now();
   const runner = createOpenAIWriteAgentRunner(config);
+  const authorizedImages = selectAuthorizedCanvasImages(config.model, input.authorizedImages || []);
+  const withAuthorizedImages = (prompt: string): string | AgentInputItem[] => authorizedImages.length > 0
+    ? [{
+      role: "user",
+      content: [
+        { type: "input_text", text: prompt },
+        ...authorizedImages.map(image => ({ type: "input_image" as const, image, detail: "auto" })),
+      ],
+    }]
+    : prompt;
   const sdkTools = createWriteAgentSdkTools();
   const trace: WriteAgentGraphTraceRecord[] = [];
+  let providerStartPromise: Promise<void> | null = null;
+  const beforeProviderInvocation = async () => {
+    input.signal?.throwIfAborted();
+    await input.onProviderBoundary?.();
+    if (!providerStartPromise) {
+      providerStartPromise = Promise.resolve(input.onBeforeProvider?.());
+    }
+    await providerStartPromise;
+  };
   const withStep = async <T,>(node: string, label: string, fn: () => Promise<{ value: T; summary?: string; meta?: Record<string, unknown> }>) => {
+    input.signal?.throwIfAborted();
     const started = Date.now();
     await input.onStep?.({ type: "step_start", node, message: getWriteAgentNodeLabel(node, "start") });
     const result = await fn();
+    input.signal?.throwIfAborted();
     const traceItem: WriteAgentGraphTraceRecord = {
       node,
       durationMs: Date.now() - started,
@@ -2691,12 +2934,13 @@ const runOpenAIWriteAgentRuntime = async (
   let activeCards: any[] = [];
 
   const threadId = await withStep("hydrate_context", "context hydrated", async () => {
+    const expectedThreadType = input.threadType || "chat";
     thread = input.threadId
       ? (await pool.query(
         `SELECT id, title, summary, state, created_at, updated_at
          FROM write_agent_threads
-         WHERE id = $1 AND user_id = $2`,
-        [input.threadId, input.userId]
+         WHERE id = $1 AND user_id = $2 AND thread_type = $3`,
+        [input.threadId, input.userId, expectedThreadType]
       )).rows[0]
       : null;
     if (!thread) {
@@ -2704,29 +2948,72 @@ const runOpenAIWriteAgentRuntime = async (
         `INSERT INTO write_agent_threads (user_id, title, state, thread_type)
          VALUES ($1, $2, $3, $4)
          RETURNING id, title, summary, state, thread_type, created_at, updated_at`,
-        [input.userId, inferThreadTitle(input.message), JSON.stringify({}), "chat"]
+        [input.userId, inferThreadTitle(input.message), JSON.stringify({}), expectedThreadType]
       )).rows[0];
     }
     const normalizedThreadId = Number(thread.id);
-    await pool.query(
+    const userMessageMeta = {
+      state: input.userState,
+      action: input.isCreateArticle ? "create_article" : undefined,
+      ...(input.requestKey ? { canvasRunRequestKey: input.requestKey } : {}),
+    };
+    const insertedUserMessage = (await pool.query(
       `INSERT INTO write_agent_messages (thread_id, role, content, meta)
-       VALUES ($1, 'user', $2, $3)`,
-      [normalizedThreadId, input.message, JSON.stringify({ state: input.userState, action: input.isCreateArticle ? "create_article" : undefined })]
-    );
-    dbCards = await fetchUserSavedCards(pool, input.userId);
-    previousMessages = await getRecentThreadMessages(pool, normalizedThreadId, 14);
+       VALUES ($1, 'user', $2, $3)
+       ${input.requestKey ? "ON CONFLICT DO NOTHING" : ""}
+       RETURNING id`,
+      [normalizedThreadId, input.message, JSON.stringify(userMessageMeta)]
+    )).rows[0];
+    let currentUserMessageId = Number(insertedUserMessage?.id);
+    if (!Number.isSafeInteger(currentUserMessageId) && input.requestKey) {
+      const existingUserMessage = (await pool.query(
+        `SELECT id
+         FROM write_agent_messages
+         WHERE thread_id = $1 AND role = 'user' AND meta->>'canvasRunRequestKey' = $2
+         LIMIT 1`,
+        [normalizedThreadId, input.requestKey],
+      )).rows[0];
+      currentUserMessageId = Number(existingUserMessage?.id);
+    }
+    if (isCanvasRun && !Number.isSafeInteger(currentUserMessageId)) {
+      throw new Error("Canvas Agent user instruction could not be persisted");
+    }
+    // Supplying authorizedCards creates a hard material boundary for canvas
+    // runs: global cards and notes are not hydrated into the model context.
+    dbCards = input.authorizedCards === undefined
+      ? await fetchUserSavedCards(pool, input.userId)
+      : sanitizeWritingCards(input.authorizedCards);
+    previousMessages = isCanvasRun
+      ? await getRecentCanvasUserInstructions(pool, normalizedThreadId, 10, currentUserMessageId)
+      : await getRecentThreadMessages(pool, normalizedThreadId, 14);
+    if (isCanvasRun) {
+      // Canvas assistant/tool output remains stored for the UI and audit trail,
+      // but only prior user instructions may cross into a later model run.
+      thread = {
+        ...thread,
+        summary: summarizeCanvasUserInstructions(previousMessages),
+      };
+    }
     const threadState = (thread.state || {}) as WriteAgentState;
     mergedState = {
-      focusedTopic: input.userState.focusedTopic || threadState.focusedTopic,
-      activatedNodeIds: input.userState.activatedNodeIds || threadState.activatedNodeIds || [],
-      activationSummary: input.userState.activationSummary || threadState.activationSummary || [],
-      selectedStyleSkillId: input.userState.selectedStyleSkillId || threadState.selectedStyleSkillId,
+      focusedTopic: isCanvasRun ? input.userState.focusedTopic : input.userState.focusedTopic || threadState.focusedTopic,
+      activatedNodeIds: isCanvasRun
+        ? input.userState.activatedNodeIds || []
+        : input.userState.activatedNodeIds || threadState.activatedNodeIds || [],
+      activationSummary: isCanvasRun
+        ? input.userState.activationSummary || []
+        : input.userState.activationSummary || threadState.activationSummary || [],
+      selectedStyleSkillId: isCanvasRun
+        ? input.userState.selectedStyleSkillId
+        : input.userState.selectedStyleSkillId || threadState.selectedStyleSkillId,
       selectedSkillIds: input.userState.selectedSkillIds || threadState.selectedSkillIds || [],
       effectiveSkillIds: Array.isArray(threadState.effectiveSkillIds) ? threadState.effectiveSkillIds : [],
       writingGoal: input.userState.writingGoal || threadState.writingGoal,
       pendingChoice: input.userState.pendingChoice || threadState.pendingChoice,
-      selectedCardIds: input.userState.selectedCardIds || threadState.selectedCardIds || [],
-      sourceImageIds: threadState.sourceImageIds || [],
+      selectedCardIds: isCanvasRun
+        ? input.userState.selectedCardIds || []
+        : input.userState.selectedCardIds || threadState.selectedCardIds || [],
+      sourceImageIds: isCanvasRun ? [] : threadState.sourceImageIds || [],
       lastIntent: threadState.lastIntent,
       latestOutline: Array.isArray(threadState.latestOutline) ? threadState.latestOutline : [],
       latestAngle: typeof threadState.latestAngle === "string" ? threadState.latestAngle : undefined,
@@ -2741,7 +3028,17 @@ const runOpenAIWriteAgentRuntime = async (
   let styleSkill: WriteAgentSkillRecord | undefined;
   await withStep("load_effective_skills", "skills loaded", async () => {
     agentSkills = await resolveWriteAgentSkills(pool, input.userId, mergedState.selectedSkillIds, mergedState.selectedStyleSkillId);
-    styleSkill = agentSkills.find(skill => skill.type === "style")
+    if (input.agentSystemPrompt?.trim()) {
+      agentSkills.push({
+        id: "canvas-agent-instructions",
+        name: "画布 Agent 指令",
+        type: "writing",
+        scenario: "drafting",
+        prompt: input.agentSystemPrompt.trim().slice(0, 8000),
+        visibility: "system",
+      });
+    }
+    styleSkill = selectPrimaryWriteStyleSkill(agentSkills, mergedState.selectedStyleSkillId)
       || await resolveWriteStyleSkill(pool, input.userId, mergedState.selectedStyleSkillId);
     await input.onStep?.({
       type: "partial_status",
@@ -2758,6 +3055,7 @@ const runOpenAIWriteAgentRuntime = async (
   const { intent, requestedTools } = await withStep("classify_intent", "intent classified locally", async () => {
     let classified: WriteAgentIntentClassification = classifyWriteAgentIntent(input.message, input.isCreateArticle);
     if (classified.intent.needsModelRouter) {
+      await beforeProviderInvocation();
       const rawIntent = await requestAiChatCompletion([
         {
           role: "system",
@@ -2771,7 +3069,8 @@ const runOpenAIWriteAgentRuntime = async (
         temperature: 0.1,
         maxTokens: 260,
         logLabel: "write_agent_intent_router",
-        disableThinking: true
+        disableThinking: true,
+        signal: input.signal,
       });
       classified = mergeWriteAgentModelRouterResult(
         classified,
@@ -2796,7 +3095,7 @@ const runOpenAIWriteAgentRuntime = async (
     recalledCards = requestedTools.includes("recall_cards")
       ? toolRecallCards(`${input.message} ${mergedState.focusedTopic || ""}`, dbCards, activeCards.map(card => card.id))
       : [];
-    recentNotes = requestedTools.includes("list_recent_notes") || requestedTools.includes("generate_draft")
+    recentNotes = input.authorizedCards === undefined && (requestedTools.includes("list_recent_notes") || requestedTools.includes("generate_draft"))
       ? await toolListRecentNotes(pool, input.userId, 4)
       : [];
     return {
@@ -2873,6 +3172,7 @@ const runOpenAIWriteAgentRuntime = async (
     name: "MaterialAgent",
     handoffDescription: "Select and explain relevant AtomFlow knowledge cards for writing tasks.",
     model: config.model,
+    modelSettings: runtimeModelSettings,
     instructions: "你负责判断召回素材是否足以支撑写作任务。必须明确素材不足，不要伪造来源。",
     tools: sdkTools,
     inputGuardrails: [writeAgentInputGuardrail],
@@ -2882,6 +3182,7 @@ const runOpenAIWriteAgentRuntime = async (
     name: "OutlineAgent",
     handoffDescription: "Generate article angles and outlines from AtomFlow knowledge cards.",
     model: config.model,
+    modelSettings: runtimeModelSettings,
     instructions: WRITING_PLAN_SYSTEM_PROMPT,
     inputGuardrails: [writeAgentInputGuardrail],
     outputGuardrails: [writeAgentOutputGuardrail]
@@ -2890,6 +3191,7 @@ const runOpenAIWriteAgentRuntime = async (
     name: "DraftAgent",
     handoffDescription: "Write article drafts from outlines, cards, citations and style skills.",
     model: config.model,
+    modelSettings: runtimeModelSettings,
     instructions: WRITING_AGENT_SYSTEM_PROMPT,
     inputGuardrails: [writeAgentInputGuardrail],
     outputGuardrails: [writeAgentOutputGuardrail]
@@ -2898,6 +3200,7 @@ const runOpenAIWriteAgentRuntime = async (
     name: "CoordinatorAgent",
     handoffDescription: "Coordinate AtomFlow writing tasks and produce final user-facing answers.",
     model: config.model,
+    modelSettings: runtimeModelSettings,
     instructions: `你是 AtomFlow 的写作助手 Agent。默认基于用户知识库回答，不要频繁反问。
 
 规则：
@@ -2931,27 +3234,33 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
       if (cardsForWriting.length > 0) {
         await input.onStep?.({ type: "partial_status", node: "generate_answer_or_draft", message: shouldGenerateDraft ? "正在规划文章结构" : "正在生成提纲" });
         const topicForWriting = mergedState.focusedTopic || input.message;
-        const planResult = await runner.run(outlineAgent, buildWritingPlanPrompt(topicForWriting, cardsForWriting, sanitizeWritingCards(recalledCards), styleSkill, agentSkills), {
+        await beforeProviderInvocation();
+        const planResult = await runner.run(outlineAgent, withAuthorizedImages(buildWritingPlanPrompt(topicForWriting, cardsForWriting, sanitizeWritingCards(recalledCards), styleSkill, agentSkills)), {
           context: sdkContext,
-          maxTurns: 4
+          maxTurns: 4,
+          signal: input.signal,
         });
         generatedPlan = sanitizeWritingPlan(safeJsonParse<WritingPlanResult>(String(planResult.finalOutput || "")), topicForWriting);
         generatedOutlineText = generatedPlan.outline.map(item => `- ${item.heading}：${item.goal}`).join("\n");
         const evidenceMap = buildEvidenceMap(generatedPlan, cardsForWriting);
         if (shouldGenerateDraft) {
           await input.onStep?.({ type: "partial_status", node: "generate_answer_or_draft", message: "正在生成完整文章草稿" });
-          const draftResult = await runner.run(draftAgent, buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards), evidenceMap, styleSkill, agentSkills), {
+          await beforeProviderInvocation();
+          const draftResult = await runner.run(draftAgent, withAuthorizedImages(buildDraftPrompt(topicForWriting, generatedPlan, cardsForWriting, sanitizeWritingCards(recalledCards), evidenceMap, styleSkill, agentSkills)), {
             context: sdkContext,
-            maxTurns: 4
+            maxTurns: 4,
+            signal: input.signal,
           });
           generatedDraftText = String(draftResult.finalOutput || "").trim();
-          if (generatedDraftText) {
+          if (generatedDraftText && input.isCreateArticle) {
             const preparedDraft = prepareAgentDraftForNote(generatedDraftText, generatedPlan.title);
             await input.onStep?.({ type: "partial_status", node: "persist_memory", message: "正在保存文章与引用链路" });
             const activationSummaryForNote = (mergedState.activationSummary || []).length > 0
               ? mergedState.activationSummary || []
               : cardsForWriting.slice(0, 5).map(card => `${card.type} · ${card.content.slice(0, 20)}`);
+            input.signal?.throwIfAborted();
             persistedDraftNote = await createAgentDraftNote(pool, input.userId, {
+              creationKey: input.creationKey,
               title: generatedPlan.title,
               content: preparedDraft.html,
               topic: topicForWriting,
@@ -2982,7 +3291,9 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
         generatedPlan?.angle ? `核心判断：${generatedPlan.angle}` : "",
         "你可以在「我的文章」里继续编辑；知识节点、原文摘录、来源图片和引用映射已经写入文章元信息。"
       ].filter(Boolean).join("\n")
-      : String((await runner.run(coordinatorAgent, formatOpenAIWriteAgentPrompt({
+      : String((await (async () => {
+        await beforeProviderInvocation();
+        return runner.run(coordinatorAgent, withAuthorizedImages(formatOpenAIWriteAgentPrompt({
         thread,
         message: input.message,
         mergedState,
@@ -2993,10 +3304,12 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
         generatedDraftText,
         agentSkills,
         styleSkill
-      }), {
+      })), {
         context: sdkContext,
-        maxTurns: 6
-      })).finalOutput || "").trim();
+        maxTurns: 6,
+        signal: input.signal,
+        });
+      })()).finalOutput || "").trim();
     return { value: null, summary: persistedDraftNote ? `note=${persistedDraftNote.id}` : `answer=${assistantContent.length}`, meta: { sdk: "openai-agents", provider: config.providerLabel, model: config.model } };
   });
 
@@ -3033,7 +3346,8 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
       },
       runtime: "openai-agents-sdk",
       provider: config.providerLabel,
-      model: config.model
+      model: config.model,
+      usedImages: authorizedImages.length,
     };
     if (requestedTools.length > 0) {
       await pool.query(
@@ -3083,8 +3397,12 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
       selectedSkillIds: agentSkills.filter(skill => !isBaselineSkill(skill)).map(skill => skill.id),
       effectiveSkillIds: agentSkills.map(skill => skill.id)
     };
-    const finalMessages = await getRecentThreadMessages(pool, threadId, 14);
-    const summary = summarizeAgentMessages(finalMessages.map(item => ({ role: item.role, content: item.content })));
+    const finalMessages = isCanvasRun
+      ? await getRecentCanvasUserInstructions(pool, threadId, 10)
+      : await getRecentThreadMessages(pool, threadId, 14);
+    const summary = isCanvasRun
+      ? summarizeCanvasUserInstructions(finalMessages)
+      : summarizeAgentMessages(finalMessages.map(item => ({ role: item.role, content: item.content })));
     await upsertThreadState(pool, threadId, summary, nextState, thread?.title || inferThreadTitle(input.message));
     mergedState = nextState;
     if (selectedCardIds.length > 0) {
@@ -3102,6 +3420,18 @@ ${formatAgentSkillInstructions(agentSkills, ["citation", "writing", "style"]) ||
   });
 
   await withStep("respond", "response ready", async () => ({ value: null, summary: `thread=${threadId}` }));
+  if (assistantMessageId) {
+    const completedTrace = [...trace];
+    const traceUpdate = await pool.query(
+      `UPDATE write_agent_messages
+       SET meta = jsonb_set(COALESCE(meta, '{}'::jsonb), '{graphTrace}', $3::jsonb, true)
+       WHERE id = $1 AND thread_id = $2`,
+      [assistantMessageId, threadId, JSON.stringify(completedTrace)],
+    );
+    if (traceUpdate.rowCount !== 1) throw new Error("Writing Agent trace could not be finalized");
+    toolPayload = { ...toolPayload, graphTrace: completedTrace };
+  }
+  input.signal?.throwIfAborted();
   await persistAgentGraphEvents(pool, input.userId, threadId, trace, runId);
   await persistAgentRunEvent(pool, {
     userId: input.userId,
@@ -3351,6 +3681,10 @@ const buildNoteActivatedNodes = (cards: WritingCardInput[]) => {
     sourceUrl: card.sourceUrl,
     sourceContext: card.sourceContext,
     sourceImages: card.sourceImages || [],
+    canvasNodeId: card.canvasNodeId,
+    captureId: card.captureId,
+    citationPrefix: card.citationPrefix,
+    citationSuffix: card.citationSuffix,
     tags: card.tags || []
   }));
 };
@@ -3366,6 +3700,11 @@ const buildNoteSourceArticles = (cards: WritingCardInput[]) => {
               citationContext?: string;
               sourceImages?: string[];
               savedAt?: string;
+              canvasNodeId?: number;
+              captureId?: string;
+              exact?: string;
+              prefix?: string;
+              suffix?: string;
   }>();
   cards.forEach(card => {
     const key = card.savedArticleId
@@ -3381,27 +3720,69 @@ const buildNoteSourceArticles = (cards: WritingCardInput[]) => {
       excerpt: card.sourceExcerpt || card.sourceContext || card.context || card.content.slice(0, 140),
       citationContext: card.sourceContext,
       sourceImages: card.sourceImages || [],
-      savedAt: card.savedAt
+      savedAt: card.savedAt,
+      canvasNodeId: card.canvasNodeId,
+      captureId: card.captureId,
+      exact: card.originalQuote,
+      prefix: card.citationPrefix,
+      suffix: card.citationSuffix,
     });
   });
   return Array.from(unique.values());
 };
 
 // 从写作卡片中提取唯一来源文章列表
-const buildSourceArticlesFromCards = (cardsForWriting: any[], _dbCards: any[]) => {
-  const articleMap = new Map<string, { articleId?: number; articleTitle: string; url?: string; cardIds: string[]; imageUrls?: string[] }>();
+const buildSourceArticlesFromCards = (cardsForWriting: WritingCardInput[], _dbCards: unknown[]) => {
+  const articleMap = new Map<string, {
+    savedArticleId?: number;
+    articleId?: number;
+    title: string;
+    articleTitle: string;
+    source: string;
+    url?: string;
+    excerpt?: string;
+    citationContext?: string;
+    sourceImages?: string[];
+    imageUrls?: string[];
+    cardIds: string[];
+    canvasNodeId?: number;
+    captureId?: string;
+    exact?: string;
+    prefix?: string;
+    suffix?: string;
+  }>();
   for (const card of cardsForWriting) {
-    const savedArticleId = card.savedArticleId ?? card.saved_article_id;
-    const articleTitle = card.articleTitle ?? card.article_title ?? card.context_title ?? '未知来源';
-    const sourceUrl = card.sourceUrl ?? card.article_url;
-    const key = savedArticleId ? `article_${savedArticleId}` : `title_${articleTitle}`;
+    const savedArticleId = card.savedArticleId;
+    const articleTitle = card.articleTitle || '未知来源';
+    const sourceUrl = card.sourceUrl;
+    const key = card.captureId
+      ? `capture_${card.captureId}`
+      : savedArticleId
+        ? `saved_${savedArticleId}`
+        : card.articleId
+          ? `article_${card.articleId}`
+          : card.canvasNodeId
+            ? `canvas_${card.canvasNodeId}`
+            : `source_${sourceUrl || articleTitle}`;
     if (!articleMap.has(key)) {
+      const sourceImages = normalizeJsonStringArray(card.sourceImages);
       articleMap.set(key, {
-        articleId: savedArticleId || undefined,
+        savedArticleId,
+        articleId: card.articleId,
+        title: articleTitle,
         articleTitle,
+        source: card.sourceName || '画布授权素材',
         url: sourceUrl || undefined,
+        excerpt: card.sourceExcerpt || card.sourceContext || card.originalQuote || card.content.slice(0, 260),
+        citationContext: card.sourceContext,
         cardIds: [],
-        imageUrls: normalizeJsonStringArray(card.sourceImages),
+        sourceImages,
+        imageUrls: sourceImages,
+        canvasNodeId: card.canvasNodeId,
+        captureId: card.captureId,
+        exact: card.originalQuote,
+        prefix: card.citationPrefix,
+        suffix: card.citationSuffix,
       });
     }
     if (typeof card.id === "string") {
@@ -3428,14 +3809,21 @@ const buildAgentSources = (cards: any[]): WriteAgentSourcesRecord => {
         source: card.sourceName,
         url: card.sourceUrl,
         citationContext: card.sourceContext,
-        imageUrls: card.sourceImages || []
+        imageUrls: card.sourceImages || [],
+        canvasNodeId: card.canvasNodeId,
+        captureId: card.captureId,
       });
     }
     if (card.originalQuote && card.id) {
       quotes.push({
         cardId: card.id,
         articleTitle: card.articleTitle,
-        quote: card.originalQuote
+        quote: card.originalQuote,
+        sourceUrl: card.sourceUrl,
+        canvasNodeId: card.canvasNodeId,
+        captureId: card.captureId,
+        prefix: card.citationPrefix,
+        suffix: card.citationSuffix,
       });
     }
     (card.sourceImages || []).slice(0, 4).forEach((url, index) => {
@@ -3515,6 +3903,7 @@ const createAgentDraftNote = async (
   pool: pg.Pool,
   userId: number,
   input: {
+    creationKey?: string;
     title: string;
     content: string;
     topic: string;
@@ -3569,6 +3958,7 @@ const createAgentDraftNote = async (
 ) => {
   const tags = Array.from(new Set(input.activeCards.flatMap(card => card.tags || []))).slice(0, 10);
   const meta = {
+    creationKey: input.creationKey,
     topic: input.topic,
     style: input.style,
     outline: input.outline,
@@ -3584,10 +3974,12 @@ const createAgentDraftNote = async (
 	    }
 	  };
   const row = (await pool.query(
-    `INSERT INTO notes (user_id, title, content, tags, meta)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO notes (user_id, title, content, tags, meta, creation_key)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (user_id, creation_key) WHERE creation_key IS NOT NULL
+     DO UPDATE SET creation_key = EXCLUDED.creation_key
      RETURNING id, title, content, tags, meta, created_at, updated_at`,
-    [userId, input.title, input.content, JSON.stringify(tags), JSON.stringify(meta)]
+    [userId, input.title, input.content, JSON.stringify(tags), JSON.stringify(meta), input.creationKey || null]
   )).rows[0];
   return row;
 };
@@ -3762,6 +4154,7 @@ const requestAiChatCompletion = async (
     timeoutMs?: number;
     logLabel: string;
     disableThinking?: boolean;
+    signal?: AbortSignal;
   }
 ) => {
   const config = getAiChatConfig();
@@ -3789,7 +4182,9 @@ const requestAiChatCompletion = async (
           ? { enable_thinking: false }
           : {}),
       }),
-      signal: controller.signal,
+      signal: options.signal
+        ? AbortSignal.any([controller.signal, options.signal])
+        : controller.signal,
     });
 
     if (!response.ok) {
@@ -3828,6 +4223,360 @@ const normalizeJsonObject = (value: unknown) => (
   isPlainRecord(value) ? value : {}
 );
 
+const normalizeCanvasSkillId = (candidate: unknown): number | string | undefined => (
+  typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate > 0
+    ? candidate
+    : typeof candidate === "string" && candidate.trim() && candidate.trim().length <= 128
+      ? candidate.trim()
+      : undefined
+);
+
+const normalizeCanvasSkillConfig = (
+  value: unknown,
+  emptyMode: "inherit" | "override" = "inherit",
+): WriteCanvasSkillConfig => {
+  const record = isPlainRecord(value) ? value : {};
+  const source = Array.isArray(value)
+    ? value
+    : Array.isArray(record.skillIds)
+      ? record.skillIds
+      : Array.isArray(record.selectedSkillIds)
+        ? record.selectedSkillIds
+        : [];
+  const seen = new Set<string>();
+  const skillIds: Array<number | string> = [];
+  for (const candidate of source) {
+    const normalized = normalizeCanvasSkillId(candidate);
+    if (normalized === undefined) continue;
+    const key = String(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    skillIds.push(normalized);
+    if (skillIds.length >= WRITE_CANVAS_MAX_SKILL_IDS) break;
+  }
+  const primaryStyleSkillId = normalizeCanvasSkillId(record.primaryStyleSkillId ?? record.selectedStyleSkillId);
+  const hasSelection = skillIds.length > 0 || primaryStyleSkillId !== undefined;
+  const explicitMode = record.mode === "inherit" || record.mode === "override" ? record.mode : undefined;
+  const inherit = explicitMode
+    ? explicitMode === "inherit"
+    : typeof record.inherit === "boolean"
+      ? record.inherit
+      : !hasSelection && emptyMode === "inherit";
+  return {
+    mode: inherit ? "inherit" : "override",
+    inherit,
+    skillIds: inherit ? [] : skillIds,
+    ...(!inherit && primaryStyleSkillId !== undefined ? { primaryStyleSkillId } : {}),
+  };
+};
+
+const filterCanvasSkillConfigFromAvailable = (
+  available: WriteAgentSkillRecord[],
+  value: unknown,
+  emptyMode: "inherit" | "override" = "inherit",
+): WriteCanvasSkillConfig => {
+  const requested = normalizeCanvasSkillConfig(value, emptyMode);
+  if (requested.inherit) return requested;
+  const availableById = new Map(available.map(skill => [String(skill.id), skill]));
+  const skillIds = requested.skillIds.filter(id => availableById.has(String(id)));
+  const primaryStyleSkillId = requested.primaryStyleSkillId !== undefined
+    && availableById.get(String(requested.primaryStyleSkillId))?.type === "style"
+    ? requested.primaryStyleSkillId
+    : undefined;
+  return {
+    mode: "override",
+    inherit: false,
+    skillIds,
+    ...(primaryStyleSkillId !== undefined ? { primaryStyleSkillId } : {}),
+  };
+};
+
+const filterCanvasSkillConfig = async (
+  database: pg.Pool | pg.PoolClient,
+  userId: number,
+  value: unknown,
+  emptyMode: "inherit" | "override" = "inherit",
+): Promise<WriteCanvasSkillConfig> => {
+  const available = await fetchWriteAgentSkills(database, userId);
+  return filterCanvasSkillConfigFromAvailable(available, value, emptyMode);
+};
+
+const resolveEffectiveCanvasSkillsFromAvailable = (
+  available: WriteAgentSkillRecord[],
+  value: unknown,
+  inheritedValue?: unknown,
+  emptyMode: "inherit" | "override" = inheritedValue === undefined ? "override" : "inherit",
+) => {
+  const skillConfig = filterCanvasSkillConfigFromAvailable(available, value, emptyMode);
+  const inheritedConfig = inheritedValue === undefined
+    ? { mode: "override" as const, inherit: false, skillIds: [] as Array<number | string> }
+    : filterCanvasSkillConfigFromAvailable(available, inheritedValue, "override");
+  const effectiveSkillConfig: WriteCanvasSkillConfig = skillConfig.inherit
+    ? { ...inheritedConfig, mode: "override", inherit: false }
+    : { ...skillConfig, mode: "override", inherit: false };
+  const effectiveSkills = resolveWriteAgentSkillsFromAvailable(
+    available,
+    effectiveSkillConfig.skillIds,
+    effectiveSkillConfig.primaryStyleSkillId,
+  );
+  return {
+    skillConfig,
+    effectiveSkillConfig,
+    effectiveSkills: buildAgentSkillSnapshots(effectiveSkills),
+  };
+};
+
+const resolveEffectiveCanvasSkills = async (
+  pool: pg.Pool,
+  userId: number,
+  value: unknown,
+  inheritedValue?: unknown,
+  emptyMode: "inherit" | "override" = inheritedValue === undefined ? "override" : "inherit",
+) => {
+  const available = await fetchWriteAgentSkills(pool, userId);
+  return resolveEffectiveCanvasSkillsFromAvailable(available, value, inheritedValue, emptyMode);
+};
+
+const parseCanvasDocumentSnapshot = (value: unknown): WriteCanvasDocumentSnapshot | null => {
+  if (!isPlainRecord(value) || !isPlainRecord(value.store)) return null;
+  const recordCount = Object.keys(value.store).length;
+  if (recordCount > WRITE_CANVAS_DOCUMENT_MAX_RECORDS) return null;
+  if (value.schema !== undefined && !isPlainRecord(value.schema)) return null;
+  return {
+    store: value.store,
+    ...(isPlainRecord(value.schema) ? { schema: value.schema } : {}),
+  };
+};
+
+type CanvasDocumentValidationResult =
+  | { ok: true; snapshot: WriteCanvasDocumentSnapshot }
+  | { ok: false; status: 400 | 413; error: string; code: string };
+
+const validateCanvasDocumentSnapshotInput = (value: unknown): CanvasDocumentValidationResult => {
+  let parsedSnapshot = value;
+  let serializedSnapshot: string;
+  if (typeof value === "string") {
+    serializedSnapshot = value;
+    if (Buffer.byteLength(serializedSnapshot, "utf8") > WRITE_CANVAS_DOCUMENT_MAX_BYTES) {
+      return { ok: false, status: 413, error: "画布文档超过 2MB 上限", code: "CANVAS_DOCUMENT_TOO_LARGE" };
+    }
+    try {
+      parsedSnapshot = JSON.parse(serializedSnapshot);
+    } catch {
+      return { ok: false, status: 400, error: "snapshot must be valid JSON", code: "INVALID_CANVAS_DOCUMENT" };
+    }
+  } else {
+    try {
+      serializedSnapshot = JSON.stringify(value);
+    } catch {
+      return { ok: false, status: 400, error: "snapshot must be valid JSON", code: "INVALID_CANVAS_DOCUMENT" };
+    }
+    if (Buffer.byteLength(serializedSnapshot, "utf8") > WRITE_CANVAS_DOCUMENT_MAX_BYTES) {
+      return { ok: false, status: 413, error: "画布文档超过 2MB 上限", code: "CANVAS_DOCUMENT_TOO_LARGE" };
+    }
+  }
+
+  const snapshot = parseCanvasDocumentSnapshot(parsedSnapshot);
+  if (!snapshot) {
+    const count = isPlainRecord(parsedSnapshot) && isPlainRecord(parsedSnapshot.store)
+      ? Object.keys(parsedSnapshot.store).length
+      : null;
+    return count !== null && count > WRITE_CANVAS_DOCUMENT_MAX_RECORDS
+      ? {
+        ok: false,
+        status: 413,
+        error: `画布记录不能超过 ${WRITE_CANVAS_DOCUMENT_MAX_RECORDS} 条`,
+        code: "CANVAS_DOCUMENT_RECORD_LIMIT",
+      }
+      : { ok: false, status: 400, error: "snapshot.store must be an object", code: "INVALID_CANVAS_DOCUMENT" };
+  }
+  if (hasEmbeddedCanvasMedia(snapshot)) {
+    return {
+      ok: false,
+      status: 400,
+      error: "画布快照不允许原生或外链媒体，请通过受限上传接口添加素材",
+      code: "EMBEDDED_CANVAS_MEDIA_REJECTED",
+    };
+  }
+  return { ok: true, snapshot };
+};
+
+type CanvasViewportInputResult =
+  | { ok: true; viewport: { camera: { x: number; y: number; z: number } } | null }
+  | { ok: false; error: string };
+
+const parseCanvasViewportInput = (value: unknown): CanvasViewportInputResult => {
+  if (value === undefined || value === null || value === "") return { ok: true, viewport: null };
+  let parsed = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return { ok: false, error: "viewport must be valid JSON" };
+    }
+  }
+  if (!isPlainRecord(parsed) || !isPlainRecord(parsed.camera)) {
+    return { ok: false, error: "viewport.camera is required" };
+  }
+  return {
+    ok: true,
+    viewport: {
+      camera: {
+        x: clampNumber(parsed.camera.x, 0, -100_000, 100_000),
+        y: clampNumber(parsed.camera.y, 0, -100_000, 100_000),
+        z: clampNumber(parsed.camera.z, 1, 0.01, 100),
+      },
+    },
+  };
+};
+
+const remapClonedCanvasDocumentSnapshot = (
+  snapshot: WriteCanvasDocumentSnapshot,
+  nodeIdMap: Map<number, number>,
+  edgeIdMap: Map<number, number>,
+): WriteCanvasDocumentSnapshot => {
+  const recordIdMap = new Map<string, string>();
+  for (const [storeKey, rawRecord] of Object.entries(snapshot.store)) {
+    if (!isPlainRecord(rawRecord)) continue;
+    const recordId = typeof rawRecord.id === "string" ? rawRecord.id : storeKey;
+    if (rawRecord.type === "atomflow-node" && isPlainRecord(rawRecord.props)) {
+      const clonedNodeId = nodeIdMap.get(Number(rawRecord.props.nodeId));
+      if (clonedNodeId !== undefined) {
+        const clonedShapeId = `shape:atomflow-node-${clonedNodeId}`;
+        recordIdMap.set(storeKey, clonedShapeId);
+        recordIdMap.set(recordId, clonedShapeId);
+      }
+    }
+    if (isPlainRecord(rawRecord.meta)) {
+      const clonedEdgeId = edgeIdMap.get(Number(rawRecord.meta.atomflowEdgeId));
+      if (clonedEdgeId !== undefined) {
+        const clonedShapeId = `shape:atomflow-edge-${clonedEdgeId}`;
+        recordIdMap.set(storeKey, clonedShapeId);
+        recordIdMap.set(recordId, clonedShapeId);
+      }
+    }
+  }
+
+  const remapValue = (value: unknown): unknown => {
+    if (typeof value === "string") return recordIdMap.get(value) || value;
+    if (Array.isArray(value)) return value.map(remapValue);
+    if (!isPlainRecord(value)) return value;
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, remapValue(child)]));
+  };
+
+  const storeEntries = Object.entries(snapshot.store).map(([storeKey, rawRecord]) => {
+    if (!isPlainRecord(rawRecord)) return [recordIdMap.get(storeKey) || storeKey, remapValue(rawRecord)] as const;
+    const remappedRecord = remapValue(rawRecord) as Record<string, unknown>;
+    let remappedKey = recordIdMap.get(storeKey) || storeKey;
+    if (rawRecord.type === "atomflow-node" && isPlainRecord(rawRecord.props)) {
+      const clonedNodeId = nodeIdMap.get(Number(rawRecord.props.nodeId));
+      if (clonedNodeId !== undefined) {
+        remappedKey = `shape:atomflow-node-${clonedNodeId}`;
+        remappedRecord.id = remappedKey;
+        const props = isPlainRecord(remappedRecord.props) ? remappedRecord.props : {};
+        remappedRecord.props = { ...props, nodeId: String(clonedNodeId) };
+      }
+    }
+    if (isPlainRecord(rawRecord.meta)) {
+      const clonedEdgeId = edgeIdMap.get(Number(rawRecord.meta.atomflowEdgeId));
+      if (clonedEdgeId !== undefined) {
+        remappedKey = `shape:atomflow-edge-${clonedEdgeId}`;
+        remappedRecord.id = remappedKey;
+        const meta = isPlainRecord(remappedRecord.meta) ? remappedRecord.meta : {};
+        remappedRecord.meta = { ...meta, atomflowEdgeId: clonedEdgeId };
+      }
+    }
+    return [remappedKey, remappedRecord] as const;
+  });
+
+  return {
+    store: Object.fromEntries(storeEntries),
+    ...(snapshot.schema ? { schema: remapValue(snapshot.schema) as Record<string, unknown> } : {}),
+  };
+};
+
+type CanvasCloneEntityMaps = {
+  sourceProjectId: number;
+  targetProjectId: number;
+  assetIds: Map<number, number>;
+  nodeIds: Map<number, number>;
+  edgeIds: Map<number, number>;
+  agentIds: Map<number, number>;
+  threadIds: Map<number, number>;
+  messageIdsByAgent: Map<string, number>;
+};
+
+const remapCanvasCloneMetadata = (value: unknown, maps: CanvasCloneEntityMaps): unknown => {
+  const remapId = (candidate: unknown, idMap: Map<number, number>) => {
+    const replacement = idMap.get(Number(candidate));
+    if (replacement === undefined) return candidate;
+    return typeof candidate === "string" ? String(replacement) : replacement;
+  };
+  const visit = (candidate: unknown, field = "", inheritedAgentId?: number): unknown => {
+    if (Array.isArray(candidate)) return candidate.map(item => visit(item, field, inheritedAgentId));
+    if (!isPlainRecord(candidate)) {
+      if (field === "projectId" || field === "canvasProjectId") {
+        return Number(candidate) === maps.sourceProjectId
+          ? (typeof candidate === "string" ? String(maps.targetProjectId) : maps.targetProjectId)
+          : candidate;
+      }
+      if (["nodeId", "canvasNodeId", "sourceNodeId", "targetNodeId", "generatedNodeId"].includes(field)) {
+        return remapId(candidate, maps.nodeIds);
+      }
+      if (["edgeId", "atomflowEdgeId"].includes(field)) return remapId(candidate, maps.edgeIds);
+      if (["agentId", "canvasAgentId", "generatedByAgentId", "sourceAgentId"].includes(field)) {
+        return remapId(candidate, maps.agentIds);
+      }
+      if (field === "threadId") return remapId(candidate, maps.threadIds);
+      if (["assetId", "canvasAssetId", "sourceAssetId", "generatedAssetId"].includes(field)) {
+        return remapId(candidate, maps.assetIds);
+      }
+      if (["messageId", "assistantMessageId"].includes(field) && inheritedAgentId) {
+        const replacement = maps.messageIdsByAgent.get(`${inheritedAgentId}:${Number(candidate)}`);
+        if (replacement !== undefined) return typeof candidate === "string" ? String(replacement) : replacement;
+        // A retained pointer to a source-project message is misleading and may
+        // collide with another thread after cloning. Keep provenance content,
+        // but explicitly clear references outside the bounded cloned history.
+        if (maps.agentIds.has(inheritedAgentId)) return null;
+      }
+      if (field === "resultKey" && inheritedAgentId && typeof candidate === "string") {
+        const messageResult = candidate.match(/^message:(\d+)$/);
+        if (messageResult) {
+          const replacement = maps.messageIdsByAgent.get(`${inheritedAgentId}:${Number(messageResult[1])}`);
+          if (replacement !== undefined) return `message:${replacement}`;
+        }
+      }
+      if (typeof candidate === "string") {
+        const canvasNodeMatch = candidate.match(/^canvas-node:(\d+):(.*)$/);
+        if (canvasNodeMatch) {
+          const clonedNodeId = maps.nodeIds.get(Number(canvasNodeMatch[1]));
+          if (clonedNodeId !== undefined) return `canvas-node:${clonedNodeId}:${canvasNodeMatch[2]}`;
+        }
+        if (field.toLowerCase().includes("endpoint")) {
+          return candidate.replace(/\/api\/write\/canvas\/agents\/(\d+)\//g, (match, rawAgentId: string) => {
+            const clonedAgentId = maps.agentIds.get(Number(rawAgentId));
+            return clonedAgentId === undefined ? match : `/api/write/canvas/agents/${clonedAgentId}/`;
+          });
+        }
+      }
+      return candidate;
+    }
+    const markerAgentId = Number(candidate.__atomflowCloneSourceAgentId);
+    const sourceAgentId = Number(candidate.sourceAgentId ?? candidate.agentId);
+    const contextualAgentId = Number.isSafeInteger(markerAgentId) && markerAgentId > 0
+      ? markerAgentId
+      : Number.isSafeInteger(sourceAgentId) && sourceAgentId > 0
+        ? sourceAgentId
+        : inheritedAgentId;
+    return Object.fromEntries(
+      Object.entries(candidate)
+        .filter(([key]) => key !== "__atomflowCloneSourceAgentId" && key !== "__atomflowCloneSourceMessageId")
+        .map(([key, child]) => [key, visit(child, key, contextualAgentId)]),
+    );
+  };
+  return visit(value);
+};
+
 const getDefaultCanvasAgentConfig = () => {
   const config = getOpenAIWriteAgentConfig();
   return {
@@ -3844,6 +4593,13 @@ const mapCanvasProjectRow = (row: any) => ({
   id: Number(row.id),
   name: row.name as string,
   viewport: row.viewport || {},
+  documentSnapshot: row.documentSnapshot ?? row.tldrawSnapshot ?? row.tldraw_snapshot ?? row.document_snapshot ?? null,
+  documentRevision: Number(row.documentRevision ?? row.document_revision ?? 0),
+  documentSchemaVersion: Number(row.documentSchemaVersion ?? row.document_schema_version ?? 0),
+  tldrawSnapshot: row.documentSnapshot ?? row.tldrawSnapshot ?? row.tldraw_snapshot ?? row.document_snapshot ?? null,
+  tldrawRevision: Number(row.documentRevision ?? row.document_revision ?? 0),
+  tldrawSchemaVersion: Number(row.documentSchemaVersion ?? row.document_schema_version ?? 0),
+  defaultSkillConfig: normalizeCanvasSkillConfig(row.defaultSkillConfig ?? row.default_skill_config, "override"),
   createdAt: row.createdAt || row.created_at,
   updatedAt: row.updatedAt || row.updated_at,
   lastOpenedAt: row.lastOpenedAt || row.last_opened_at
@@ -3872,6 +4628,12 @@ const mapCanvasAgentRow = (row: any) => row ? ({
   temperature: Number(row.temperature ?? 0.55),
   topP: Number(row.topP ?? row.top_p ?? 1),
   maxTokens: Number(row.maxTokens ?? row.max_tokens ?? 1200),
+  threadId: row.threadId ?? row.agentThreadId ?? row.agent_thread_id
+    ? Number(row.threadId ?? row.agentThreadId ?? row.agent_thread_id)
+    : null,
+  skillConfig: normalizeCanvasSkillConfig(row.skillConfig ?? row.skill_config),
+  effectiveSkillConfig: row.effectiveSkillConfig,
+  effectiveSkills: row.effectiveSkills,
   createdAt: row.createdAt || row.created_at,
   updatedAt: row.updatedAt || row.updated_at
 }) : null;
@@ -3911,6 +4673,9 @@ const mapAgentTemplateRow = (row: any) => ({
   temperature: Number(row.temperature ?? 0.55),
   topP: Number(row.topP ?? row.top_p ?? 1),
   maxTokens: Number(row.maxTokens ?? row.max_tokens ?? 1200),
+  skillConfig: normalizeCanvasSkillConfig(row.skillConfig ?? row.skill_config),
+  effectiveSkillConfig: row.effectiveSkillConfig,
+  effectiveSkills: row.effectiveSkills,
   createdAt: row.createdAt || row.created_at,
   updatedAt: row.updatedAt || row.updated_at
 });
@@ -4020,7 +4785,10 @@ const ensureCanvasProject = async (pool: pg.Pool, userId: number) => {
     await client.query("BEGIN");
     await lockCanvasUser(client, userId);
     const existing = (await client.query(
-      `SELECT id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"
+      `SELECT id, name, viewport, tldraw_snapshot AS "documentSnapshot",
+              document_revision AS "documentRevision", document_schema_version AS "documentSchemaVersion",
+              default_skill_config AS "defaultSkillConfig",
+              created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"
        FROM write_canvas_projects
        WHERE user_id = $1
        ORDER BY last_opened_at DESC
@@ -4035,7 +4803,10 @@ const ensureCanvasProject = async (pool: pg.Pool, userId: number) => {
     const created = (await client.query(
       `INSERT INTO write_canvas_projects (user_id, name)
        VALUES ($1, '我的魔法写作项目')
-       RETURNING id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+       RETURNING id, name, viewport, tldraw_snapshot AS "documentSnapshot",
+                 document_revision AS "documentRevision", document_schema_version AS "documentSchemaVersion",
+                 default_skill_config AS "defaultSkillConfig",
+                 created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
       [userId]
     )).rows[0];
     await client.query("COMMIT");
@@ -4048,12 +4819,99 @@ const ensureCanvasProject = async (pool: pg.Pool, userId: number) => {
   }
 };
 
+const ensureCanvasAgentThread = async (pool: pg.Pool, userId: number, agentId: number) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await lockCanvasUser(client, userId);
+    const agent = (await client.query(
+      `SELECT ai.id, ai.agent_thread_id, ai.name, ai.project_id
+       FROM write_agent_instances ai
+       WHERE ai.id = $1 AND ai.user_id = $2
+       FOR UPDATE`,
+      [agentId, userId],
+    )).rows[0];
+    if (!agent) {
+      await client.query("ROLLBACK");
+      return null;
+    }
+    if (agent.agent_thread_id) {
+      const ownedThread = (await client.query(
+        `SELECT id FROM write_agent_threads
+         WHERE id = $1 AND user_id = $2 AND thread_type = 'canvas'`,
+        [agent.agent_thread_id, userId],
+      )).rows[0];
+      if (ownedThread) {
+        await client.query("COMMIT");
+        return Number(ownedThread.id);
+      }
+    }
+
+    const thread = (await client.query(
+      `INSERT INTO write_agent_threads (user_id, title, state, thread_type)
+       VALUES ($1, $2, $3, 'canvas')
+       RETURNING id`,
+      [
+        userId,
+        `${String(agent.name || "写作 Agent").slice(0, 80)} · 画布会话`,
+        JSON.stringify({ canvasAgentId: agentId, canvasProjectId: Number(agent.project_id) }),
+      ],
+    )).rows[0];
+    const threadId = Number(thread.id);
+    await client.query(
+      `INSERT INTO write_agent_messages (thread_id, role, content, meta, created_at)
+       SELECT $1, legacy.role, legacy.content,
+              COALESCE(legacy.meta, '{}'::jsonb) || jsonb_build_object('legacyCanvasMessageId', legacy.id),
+              legacy.created_at
+       FROM (
+         SELECT id, role, content, meta, created_at
+         FROM (
+           SELECT id, role, content, meta, created_at,
+                  ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS message_rank,
+                  SUM(
+                    octet_length(COALESCE(content, '')::text)
+                    + octet_length(COALESCE(meta, '{}'::jsonb)::text)
+                  ) OVER (ORDER BY created_at DESC, id DESC) AS cumulative_message_bytes
+           FROM write_canvas_agent_messages
+           WHERE user_id = $2 AND agent_id = $3
+             AND role IN ('user', 'assistant')
+         ) bounded
+         WHERE message_rank <= $4
+           AND cumulative_message_bytes <= $5
+         ORDER BY created_at ASC, id ASC
+       ) legacy`,
+      [
+        threadId,
+        userId,
+        agentId,
+        WRITE_CANVAS_MAX_MESSAGES_PER_AGENT,
+        WRITE_CANVAS_LEGACY_THREAD_MIGRATION_MAX_BYTES,
+      ],
+    );
+    await client.query(
+      `UPDATE write_agent_instances
+       SET agent_thread_id = $1, updated_at = NOW()
+       WHERE id = $2 AND user_id = $3`,
+      [threadId, agentId, userId],
+    );
+    await client.query("COMMIT");
+    return threadId;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId: number) => {
   const projectRow = (await pool.query(
-    `UPDATE write_canvas_projects
-     SET last_opened_at = NOW()
-     WHERE id = $1 AND user_id = $2
-     RETURNING id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+    `SELECT id, name, viewport, tldraw_snapshot AS "documentSnapshot",
+               document_revision AS "documentRevision", document_schema_version AS "documentSchemaVersion",
+               default_skill_config AS "defaultSkillConfig",
+               created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"
+     FROM write_canvas_projects
+     WHERE id = $1 AND user_id = $2`,
     [projectId, userId]
   )).rows[0];
   if (!projectRow) return null;
@@ -4071,11 +4929,14 @@ const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId
               'id', ai.id, 'projectId', ai.project_id, 'templateId', ai.template_id,
               'name', ai.name, 'model', ai.model, 'systemPrompt', ai.system_prompt,
               'temperature', ai.temperature, 'topP', ai.top_p, 'maxTokens', ai.max_tokens,
+              'skillConfig', ai.skill_config, 'threadId', wat.id,
               'createdAt', ai.created_at, 'updatedAt', ai.updated_at
             ) END AS agent
      FROM write_canvas_nodes n
      LEFT JOIN write_canvas_assets a ON a.id = n.asset_id AND a.user_id = n.user_id
      LEFT JOIN write_agent_instances ai ON ai.id = n.agent_id AND ai.user_id = n.user_id
+     LEFT JOIN write_agent_threads wat ON wat.id = ai.agent_thread_id
+       AND wat.user_id = ai.user_id AND wat.thread_type = 'canvas'
      WHERE n.user_id = $1 AND n.project_id = $2
      ORDER BY n.created_at ASC`,
     [userId, projectId]
@@ -4093,13 +4954,21 @@ const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId
   const agentIds = nodeRows.map(node => node.agent?.id).filter((id): id is number => typeof id === "number");
   const messages: Record<number, ReturnType<typeof mapCanvasMessageRow>[]> = {};
   if (agentIds.length > 0) {
+    const missingThreadAgentIds = nodeRows.flatMap(node => node.agent && !node.agent.threadId ? [node.agent.id] : []);
+    for (const agentId of missingThreadAgentIds) {
+      const threadId = await ensureCanvasAgentThread(pool, userId, agentId);
+      const node = nodeRows.find(candidate => candidate.agent?.id === agentId);
+      if (node?.agent) node.agent.threadId = threadId;
+    }
     const messageRows = (await pool.query(
       `SELECT id, agent_id AS "agentId", role, content, meta, created_at AS "createdAt"
        FROM (
-         SELECT id, agent_id, role, content, meta, created_at,
-                ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY created_at DESC, id DESC) AS message_rank
-         FROM write_canvas_agent_messages
-         WHERE user_id = $1 AND agent_id = ANY($2::bigint[])
+         SELECT wam.id, ai.id AS agent_id, wam.role, wam.content, wam.meta, wam.created_at,
+                ROW_NUMBER() OVER (PARTITION BY ai.id ORDER BY wam.created_at DESC, wam.id DESC) AS message_rank
+         FROM write_agent_instances ai
+         JOIN write_agent_messages wam ON wam.thread_id = ai.agent_thread_id
+         WHERE ai.user_id = $1 AND ai.id = ANY($2::bigint[])
+           AND wam.role IN ('user', 'assistant')
        ) ranked
        WHERE message_rank <= $3
        ORDER BY "agentId", "createdAt" ASC`,
@@ -4111,8 +4980,40 @@ const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId
     }
   }
 
+  const availableSkills = await fetchWriteAgentSkills(pool, userId);
+  const skillResolutionCache = new Map<string, ReturnType<typeof resolveEffectiveCanvasSkillsFromAvailable>>();
+  const resolveCachedSkills = (
+    value: unknown,
+    inheritedValue?: unknown,
+    emptyMode: "inherit" | "override" = inheritedValue === undefined ? "override" : "inherit",
+  ) => {
+    const key = JSON.stringify({
+      own: normalizeCanvasSkillConfig(value, emptyMode),
+      inherited: inheritedValue === undefined ? null : normalizeCanvasSkillConfig(inheritedValue, "override"),
+    });
+    const existing = skillResolutionCache.get(key);
+    if (existing) return existing;
+    const resolved = resolveEffectiveCanvasSkillsFromAvailable(availableSkills, value, inheritedValue, emptyMode);
+    skillResolutionCache.set(key, resolved);
+    return resolved;
+  };
+  const projectSkills = resolveCachedSkills(projectRow.defaultSkillConfig, undefined, "override");
+  const project = {
+    ...mapCanvasProjectRow(projectRow),
+    defaultSkillConfig: projectSkills.skillConfig,
+    effectiveSkillConfig: projectSkills.effectiveSkillConfig,
+    effectiveSkills: projectSkills.effectiveSkills,
+  };
+  for (const node of nodeRows) {
+    if (!node.agent) continue;
+    const agentSkills = resolveCachedSkills(node.agent.skillConfig, projectRow.defaultSkillConfig, "inherit");
+    node.agent.skillConfig = agentSkills.skillConfig;
+    node.agent.effectiveSkillConfig = agentSkills.effectiveSkillConfig;
+    node.agent.effectiveSkills = agentSkills.effectiveSkills;
+  }
+
   return {
-    project: mapCanvasProjectRow(projectRow),
+    project,
     nodes: nodeRows,
     edges: edgeRows,
     messages
@@ -4121,12 +5022,94 @@ const fetchCanvasProjectDetail = async (pool: pg.Pool, userId: number, projectId
 
 const getCanvasAgentNode = async (pool: pg.Pool, userId: number, agentId: number) => {
   return (await pool.query(
-    `SELECT n.id AS node_id, n.project_id, ai.*
+    `SELECT n.id AS node_id, n.project_id, p.default_skill_config AS project_default_skill_config, ai.*
      FROM write_agent_instances ai
      JOIN write_canvas_nodes n ON n.agent_id = ai.id AND n.user_id = ai.user_id
+     JOIN write_canvas_projects p ON p.id = ai.project_id AND p.user_id = ai.user_id
      WHERE ai.id = $1 AND ai.user_id = $2 AND n.kind = 'agent'`,
     [agentId, userId]
   )).rows[0];
+};
+
+const ensureCanvasGeneratedNoteNode = async (
+  pool: pg.Pool,
+  userId: number,
+  agentId: number,
+  noteValue: unknown,
+  threadId: number,
+  runId: string,
+) => {
+  const noteId = isPlainRecord(noteValue) ? Number(noteValue.id) : Number(noteValue);
+  if (!Number.isSafeInteger(noteId) || noteId <= 0) return null;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await lockCanvasUser(client, userId);
+    const agent = (await client.query(
+      `SELECT n.id AS node_id, n.project_id, n.x, n.y, n.width
+       FROM write_agent_instances ai
+       JOIN write_canvas_nodes n
+         ON n.agent_id = ai.id AND n.user_id = ai.user_id AND n.project_id = ai.project_id
+       WHERE ai.id = $1 AND ai.user_id = $2 AND n.kind = 'agent'
+       FOR UPDATE OF ai, n`,
+      [agentId, userId],
+    )).rows[0];
+    if (!agent) throw new Error("Canvas Agent no longer exists");
+    const note = (await client.query(
+      `SELECT id, title, content, tags, meta, created_at, updated_at
+       FROM notes
+       WHERE id = $1 AND user_id = $2
+       FOR SHARE`,
+      [noteId, userId],
+    )).rows[0];
+    if (!note) throw new Error("Generated note no longer exists");
+
+    let nodeRow = (await client.query(
+      `SELECT id, project_id AS "projectId", kind, title, summary, ref_id AS "refId",
+              meta, x, y, width, height, created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM write_canvas_nodes
+       WHERE user_id = $1 AND project_id = $2 AND kind = 'note' AND ref_id = $3
+       ORDER BY id ASC
+       LIMIT 1
+       FOR UPDATE`,
+      [userId, Number(agent.project_id), String(noteId)],
+    )).rows[0];
+    if (!nodeRow) {
+      const nodeCount = Number((await client.query(
+        `SELECT COUNT(*)::int AS count
+         FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2`,
+        [userId, Number(agent.project_id)],
+      )).rows[0]?.count || 0);
+      if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+        throw new Error("项目节点数量已达到上限，文章已保存但无法添加到画布");
+      }
+      nodeRow = (await client.query(
+        `INSERT INTO write_canvas_nodes
+           (user_id, project_id, kind, title, summary, ref_id, meta, x, y, width, height)
+         VALUES ($1, $2, 'note', $3, $4, $5, $6, $7, $8, 360, 240)
+         RETURNING id, project_id AS "projectId", kind, title, summary, ref_id AS "refId",
+                   meta, x, y, width, height, created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [
+          userId,
+          Number(agent.project_id),
+          String(note.title || "文章草稿").slice(0, 120),
+          normalizePlainText(note.content || "").slice(0, 500),
+          String(noteId),
+          JSON.stringify({ generatedByAgentId: agentId, threadId, runId }),
+          Number(agent.x) + Number(agent.width) + 80,
+          Number(agent.y),
+        ],
+      )).rows[0];
+    }
+    await client.query("COMMIT");
+    return mapCanvasNodeRow(nodeRow);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNodeId: number, projectId: number): Promise<CanvasContextItem[]> => {
@@ -4159,6 +5142,7 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
         kind,
         title: row.title || row.asset_title || row.file_name || "资料",
         text,
+        refId: row.ref_id ? String(row.ref_id) : undefined,
         imageDataUrl: kind === "asset_image" ? row.data_url || undefined : undefined,
         mimeType: row.mime_type || undefined,
         sourceLabel: row.file_name || undefined
@@ -4167,7 +5151,8 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
     }
     if (kind === "saved_article" && row.ref_id) {
       const article = (await pool.query(
-        `SELECT id, title, source, url, excerpt, content, citation_context, image_urls
+        `SELECT id, title, source, url, excerpt, content, citation_context, image_urls,
+                audio_url, audio_duration
          FROM saved_articles
          WHERE id = $1 AND user_id = $2`,
         [Number(row.ref_id), userId]
@@ -4177,8 +5162,19 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
           nodeId: Number(row.id),
           kind,
           title: article.title,
-          text: normalizePlainText([article.citation_context, article.excerpt, article.content].filter(Boolean).join("\n")).slice(0, 12000),
-          sourceLabel: article.source || article.url || undefined
+          refId: String(article.id),
+          text: normalizePlainText([
+            article.citation_context,
+            article.excerpt,
+            article.content,
+            article.audio_url ? `音频：${article.audio_url}` : "",
+            article.audio_duration ? `时长：${article.audio_duration}` : "",
+          ].filter(Boolean).join("\n")).slice(0, 12000),
+          sourceLabel: article.source || article.url || undefined,
+          sourceUrl: article.url || undefined,
+          sourceExcerpt: article.excerpt || undefined,
+          sourceContext: article.citation_context || undefined,
+          savedArticleId: Number(article.id),
         });
       }
       continue;
@@ -4186,7 +5182,8 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
     if (kind === "atom_card" && row.ref_id) {
       const card = (await pool.query(
         `SELECT sc.id, sc.type, sc.content, sc.summary, sc.original_quote, sc.context,
-                sc.citation_note, sc.tags, sc.article_title, sa.source, sa.url
+                sc.citation_note, sc.tags, sc.article_title, sc.article_id, sc.saved_article_id,
+                sa.source, sa.url, sa.excerpt, sa.citation_context
          FROM saved_cards sc
          LEFT JOIN saved_articles sa ON sa.id = sc.saved_article_id AND sa.user_id = sc.user_id
          WHERE sc.id = $1 AND sc.user_id = $2`,
@@ -4197,6 +5194,7 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
           nodeId: Number(row.id),
           kind,
           title: `${card.type} · ${card.article_title || row.title || "原子卡"}`,
+          refId: String(card.id),
           text: normalizePlainText([
             `[${card.type}] ${card.content}`,
             card.summary,
@@ -4205,7 +5203,17 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
             card.citation_note ? `引用建议：${card.citation_note}` : "",
             card.tags ? `tags：${(typeof card.tags === "string" ? JSON.parse(card.tags) : card.tags).join("、")}` : "",
           ].filter(Boolean).join("\n")).slice(0, 6000),
-          sourceLabel: card.source || card.url || undefined
+          sourceLabel: card.source || card.url || undefined,
+          sourceUrl: card.url || undefined,
+          sourceExcerpt: card.excerpt || undefined,
+          sourceContext: card.context || card.citation_context || undefined,
+          originalQuote: card.original_quote || undefined,
+          articleId: Number.isSafeInteger(Number(card.article_id)) && Number(card.article_id) > 0
+            ? Number(card.article_id)
+            : undefined,
+          savedArticleId: Number.isSafeInteger(Number(card.saved_article_id)) && Number(card.saved_article_id) > 0
+            ? Number(card.saved_article_id)
+            : undefined,
         });
       }
       continue;
@@ -4222,10 +5230,76 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
           nodeId: Number(row.id),
           kind,
           title: note.title || row.title || "文章草稿",
+          refId: String(note.id),
           text: normalizePlainText(note.content || "").slice(0, 12000),
           sourceLabel: "我的文章"
         });
       }
+      continue;
+    }
+    if (kind === "citation") {
+      const article = isPlainRecord(row.meta?.article) ? row.meta.article : {};
+      const selection = isPlainRecord(row.meta?.selection) ? row.meta.selection : {};
+      const exact = typeof selection.exact === "string" ? selection.exact.slice(0, 2000) : "";
+      const prefix = typeof selection.prefix === "string" ? selection.prefix.slice(-120) : "";
+      const suffix = typeof selection.suffix === "string" ? selection.suffix.slice(0, 120) : "";
+      const paragraph = typeof selection.paragraph === "string" ? selection.paragraph.slice(0, 8000) : "";
+      const articleId = Number(article.id);
+      const text = normalizePlainText([
+        typeof selection.heading === "string" ? selection.heading : "",
+        exact,
+        paragraph,
+        typeof article.excerpt === "string" ? article.excerpt : "",
+      ].filter(Boolean).join("\n")).slice(0, 12000);
+      items.push({
+        nodeId: Number(row.id),
+        kind,
+        title: row.title || (typeof article.title === "string" ? article.title : "引用"),
+        text,
+        refId: row.ref_id ? String(row.ref_id) : undefined,
+        sourceLabel: typeof article.source === "string"
+          ? article.source
+          : typeof article.url === "string" ? article.url : undefined,
+        sourceUrl: typeof article.url === "string" ? article.url : undefined,
+        sourceExcerpt: typeof article.excerpt === "string" ? article.excerpt : undefined,
+        sourceContext: paragraph || [prefix, exact, suffix].filter(Boolean).join(" "),
+        originalQuote: exact || undefined,
+        articleId: Number.isSafeInteger(articleId) && articleId > 0 ? articleId : undefined,
+        captureId: typeof row.meta?.captureId === "string"
+          ? row.meta.captureId
+          : row.ref_id ? String(row.ref_id) : undefined,
+        citationPrefix: prefix || undefined,
+        citationSuffix: suffix || undefined,
+      });
+      continue;
+    }
+    if (kind === "podcast_episode") {
+      const episode = isPlainRecord(row.meta?.episode) ? row.meta.episode : row.meta;
+      const episodeSourceUrl = typeof episode.sourceUrl === "string"
+        ? episode.sourceUrl
+        : typeof episode.url === "string" ? episode.url : undefined;
+      const episodeArticleId = Number(episode.articleId);
+      const episodeSavedArticleId = Number(episode.savedArticleId);
+      items.push({
+        nodeId: Number(row.id),
+        kind,
+        title: row.title || (typeof episode.title === "string" ? episode.title : "播客单集"),
+        text: normalizePlainText([
+          row.summary,
+          typeof episode.excerpt === "string" ? episode.excerpt : "",
+        ].filter(Boolean).join("\n")).slice(0, 12000),
+        refId: row.ref_id ? String(row.ref_id) : undefined,
+        sourceLabel: typeof episode.source === "string"
+          ? episode.source
+          : episodeSourceUrl,
+        sourceUrl: episodeSourceUrl,
+        sourceExcerpt: typeof episode.excerpt === "string" ? episode.excerpt : row.summary || undefined,
+        sourceContext: row.summary || (typeof episode.excerpt === "string" ? episode.excerpt : undefined),
+        articleId: Number.isSafeInteger(episodeArticleId) && episodeArticleId > 0 ? episodeArticleId : undefined,
+        savedArticleId: Number.isSafeInteger(episodeSavedArticleId) && episodeSavedArticleId > 0
+          ? episodeSavedArticleId
+          : undefined,
+      });
     }
   }
   let remainingChars = WRITE_CANVAS_MAX_CONTEXT_CHARS;
@@ -4237,9 +5311,53 @@ const resolveCanvasContextItems = async (pool: pg.Pool, userId: number, agentNod
   });
 };
 
+const canvasContextsToWritingCards = (contexts: CanvasContextItem[]): WritingCardInput[] => contexts.flatMap(context => {
+  const text = context.text || context.title;
+  const chunks = text.match(/[\s\S]{1,500}/g)?.slice(0, 4) || [context.title];
+  return chunks.map((chunk, index) => ({
+    id: context.kind === "atom_card" && context.refId
+      ? context.refId
+      : `canvas-node:${context.nodeId}:${index}`,
+    type: "灵感" as const,
+    content: chunk,
+    summary: index === 0 ? text.slice(0, 180) : undefined,
+    tags: ["画布授权", context.kind],
+    articleTitle: chunks.length > 1 ? `${context.title} (${index + 1}/${chunks.length})` : context.title,
+    sourceName: context.sourceLabel,
+    sourceUrl: context.sourceUrl,
+    sourceExcerpt: context.sourceExcerpt,
+    sourceContext: context.sourceContext,
+    originalQuote: index === 0 ? context.originalQuote : undefined,
+    articleId: context.articleId,
+    savedArticleId: context.savedArticleId,
+    canvasNodeId: context.nodeId,
+    captureId: context.captureId,
+    citationPrefix: context.citationPrefix,
+    citationSuffix: context.citationSuffix,
+  }));
+});
+
 const canvasModelSupportsImages = (model: string) => {
   const normalized = model.toLowerCase();
   return /(vision|vl|gpt-4o|gpt-4\.1|gpt-5|o3|o4|gemini|claude-3|mimo-vl)/.test(normalized);
+};
+
+const selectAuthorizedCanvasImages = (model: string, candidates: string[]) => {
+  if (!canvasModelSupportsImages(model)) return [];
+  const selected: string[] = [];
+  let totalBytes = 0;
+  for (const candidate of candidates) {
+    if (selected.length >= 4) break;
+    if (typeof candidate !== "string") continue;
+    const match = /^data:image\/(?:png|jpe?g|webp|gif);base64,([A-Za-z0-9+/]+={0,2})$/i.exec(candidate);
+    if (!match) continue;
+    const padding = match[1].endsWith("==") ? 2 : match[1].endsWith("=") ? 1 : 0;
+    const decodedBytes = Math.floor(match[1].length * 3 / 4) - padding;
+    if (decodedBytes <= 0 || totalBytes + decodedBytes > WRITE_CANVAS_MAX_CONTEXT_IMAGE_BYTES) continue;
+    totalBytes += decodedBytes;
+    selected.push(candidate);
+  }
+  return selected;
 };
 
 const requestCanvasAgentCompletion = async (input: {
@@ -4492,688 +5610,82 @@ const get36KrArticleId = (url?: string) => {
   return match?.[1] || null;
 };
 
-async function fetchRSSFeeds(): Promise<Article[]> {
-  try {
-    const results = await Promise.allSettled([
-      parseWithRetry([
-          'rsshub://sspai/index'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://www.woshipm.com/feed',
-          'rsshub://woshipm/popular'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://36kr/hot-list',
-          'https://36kr.com/feed',
-          'rsshub://36kr/news'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://www.huxiu.com/rss/0.xml',
-          'rsshub://huxiu/article'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://plink.anyfeeder.com/weixin/AI_era'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://jike/topic/63579abb6724cc583b9bba9a'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://github.blog/feed/'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://twitter/user/sama'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://feed.xyzfm.space/dk4yh3pkpjp3'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://youtube/user/%40lexfridman',
-          'https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://youtube/user/%40ycombinator',
-          'https://www.youtube.com/feeds/videos.xml?channel_id=UCcefcZRL2oaA_uBNeo5UOWg'
-        ], 20000, 2),
-      parseWithRetry([
-          'rsshub://youtube/user/@AndrejKarpathy',
-          'https://www.youtube.com/feeds/videos.xml?channel_id=UCYO_jab_esuFRV4b17AJtAw'
-        ], 20000, 2),
-      parseWithRetry([
-          'https://aihot.virxact.com/feed.xml'
-        ], 20000, 2)
-    ]);
-    const sspaiArticles = results[0].status === 'fulfilled'
-      ? normalizeFeedItems(results[0].value.items, '少数派', '科技资讯', 0, extractFeedIcon(results[0].value))
-      : [];
-    const woshipmArticles = results[1].status === 'fulfilled'
-      ? normalizeFeedItems(results[1].value.items, '人人都是产品经理', '产品运营', 1000, extractFeedIcon(results[1].value))
-      : [];
-    const krArticles = results[2].status === 'fulfilled'
-      ? normalizeFeedItems(results[2].value.items, '36氪', '创投商业', 2000, extractFeedIcon(results[2].value))
-      : [];
-    const huxiuArticles = results[3].status === 'fulfilled'
-      ? normalizeFeedItems(results[3].value.items, '虎嗅', '商业资讯', 3000, extractFeedIcon(results[3].value))
-      : [];
-    const zslrenArticles = results[4].status === 'fulfilled'
-      ? normalizeFeedItems(results[4].value.items, '数字生命卡兹克', '公众号', 4000, extractFeedIcon(results[4].value))
-      : [];
-    const xzyArticles = results[5].status === 'fulfilled'
-      ? normalizeFeedItems(results[5].value.items, '新智元', '公众号', 4500, extractFeedIcon(results[5].value))
-      : [];
-    const jikeArticles = results[6].status === 'fulfilled'
-      ? normalizeFeedItems(results[6].value.items, '即刻话题', 'Jike', 6000, extractFeedIcon(results[6].value))
-      : [];
-    const githubArticles = results[7].status === 'fulfilled'
-      ? normalizeFeedItems(results[7].value.items, 'GitHub Blog', 'Tech', 7000, extractFeedIcon(results[7].value))
-      : [];
-    const samaArticles = results[8].status === 'fulfilled'
-      ? normalizeFeedItems(results[8].value.items, 'Sam Altman', 'Twitter', 8000, extractFeedIcon(results[8].value))
-      : [];
-    const xyzfmArticles = results[9].status === 'fulfilled'
-      ? normalizeFeedItems(results[9].value.items, '张小珺商业访谈录', 'Podcast', 9000, extractFeedIcon(results[9].value))
-      : [];
-    const lexArticles = results[10].status === 'fulfilled'
-      ? normalizeFeedItems(results[10].value.items, 'Lex Fridman', 'Podcast', 10000, extractFeedIcon(results[10].value))
-      : [];
-    const ycArticles = results[11].status === 'fulfilled'
-      ? normalizeFeedItems(results[11].value.items, 'Y Combinator', 'YouTube', 11000, extractFeedIcon(results[11].value))
-      : [];
-    const karpathyArticles = results[12].status === 'fulfilled'
-      ? normalizeFeedItems(results[12].value.items, 'Andrej Karpathy', 'YouTube', 12000, extractFeedIcon(results[12].value))
-      : [];
-    const aiHotSelectedArticles = results[13].status === 'fulfilled'
-      ? normalizeFeedItems(results[13].value.items, 'AI HOT 精选', 'AI 资讯', 13000, extractFeedIcon(results[13].value))
-      : [];
-    logger.info({
-      module: "rss",
-      counts: {
-        sspai: sspaiArticles.length,
-        woshipm: woshipmArticles.length,
-        kr36: krArticles.length,
-        huxiu: huxiuArticles.length,
-        zslren: zslrenArticles.length,
-        xzy: xzyArticles.length,
-        jike: jikeArticles.length,
-        github: githubArticles.length,
-        sama: samaArticles.length,
-        xyzfm: xyzfmArticles.length,
-        lex: lexArticles.length,
-        yc: ycArticles.length,
-        karpathy: karpathyArticles.length,
-        aiHotSelected: aiHotSelectedArticles.length
-      }
-    }, "RSS feed counts");
-    const feedNames = [
-      'sspai',
-      'woshipm',
-      '36kr',
-      'huxiu',
-      'zslren',
-      'xzy',
-      'jike topic',
-      'GitHub Blog',
-      'Sam Altman Twitter',
-      '张小珺商业访谈录',
-      'Lex Fridman',
-      'Y Combinator',
-      'Andrej Karpathy',
-      'AI HOT 精选',
-    ];
-    results.forEach((result, index) => {
-      if (result.status === 'rejected') {
-        logger.error({ err: result.reason, module: "rss", feed: feedNames[index] }, "Failed to fetch RSS feed");
-      }
-    });
-    const merged = [
-      ...sspaiArticles,
-      ...woshipmArticles,
-      ...krArticles,
-      ...huxiuArticles,
-      ...zslrenArticles,
-      ...xzyArticles,
-      ...jikeArticles,
-      ...githubArticles,
-      ...samaArticles,
-      ...xyzfmArticles,
-      ...lexArticles,
-      ...ycArticles,
-      ...karpathyArticles,
-      ...aiHotSelectedArticles
-    ];
-    const ordered = rankArticles(merged);
-    return ordered.length > 0 ? ordered : [...MOCK_ARTICLES];
-  } catch (error) {
-    logger.error({ err: error, module: "rss" }, "Failed to fetch RSS, falling back to mock data");
-    return [...MOCK_ARTICLES];
-  }
+type BuiltinFeedSource = {
+  id: string;
+  label: string;
+  urls: readonly string[];
+  source: string;
+  topic: string;
+  idOffset: number;
+};
+
+const BUILTIN_FEED_SOURCES: readonly BuiltinFeedSource[] = [
+  { id: "sspai", label: "少数派", urls: ["rsshub://sspai/index"], source: "少数派", topic: "科技资讯", idOffset: 0 },
+  { id: "woshipm", label: "人人都是产品经理", urls: ["https://www.woshipm.com/feed", "rsshub://woshipm/popular"], source: "人人都是产品经理", topic: "产品运营", idOffset: 1000 },
+  { id: "36kr", label: "36氪", urls: ["rsshub://36kr/hot-list", "https://36kr.com/feed", "rsshub://36kr/news"], source: "36氪", topic: "创投商业", idOffset: 2000 },
+  { id: "huxiu", label: "虎嗅", urls: ["https://www.huxiu.com/rss/0.xml", "rsshub://huxiu/article"], source: "虎嗅", topic: "商业资讯", idOffset: 3000 },
+  { id: "zslren", label: "数字生命卡兹克", urls: ["https://wechat2rss.bestblogs.dev/feed/ff621c3e98d6ae6fceb3397e57441ffc6ea3c17f.xml"], source: "数字生命卡兹克", topic: "公众号", idOffset: 4000 },
+  { id: "xzy", label: "新智元", urls: ["https://plink.anyfeeder.com/weixin/AI_era"], source: "新智元", topic: "公众号", idOffset: 4500 },
+  { id: "jike", label: "即刻话题", urls: ["rsshub://jike/topic/63579abb6724cc583b9bba9a"], source: "即刻话题", topic: "Jike", idOffset: 6000 },
+  { id: "github", label: "GitHub Blog", urls: ["https://github.blog/feed/"], source: "GitHub Blog", topic: "Tech", idOffset: 7000 },
+  { id: "sama", label: "Sam Altman Twitter", urls: ["rsshub://twitter/user/sama"], source: "Sam Altman", topic: "Twitter", idOffset: 8000 },
+  { id: "xyzfm", label: "张小珺商业访谈录", urls: ["https://feed.xyzfm.space/dk4yh3pkpjp3"], source: "张小珺商业访谈录", topic: "Podcast", idOffset: 9000 },
+  { id: "lex", label: "Lex Fridman", urls: ["rsshub://youtube/user/%40lexfridman", "https://www.youtube.com/feeds/videos.xml?channel_id=UCSHZKyawb77ixDdsGog4iWA"], source: "Lex Fridman", topic: "Podcast", idOffset: 10000 },
+  { id: "yc", label: "Y Combinator", urls: ["rsshub://youtube/user/%40ycombinator", "https://www.youtube.com/feeds/videos.xml?channel_id=UCcefcZRL2oaA_uBNeo5UOWg"], source: "Y Combinator", topic: "YouTube", idOffset: 11000 },
+  { id: "karpathy", label: "Andrej Karpathy", urls: ["rsshub://youtube/user/@AndrejKarpathy", "https://www.youtube.com/feeds/videos.xml?channel_id=UCYO_jab_esuFRV4b17AJtAw"], source: "Andrej Karpathy", topic: "YouTube", idOffset: 12000 },
+  { id: "aiHotSelected", label: "AI HOT 精选", urls: ["https://aihot.virxact.com/feed.xml"], source: "AI HOT 精选", topic: "AI 资讯", idOffset: 13000 },
+];
+
+async function fetchBuiltinFeedSource(source: BuiltinFeedSource, parentSignal: AbortSignal): Promise<Article[]> {
+  const sourceSignal = AbortSignal.any([parentSignal, AbortSignal.timeout(20_000)]);
+  const parsed = await parseFirstAvailable([...source.urls], sourceSignal);
+  return normalizeFeedItems(
+    parsed.items || [],
+    source.source,
+    source.topic,
+    source.idOffset,
+    extractFeedIcon(parsed),
+  );
 }
 
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 1000);
+  const billingConfig = loadBillingConfig(isProduction);
   const appUrl = process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : undefined);
   if (isProduction && (!appUrl || /your-domain\.example|replace-/i.test(appUrl))) {
     throw new Error("APP_URL or RAILWAY_PUBLIC_DOMAIN must identify the real production origin");
   }
-  validateProductionLegalConfiguration(appUrl);
+  validateProductionLegalConfiguration(appUrl, billingConfig.enabled);
   app.set("trust proxy", 1);
   app.disable("x-powered-by");
 
-  const dbPoolMax = readBoundedEnvNumber(process.env.DB_POOL_MAX, 10, 2, 50);
-  const dbConnectionTimeoutMs = readBoundedEnvNumber(process.env.DB_CONNECTION_TIMEOUT_MS, 5000, 1000, 30000);
-  const dbIdleTimeoutMs = readBoundedEnvNumber(process.env.DB_IDLE_TIMEOUT_MS, 30000, 5000, 120000);
-  const dbStatementTimeoutMs = readBoundedEnvNumber(process.env.DB_STATEMENT_TIMEOUT_MS, 30000, 1000, 120000);
   if (isProduction && !process.env.DATABASE_URL) {
     throw new Error("DATABASE_URL environment variable must be set in production");
   }
 
-  // --- Database init (PostgreSQL) ---
-  // Note: rejectUnauthorized: false is required for Railway's self-signed PG certs.
-  // If migrating to another platform (Supabase, Neon, etc.), review this setting.
+  // Railway runs the idempotent schema migration as a pre-deploy command.
+  // The web process only verifies the version marker so it can bind its port quickly.
   let pool: pg.Pool | null = null;
-  let dbAvailable = false;
   let schemaReady = false;
   try {
-    const _pool = new pg.Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.NODE_ENV === 'production'
-        ? { rejectUnauthorized: false }
-        : false,
-      max: dbPoolMax,
-      connectionTimeoutMillis: dbConnectionTimeoutMs,
-      idleTimeoutMillis: dbIdleTimeoutMs,
-      statement_timeout: dbStatementTimeoutMs,
-      query_timeout: dbStatementTimeoutMs + 1000,
-    });
-    _pool.on("error", error => {
-      logger.error({ err: error, module: "db" }, "Unexpected PostgreSQL pool error");
-    });
-    // Test connection
-    await _pool.query('SELECT 1');
-    pool = _pool;
-    dbAvailable = true;
-    logger.info({ module: "db" }, "Database connected successfully");
+    pool = createDatabasePool(logger);
+    await pool.query("SELECT 1");
+    schemaReady = await verifyDatabaseSchema(pool);
+    if (schemaReady) {
+      logger.info({ module: "db", schemaVersion: DATABASE_SCHEMA_VERSION }, "Database connected and schema version verified");
+    } else {
+      logger.error({ module: "db", expectedSchemaVersion: DATABASE_SCHEMA_VERSION }, "Database schema version is not ready; run npm run migrate");
+    }
   } catch (err) {
+    await pool?.end().catch(() => undefined);
+    pool = null;
     if (isProduction) throw err;
     logger.warn({ err, module: "db" }, "Database unavailable; server will start without auth/persistence features");
   }
 
-  if (pool) {
-  const schemaLockClient = await pool.connect();
-  let schemaLockReleased = false;
-  try {
-  await schemaLockClient.query(`SELECT pg_advisory_lock(hashtext('atomflow-schema-migration'))`);
-  try {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id           SERIAL PRIMARY KEY,
-      email        TEXT NOT NULL UNIQUE,
-      nickname     TEXT,
-      avatar_url   TEXT,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_ai_usage_daily (
-      user_id               INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      usage_date            DATE NOT NULL DEFAULT CURRENT_DATE,
-      operation_count       INTEGER NOT NULL DEFAULT 0 CHECK (operation_count >= 0),
-      reserved_output_tokens BIGINT NOT NULL DEFAULT 0 CHECK (reserved_output_tokens >= 0),
-      updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (user_id, usage_date)
-    )
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS verification_codes (
-      id           SERIAL PRIMARY KEY,
-      email        TEXT NOT NULL,
-      code         TEXT NOT NULL,
-      expires_at   TIMESTAMPTZ NOT NULL,
-      used         BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_vc_email ON verification_codes(email, used, expires_at)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_vc_expires_at ON verification_codes(expires_at)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_vc_used_created_at ON verification_codes(created_at) WHERE used = TRUE`);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS session (
-      sid VARCHAR NOT NULL PRIMARY KEY,
-      sess JSON NOT NULL,
-      expire TIMESTAMP(6) NOT NULL
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON session(expire)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_session_user_id ON session ((sess ->> 'userId'))`);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS saved_cards (
-      id             TEXT PRIMARY KEY,
-      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      type           TEXT NOT NULL,
-      content        TEXT NOT NULL,
-      tags           JSONB NOT NULL DEFAULT '[]'::jsonb,
-      article_title  TEXT NOT NULL DEFAULT '',
-      article_id     BIGINT,
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_user ON saved_cards(user_id)`);
-  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_updated ON saved_cards(user_id, updated_at DESC)`);
-
-  // --- Schema migrations for password auth, preferences, notes ---
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT`);
-  await pool.query(`ALTER TABLE verification_codes ADD COLUMN IF NOT EXISTS password_hash TEXT`);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_preferences (
-      user_id      INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      source_layout JSONB,
-      theme        TEXT DEFAULT 'light',
-      view_mode    TEXT DEFAULT 'card',
-      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS notes (
-      id           SERIAL PRIMARY KEY,
-      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title        TEXT NOT NULL DEFAULT '',
-      content      TEXT NOT NULL DEFAULT '',
-      tags         JSONB NOT NULL DEFAULT '[]'::jsonb,
-      meta         JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`ALTER TABLE notes ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id, updated_at DESC)`);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_agent_threads (
-      id           BIGSERIAL PRIMARY KEY,
-      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title        TEXT NOT NULL DEFAULT '新的写作会话',
-      summary      TEXT NOT NULL DEFAULT '',
-      state        JSONB NOT NULL DEFAULT '{}'::jsonb,
-      thread_type  TEXT NOT NULL DEFAULT 'chat' CHECK (thread_type IN ('chat', 'skill')),
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_threads_user ON write_agent_threads(user_id, updated_at DESC)`);
-  await pool.query(`ALTER TABLE write_agent_threads ADD COLUMN IF NOT EXISTS thread_type TEXT NOT NULL DEFAULT 'chat'`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_threads_type ON write_agent_threads(user_id, thread_type, updated_at DESC)`);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_agent_messages (
-      id           BIGSERIAL PRIMARY KEY,
-      thread_id    BIGINT NOT NULL REFERENCES write_agent_threads(id) ON DELETE CASCADE,
-      role         TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
-      content      TEXT NOT NULL DEFAULT '',
-      meta         JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_messages_thread ON write_agent_messages(thread_id, created_at ASC)`);
-
-  // User custom subscriptions
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_subscriptions (
-      id          SERIAL PRIMARY KEY,
-      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      name        TEXT NOT NULL,
-      rss_url     TEXT NOT NULL,
-      color       TEXT NOT NULL DEFAULT '#718096',
-      icon        TEXT,
-      topic       TEXT NOT NULL DEFAULT '自定义订阅',
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (user_id, name)
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user ON user_subscriptions(user_id)`);
-
-  // Articles from user custom subscriptions (permanently stored, per-user)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_articles (
-      id              BIGSERIAL PRIMARY KEY,
-      user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      subscription_id INTEGER NOT NULL REFERENCES user_subscriptions(id) ON DELETE CASCADE,
-      source          TEXT NOT NULL,
-      source_icon     TEXT,
-      topic           TEXT NOT NULL DEFAULT '自定义订阅',
-      title           TEXT NOT NULL,
-      excerpt         TEXT NOT NULL DEFAULT '',
-      content         TEXT NOT NULL DEFAULT '',
-      url             TEXT,
-      audio_url       TEXT,
-      audio_duration  TEXT,
-      published_at    BIGINT,
-      time_str        TEXT NOT NULL DEFAULT '',
-      saved           BOOLEAN NOT NULL DEFAULT FALSE,
-      full_fetched    BOOLEAN NOT NULL DEFAULT FALSE,
-      markdown_content TEXT,
-      fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_articles_unique_url ON user_articles(user_id, url) WHERE url IS NOT NULL`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_articles_user_source ON user_articles(user_id, source)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_articles_published ON user_articles(user_id, published_at DESC)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_articles_subscription ON user_articles(subscription_id)`);
-
-  // --- saved_articles: persisted original articles when user saves to knowledge base ---
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS saved_articles (
-      id            BIGSERIAL PRIMARY KEY,
-      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title         TEXT NOT NULL DEFAULT '',
-      url           TEXT,
-      source        TEXT NOT NULL DEFAULT '',
-      source_icon   TEXT,
-      topic         TEXT NOT NULL DEFAULT '',
-      excerpt       TEXT NOT NULL DEFAULT '',
-      content       TEXT NOT NULL DEFAULT '',
-      citation_context TEXT,
-      image_urls    JSONB NOT NULL DEFAULT '[]'::jsonb,
-      published_at  BIGINT,
-      saved_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS citation_context TEXT`);
-  await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS image_urls JSONB NOT NULL DEFAULT '[]'::jsonb`);
-  await pool.query(`ALTER TABLE saved_articles ADD COLUMN IF NOT EXISTS content_hash TEXT`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_articles_user ON saved_articles(user_id, saved_at DESC)`);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_articles_unique ON saved_articles(user_id, url) WHERE url IS NOT NULL`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_agent_events (
-      id           BIGSERIAL PRIMARY KEY,
-      thread_id    BIGINT NOT NULL REFERENCES write_agent_threads(id) ON DELETE CASCADE,
-      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      node         TEXT NOT NULL,
-      duration_ms  INTEGER NOT NULL DEFAULT 0,
-      input_summary TEXT,
-      output_summary TEXT,
-      meta         JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_events_thread ON write_agent_events(thread_id, created_at ASC)`);
-
-	  await pool.query(`
-	    CREATE TABLE IF NOT EXISTS write_style_skills (
-      id           BIGSERIAL PRIMARY KEY,
-      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      name         TEXT NOT NULL,
-      description  TEXT NOT NULL DEFAULT '',
-      prompt       TEXT NOT NULL,
-      examples     JSONB NOT NULL DEFAULT '[]'::jsonb,
-      constraints  JSONB NOT NULL DEFAULT '[]'::jsonb,
-      is_default   BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-	  `);
-	  await pool.query(`ALTER TABLE write_style_skills ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'style'`);
-	  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_style_skills_user ON write_style_skills(user_id, updated_at DESC)`);
-	  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_style_skills_user_type ON write_style_skills(user_id, type, updated_at DESC)`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_canvas_projects (
-      id             BIGSERIAL PRIMARY KEY,
-      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      name           TEXT NOT NULL DEFAULT '新的魔法写作项目',
-      viewport       JSONB NOT NULL DEFAULT '{}'::jsonb,
-      last_opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_projects_user ON write_canvas_projects(user_id, last_opened_at DESC)`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_canvas_assets (
-      id             BIGSERIAL PRIMARY KEY,
-      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      project_id     BIGINT REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
-      type           TEXT NOT NULL CHECK (type IN ('text','file','image')),
-      title          TEXT NOT NULL DEFAULT '',
-      content_text   TEXT NOT NULL DEFAULT '',
-      extracted_text TEXT NOT NULL DEFAULT '',
-      file_name      TEXT,
-      mime_type      TEXT,
-      data_url       TEXT,
-      meta           JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_assets_user ON write_canvas_assets(user_id, created_at DESC)`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_agent_templates (
-      id            BIGSERIAL PRIMARY KEY,
-      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      name          TEXT NOT NULL,
-      model         TEXT NOT NULL,
-      system_prompt TEXT NOT NULL DEFAULT '',
-      temperature   REAL NOT NULL DEFAULT 0.55,
-      top_p         REAL NOT NULL DEFAULT 1,
-      max_tokens    INTEGER NOT NULL DEFAULT 1200,
-      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_templates_user ON write_agent_templates(user_id, updated_at DESC)`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_agent_instances (
-      id            BIGSERIAL PRIMARY KEY,
-      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      project_id    BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
-      template_id   BIGINT REFERENCES write_agent_templates(id) ON DELETE SET NULL,
-      name          TEXT NOT NULL DEFAULT '写作 Agent',
-      model         TEXT NOT NULL,
-      system_prompt TEXT NOT NULL DEFAULT '',
-      temperature   REAL NOT NULL DEFAULT 0.55,
-      top_p         REAL NOT NULL DEFAULT 1,
-      max_tokens    INTEGER NOT NULL DEFAULT 1200,
-      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_agent_instances_project ON write_agent_instances(project_id, updated_at DESC)`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_canvas_nodes (
-      id          BIGSERIAL PRIMARY KEY,
-      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      project_id  BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
-      kind        TEXT NOT NULL CHECK (kind IN ('asset_text','asset_file','asset_image','saved_article','atom_card','note','agent','result')),
-      title       TEXT NOT NULL DEFAULT '',
-      summary     TEXT NOT NULL DEFAULT '',
-      ref_id      TEXT,
-      asset_id    BIGINT REFERENCES write_canvas_assets(id) ON DELETE SET NULL,
-      agent_id    BIGINT REFERENCES write_agent_instances(id) ON DELETE CASCADE,
-      meta        JSONB NOT NULL DEFAULT '{}'::jsonb,
-      x           REAL NOT NULL DEFAULT 0,
-      y           REAL NOT NULL DEFAULT 0,
-      width       REAL NOT NULL DEFAULT 280,
-      height      REAL NOT NULL DEFAULT 180,
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_nodes_project ON write_canvas_nodes(project_id, updated_at DESC)`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_canvas_edges (
-      id             BIGSERIAL PRIMARY KEY,
-      user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      project_id     BIGINT NOT NULL REFERENCES write_canvas_projects(id) ON DELETE CASCADE,
-      source_node_id BIGINT NOT NULL REFERENCES write_canvas_nodes(id) ON DELETE CASCADE,
-      target_node_id BIGINT NOT NULL REFERENCES write_canvas_nodes(id) ON DELETE CASCADE,
-      relation       TEXT NOT NULL DEFAULT 'context' CHECK (relation IN ('context')),
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (project_id, source_node_id, target_node_id, relation)
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_edges_target ON write_canvas_edges(project_id, target_node_id)`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS write_canvas_agent_messages (
-      id         BIGSERIAL PRIMARY KEY,
-      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      agent_id   BIGINT NOT NULL REFERENCES write_agent_instances(id) ON DELETE CASCADE,
-      role       TEXT NOT NULL CHECK (role IN ('user','assistant')),
-      content    TEXT NOT NULL DEFAULT '',
-      meta       JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_write_canvas_agent_messages_agent ON write_canvas_agent_messages(agent_id, created_at ASC)`);
-
-  // --- saved_cards: add origin and saved_article_id columns ---
-  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'manual'`);
-  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS saved_article_id BIGINT REFERENCES saved_articles(id) ON DELETE SET NULL`);
-  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS summary TEXT`);
-  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS original_quote TEXT`);
-  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS context TEXT`);
-  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS citation_note TEXT`);
-  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS evidence_role TEXT`);
-  await pool.query(`ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS raw_card_meta JSONB NOT NULL DEFAULT '{}'::jsonb`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_saved_cards_saved_article ON saved_cards(saved_article_id)`);
-  const contentHashIndexIsUnique = Boolean((await pool.query(
-    `SELECT i.indisunique AS "isUnique"
-     FROM pg_class c
-     JOIN pg_index i ON i.indexrelid = c.oid
-     WHERE c.relname = 'idx_saved_articles_content_hash_unique_v2' AND pg_table_is_visible(c.oid)`,
-  )).rows[0]?.isUnique);
-  if (!contentHashIndexIsUnique) {
-    await pool.query(`
-      WITH ranked AS (
-        SELECT *, FIRST_VALUE(id) OVER (
-          PARTITION BY user_id, content_hash ORDER BY saved_at DESC, id DESC
-        ) AS keep_id
-        FROM saved_articles
-        WHERE content_hash IS NOT NULL
-      ), merged AS (
-        SELECT keep_id,
-               (array_agg(NULLIF(content, '') ORDER BY length(content) DESC, saved_at DESC)
-                 FILTER (WHERE content <> ''))[1] AS content,
-               (array_agg(NULLIF(excerpt, '') ORDER BY length(excerpt) DESC, saved_at DESC)
-                 FILTER (WHERE excerpt <> ''))[1] AS excerpt,
-               (array_agg(NULLIF(citation_context, '') ORDER BY length(citation_context) DESC, saved_at DESC)
-                 FILTER (WHERE citation_context IS NOT NULL AND citation_context <> ''))[1] AS citation_context,
-               (array_agg(image_urls ORDER BY jsonb_array_length(image_urls) DESC, saved_at DESC)
-                 FILTER (WHERE jsonb_typeof(image_urls) = 'array' AND jsonb_array_length(image_urls) > 0))[1] AS image_urls,
-               (array_agg(source_icon ORDER BY saved_at DESC)
-                 FILTER (WHERE source_icon IS NOT NULL))[1] AS source_icon,
-               MAX(published_at) AS published_at
-        FROM ranked
-        GROUP BY keep_id
-        HAVING COUNT(*) > 1
-      )
-      UPDATE saved_articles keep
-      SET content = COALESCE(merged.content, keep.content),
-          excerpt = COALESCE(merged.excerpt, keep.excerpt),
-          citation_context = COALESCE(merged.citation_context, keep.citation_context),
-          image_urls = COALESCE(merged.image_urls, keep.image_urls),
-          source_icon = COALESCE(keep.source_icon, merged.source_icon),
-          published_at = COALESCE(keep.published_at, merged.published_at)
-      FROM merged
-      WHERE keep.id = merged.keep_id
-    `);
-    await pool.query(`
-      WITH duplicates AS (
-        SELECT id, user_id, FIRST_VALUE(id) OVER (
-          PARTITION BY user_id, content_hash ORDER BY saved_at DESC, id DESC
-        ) AS keep_id
-        FROM saved_articles
-        WHERE content_hash IS NOT NULL
-      )
-      UPDATE saved_cards sc
-      SET saved_article_id = duplicates.keep_id
-      FROM duplicates
-      WHERE sc.saved_article_id = duplicates.id AND duplicates.id <> duplicates.keep_id
-    `);
-    await pool.query(`
-      WITH duplicates AS (
-        SELECT id, user_id, FIRST_VALUE(id) OVER (
-          PARTITION BY user_id, content_hash ORDER BY saved_at DESC, id DESC
-        ) AS keep_id
-        FROM saved_articles
-        WHERE content_hash IS NOT NULL
-      )
-      UPDATE write_canvas_nodes n
-      SET ref_id = duplicates.keep_id::text, updated_at = NOW()
-      FROM duplicates
-      WHERE n.kind = 'saved_article'
-        AND n.user_id = duplicates.user_id
-        AND n.ref_id = duplicates.id::text
-        AND duplicates.id <> duplicates.keep_id
-    `);
-    await pool.query(`
-      WITH duplicates AS (
-        SELECT id, FIRST_VALUE(id) OVER (
-          PARTITION BY user_id, content_hash ORDER BY saved_at DESC, id DESC
-        ) AS keep_id
-        FROM saved_articles
-        WHERE content_hash IS NOT NULL
-      )
-      DELETE FROM saved_articles sa
-      USING duplicates
-      WHERE sa.id = duplicates.id AND duplicates.id <> duplicates.keep_id
-    `);
-    await pool.query(`DROP INDEX IF EXISTS idx_saved_articles_content_hash`);
-    await pool.query(`CREATE UNIQUE INDEX idx_saved_articles_content_hash_unique_v2 ON saved_articles(user_id, content_hash) WHERE content_hash IS NOT NULL`);
-  }
-
-  // --- card_relations: knowledge graph (reserved for future use) ---
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS card_relations (
-      id              SERIAL PRIMARY KEY,
-      card_a          TEXT NOT NULL REFERENCES saved_cards(id) ON DELETE CASCADE,
-      card_b          TEXT NOT NULL REFERENCES saved_cards(id) ON DELETE CASCADE,
-      relation_type   TEXT NOT NULL CHECK (relation_type IN ('supports','conflicts','extends')),
-      confidence      REAL DEFAULT 0.5,
-      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (card_a, card_b, relation_type)
-    )
-  `);
-
-  // --- pgvector: optional semantic search extension ---
-  let pgvectorAvailable = false;
-  try {
-    await pool.query('CREATE EXTENSION IF NOT EXISTS vector');
-    pgvectorAvailable = true;
-    await pool.query('ALTER TABLE saved_cards ADD COLUMN IF NOT EXISTS embedding vector(1536)');
-    logger.info({ module: "db" }, "pgvector extension enabled");
-  } catch {
-    logger.info({ module: "db" }, "pgvector not available, semantic search disabled");
-  }
-
-  // Backfill: set default nickname for existing users who don't have one
-  await pool.query("UPDATE users SET nickname = split_part(email, '@', 1) WHERE nickname IS NULL");
-  schemaReady = true;
-  } finally {
-    try {
-      const unlocked = (await schemaLockClient.query(
-        `SELECT pg_advisory_unlock(hashtext('atomflow-schema-migration')) AS unlocked`,
-      )).rows[0]?.unlocked === true;
-      schemaLockReleased = unlocked;
-    } catch (error) {
-      logger.error({ err: error, module: "db" }, "Failed to release schema migration lock");
-    }
-  }
-  } catch (err) {
-    if (isProduction) throw err;
-    logger.error({ err, module: "db" }, "Database schema migration failed; some features may be unavailable");
-  } finally {
-    schemaLockClient.release(schemaLockReleased ? undefined : true);
-  }
-  } // end if (pool)
+  const billingService = pool && schemaReady ? new BillingService(pool, billingConfig, logger) : null;
+  billingService?.startWorkers();
 
   const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
@@ -5184,6 +5696,34 @@ async function startServer() {
         auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
       })
     : null;
+
+  const sendRssRuntimeAlert = async (alert: RssRuntimeAlert) => {
+    const recipient = process.env.SECURITY_CONTACT_EMAIL?.trim();
+    if (!recipient) throw new Error("SECURITY_CONTACT_EMAIL is not configured for RSS memory alerts");
+    const rssMegabytes = Math.round((alert.rssBytes / 1024 / 1024) * 10) / 10;
+    const subject = `[AtomFlow] ${alert.kind} (${rssMegabytes} MB)`;
+    const textContent = `${alert.message}\n\nRSS: ${rssMegabytes} MB\nTime: ${alert.occurredAt}`;
+    if (resend) {
+      const result = await resend.emails.send({
+        from: "AtomFlow <noreply@atomflow.cloud>",
+        to: recipient,
+        subject,
+        text: textContent,
+      });
+      if (result.error) throw new Error(`Resend RSS alert failed: ${result.error.message}`);
+      return;
+    }
+    if (smtpTransporter) {
+      await smtpTransporter.sendMail({
+        from: `AtomFlow <${process.env.SMTP_USER}>`,
+        to: recipient,
+        subject,
+        text: textContent,
+      });
+      return;
+    }
+    throw new Error("No email transport is configured for RSS memory alerts");
+  };
 
   // Avatar upload setup (memory storage → compress → base64 data URL stored in DB)
   const AVATAR_MAX_BYTES = 2 * 1024 * 1024; // 2MB threshold for compression
@@ -5215,6 +5755,20 @@ async function startServer() {
       ];
       cb(null, allowed.includes(file.mimetype));
     }
+  });
+  const canvasDocumentUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fileSize: WRITE_CANVAS_DOCUMENT_MAX_BYTES,
+      files: 1,
+      fields: 8,
+      parts: 9,
+      fieldNameSize: 100,
+      fieldSize: WRITE_CANVAS_DOCUMENT_MAX_BYTES,
+    },
+    fileFilter: (_req, file, cb) => {
+      cb(null, ["application/json", "application/octet-stream", "text/json", "text/plain"].includes(file.mimetype));
+    },
   });
 
   const apiLimiter = rateLimit({
@@ -5330,20 +5884,30 @@ async function startServer() {
   const remoteRssMaxBytes = readBoundedEnvNumber(process.env.REMOTE_RSS_MAX_MB, 5, 1, 10) * 1024 * 1024;
   const remoteRssMaxItems = readBoundedEnvNumber(process.env.REMOTE_RSS_MAX_ITEMS, 500, 20, 1000);
 
+  const paddleFrameOrigins = billingConfig.environment === "sandbox"
+    ? ["https://sandbox-buy.paddle.com"]
+    : ["https://buy.paddle.com"];
+  const paddleConnectOrigins = billingConfig.environment === "sandbox"
+    ? ["https://sandbox-create-checkout.paddle.com", "https://sandbox-api.paddle.com"]
+    : ["https://create-checkout.paddle.com", "https://api.paddle.com"];
+  const paddleCdnOrigin = "https://cdn.paddle.com";
+  const paddleStyleOrigins = billingConfig.environment === "sandbox"
+    ? ["https://sandbox-cdn.paddle.com"]
+    : [paddleCdnOrigin];
   app.use(helmet({
     contentSecurityPolicy: isProduction ? {
       directives: {
         defaultSrc: ["'self'"],
         baseUri: ["'self'"],
-        connectSrc: ["'self'", "wss:"],
+        connectSrc: ["'self'", ...(billingConfig.enabled ? paddleConnectOrigins : [])],
         fontSrc: ["'self'", "data:"],
         frameAncestors: ["'none'"],
-        frameSrc: ["'none'"],
-        imgSrc: ["'self'", "data:", "blob:", "https:"],
-        mediaSrc: ["'self'", "blob:", "data:", "https:"],
+        frameSrc: billingConfig.enabled ? paddleFrameOrigins : ["'none'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        mediaSrc: ["'self'", "blob:", "data:"],
         objectSrc: ["'none'"],
-        scriptSrc: ["'self'"],
-        styleSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrc: ["'self'", ...(billingConfig.enabled ? [paddleCdnOrigin] : [])],
+        styleSrc: ["'self'", "'unsafe-inline'", ...(billingConfig.enabled ? paddleStyleOrigins : [])],
         workerSrc: ["'self'", "blob:"],
       },
     } : false,
@@ -5358,6 +5922,22 @@ async function startServer() {
     },
   }));
   const jsonBodyLimitKb = readBoundedEnvNumber(process.env.JSON_BODY_LIMIT_KB, 256, 64, 1024);
+  app.post("/api/billing/webhooks/paddle", express.raw({ type: "application/json", limit: "256kb" }), asyncHandler(async (req, res) => {
+    if (!billingService || !billingConfig.enabled) {
+      return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务未启用" });
+    }
+    const signature = req.get("paddle-signature") || "";
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    try {
+      await billingService.receiveWebhook(rawBody, signature);
+      return res.status(200).json({ received: true });
+    } catch (error) {
+      if (error instanceof BillingError) {
+        return res.status(error.status).json({ code: error.code, error: error.message });
+      }
+      throw error;
+    }
+  }));
   app.use(express.json({ limit: `${jsonBodyLimitKb}kb`, strict: true }));
   app.use(express.urlencoded({ extended: false, limit: "64kb", parameterLimit: 50 }));
   app.use(pinoHttp({
@@ -5456,6 +6036,12 @@ async function startServer() {
   );
   const articleSaveConcurrencyGuard = createUserConcurrencyGuard(1);
   const canvasAgentConcurrencyGuard = createUserConcurrencyGuard(1);
+  const mediaProxyUserConcurrencyGuard = createUserConcurrencyGuard(
+    readBoundedEnvNumber(process.env.MEDIA_PROXY_USER_CONCURRENCY, 2, 1, 4),
+  );
+  const mediaProxyGlobalConcurrencyGuard = createUserConcurrencyGuard(
+    readBoundedEnvNumber(process.env.MEDIA_PROXY_GLOBAL_CONCURRENCY, 8, 2, 20),
+  );
   const paidConcurrencyMiddleware: express.RequestHandler = (req, res, next) => {
     let releaseGlobal: (() => void) | undefined;
     let releaseUser: (() => void) | undefined;
@@ -5623,15 +6209,67 @@ async function startServer() {
     }
   };
 
+  let rssRuntime: RssRuntimeController<BuiltinFeedSource, Article[]> | null = null;
+
   app.get("/api/health", asyncHandler(async (_req, res) => {
-    if (!pool || !schemaReady) return res.status(503).json({ status: "unhealthy", database: pool ? "schema-unavailable" : "unavailable" });
-    await pool.query("SELECT 1 FROM users LIMIT 0");
     res.setHeader("Cache-Control", "no-store");
-    return res.json({ status: "ok", database: "connected" });
+    if (!pool || !schemaReady) {
+      return res.status(503).json({ status: "unhealthy", database: pool ? "schema-unavailable" : "unavailable" });
+    }
+    try {
+      schemaReady = await verifyDatabaseSchema(pool);
+      if (!schemaReady) {
+        return res.status(503).json({ status: "unhealthy", database: "schema-unavailable" });
+      }
+      const rssStatus = rssRuntime?.getStatus();
+      return res.json({
+        status: "ok",
+        database: "connected",
+        schemaVersion: DATABASE_SCHEMA_VERSION,
+        rss: rssStatus ? {
+          state: rssStatus.refresh.pausedForMemory
+            ? "paused-memory"
+            : rssStatus.refresh.inProgress ? "refreshing" : "active",
+          lastCompletedAt: rssStatus.refresh.lastCompletedAt,
+          lastSuccessfulAt: rssStatus.refresh.lastSuccessfulAt,
+          maxConsecutiveFailures: Math.max(
+            0,
+            ...Object.values(rssStatus.sources).map(source => source.consecutiveFailures),
+          ),
+        } : { state: "starting", lastCompletedAt: null, lastSuccessfulAt: null, maxConsecutiveFailures: 0 },
+      });
+    } catch (error) {
+      logger.warn({ err: error, module: "db" }, "Database health check failed");
+      return res.status(503).json({ status: "unhealthy", database: "unavailable" });
+    }
   }));
 
   // In-memory database for prototype
   let articles: Article[] = [];
+  const fullArticleImageAuthorizationCache = new Map<string, { expiresAt: number; imageUrls: string[] }>();
+  const rememberFullArticleImages = (article: Article) => {
+    const key = article.url || `${article.source}\u0000${article.title}`;
+    fullArticleImageAuthorizationCache.set(key, {
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      imageUrls: extractImageUrlsFromArticle(article, 48),
+    });
+    while (fullArticleImageAuthorizationCache.size > 500) {
+      const oldestKey = fullArticleImageAuthorizationCache.keys().next().value;
+      if (typeof oldestKey !== 'string') break;
+      fullArticleImageAuthorizationCache.delete(oldestKey);
+    }
+  };
+  const isCachedFullArticleImage = (imageUrl: string) => {
+    const now = Date.now();
+    for (const [key, cached] of fullArticleImageAuthorizationCache) {
+      if (cached.expiresAt <= now) {
+        fullArticleImageAuthorizationCache.delete(key);
+        continue;
+      }
+      if (cached.imageUrls.includes(imageUrl)) return true;
+    }
+    return false;
+  };
   const cachedArticles = await loadArticlesCache();
   if (cachedArticles.length > 0) {
     articles = cachedArticles;
@@ -5639,32 +6277,59 @@ async function startServer() {
     articles = [...MOCK_ARTICLES];
   }
 
-  // Load RSS feeds on startup
-  logger.info({ module: "rss" }, "Fetching RSS feeds");
-  const refreshFeeds = async () => {
-    try {
-      const fresh = await fetchRSSFeeds();
-      logger.info({ module: "rss", freshCount: fresh.length }, "Fetched fresh articles");
-
-      // 只有当新数据不为空时才合并
-      if (fresh.length > 0) {
-        const withFallback = mergeWithSourceFallback(articles, fresh);
-        articles = mergeArticles(articles, rankArticles(withFallback));
-        await saveArticlesCache(articles);
-        logger.info({ module: "rss", articleCount: articles.length }, "Loaded articles");
-      } else {
-        logger.info({ module: "rss" }, "No fresh articles fetched, keeping existing data");
-      }
-    } catch (error) {
-      logger.error({ err: error, module: "rss" }, "Failed to refresh feeds, keeping existing data");
-    }
+  const rssRefreshIntervalMs = readBoundedEnvNumber(process.env.RSS_REFRESH_INTERVAL_MINUTES, 30, 5, 360) * 60 * 1000;
+  const rssMemoryWarningBytes = readBoundedEnvNumber(process.env.RSS_MEMORY_WARNING_MB, 600, 256, 4096) * 1024 * 1024;
+  const rssMemoryPauseBytes = readBoundedEnvNumber(process.env.RSS_MEMORY_PAUSE_MB, 700, 300, 6144) * 1024 * 1024;
+  const rssMemoryResumeBytes = readBoundedEnvNumber(process.env.RSS_MEMORY_RESUME_MB, 550, 128, 4096) * 1024 * 1024;
+  const rssMaxConcurrency = readBoundedEnvNumber(process.env.RSS_MAX_CONCURRENCY, RSS_MAX_CONCURRENCY, 1, 8);
+  const onRssRuntimeEvent = (event: RssRuntimeEvent) => {
+    const memory = process.memoryUsage();
+    const runtimeStatus = rssRuntime?.getStatus();
+    const payload = {
+      module: "rss-runtime",
+      event: event.event,
+      rssBytes: memory.rss,
+      heapUsedBytes: memory.heapUsed,
+      externalBytes: memory.external,
+      articleCount: articles.length,
+      configuredConcurrency: rssMaxConcurrency,
+      activeSources: runtimeStatus?.refresh.activeSources ?? 0,
+      maxObservedActiveSources: runtimeStatus?.refresh.maxObservedActiveSources ?? 0,
+      lastCycleDurationMs: runtimeStatus?.refresh.lastDurationMs ?? null,
+      ...(event.details || {}),
+    };
+    if (event.event === "memory-alert-failed") logger.error(payload, "RSS memory alert failed");
+    else if (event.event === "source-failed") logger.warn(payload, "RSS source refresh failed");
+    else logger.info(payload, "RSS runtime event");
   };
-  logger.info({ module: "rss", articleCount: articles.length }, "Using cached or fallback articles, refreshing in background");
-  refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds in background"));
-  const feedRefreshTimer = setInterval(() => {
-    refreshFeeds().catch(error => logger.error({ err: error, module: "rss" }, "Failed to refresh feeds"));
-  }, 10 * 60 * 1000);
-  feedRefreshTimer.unref();
+
+  rssRuntime = new RssRuntimeController<BuiltinFeedSource, Article[]>({
+    getSources: () => BUILTIN_FEED_SOURCES,
+    getSourceId: source => source.id,
+    refreshSource: fetchBuiltinFeedSource,
+    refreshIntervalMs: rssRefreshIntervalMs,
+    concurrency: rssMaxConcurrency,
+    memoryWarningBytes: rssMemoryWarningBytes,
+    memoryPauseBytes: rssMemoryPauseBytes,
+    memoryResumeBytes: rssMemoryResumeBytes,
+    sendAlert: sendRssRuntimeAlert,
+    onEvent: onRssRuntimeEvent,
+    onCycleComplete: async ({ results, failureCount, skippedSourceCount }) => {
+      const counts = Object.fromEntries(BUILTIN_FEED_SOURCES.map(source => [source.id, results.get(source.id)?.length || 0]));
+      const fresh = Array.from(results.values()).flat();
+      logger.info({ module: "rss", counts, freshCount: fresh.length, failureCount, skippedSourceCount }, "RSS feed counts");
+      if (fresh.length === 0) {
+        logger.info({ module: "rss" }, "No fresh articles fetched, keeping existing data");
+        return;
+      }
+      const withFallback = mergeWithSourceFallback(articles, fresh);
+      articles = mergeArticles(articles, rankArticles(withFallback)).slice(0, RSS_GLOBAL_ARTICLE_LIMIT);
+      await saveArticlesCache(articles);
+      logger.info({ module: "rss", articleCount: articles.length }, "Loaded articles");
+    },
+  });
+  logger.info({ module: "rss", articleCount: articles.length }, "Using cached or fallback articles, starting bounded refresh runtime");
+  rssRuntime.start();
 
   const cleanupExpiredVerificationCodes = async () => {
     const client = await pool.connect();
@@ -5948,8 +6613,7 @@ async function startServer() {
   };
 
   const hasRecentAuthentication = (req: express.Request) => (
-    typeof req.session.reauthenticatedAt === "number" &&
-    Date.now() - req.session.reauthenticatedAt <= 15 * 60 * 1000
+    isRecentAuthentication(req.session.reauthenticatedAt)
   );
 
   const requireRecentAuthentication: express.RequestHandler = (req, res, next) => {
@@ -5959,10 +6623,121 @@ async function startServer() {
     next();
   };
 
-  const reserveDailyAiBudget = async (userId: number, reservedOutputTokens: number) => {
+  const sendBillingError = (res: express.Response, error: unknown) => {
+    if (error instanceof BillingError) {
+      return res.status(error.status).json({ code: error.code, error: error.message });
+    }
+    logger.error({ err: error, module: "billing" }, "Billing request failed");
+    return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务暂时不可用" });
+  };
+
+  const requireMagicWritingReadAccess: express.RequestHandler = asyncHandler(async (req, res, next) => {
+    if (!billingConfig.enabled) return next();
+    if (!billingService) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务暂时不可用" });
+    try {
+      const status = await billingService.resolveMagicWritingAccess(req.session.userId!);
+      if (status.access === "full" || status.access === "read_only") return next();
+      return res.status(402).json({ code: "MAGIC_WRITE_SUBSCRIPTION_REQUIRED", error: "魔法写作需要 Pro 订阅" });
+    } catch (error) {
+      return sendBillingError(res, error);
+    }
+  });
+
+  const requireMagicWritingFullAccess: express.RequestHandler = asyncHandler(async (req, res, next) => {
+    if (!billingConfig.enabled) return next();
+    if (!billingService) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务暂时不可用" });
+    try {
+      const status = await billingService.resolveMagicWritingAccess(req.session.userId!);
+      if (status.access === "full") return next();
+      const code = status.access === "read_only" ? "MAGIC_WRITE_READ_ONLY" : "MAGIC_WRITE_SUBSCRIPTION_REQUIRED";
+      const error = status.access === "read_only" ? "当前魔法写作空间为只读" : "魔法写作需要 Pro 订阅";
+      return res.status(402).json({ code, error });
+    } catch (billingError) {
+      return sendBillingError(res, billingError);
+    }
+  });
+
+  app.get("/api/billing/plans", asyncHandler(async (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    if (!billingConfig.enabled) {
+      res.setHeader("Cache-Control", "public, max-age=300");
+      return res.json({ enabled: false, plans: billingConfig.plans });
+    }
+    if (!billingService) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务暂时不可用" });
+    try {
+      const plans = await billingService.getValidatedPlans();
+      res.setHeader("Cache-Control", "public, max-age=300");
+      return res.json({ enabled: true, plans });
+    } catch (error) {
+      return sendBillingError(res, error);
+    }
+  }));
+
+  app.get("/api/billing/status", requireAuth, asyncHandler(async (req, res) => {
+    res.setHeader("Cache-Control", "private, no-store");
+    if (!billingService) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务暂时不可用" });
+    try {
+      const status = await billingService.resolveMagicWritingAccess(req.session.userId!);
+      const scheduledCancelAt = status.scheduledChange
+        ? String(status.scheduledChange.effective_at || status.scheduledChange.effectiveAt || status.currentPeriodEndsAt || "") || null
+        : null;
+      return res.json({
+        enabled: billingConfig.enabled,
+        access: status.access,
+        subscriptionStatus: status.subscriptionStatus,
+        planCode: status.planCode,
+        currentPeriodEnd: status.currentPeriodEndsAt,
+        scheduledCancelAt,
+        paymentActionRequired: status.paymentActionRequired,
+        hasLegacyWriteData: status.hasWritingHistory,
+        hasBillingCustomer: status.hasBillingCustomer,
+      });
+    } catch (error) {
+      return sendBillingError(res, error);
+    }
+  }));
+
+  app.post("/api/billing/checkout", requireAuth, asyncHandler(async (req, res) => {
+    if (!billingService || !billingConfig.enabled) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务未启用" });
+    const planCode = req.body?.planCode;
+    const requestId = typeof req.body?.requestId === "string" ? req.body.requestId.trim() : "";
+    if (!isBillingPlanCode(planCode)) return res.status(400).json({ code: "INVALID_BILLING_PLAN", error: "套餐无效" });
+    try {
+      return res.json(await billingService.createCheckout(req.session.userId!, req.session.email || "", planCode, requestId));
+    } catch (error) {
+      return sendBillingError(res, error);
+    }
+  }));
+
+  app.post("/api/billing/portal", requireAuth, asyncHandler(async (req, res) => {
+    if (!billingService || !billingConfig.enabled) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务未启用" });
+    try {
+      res.setHeader("Cache-Control", "no-store");
+      return res.json(await billingService.createPortal(req.session.userId!));
+    } catch (error) {
+      return sendBillingError(res, error);
+    }
+  }));
+
+  app.use("/api/notes", requireAuth, (req, res, next) => (
+    req.method === "GET" || req.method === "HEAD"
+      ? requireMagicWritingReadAccess(req, res, next)
+      : requireMagicWritingFullAccess(req, res, next)
+  ));
+  app.use("/api/write", requireAuth, (req, res, next) => (
+    req.method === "GET" || req.method === "HEAD"
+      ? requireMagicWritingReadAccess(req, res, next)
+      : requireMagicWritingFullAccess(req, res, next)
+  ));
+
+  const reserveDailyAiBudget = async (
+    userId: number,
+    reservedOutputTokens: number,
+    database: pg.Pool | pg.PoolClient = pool,
+  ) => {
     const maxOperations = readBoundedEnvNumber(process.env.PAID_OPERATION_DAILY_LIMIT, 100, 1, 10000);
     const maxOutputTokens = readBoundedEnvNumber(process.env.PAID_OUTPUT_TOKENS_DAILY_LIMIT, 200_000, 1000, 10_000_000);
-    return (await pool.query(
+    return (await database.query(
       `INSERT INTO user_ai_usage_daily (user_id, usage_date, operation_count, reserved_output_tokens)
        SELECT $1, CURRENT_DATE, 1, $2
        WHERE $2 <= $4
@@ -5977,6 +6752,15 @@ async function startServer() {
     )).rows[0] || null;
   };
 
+  const getWriteAgentOutputReservation = (
+    perTurnMaxTokens: unknown,
+    modelTurnLimit: number,
+    routerTokens = 0,
+  ) => {
+    const perTurn = Math.round(clampNumber(perTurnMaxTokens, 1200, 128, getCanvasAgentMaxOutputTokens()));
+    return perTurn * Math.max(1, Math.round(modelTurnLimit)) + Math.max(0, Math.round(routerTokens));
+  };
+
   const dailyPaidOperationBudgetMiddleware: express.RequestHandler = asyncHandler(async (req, res, next) => {
     const userId = req.session.userId;
     if (!userId) return res.status(401).json({ error: "请先登录" });
@@ -5988,12 +6772,822 @@ async function startServer() {
     next();
   });
 
+  const writingAgentDailyBudgetMiddleware: express.RequestHandler = asyncHandler(async (req, res, next) => {
+    const userId = req.session.userId;
+    if (!userId) return res.status(401).json({ error: "请先登录" });
+    const reservation = await reserveDailyAiBudget(
+      userId,
+      getWriteAgentOutputReservation(getCanvasAgentMaxOutputTokens(), 6, 260),
+    );
+    if (!reservation) {
+      res.setHeader("Retry-After", "3600");
+      return res.status(429).json({ error: "今日 AI 使用额度已达到上限，请稍后再试" });
+    }
+    next();
+  });
+
+  const canvasAgentRunLeaseMs = readBoundedEnvNumber(
+    process.env.WRITE_CANVAS_RUN_LEASE_MS,
+    Math.min(3_600_000, Math.max(1_200_000, AI_REQUEST_TIMEOUT_MS * 4)),
+    300_000,
+    3_600_000,
+  );
+  const canvasAgentRunDeadlineMs = Math.max(
+    60_000,
+    canvasAgentRunLeaseMs - Math.min(180_000, Math.floor(canvasAgentRunLeaseMs / 2)),
+  );
+
+  const sendCanvasRunFinal = (res: express.Response, payloadValue: unknown, replayed = false) => {
+    const payload = isPlainRecord(payloadValue)
+      ? { ...payloadValue, ...(replayed ? { replayed: true } : {}) }
+      : { replayed, message: "文章已创建" };
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
+    res.write("event: final\n");
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    res.end();
+  };
+
+  const sendCanvasRunRetryable = (res: express.Response, message: string) => {
+    res.setHeader("Retry-After", "5");
+    return res.status(409).json({ code: "CANVAS_RUN_IN_PROGRESS", error: message, retryable: true });
+  };
+
+  const sendCanvasRunAttemptsExhausted = (res: express.Response) => res.status(409).json({
+    code: "CANVAS_RUN_ATTEMPTS_EXHAUSTED",
+    error: "该创建文章请求的执行次数已用尽，请使用新的 requestId 重试",
+    retryable: false,
+  });
+
+  const hasActiveCanvasAgentRun = async (
+    database: pg.Pool | pg.PoolClient,
+    userId: number,
+    scope: { projectId?: number; agentId?: number },
+  ) => Boolean((await database.query(
+    `SELECT active_run.agent_id
+     FROM (
+       SELECT run_request.agent_id, agent.project_id
+       FROM write_canvas_agent_run_requests AS run_request
+       JOIN write_agent_instances AS agent
+         ON agent.id = run_request.agent_id AND agent.user_id = run_request.user_id
+       WHERE run_request.user_id = $1
+         AND run_request.status = 'running'
+         AND run_request.lease_expires_at IS NOT NULL
+         AND run_request.lease_expires_at > NOW()
+       UNION ALL
+       SELECT execution_lease.agent_id, agent.project_id
+       FROM write_canvas_agent_execution_leases AS execution_lease
+       JOIN write_agent_instances AS agent
+         ON agent.id = execution_lease.agent_id AND agent.user_id = execution_lease.user_id
+       WHERE execution_lease.user_id = $1
+         AND execution_lease.lease_expires_at > NOW()
+     ) AS active_run
+     WHERE ($2::bigint IS NULL OR active_run.project_id = $2)
+       AND ($3::bigint IS NULL OR active_run.agent_id = $3)
+     LIMIT 1`,
+    [userId, scope.projectId ?? null, scope.agentId ?? null],
+  )).rows[0]);
+
+  const acquireCanvasAgentExecutionLease = async (input: {
+    userId: number;
+    agentId: number;
+    runId: string;
+  }): Promise<"acquired" | "active" | "agent_missing"> => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, input.userId);
+      const agent = (await client.query(
+        `SELECT id, agent_thread_id
+         FROM write_agent_instances
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [input.agentId, input.userId],
+      )).rows[0];
+      if (!agent) {
+        await client.query("ROLLBACK");
+        return "agent_missing";
+      }
+      await client.query(
+        `DELETE FROM write_canvas_agent_execution_leases
+         WHERE user_id = $1 AND agent_id = $2 AND lease_expires_at <= NOW()`,
+        [input.userId, input.agentId],
+      );
+      if (await hasActiveCanvasAgentRun(client, input.userId, { agentId: input.agentId })) {
+        await client.query("ROLLBACK");
+        return "active";
+      }
+      await client.query(
+        `INSERT INTO write_canvas_agent_execution_leases
+           (user_id, agent_id, thread_id, run_id, lease_kind, lease_expires_at)
+         VALUES ($1, $2, $3, $4, 'chat', NOW() + ($5::bigint * INTERVAL '1 millisecond'))`,
+        [input.userId, input.agentId, agent.agent_thread_id || null, input.runId, canvasAgentRunLeaseMs],
+      );
+      await client.query("COMMIT");
+      return "acquired";
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+
+  const updateCanvasAgentExecutionLeaseThread = async (input: {
+    userId: number;
+    agentId: number;
+    runId: string;
+    threadId: number;
+  }) => Boolean((await pool.query(
+    `UPDATE write_canvas_agent_execution_leases
+     SET thread_id = $4, updated_at = NOW()
+     WHERE user_id = $1 AND agent_id = $2 AND run_id = $3
+       AND lease_expires_at > NOW()
+     RETURNING id`,
+    [input.userId, input.agentId, input.runId, input.threadId],
+  )).rows[0]);
+
+  const renewCanvasAgentExecutionLease = async (input: {
+    userId: number;
+    agentId: number;
+    runId: string;
+  }) => {
+    const renewed = (await pool.query(
+      `UPDATE write_canvas_agent_execution_leases
+       SET lease_expires_at = NOW() + ($4::bigint * INTERVAL '1 millisecond'),
+           updated_at = NOW()
+       WHERE user_id = $1 AND agent_id = $2 AND run_id = $3
+         AND lease_expires_at > NOW()
+       RETURNING id`,
+      [input.userId, input.agentId, input.runId, canvasAgentRunLeaseMs],
+    )).rows[0];
+    if (!renewed) throw new Error("Canvas Agent execution lease expired before provider invocation");
+  };
+
+  const renewCanvasCreateArticleRunLease = async (input: {
+    userId: number;
+    agentId: number;
+    requestId: string;
+    runId: string;
+  }) => {
+    const renewed = (await pool.query(
+      `UPDATE write_canvas_agent_run_requests
+       SET lease_expires_at = NOW() + ($5::bigint * INTERVAL '1 millisecond'),
+           updated_at = NOW()
+       WHERE user_id = $1 AND agent_id = $2 AND request_id = $3 AND run_id = $4
+         AND status = 'running'
+         AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()
+       RETURNING id`,
+      [input.userId, input.agentId, input.requestId, input.runId, canvasAgentRunLeaseMs],
+    )).rows[0];
+    if (!renewed) throw new Error("Canvas create-article lease expired before provider invocation");
+  };
+
+  const releaseCanvasAgentExecutionLease = async (input: {
+    userId: number;
+    agentId: number;
+    runId: string;
+  }) => {
+    await pool.query(
+      `DELETE FROM write_canvas_agent_execution_leases
+       WHERE user_id = $1 AND agent_id = $2 AND run_id = $3`,
+      [input.userId, input.agentId, input.runId],
+    );
+  };
+
+  const completeCanvasRunRequest = async (input: {
+    userId: number;
+    agentId: number;
+    requestId: string;
+    runId: string;
+    payload: unknown;
+    noteId?: number;
+    threadId?: number;
+  }) => {
+    const completed = (await pool.query(
+      `UPDATE write_canvas_agent_run_requests
+       SET status = 'completed', response_payload = $5, note_id = $6, thread_id = $7,
+           lease_expires_at = NULL, error_message = NULL, completed_at = NOW(), updated_at = NOW()
+       WHERE user_id = $1 AND agent_id = $2 AND request_id = $3 AND run_id = $4
+         AND status = 'running'
+       RETURNING id`,
+      [
+        input.userId,
+        input.agentId,
+        input.requestId,
+        input.runId,
+        JSON.stringify(input.payload),
+        input.noteId || null,
+        input.threadId || null,
+      ],
+    )).rows[0];
+    if (!completed) {
+      const current = (await pool.query(
+        `SELECT run_id, status
+         FROM write_canvas_agent_run_requests
+         WHERE user_id = $1 AND agent_id = $2 AND request_id = $3`,
+        [input.userId, input.agentId, input.requestId],
+      )).rows[0];
+      if (current?.status === "completed" && String(current.run_id) === input.runId) return;
+      throw new Error("Canvas run ownership expired before completion");
+    }
+  };
+
+  const failCanvasRunRequest = async (input: {
+    userId: number;
+    agentId: number;
+    requestId: string;
+    runId: string;
+    error: unknown;
+  }) => {
+    await pool.query(
+      `UPDATE write_canvas_agent_run_requests
+       SET status = 'failed', lease_expires_at = NULL, error_message = $5,
+           updated_at = NOW()
+       WHERE user_id = $1 AND agent_id = $2 AND request_id = $3 AND run_id = $4
+         AND status = 'running'`,
+      [
+        input.userId,
+        input.agentId,
+        input.requestId,
+        input.runId,
+        normalizePlainText(input.error instanceof Error ? input.error.message : String(input.error || "run failed")).slice(0, 500),
+      ],
+    );
+  };
+
+  const canvasAgentChatValidationMiddleware: express.RequestHandler = asyncHandler(async (req, res, next) => {
+    const userId = req.session.userId;
+    if (!userId) return res.status(401).json({ error: "请先登录" });
+    const agentId = Number(req.params.id);
+    if (!Number.isSafeInteger(agentId) || agentId <= 0) {
+      return res.status(400).json({ error: "invalid agent id" });
+    }
+    const message = typeof req.body?.message === "string"
+      ? req.body.message.trim().slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH)
+      : "";
+    if (!message) return res.status(400).json({ error: "message is required" });
+    const isCreateArticle = req.body?.action === "create_article";
+    const requestId = typeof req.body?.requestId === "string" ? req.body.requestId.trim() : "";
+    if (isCreateArticle && (!requestId || requestId.length > 128)) {
+      return res.status(400).json({ error: "requestId is required for create_article" });
+    }
+    const agentRow = await getCanvasAgentNode(pool, userId, agentId);
+    if (!agentRow) return res.status(404).json({ error: "agent not found" });
+    const focusedTopic = typeof req.body?.focusedTopic === "string"
+      ? req.body.focusedTopic.slice(0, 500)
+      : message;
+    const requestFingerprint = isCreateArticle
+      ? createHash("sha256").update(JSON.stringify({ action: "create_article", message, focusedTopic })).digest("hex")
+      : "";
+    res.locals.canvasAgentChat = {
+      userId,
+      agentId,
+      agentRow,
+      message,
+      focusedTopic,
+      isCreateArticle,
+      requestId,
+      requestFingerprint,
+      creationKey: isCreateArticle ? `canvas:${agentId}:${requestId}` : undefined,
+    };
+    next();
+  });
+
+  const canvasAgentExecutionValidationMiddleware: express.RequestHandler = (req, res, next) => {
+    const prepared = res.locals.canvasAgentChat;
+    if (!prepared) return res.status(500).json({ error: "Canvas Agent request was not prepared" });
+    if (!getOpenAIWriteAgentConfig()) {
+      return res.status(500).json({ error: "Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL" });
+    }
+    if (!isAllowedCanvasAgentModel(prepared.agentRow.model)) {
+      return res.status(400).json({ error: "该 Agent 使用的模型未被服务器允许，请先更新模型设置" });
+    }
+    next();
+  };
+
+  const canvasAgentContextValidationMiddleware: express.RequestHandler = asyncHandler(async (_req, res, next) => {
+    const prepared = res.locals.canvasAgentChat;
+    if (!prepared) return res.status(500).json({ error: "Canvas Agent request was not prepared" });
+    const contexts = await resolveCanvasContextItems(
+      pool,
+      prepared.userId,
+      Number(prepared.agentRow.node_id),
+      Number(prepared.agentRow.project_id),
+    );
+    res.locals.canvasAgentContexts = contexts;
+    if (!prepared.isCreateArticle) return next();
+    const durableNoteExists = Boolean((await pool.query(
+      `SELECT 1 FROM notes WHERE user_id = $1 AND creation_key = $2 LIMIT 1`,
+      [prepared.userId, prepared.creationKey],
+    )).rows[0]);
+    if (durableNoteExists) return next();
+    const usableCards = sanitizeWritingCards(canvasContextsToWritingCards(contexts));
+    if (usableCards.length === 0) {
+      return res.status(400).json({
+        code: "CANVAS_CONTEXT_REQUIRED",
+        error: "创建文章前，请先将至少一项可用素材连接到 Agent",
+        retryable: false,
+      });
+    }
+    next();
+  });
+
+  const canvasCreateArticleReplayMiddleware: express.RequestHandler = asyncHandler(async (_req, res, next) => {
+    const prepared = res.locals.canvasAgentChat;
+    if (!prepared?.isCreateArticle) return next();
+    const existing = (await pool.query(
+      `SELECT request_fingerprint, status, response_payload, attempt_count,
+              lease_expires_at IS NOT NULL AND lease_expires_at > NOW() AS lease_active,
+              EXISTS (
+                SELECT 1 FROM notes
+                WHERE user_id = $1 AND creation_key = $4
+              ) AS note_exists
+       FROM write_canvas_agent_run_requests
+       WHERE user_id = $1 AND agent_id = $2 AND request_id = $3`,
+      [prepared.userId, prepared.agentId, prepared.requestId, prepared.creationKey],
+    )).rows[0];
+    if (!existing) return next();
+    if (existing.request_fingerprint !== prepared.requestFingerprint) {
+      return res.status(409).json({
+        code: "CANVAS_REQUEST_ID_REUSED",
+        error: "requestId 已用于不同的创建文章请求，请生成新的 requestId",
+        retryable: false,
+      });
+    }
+    if (existing.status === "completed" && isPlainRecord(existing.response_payload)) {
+      sendCanvasRunFinal(res, existing.response_payload, true);
+      return;
+    }
+    if (existing.status === "running" && existing.lease_active) {
+      sendCanvasRunRetryable(res, "同一创建文章请求仍在执行，请稍后重试");
+      return;
+    }
+    if (!existing.note_exists && Number(existing.attempt_count) >= WRITE_CANVAS_AGENT_RUN_MAX_ATTEMPTS) {
+      sendCanvasRunAttemptsExhausted(res);
+      return;
+    }
+    next();
+  });
+
+  const canvasCreateArticleClaimMiddleware: express.RequestHandler = asyncHandler(async (_req, res, next) => {
+    const prepared = res.locals.canvasAgentChat;
+    if (!prepared?.isCreateArticle) return next();
+    const proposedRunId = randomUUID();
+    const client = await pool.connect();
+    let outcome:
+      | { type: "acquired"; runId: string }
+      | { type: "replay"; payload: unknown }
+      | { type: "in_progress" }
+      | { type: "conflict" }
+      | { type: "agent_missing" }
+      | { type: "attempts_exhausted" };
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, prepared.userId);
+      const agent = (await client.query(
+        `SELECT id
+         FROM write_agent_instances
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [prepared.agentId, prepared.userId],
+      )).rows[0];
+      if (!agent) {
+        outcome = { type: "agent_missing" };
+      } else if (await hasActiveCanvasAgentRun(client, prepared.userId, { agentId: prepared.agentId })) {
+        outcome = { type: "in_progress" };
+      } else {
+        const inserted = (await client.query(
+          `INSERT INTO write_canvas_agent_run_requests
+             (user_id, agent_id, request_id, request_fingerprint, action, run_id, status, lease_expires_at)
+           VALUES ($1, $2, $3, $4, 'create_article', $5, 'running', NOW() + ($6::bigint * INTERVAL '1 millisecond'))
+           ON CONFLICT (user_id, agent_id, request_id) DO NOTHING
+           RETURNING id`,
+          [prepared.userId, prepared.agentId, prepared.requestId, prepared.requestFingerprint, proposedRunId, canvasAgentRunLeaseMs],
+        )).rows[0];
+        const row = (await client.query(
+          `SELECT request_fingerprint, run_id, status, response_payload, attempt_count,
+                  lease_expires_at IS NOT NULL AND lease_expires_at > NOW() AS lease_active
+           FROM write_canvas_agent_run_requests
+           WHERE user_id = $1 AND agent_id = $2 AND request_id = $3
+           FOR UPDATE`,
+          [prepared.userId, prepared.agentId, prepared.requestId],
+        )).rows[0];
+        const noteExists = Boolean((await client.query(
+          `SELECT 1 FROM notes WHERE user_id = $1 AND creation_key = $2`,
+          [prepared.userId, prepared.creationKey],
+        )).rows[0]);
+        if (!row || row.request_fingerprint !== prepared.requestFingerprint) {
+          outcome = { type: "conflict" };
+        } else if (inserted) {
+          outcome = { type: "acquired", runId: proposedRunId };
+        } else if (row.status === "completed" && isPlainRecord(row.response_payload)) {
+          outcome = { type: "replay", payload: row.response_payload };
+        } else if (row.status === "running" && row.lease_active) {
+          outcome = { type: "in_progress" };
+        } else if (noteExists) {
+          // The paid model already produced its durable Note. An expired owner
+          // may repair the response/node record without starting another attempt.
+          await client.query(
+            `UPDATE write_canvas_agent_run_requests
+             SET run_id = $4, status = 'running', response_payload = NULL,
+                 lease_expires_at = NOW() + ($5::bigint * INTERVAL '1 millisecond'),
+                 error_message = NULL, completed_at = NULL, updated_at = NOW()
+             WHERE user_id = $1 AND agent_id = $2 AND request_id = $3`,
+            [prepared.userId, prepared.agentId, prepared.requestId, proposedRunId, canvasAgentRunLeaseMs],
+          );
+          outcome = { type: "acquired", runId: proposedRunId };
+        } else if (Number(row.attempt_count) >= WRITE_CANVAS_AGENT_RUN_MAX_ATTEMPTS) {
+          outcome = { type: "attempts_exhausted" };
+        } else {
+          const retried = (await client.query(
+            `UPDATE write_canvas_agent_run_requests
+             SET run_id = $4, status = 'running', response_payload = NULL,
+                 lease_expires_at = NOW() + ($5::bigint * INTERVAL '1 millisecond'),
+                 budget_reserved_at = CASE
+                   WHEN provider_started_at IS NULL THEN budget_reserved_at
+                   ELSE NULL
+                 END,
+                 provider_started_at = NULL,
+                 error_message = NULL,
+                 completed_at = NULL, updated_at = NOW()
+             WHERE user_id = $1 AND agent_id = $2 AND request_id = $3
+               AND attempt_count < $6
+             RETURNING run_id`,
+            [
+              prepared.userId,
+              prepared.agentId,
+              prepared.requestId,
+              proposedRunId,
+              canvasAgentRunLeaseMs,
+              WRITE_CANVAS_AGENT_RUN_MAX_ATTEMPTS,
+            ],
+          )).rows[0];
+          outcome = retried
+            ? { type: "acquired", runId: proposedRunId }
+            : { type: "attempts_exhausted" };
+        }
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    if (outcome.type === "conflict") {
+      return res.status(409).json({
+        code: "CANVAS_REQUEST_ID_REUSED",
+        error: "requestId 已用于不同的创建文章请求，请生成新的 requestId",
+        retryable: false,
+      });
+    }
+    if (outcome.type === "agent_missing") {
+      return res.status(404).json({ error: "agent not found" });
+    }
+    if (outcome.type === "replay") {
+      sendCanvasRunFinal(res, outcome.payload, true);
+      return;
+    }
+    if (outcome.type === "in_progress") {
+      sendCanvasRunRetryable(res, "该 Agent 已有生成任务正在执行，请稍后重试");
+      return;
+    }
+    if (outcome.type === "attempts_exhausted") {
+      sendCanvasRunAttemptsExhausted(res);
+      return;
+    }
+    res.locals.canvasAgentRunId = outcome.runId;
+    res.locals.canvasAgentRunDeadlineAt = Date.now() + canvasAgentRunDeadlineMs;
+    next();
+  });
+
+  const canvasCreateArticleNoteRecoveryMiddleware: express.RequestHandler = asyncHandler(async (_req, res, next) => {
+    const prepared = res.locals.canvasAgentChat;
+    const runId = String(res.locals.canvasAgentRunId || "");
+    if (!prepared?.isCreateArticle || !runId) return next();
+    try {
+      const note = (await pool.query(
+        `SELECT id, title, content, tags, meta, created_at, updated_at
+         FROM notes
+         WHERE user_id = $1 AND creation_key = $2`,
+        [prepared.userId, prepared.creationKey],
+      )).rows[0];
+      if (!note) return next();
+      const threadId = await ensureCanvasAgentThread(pool, prepared.userId, prepared.agentId);
+      if (!threadId) throw new Error("Canvas Agent thread could not be recovered");
+      let noteNode = null;
+      let recoveryWarning: string | undefined;
+      try {
+        noteNode = await ensureCanvasGeneratedNoteNode(pool, prepared.userId, prepared.agentId, note, threadId, runId);
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes("节点数量已达到上限")) throw error;
+        recoveryWarning = error.message;
+      }
+      const assistant = (await pool.query(
+        `SELECT id, role, content, meta, created_at
+         FROM write_agent_messages
+         WHERE thread_id = $1 AND role = 'assistant' AND meta->>'noteId' = $2
+         ORDER BY id DESC
+         LIMIT 1`,
+        [threadId, String(note.id)],
+      )).rows[0];
+      const thread = (await pool.query(
+        `SELECT state FROM write_agent_threads WHERE id = $1 AND user_id = $2 AND thread_type = 'canvas'`,
+        [threadId, prepared.userId],
+      )).rows[0];
+      const assistantContent = assistant?.content || `文章《${note.title || "未命名文章"}》已创建，可在「我的文章」继续编辑。`;
+      const toolResult = isPlainRecord(assistant?.meta)
+        ? assistant.meta
+        : { runId, noteId: Number(note.id), noteTitle: note.title, noteSaved: true, recovered: true };
+      const uiBlocks = Array.isArray(toolResult.uiBlocks)
+        ? toolResult.uiBlocks
+        : [
+          { type: "answer", markdown: assistantContent },
+          { type: "draft_created", noteId: Number(note.id), noteTitle: note.title || "未命名文章" },
+        ];
+      const payload = {
+        runId,
+        recovered: true,
+        message: assistant
+          ? mapCanvasMessageRow({ ...assistant, agent_id: prepared.agentId })
+          : {
+            id: 0,
+            agentId: prepared.agentId,
+            role: "assistant",
+            content: assistantContent,
+            meta: toolResult,
+            createdAt: note.updated_at || note.created_at,
+          },
+        threadId,
+        threadState: isPlainRecord(thread?.state) ? thread.state : {},
+        toolResult,
+        uiBlocks,
+        choices: Array.isArray(toolResult.choices) ? toolResult.choices : [],
+        sources: isPlainRecord(toolResult.sources) ? toolResult.sources : { cards: [], images: [] },
+        note,
+        noteNode,
+        ...(recoveryWarning ? { warning: recoveryWarning } : {}),
+        context: {
+          nodes: [],
+          usedImages: Number(toolResult.usedImages) || 0,
+          authorizedCardIds: [],
+          globalRecallCandidates: [],
+          globalRecallRequiresConfirmation: false,
+          globalRecallConfirmationEndpoint: `/api/write/canvas/agents/${prepared.agentId}/recall/confirm`,
+        },
+      };
+      await completeCanvasRunRequest({
+        userId: prepared.userId,
+        agentId: prepared.agentId,
+        requestId: prepared.requestId,
+        runId,
+        payload,
+        noteId: Number(note.id),
+        threadId,
+      });
+      sendCanvasRunFinal(res, payload, true);
+    } catch (error) {
+      try {
+        await failCanvasRunRequest({
+          userId: prepared.userId,
+          agentId: prepared.agentId,
+          requestId: prepared.requestId,
+          runId,
+          error,
+        });
+      } catch (persistenceError) {
+        logger.error(
+          { err: persistenceError, module: "canvas-agent", runId, agentId: prepared.agentId, userId: prepared.userId },
+          "Failed to release Canvas create-article claim after Note recovery error",
+        );
+      }
+      const completed = (await pool.query(
+        `SELECT response_payload
+         FROM write_canvas_agent_run_requests
+         WHERE user_id = $1 AND agent_id = $2 AND request_id = $3
+           AND status = 'completed'`,
+        [prepared.userId, prepared.agentId, prepared.requestId],
+      )).rows[0];
+      if (isPlainRecord(completed?.response_payload)) {
+        sendCanvasRunFinal(res, completed.response_payload, true);
+        return;
+      }
+      throw error;
+    }
+  });
+
+  const canvasAgentExecutionLeaseMiddleware: express.RequestHandler = asyncHandler(async (_req, res, next) => {
+    const prepared = res.locals.canvasAgentChat;
+    if (!prepared) return res.status(500).json({ error: "Canvas Agent request was not prepared" });
+    if (prepared.isCreateArticle) return next();
+    const runId = randomUUID();
+    const outcome = await acquireCanvasAgentExecutionLease({
+      userId: prepared.userId,
+      agentId: prepared.agentId,
+      runId,
+    });
+    if (outcome === "agent_missing") return res.status(404).json({ error: "agent not found" });
+    if (outcome === "active") {
+      res.setHeader("Retry-After", "5");
+      return res.status(409).json({
+        code: "CANVAS_AGENT_RUN_ACTIVE",
+        error: "该 Agent 已有生成任务正在执行，请稍后重试",
+        retryable: true,
+      });
+    }
+    let releasePromise: Promise<void> | null = null;
+    const release = async () => {
+      if (!releasePromise) {
+        releasePromise = releaseCanvasAgentExecutionLease({
+          userId: prepared.userId,
+          agentId: prepared.agentId,
+          runId,
+        }).catch(error => {
+          logger.error(
+            { err: error, module: "canvas-agent", runId, agentId: prepared.agentId, userId: prepared.userId },
+            "Failed to release Canvas Agent execution lease",
+          );
+        });
+      }
+      await releasePromise;
+    };
+    res.locals.canvasAgentRunId = runId;
+    res.locals.canvasAgentRunDeadlineAt = Date.now() + canvasAgentRunDeadlineMs;
+    res.locals.releaseCanvasAgentExecutionLease = release;
+    next();
+  });
+
+  const beginCanvasCreateArticleProviderAttempt = async (input: {
+    userId: number;
+    agentId: number;
+    requestId: string;
+    runId: string;
+  }) => {
+    const started = (await pool.query(
+      `UPDATE write_canvas_agent_run_requests
+       SET attempt_count = attempt_count + 1,
+           provider_started_at = NOW(), updated_at = NOW()
+       WHERE user_id = $1 AND agent_id = $2 AND request_id = $3 AND run_id = $4
+         AND status = 'running'
+         AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()
+         AND budget_reserved_at IS NOT NULL
+         AND provider_started_at IS NULL
+         AND attempt_count < $5
+       RETURNING attempt_count`,
+      [input.userId, input.agentId, input.requestId, input.runId, WRITE_CANVAS_AGENT_RUN_MAX_ATTEMPTS],
+    )).rows[0];
+    if (!started) throw new Error("Canvas create-article provider attempt is not ready");
+  };
+
+  const canvasAgentDailyBudgetMiddleware: express.RequestHandler = asyncHandler(async (_req, res, next) => {
+    const prepared = res.locals.canvasAgentChat;
+    if (!prepared) return res.status(500).json({ error: "Canvas Agent request was not prepared" });
+    if (!prepared.isCreateArticle) {
+      let reservation;
+      try {
+        reservation = await reserveDailyAiBudget(
+          prepared.userId,
+          getWriteAgentOutputReservation(prepared.agentRow.max_tokens, 6, 260),
+        );
+      } catch (error) {
+        if (typeof res.locals.releaseCanvasAgentExecutionLease === "function") {
+          await res.locals.releaseCanvasAgentExecutionLease();
+        }
+        throw error;
+      }
+      if (!reservation) {
+        if (typeof res.locals.releaseCanvasAgentExecutionLease === "function") {
+          await res.locals.releaseCanvasAgentExecutionLease();
+        }
+        res.setHeader("Retry-After", "3600");
+        return res.status(429).json({ error: "今日 AI 使用额度已达到上限，请稍后再试" });
+      }
+      return next();
+    }
+    const runId = String(res.locals.canvasAgentRunId || "");
+    if (!runId) return res.status(409).json({ error: "创建文章请求尚未取得执行权", retryable: true });
+    let client: pg.PoolClient | null = null;
+    let outcome: "ready" | "budget_exhausted" | "attempts_exhausted" = "budget_exhausted";
+    try {
+      client = await pool.connect();
+      await client.query("BEGIN");
+      const run = (await client.query(
+        `SELECT budget_reserved_at, provider_started_at, attempt_count
+         FROM write_canvas_agent_run_requests
+         WHERE user_id = $1 AND agent_id = $2 AND request_id = $3 AND run_id = $4
+           AND status = 'running'
+         FOR UPDATE`,
+        [prepared.userId, prepared.agentId, prepared.requestId, runId],
+      )).rows[0];
+      if (!run) {
+        await client.query("ROLLBACK");
+        return sendCanvasRunRetryable(res, "创建文章请求的执行权已变化，请重试");
+      }
+      if (run.provider_started_at) {
+        await client.query("ROLLBACK");
+        return sendCanvasRunRetryable(res, "创建文章请求的模型调用已开始，请稍后重试");
+      }
+      if (Number(run.attempt_count) >= WRITE_CANVAS_AGENT_RUN_MAX_ATTEMPTS) {
+        await client.query(
+          `UPDATE write_canvas_agent_run_requests
+           SET status = 'failed', lease_expires_at = NULL,
+               error_message = 'provider attempt limit exhausted', updated_at = NOW()
+           WHERE user_id = $1 AND agent_id = $2 AND request_id = $3 AND run_id = $4`,
+          [prepared.userId, prepared.agentId, prepared.requestId, runId],
+        );
+        outcome = "attempts_exhausted";
+      } else if (run.budget_reserved_at) {
+        outcome = "ready";
+      } else {
+        const reservation = await reserveDailyAiBudget(
+          prepared.userId,
+          getWriteAgentOutputReservation(prepared.agentRow.max_tokens, 2),
+          client,
+        );
+        if (reservation) {
+          await client.query(
+            `UPDATE write_canvas_agent_run_requests
+             SET budget_reserved_at = NOW(), updated_at = NOW()
+             WHERE user_id = $1 AND agent_id = $2 AND request_id = $3 AND run_id = $4`,
+            [prepared.userId, prepared.agentId, prepared.requestId, runId],
+          );
+          outcome = "ready";
+        } else {
+          await client.query(
+            `UPDATE write_canvas_agent_run_requests
+             SET status = 'failed', lease_expires_at = NULL,
+                 error_message = 'daily AI budget exhausted', updated_at = NOW()
+             WHERE user_id = $1 AND agent_id = $2 AND request_id = $3 AND run_id = $4`,
+            [prepared.userId, prepared.agentId, prepared.requestId, runId],
+          );
+          outcome = "budget_exhausted";
+        }
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      if (client) await client.query("ROLLBACK").catch(() => undefined);
+      try {
+        await failCanvasRunRequest({
+          userId: prepared.userId,
+          agentId: prepared.agentId,
+          requestId: prepared.requestId,
+          runId,
+          error,
+        });
+      } catch (persistenceError) {
+        logger.error(
+          { err: persistenceError, module: "canvas-agent", runId, agentId: prepared.agentId, userId: prepared.userId },
+          "Failed to release Canvas create-article claim after budget error",
+        );
+      }
+      throw error;
+    } finally {
+      client?.release();
+    }
+    if (outcome === "attempts_exhausted") {
+      sendCanvasRunAttemptsExhausted(res);
+      return;
+    }
+    if (outcome === "budget_exhausted") {
+      res.setHeader("Retry-After", "3600");
+      return res.status(429).json({ error: "今日 AI 使用额度已达到上限，请稍后再试" });
+    }
+    next();
+  });
+
   // --- Set/Change password (requires auth) ---
   app.put("/api/auth/set-password", requireAuth, asyncHandler(async (req, res) => {
     const password = req.body?.password || '';
+    const currentPassword = typeof req.body?.currentPassword === "string" ? req.body.currentPassword : "";
     if (!password || password.length < 8) {
       return res.status(400).json({ error: '密码至少 8 个字符' });
     }
+
+    const account = (await pool.query(
+      'SELECT id, email, password_hash FROM users WHERE id = $1',
+      [req.session.userId],
+    )).rows[0];
+    if (!account) return res.status(404).json({ error: '用户不存在' });
+
+    const authorized = await canChangePassword({
+      existingPasswordHash: account.password_hash || null,
+      currentPassword,
+      reauthenticatedAt: req.session.reauthenticatedAt,
+      comparePassword: bcrypt.compare,
+    });
+    if (!authorized) {
+      return res.status(403).json({
+        code: "REAUTH_REQUIRED",
+        error: account.password_hash
+          ? "请输入当前密码，或重新登录后再修改密码"
+          : "请使用邮箱验证码重新登录后设置密码",
+      });
+    }
+
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await updatePasswordAndInvalidateSessions(req.session.userId, passwordHash);
     if (!user) return res.status(404).json({ error: '用户不存在' });
@@ -6093,7 +7687,11 @@ async function startServer() {
          UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_nodes t WHERE user_id = $1
          UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_edges t WHERE user_id = $1
          UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_agent_messages t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM write_canvas_agent_run_requests t WHERE user_id = $1
          UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM user_ai_usage_daily t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM billing_subscriptions t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM billing_checkout_attempts t WHERE user_id = $1
+         UNION ALL SELECT COALESCE(SUM(octet_length(row_to_json(t)::text)), 0)::bigint FROM billing_usage_events t WHERE user_id = $1
        ) estimates`,
       [userId],
     )).rows[0];
@@ -6132,7 +7730,11 @@ async function startServer() {
       canvasNodes,
       canvasEdges,
       canvasMessages,
+      canvasRunRequests,
       aiUsage,
+      billingSubscriptions,
+      billingCheckoutAttempts,
+      billingUsageEvents,
     ] = await Promise.all([
       rows(`SELECT id, email, nickname, avatar_url, created_at, (password_hash IS NOT NULL) AS has_password FROM users WHERE id = $1`),
       rows(`SELECT source_layout, theme, view_mode, updated_at FROM user_preferences WHERE user_id = $1`),
@@ -6153,7 +7755,11 @@ async function startServer() {
       rows(`SELECT * FROM write_canvas_nodes WHERE user_id = $1 ORDER BY id`),
       rows(`SELECT * FROM write_canvas_edges WHERE user_id = $1 ORDER BY id`),
       rows(`SELECT * FROM write_canvas_agent_messages WHERE user_id = $1 ORDER BY id`),
+      rows(`SELECT * FROM write_canvas_agent_run_requests WHERE user_id = $1 ORDER BY id`),
       rows(`SELECT usage_date, operation_count, reserved_output_tokens, updated_at FROM user_ai_usage_daily WHERE user_id = $1 ORDER BY usage_date`),
+      rows(`SELECT paddle_subscription_id, product_id, price_id, plan_code, status, current_period_starts_at, current_period_ends_at, scheduled_change, created_at, updated_at FROM billing_subscriptions WHERE user_id = $1 ORDER BY created_at`),
+      rows(`SELECT id, request_id, plan_code, paddle_transaction_id, status, error_code, created_at, updated_at FROM billing_checkout_attempts WHERE user_id = $1 ORDER BY created_at`),
+      rows(`SELECT operation_key, operation_type, occurred_at FROM billing_usage_events WHERE user_id = $1 ORDER BY occurred_at`),
     ]);
     const payload = {
       format: "atomflow-account-export-v1",
@@ -6175,8 +7781,14 @@ async function startServer() {
         nodes: canvasNodes,
         edges: canvasEdges,
         messages: canvasMessages,
+        runRequests: canvasRunRequests,
       },
       aiUsage,
+      billing: {
+        subscriptions: billingSubscriptions,
+        checkoutAttempts: billingCheckoutAttempts,
+        usageEvents: billingUsageEvents,
+      },
     };
     await client.query("COMMIT");
     const exportBody = JSON.stringify(payload);
@@ -6215,19 +7827,29 @@ async function startServer() {
       return res.status(403).json({ code: "REAUTH_REQUIRED", error: "请使用邮箱验证码重新登录后再注销账户" });
     }
 
-    const client = await pool.connect();
+    if (!billingService) {
+      return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单状态暂时无法确认，账户尚未删除" });
+    }
     try {
-      await client.query("BEGIN");
-      await client.query(`DELETE FROM verification_codes WHERE email = $1`, [user.email]);
-      await client.query(`DELETE FROM session WHERE sess ->> 'userId' = $1`, [String(userId)]);
-      const deleted = await client.query(`DELETE FROM users WHERE id = $1`, [userId]);
-      if (deleted.rowCount !== 1) throw new Error("Account deletion did not remove exactly one user");
-      await client.query("COMMIT");
+      await billingService.deleteAccountUnderBillingLock(
+        userId,
+        async client => {
+          // BillingService has opened BEGIN on this same client before invoking
+          // the callback, so the user row lock covers the remote cancellation.
+          await lockCanvasUser(client, userId);
+          if (await hasActiveCanvasAgentRun(client, userId, {})) {
+            throw new BillingError(409, "CANVAS_AGENT_RUN_ACTIVE", "账户仍有画布 Agent 正在生成内容，请等待完成后再注销");
+          }
+        },
+        async client => {
+          await client.query(`DELETE FROM verification_codes WHERE email = $1`, [user.email]);
+          await client.query(`DELETE FROM session WHERE sess ->> 'userId' = $1`, [String(userId)]);
+          const deleted = await client.query(`DELETE FROM users WHERE id = $1`, [userId]);
+          if (deleted.rowCount !== 1) throw new Error("Account deletion did not remove exactly one user");
+        },
+      );
     } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
+      return sendBillingError(res, error);
     }
     await new Promise<void>((resolve, reject) => {
       req.session.destroy(error => error ? reject(error) : resolve());
@@ -6332,7 +7954,7 @@ async function startServer() {
   }));
 
   // API Routes
-  
+
   // Get all articles (global + user's private articles when logged in)
   app.get("/api/articles", asyncHandler(async (req, res) => {
     if (!req.session.userId) {
@@ -6513,19 +8135,36 @@ async function startServer() {
   }));
 
   // Save an article (mark as saved and extract cards)
-  app.post("/api/articles/:id/save", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, articleSaveConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/articles/:id/save", requireAuth, remoteFetchLimiter, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, articleSaveConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
-    let article = articles.find(a => a.id === articleId);
+    const sourceUrl = typeof req.query.sourceUrl === 'string' ? req.query.sourceUrl.trim() : '';
+    const sourceName = typeof req.query.sourceName === 'string' ? req.query.sourceName.trim() : '';
+    const sourceTitle = typeof req.query.sourceTitle === 'string' ? req.query.sourceTitle.trim() : '';
+    let article = findArticleByIdentity(articles, {
+      id: articleId,
+      url: sourceUrl || undefined,
+      source: sourceName || undefined,
+      title: sourceTitle || undefined,
+    });
     let isUserArticle = false;
 
     // If not in global store, check user_articles DB
     if (!article && req.session.userId) {
+      const hasSourceIdentity = !sourceUrl && Boolean(sourceName && sourceTitle);
+      const identityCondition = sourceUrl ? 'url = $2' : hasSourceIdentity ? 'source = $2 AND title = $3' : 'id = $2';
+      const identityParams = sourceUrl
+        ? [req.session.userId, sourceUrl]
+        : hasSourceIdentity
+          ? [req.session.userId, sourceName, sourceTitle]
+          : [req.session.userId, articleId];
       const row = (await pool.query(
         `SELECT id, source, source_icon, topic, title, excerpt, content, url,
                 audio_url, audio_duration, published_at, time_str, saved,
                 full_fetched, markdown_content
-         FROM user_articles WHERE id = $1 AND user_id = $2`,
-        [articleId, req.session.userId]
+         FROM user_articles
+         WHERE user_id = $1 AND ${identityCondition}
+         LIMIT 1`,
+        identityParams
       )).rows[0];
       if (row) {
         isUserArticle = true;
@@ -6544,6 +8183,10 @@ async function startServer() {
     if (!article) {
       return res.status(404).json({ error: "Article not found" });
     }
+
+    // Built-in RSS articles are shared process state. Work on a request-local
+    // copy so user-specific fetch/extraction/save state never leaks to others.
+    article = { ...article, cards: [] };
 
     // First, we need to determine the saved_article_id to check for duplicates properly
     // This is a pre-check to see if we've already saved this article
@@ -6571,33 +8214,27 @@ async function startServer() {
       : null;
 
     if (!existingCard) {
+      article = await buildFullArticleView(article);
+
       // AI extraction BEFORE transaction (may take up to 45s, don't hold DB conn)
-      let cardsToSave = article.cards;
-	      let articleCitationContext = buildDefaultArticleCitationContext(article);
-	      let origin: 'ai' | 'manual' = 'manual';
-	      let extractionSkills: WriteAgentSkillRecord[] = [];
-	      if (!cardsToSave || cardsToSave.length === 0) {
-	        extractionSkills = (await resolveWriteAgentSkills(pool, req.session.userId)).filter(skill => skill.type === "card_storage" || skill.type === "citation");
-	        const extracted = await extractKnowledgeWithAI(article, extractionSkills);
-        const aiCards = extracted.cards;
-        if (extracted.articleCitationContext) {
-          articleCitationContext = extracted.articleCitationContext;
-        }
-        if (aiCards.length > 0) {
-          cardsToSave = aiCards;
-          origin = 'ai';
-        } else if (isAiFallbackDisabled()) {
-          return res.status(502).json({ error: "AI extraction failed", fallbackDisabled: true });
-        } else {
-          cardsToSave = buildCardsFromArticleContent(article);
-          // Mark fallback cards with a tag so users know they're lower quality
-          cardsToSave = cardsToSave.map(card => ({
-            ...card,
-            tags: [...(card.tags || []), '自动提取']
-          }));
-        }
-        article.cards = cardsToSave;
+      const extraction = await extractCardsForUser({
+        article,
+        userId: req.session.userId,
+        defaultArticleCitationContext: buildDefaultArticleCitationContext(article),
+        resolveSkills: userId => resolveWriteAgentSkills(pool, userId),
+        extractWithAI: extractKnowledgeWithAI,
+        buildFallbackCards: buildCardsFromArticleContent,
+        fallbackDisabled: isAiFallbackDisabled(),
+      });
+      if (!extraction) {
+        return res.status(502).json({ error: "AI extraction failed", fallbackDisabled: true });
       }
+      const {
+        cards: cardsToSave,
+        articleCitationContext,
+        origin,
+        extractionSkills,
+      } = extraction;
 
       const newCards: AtomCard[] = cardsToSave.map(c => ({
         ...c,
@@ -6617,10 +8254,14 @@ async function startServer() {
         if (normalizedUrl) {
           // URL exists: upsert using unique index (with normalized URL)
           const savedArticleResult = await client.query(
-            `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, citation_context, image_urls, published_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, citation_context, image_urls, audio_url, audio_duration, published_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT (user_id, url) WHERE url IS NOT NULL
-             DO UPDATE SET title = EXCLUDED.title, content = EXCLUDED.content, excerpt = EXCLUDED.excerpt, source_icon = EXCLUDED.source_icon, citation_context = EXCLUDED.citation_context, image_urls = EXCLUDED.image_urls
+             DO UPDATE SET title = EXCLUDED.title, content = EXCLUDED.content, excerpt = EXCLUDED.excerpt,
+                           source_icon = EXCLUDED.source_icon, citation_context = EXCLUDED.citation_context,
+                           image_urls = EXCLUDED.image_urls,
+                           audio_url = COALESCE(NULLIF(EXCLUDED.audio_url, ''), saved_articles.audio_url),
+                           audio_duration = COALESCE(NULLIF(EXCLUDED.audio_duration, ''), saved_articles.audio_duration)
              RETURNING id`,
             [
               req.session.userId, article.title, normalizedUrl,
@@ -6628,6 +8269,8 @@ async function startServer() {
               article.excerpt, article.markdownContent || article.content || article.excerpt,
               articleCitationContext,
               JSON.stringify(articleImageUrls),
+              article.audioUrl || null,
+              article.audioDuration || null,
               article.publishedAt || null
             ]
           );
@@ -6643,8 +8286,11 @@ async function startServer() {
             savedArticleId = existing.rows[0].id;
             await client.query(
               `UPDATE saved_articles
-               SET title = $1, content = $2, excerpt = $3, source_icon = $4, citation_context = $5, image_urls = $6
-               WHERE id = $7 AND user_id = $8`,
+               SET title = $1, content = $2, excerpt = $3, source_icon = $4,
+                   citation_context = $5, image_urls = $6,
+                   audio_url = COALESCE(NULLIF($7, ''), audio_url),
+                   audio_duration = COALESCE(NULLIF($8, ''), audio_duration)
+               WHERE id = $9 AND user_id = $10`,
               [
                 article.title,
                 article.markdownContent || article.content || article.excerpt,
@@ -6652,21 +8298,25 @@ async function startServer() {
                 article.sourceIcon || null,
                 articleCitationContext,
                 JSON.stringify(articleImageUrls),
+                article.audioUrl || null,
+                article.audioDuration || null,
                 savedArticleId,
                 req.session.userId
               ]
             );
           } else {
             const insertResult = await client.query(
-              `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, citation_context, image_urls, published_at, content_hash)
-               VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+              `INSERT INTO saved_articles (user_id, title, url, source, source_icon, topic, excerpt, content, citation_context, image_urls, audio_url, audio_duration, published_at, content_hash)
+               VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                ON CONFLICT (user_id, content_hash) WHERE content_hash IS NOT NULL
                DO UPDATE SET title = EXCLUDED.title,
                              content = EXCLUDED.content,
                              excerpt = EXCLUDED.excerpt,
                              source_icon = EXCLUDED.source_icon,
                              citation_context = EXCLUDED.citation_context,
-                             image_urls = EXCLUDED.image_urls
+                             image_urls = EXCLUDED.image_urls,
+                             audio_url = COALESCE(NULLIF(EXCLUDED.audio_url, ''), saved_articles.audio_url),
+                             audio_duration = COALESCE(NULLIF(EXCLUDED.audio_duration, ''), saved_articles.audio_duration)
                RETURNING id`,
               [
                 req.session.userId, article.title,
@@ -6674,6 +8324,8 @@ async function startServer() {
                 article.excerpt, article.markdownContent || article.content || article.excerpt,
                 articleCitationContext,
                 JSON.stringify(articleImageUrls),
+                article.audioUrl || null,
+                article.audioDuration || null,
                 article.publishedAt || null,
                 contentHash
               ]
@@ -6722,13 +8374,13 @@ async function startServer() {
         client.release();
       }
     }
-    article.saved = true;
+    article = { ...article, saved: true };
 
     // Also update saved flag in user_articles if this is a user article
     if (isUserArticle) {
       await pool.query(
         'UPDATE user_articles SET saved = TRUE WHERE id = $1 AND user_id = $2',
-        [articleId, req.session.userId]
+        [article.id, req.session.userId]
       );
     }
 
@@ -6736,20 +8388,40 @@ async function startServer() {
   }));
 
   // Fetch full content for an article
-  app.get("/api/articles/:id/full", asyncHandler(async (req, res) => {
+  app.get("/api/articles/:id/full", remoteFetchLimiter, asyncHandler(async (req, res) => {
     const articleId = parseInt(req.params.id);
-    let article: Article | undefined = articles.find(a => a.id === articleId);
+    const sourceUrl = typeof req.query.sourceUrl === 'string' ? req.query.sourceUrl.trim() : '';
+    const sourceName = typeof req.query.sourceName === 'string' ? req.query.sourceName.trim() : '';
+    const sourceTitle = typeof req.query.sourceTitle === 'string' ? req.query.sourceTitle.trim() : '';
+    let article: Article | undefined = findArticleByIdentity(articles, {
+      id: articleId,
+      url: sourceUrl || undefined,
+      source: sourceName || undefined,
+      title: sourceTitle || undefined,
+    });
+
+    let userArticleId: number | null = null;
 
     // If not in global store, check user_articles DB
     if (!article && req.session.userId) {
+      const hasSourceIdentity = !sourceUrl && Boolean(sourceName && sourceTitle);
+      const identityCondition = sourceUrl ? 'url = $2' : hasSourceIdentity ? 'source = $2 AND title = $3' : 'id = $2';
+      const identityParams = sourceUrl
+        ? [req.session.userId, sourceUrl]
+        : hasSourceIdentity
+          ? [req.session.userId, sourceName, sourceTitle]
+          : [req.session.userId, articleId];
       const row = (await pool.query(
         `SELECT id, source, source_icon, topic, title, excerpt, content, url,
                 audio_url, audio_duration, published_at, time_str, saved,
                 full_fetched, markdown_content
-         FROM user_articles WHERE id = $1 AND user_id = $2`,
-        [articleId, req.session.userId]
+         FROM user_articles
+         WHERE user_id = $1 AND ${identityCondition}
+         LIMIT 1`,
+        identityParams
       )).rows[0];
       if (row) {
+        userArticleId = Number(row.id);
         article = {
           id: Number(row.id), saved: row.saved, source: row.source,
           sourceIcon: row.source_icon ?? undefined, topic: row.topic,
@@ -6766,25 +8438,28 @@ async function startServer() {
       return res.status(404).json({ error: "Article not found" });
     }
 
-    try {
-      // 所有源都直接使用RSS内容，不进行网页抓取
-      if (article.source === '即刻话题') {
-        article.markdownContent = formatJikeContent(article.content);
-      } else {
-        article.markdownContent = article.content || article.excerpt || '暂无内容';
+    const fullArticle = await buildFullArticleView(article);
+    if (userArticleId && req.session.userId) {
+      if (fullArticle.markdownContent && fullArticle.markdownContent !== article.markdownContent) {
+        // Cache the normalized full text so later image-proxy requests can prove
+        // that an exact absolute image URL came from this account-owned article.
+        await pool.query(
+          `UPDATE user_articles
+           SET markdown_content = $1, full_fetched = TRUE
+           WHERE id = $2 AND user_id = $3`,
+          [fullArticle.markdownContent, userArticleId, req.session.userId],
+        );
       }
-      
-      article.readabilityUsed = false;
-      article.fullFetched = true;
-      
-      return res.json({ success: true, article });
-    } catch (error) {
-      logger.error({ err: error, module: "articles", articleId }, "Failed to process article content");
-      article.markdownContent = article.content || article.excerpt || '暂无内容';
-      article.readabilityUsed = false;
-      article.fullFetched = true;
-      return res.json({ success: true, article });
+    } else {
+      // Keep request-local hydration isolated from shared feed objects while
+      // retaining bounded, expiring evidence for exact image proxy requests.
+      rememberFullArticleImages(fullArticle);
     }
+
+    return res.json({
+      success: true,
+      article: fullArticle,
+    });
   }));
 
   // Image proxy to bypass CSP and hotlink protection
@@ -6804,9 +8479,41 @@ async function startServer() {
       return res.status(400).send("Invalid url protocol");
     }
     const hostname = parsedUrl.hostname.toLowerCase();
-    const isAllowedHost = ALLOWED_IMAGE_HOST_SUFFIXES.some(
+    const isAllowlistedHost = ALLOWED_IMAGE_HOST_SUFFIXES.some(
       suffix => hostname === suffix || hostname.endsWith(`.${suffix}`)
     );
+    const referencedByGlobalArticle = articles.some(article => (
+      article.sourceIcon === imageUrl
+      || article.sourceImages?.includes(imageUrl)
+      || extractImageUrlsFromArticle(article).includes(imageUrl)
+    )) || isCachedFullArticleImage(imageUrl);
+    let referencedByUserArticle = false;
+    if (!isAllowlistedHost && !referencedByGlobalArticle && req.session.userId) {
+      const candidateRows = (await pool.query(
+        `SELECT url, source_icon, content, markdown_content, NULL::jsonb AS image_urls
+         FROM user_articles
+         WHERE user_id = $1 AND (
+           url = $3 OR source_icon = $2 OR content LIKE '%' || $2 || '%' OR markdown_content LIKE '%' || $2 || '%'
+         )
+         UNION ALL
+         SELECT url, source_icon, content, NULL::text AS markdown_content, image_urls
+         FROM saved_articles
+         WHERE user_id = $1 AND (
+           url = $3 OR source_icon = $2 OR content LIKE '%' || $2 || '%' OR image_urls::text LIKE '%' || $2 || '%'
+         )`,
+        [req.session.userId, imageUrl, referer || null],
+      )).rows;
+      referencedByUserArticle = candidateRows.some(row => (
+        row.source_icon === imageUrl
+        || normalizeJsonStringArray(row.image_urls).includes(imageUrl)
+        || extractImageUrlsFromArticle({
+          url: typeof row.url === 'string' ? row.url : undefined,
+          content: typeof row.content === 'string' ? row.content : '',
+          markdownContent: typeof row.markdown_content === 'string' ? row.markdown_content : undefined,
+        }).includes(imageUrl)
+      ));
+    }
+    const isAllowedHost = isAllowlistedHost || referencedByGlobalArticle || referencedByUserArticle;
     if (!isAllowedHost) {
       return res.status(403).send("Host not allowed");
     }
@@ -6814,7 +8521,7 @@ async function startServer() {
     const imageProxyTimeoutMs = readBoundedEnvNumber(process.env.IMAGE_PROXY_TIMEOUT_MS, 8000, 1000, 20000);
     const assertAllowedImageHost = (url: URL) => {
       const candidateHost = url.hostname.toLowerCase();
-      if (!ALLOWED_IMAGE_HOST_SUFFIXES.some(suffix => candidateHost === suffix || candidateHost.endsWith(`.${suffix}`))) {
+      if (candidateHost !== hostname && !ALLOWED_IMAGE_HOST_SUFFIXES.some(suffix => candidateHost === suffix || candidateHost.endsWith(`.${suffix}`))) {
         throw new Error("Image host not allowed");
       }
     };
@@ -6834,6 +8541,7 @@ async function startServer() {
         timeoutMs: imageProxyTimeoutMs,
         maxBytes: imageProxyMaxBytes,
         maxRedirects: 2,
+        allowedPorts: PUBLIC_WEB_PORTS,
         validateUrl: assertAllowedImageHost,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -6847,13 +8555,105 @@ async function startServer() {
         return res.status(415).send("Remote content is not a supported image");
       }
       res.setHeader('Content-Type', contentType);
-      res.setHeader('Cache-Control', 'public, max-age=31536000');
+      res.setHeader(
+        'Cache-Control',
+        isAllowlistedHost || referencedByGlobalArticle
+          ? 'public, max-age=31536000, immutable'
+          : 'private, no-store',
+      );
       res.send(resource.body);
     } catch (error) {
       logger.error({ err: error, module: "image-proxy", imageHost: parsedUrl.hostname }, "Image proxy error");
       if (error instanceof ResponseLimitError) return res.status(413).send("Remote image is too large");
       if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) return res.status(504).send("Remote image timed out");
       res.status(502).send("Failed to load image");
+    }
+  }));
+
+  // Authenticated, bounded proxy for podcast audio. The exact URL must already
+  // belong to content visible to this account, so this cannot become an open
+  // proxy. Range requests are forwarded to preserve seeking and metadata loads.
+  app.get("/api/media-proxy", requireAuth, remoteFetchLimiter, asyncHandler(async (req, res) => {
+    const targetUrl = typeof req.query.url === "string" ? req.query.url.trim() : "";
+    if (!targetUrl) return res.status(400).send("Missing url parameter");
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(targetUrl);
+    } catch {
+      return res.status(400).send("Invalid url parameter");
+    }
+    if (!["http:", "https:"].includes(parsedUrl.protocol) || (parsedUrl.port && !["80", "443"].includes(parsedUrl.port))) {
+      return res.status(400).send("Invalid media URL");
+    }
+    const authorizedInMemory = articles.some(article => article.audioUrl === targetUrl);
+    const authorizedInDatabase = authorizedInMemory ? true : (await pool.query(
+      `SELECT (
+         EXISTS (SELECT 1 FROM user_articles WHERE user_id = $1 AND audio_url = $2)
+         OR EXISTS (SELECT 1 FROM saved_articles WHERE user_id = $1 AND audio_url = $2)
+       ) AS authorized`,
+      [req.session.userId, targetUrl],
+    )).rows[0]?.authorized === true;
+    if (!authorizedInDatabase) return res.status(403).send("Media URL is not available to this account");
+
+    const requestedRange = req.get("range")?.trim();
+    const rangeMatch = requestedRange?.match(/^bytes=(\d*)-(\d*)$/);
+    if (requestedRange && (!rangeMatch || (!rangeMatch[1] && !rangeMatch[2]))) return res.status(416).send("Unsupported range");
+    const mediaProxyRangeBytes = readBoundedEnvNumber(process.env.MEDIA_PROXY_RANGE_MB, 8, 1, 16) * 1024 * 1024;
+    let range: string;
+    if (!rangeMatch) {
+      range = `bytes=0-${mediaProxyRangeBytes - 1}`;
+    } else if (rangeMatch[1]) {
+      const start = Number(rangeMatch[1]);
+      const requestedEnd = rangeMatch[2] ? Number(rangeMatch[2]) : start + mediaProxyRangeBytes - 1;
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd) || requestedEnd < start) return res.status(416).send("Unsupported range");
+      range = `bytes=${start}-${Math.min(requestedEnd, start + mediaProxyRangeBytes - 1)}`;
+    } else {
+      const suffixBytes = Number(rangeMatch[2]);
+      if (!Number.isSafeInteger(suffixBytes) || suffixBytes <= 0) return res.status(416).send("Unsupported range");
+      range = `bytes=-${Math.min(suffixBytes, mediaProxyRangeBytes)}`;
+    }
+    const mediaProxyTimeoutMs = readBoundedEnvNumber(process.env.MEDIA_PROXY_TIMEOUT_MS, 20_000, 2_000, 60_000);
+    let releaseGlobal: (() => void) | undefined;
+    let releaseUser: (() => void) | undefined;
+    try {
+      releaseGlobal = mediaProxyGlobalConcurrencyGuard.acquire("global");
+      releaseUser = mediaProxyUserConcurrencyGuard.acquire(authenticatedUserKey(req));
+      const resource = await fetchBoundedPublicResource(targetUrl, {
+        timeoutMs: mediaProxyTimeoutMs,
+        maxBytes: mediaProxyRangeBytes,
+        maxRedirects: 3,
+        headers: {
+          "User-Agent": "AtomFlow/1.0 podcast media proxy",
+          Accept: "audio/*,application/ogg,application/octet-stream;q=0.5",
+          Range: range,
+        },
+      });
+      if (resource.status !== 200 && resource.status !== 206) throw new Error(`Media source returned ${resource.status}`);
+      const contentType = (resource.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+      if (!(/^audio\//.test(contentType) || contentType === "application/ogg" || contentType === "application/octet-stream")) {
+        return res.status(415).send("Remote content is not supported audio");
+      }
+      res.status(resource.status);
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Content-Length", String(resource.body.length));
+      res.setHeader("Cache-Control", "private, max-age=300");
+      const contentRange = resource.headers.get("content-range");
+      if (contentRange) res.setHeader("Content-Range", contentRange);
+      const acceptRanges = resource.headers.get("accept-ranges");
+      if (acceptRanges) res.setHeader("Accept-Ranges", acceptRanges);
+      return res.send(resource.body);
+    } catch (error) {
+      if (error instanceof ConcurrencyLimitError) {
+        res.setHeader("Retry-After", "5");
+        return res.status(429).send("Media proxy is busy");
+      }
+      logger.error({ err: error, module: "media-proxy", mediaHost: parsedUrl.hostname }, "Media proxy error");
+      if (error instanceof ResponseLimitError) return res.status(413).send("Remote media is too large");
+      if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) return res.status(504).send("Remote media timed out");
+      return res.status(502).send("Failed to load media");
+    } finally {
+      releaseUser?.();
+      releaseGlobal?.();
     }
   }));
 
@@ -7064,6 +8864,7 @@ async function startServer() {
       `SELECT id, title, url, source, source_icon AS "sourceIcon", topic, excerpt,
               citation_context AS "citationContext",
               image_urls AS "sourceImages",
+              audio_url AS "audioUrl", audio_duration AS "audioDuration",
               published_at AS "publishedAt", saved_at AS "savedAt"
        FROM saved_articles WHERE user_id = $1 ORDER BY saved_at DESC LIMIT 500`,
       [req.session.userId]
@@ -7077,6 +8878,7 @@ async function startServer() {
       `SELECT id, title, url, source, source_icon AS "sourceIcon", topic, excerpt, content,
               citation_context AS "citationContext",
               image_urls AS "sourceImages",
+              audio_url AS "audioUrl", audio_duration AS "audioDuration",
               published_at AS "publishedAt", saved_at AS "savedAt"
        FROM saved_articles WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.session.userId]
@@ -7285,39 +9087,95 @@ async function startServer() {
   }));
 
   app.get("/api/write/canvas/projects", requireAuth, asyncHandler(async (req, res) => {
-    await ensureCanvasProject(pool, req.session.userId);
     const rows = (await pool.query(
-      `SELECT id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"
+      `SELECT id, name, viewport, document_revision AS "documentRevision",
+              document_schema_version AS "documentSchemaVersion",
+              default_skill_config AS "defaultSkillConfig",
+              created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"
        FROM write_canvas_projects
        WHERE user_id = $1
        ORDER BY last_opened_at DESC
        LIMIT $2`,
       [req.session.userId, WRITE_CANVAS_MAX_PROJECTS_PER_USER]
-    )).rows.map(mapCanvasProjectRow);
-    res.json({ projects: rows });
+    )).rows;
+    const availableSkills = await fetchWriteAgentSkills(pool, req.session.userId);
+    const projects = rows.map(row => {
+      const effective = resolveEffectiveCanvasSkillsFromAvailable(availableSkills, row.defaultSkillConfig);
+      return {
+        ...mapCanvasProjectRow(row),
+        defaultSkillConfig: effective.skillConfig,
+        effectiveSkillConfig: effective.effectiveSkillConfig,
+        effectiveSkills: effective.effectiveSkills,
+      };
+    });
+    res.json({ projects });
   }));
 
   app.post("/api/write/canvas/projects", requireAuth, asyncHandler(async (req, res) => {
     const name = typeof req.body?.name === "string" && req.body.name.trim()
       ? req.body.name.trim().slice(0, 80)
       : "新的魔法写作项目";
+    const requestId = typeof req.body?.requestId === "string" ? req.body.requestId.trim() : "";
+    if (requestId && !REQUEST_ID_PATTERN.test(requestId)) return res.status(400).json({ error: "requestId must be a UUID" });
+    const requestAction = "create_canvas_project";
+    const defaultSkillConfig = await filterCanvasSkillConfig(pool, req.session.userId, req.body?.defaultSkillConfig, "override");
+    let effective = await resolveEffectiveCanvasSkills(pool, req.session.userId, defaultSkillConfig, undefined, "override");
     const client = await pool.connect();
+    let row: Record<string, unknown> | undefined;
+    let reused = false;
     try {
       await client.query("BEGIN");
       await lockCanvasUser(client, req.session.userId);
-      const row = (await client.query(
-        `INSERT INTO write_canvas_projects (user_id, name)
-         SELECT $1, $2
-         WHERE (SELECT COUNT(*) FROM write_canvas_projects WHERE user_id = $1) < $3
-         RETURNING id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
-        [req.session.userId, name, WRITE_CANVAS_MAX_PROJECTS_PER_USER]
-      )).rows[0];
+      if (requestId) {
+        row = (await client.query(
+          `SELECT p.id, p.name, p.viewport, p.tldraw_snapshot AS "documentSnapshot",
+                  p.document_revision AS "documentRevision", p.document_schema_version AS "documentSchemaVersion",
+                  p.default_skill_config AS "defaultSkillConfig",
+                  p.created_at AS "createdAt", p.updated_at AS "updatedAt", p.last_opened_at AS "lastOpenedAt"
+           FROM write_canvas_action_requests r
+           JOIN write_canvas_projects p ON p.id = r.result_project_id AND p.user_id = r.user_id
+           WHERE r.user_id = $1 AND r.request_id = $2 AND r.action = $3
+           FOR SHARE OF r, p`,
+          [req.session.userId, requestId, requestAction],
+        )).rows[0];
+        reused = Boolean(row);
+      }
+      if (!row) {
+        row = (await client.query(
+          `INSERT INTO write_canvas_projects (user_id, name, default_skill_config)
+           SELECT $1, $2, $4
+           WHERE (SELECT COUNT(*) FROM write_canvas_projects WHERE user_id = $1) < $3
+           RETURNING id, name, viewport, tldraw_snapshot AS "documentSnapshot",
+                     document_revision AS "documentRevision", document_schema_version AS "documentSchemaVersion",
+                     default_skill_config AS "defaultSkillConfig",
+                     created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+          [req.session.userId, name, WRITE_CANVAS_MAX_PROJECTS_PER_USER, JSON.stringify(defaultSkillConfig)]
+        )).rows[0];
+        if (row && requestId) {
+          await client.query(
+            `INSERT INTO write_canvas_action_requests (user_id, request_id, action, result_project_id)
+             VALUES ($1, $2, $3, $4)`,
+            [req.session.userId, requestId, requestAction, row.id],
+          );
+        }
+      }
       if (!row) {
         await client.query("ROLLBACK");
         return res.status(413).json({ error: "画布项目数量已达到上限" });
       }
       await client.query("COMMIT");
-      res.json({ project: mapCanvasProjectRow(row) });
+      if (reused) {
+        effective = await resolveEffectiveCanvasSkills(pool, req.session.userId, row.defaultSkillConfig, undefined, "override");
+      }
+      res.json({
+        project: {
+          ...mapCanvasProjectRow(row),
+          defaultSkillConfig: effective.skillConfig,
+          effectiveSkillConfig: effective.effectiveSkillConfig,
+          effectiveSkills: effective.effectiveSkills,
+        },
+        reused,
+      });
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -7339,27 +9197,1204 @@ async function startServer() {
     if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
     const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 80) : null;
     const viewport = isPlainRecord(req.body?.viewport) ? req.body.viewport : null;
+    const hasDefaultSkillConfig = Object.prototype.hasOwnProperty.call(req.body || {}, "defaultSkillConfig");
+    const defaultSkillConfig = hasDefaultSkillConfig
+      ? await filterCanvasSkillConfig(pool, req.session.userId, req.body?.defaultSkillConfig, "override")
+      : null;
     const row = (await pool.query(
       `UPDATE write_canvas_projects
        SET name = COALESCE($1, name),
            viewport = COALESCE($2, viewport),
+           default_skill_config = COALESCE($5, default_skill_config),
            updated_at = NOW(),
            last_opened_at = NOW()
        WHERE id = $3 AND user_id = $4
-       RETURNING id, name, viewport, created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
-      [name || null, viewport ? JSON.stringify(viewport) : null, projectId, req.session.userId]
+       RETURNING id, name, viewport, tldraw_snapshot AS "documentSnapshot",
+                 document_revision AS "documentRevision", document_schema_version AS "documentSchemaVersion",
+                 default_skill_config AS "defaultSkillConfig",
+                 created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+      [name || null, viewport ? JSON.stringify(viewport) : null, projectId, req.session.userId, defaultSkillConfig ? JSON.stringify(defaultSkillConfig) : null]
     )).rows[0];
     if (!row) return res.status(404).json({ error: "project not found" });
-    res.json({ project: mapCanvasProjectRow(row) });
+    const effective = await resolveEffectiveCanvasSkills(pool, req.session.userId, row.defaultSkillConfig, undefined, "override");
+    res.json({
+      project: {
+        ...mapCanvasProjectRow(row),
+        defaultSkillConfig: effective.skillConfig,
+        effectiveSkillConfig: effective.effectiveSkillConfig,
+        effectiveSkills: effective.effectiveSkills,
+      },
+    });
   }));
 
-  app.delete("/api/write/canvas/projects/:id", requireAuth, asyncHandler(async (req, res) => {
+  const canvasDocumentMultipart = canvasDocumentUpload.fields([
+    { name: "snapshot", maxCount: 1 },
+    { name: "document", maxCount: 1 },
+  ]);
+  const updateCanvasDocument = asyncHandler(async (req, res) => {
     const projectId = Number(req.params.id);
-    if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
+    if (!Number.isSafeInteger(projectId) || projectId <= 0) return res.status(400).json({ error: "invalid project id" });
+    const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+    const snapshotFile = files?.snapshot?.[0] || files?.document?.[0];
+    const rawSnapshot = snapshotFile?.buffer.toString("utf8")
+      || (typeof req.body?.snapshot === "string" ? req.body.snapshot : "")
+      || (typeof req.body?.document === "string" ? req.body.document : "");
+    if (!rawSnapshot) return res.status(400).json({ error: "snapshot is required" });
+    const validatedDocument = validateCanvasDocumentSnapshotInput(rawSnapshot);
+    if (validatedDocument.ok === false) {
+      return res.status(validatedDocument.status).json({
+        error: validatedDocument.error,
+        code: validatedDocument.code,
+      });
+    }
+    const snapshot = validatedDocument.snapshot;
+    const baseRevision = Number(req.body?.baseRevision ?? req.body?.revision);
+    if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+      return res.status(400).json({ error: "baseRevision must be a non-negative integer" });
+    }
+    const legacySchema = typeof req.body?.schema === "string" ? req.body.schema.trim() : "";
+    let legacySchemaVersion: unknown = legacySchema || undefined;
+    if (legacySchema.startsWith("{")) {
+      try {
+        const parsedSchema = JSON.parse(legacySchema);
+        legacySchemaVersion = isPlainRecord(parsedSchema) ? parsedSchema.schemaVersion : legacySchema;
+      } catch {
+        legacySchemaVersion = legacySchema;
+      }
+    }
+    const embeddedSchemaVersionInput = isPlainRecord(snapshot.schema)
+      ? snapshot.schema.schemaVersion
+      : undefined;
+    const embeddedSchemaVersion = readCanvasDocumentSchemaVersion(snapshot) ?? undefined;
+    const requestedSchemaInput = req.body?.schemaVersion ?? legacySchemaVersion;
+    const requestedSchemaVersion = requestedSchemaInput === undefined
+      ? undefined
+      : Number(requestedSchemaInput);
+    if (
+      (embeddedSchemaVersionInput !== undefined && embeddedSchemaVersion === undefined)
+      || (requestedSchemaVersion !== undefined && (!Number.isSafeInteger(requestedSchemaVersion) || requestedSchemaVersion < 0))
+    ) {
+      return res.status(400).json({ error: "schemaVersion must be a non-negative integer" });
+    }
+    if (
+      embeddedSchemaVersion !== undefined
+      && requestedSchemaVersion !== undefined
+      && embeddedSchemaVersion !== requestedSchemaVersion
+    ) {
+      return res.status(400).json({
+        error: "schemaVersion does not match the uploaded document",
+        code: "CANVAS_SCHEMA_VERSION_MISMATCH",
+      });
+    }
+    const schemaVersion = embeddedSchemaVersion ?? requestedSchemaVersion ?? 0;
+    const viewportInput = parseCanvasViewportInput(req.body?.viewport);
+    if (viewportInput.ok === false) return res.status(400).json({ error: viewportInput.error });
+    const businessLayouts = extractCanvasBusinessLayouts(snapshot);
+
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
       await lockCanvasUser(client, req.session.userId);
+      const current = (await client.query(
+        `SELECT id, document_revision FROM write_canvas_projects
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [projectId, req.session.userId],
+      )).rows[0];
+      if (!current) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const currentRevision = Number(current.document_revision);
+      if (currentRevision !== baseRevision) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "画布已在其他位置更新，请合并后重试",
+          code: "CANVAS_REVISION_CONFLICT",
+          currentRevision,
+        });
+      }
+      if (businessLayouts.length > 0) {
+        await client.query(
+          `UPDATE write_canvas_nodes AS node
+           SET x = layout.x,
+               y = layout.y,
+               width = layout.width,
+               height = layout.height,
+               updated_at = NOW()
+           FROM jsonb_to_recordset($1::jsonb)
+             AS layout(node_id BIGINT, x REAL, y REAL, width REAL, height REAL)
+           WHERE node.id = layout.node_id
+             AND node.user_id = $2
+             AND node.project_id = $3`,
+          [JSON.stringify(businessLayouts.map(layout => ({
+            node_id: layout.nodeId,
+            x: layout.x,
+            y: layout.y,
+            width: layout.width,
+            height: layout.height,
+          }))), req.session.userId, projectId],
+        );
+      }
+      const row = (await client.query(
+        `UPDATE write_canvas_projects
+         SET tldraw_snapshot = $1,
+             document_snapshot = $1,
+             document_revision = document_revision + 1,
+             document_schema_version = $2,
+             viewport = COALESCE($6::jsonb, viewport),
+             updated_at = NOW(), last_opened_at = NOW()
+         WHERE id = $3 AND user_id = $4 AND document_revision = $5
+         RETURNING id, name, viewport, tldraw_snapshot AS "documentSnapshot",
+                   document_revision AS "documentRevision", document_schema_version AS "documentSchemaVersion",
+                   default_skill_config AS "defaultSkillConfig",
+                   created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+        [
+          JSON.stringify(snapshot),
+          schemaVersion,
+          projectId,
+          req.session.userId,
+          baseRevision,
+          viewportInput.viewport ? JSON.stringify(viewportInput.viewport) : null,
+        ],
+      )).rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "画布版本冲突", code: "CANVAS_REVISION_CONFLICT" });
+      }
+      await client.query("COMMIT");
+      const project = mapCanvasProjectRow(row);
+      res.setHeader("ETag", `\"canvas-${projectId}-${project.documentRevision}\"`);
+      return res.json({
+        snapshot: project.documentSnapshot,
+        revision: project.documentRevision,
+        schemaVersion: project.documentSchemaVersion,
+        document: {
+          snapshot: project.documentSnapshot,
+          revision: project.documentRevision,
+          schemaVersion: project.documentSchemaVersion,
+        },
+        project,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+  app.put("/api/write/canvas/projects/:id/document", requireAuth, canvasDocumentMultipart, updateCanvasDocument);
+  app.put("/api/write/canvas/projects/:id/snapshot", requireAuth, canvasDocumentMultipart, updateCanvasDocument);
+
+  app.post("/api/write/canvas/projects/:id/clone", requireAuth, canvasDocumentMultipart, asyncHandler(async (req, res) => {
+    const sourceProjectId = Number(req.params.id);
+    if (!Number.isSafeInteger(sourceProjectId) || sourceProjectId <= 0) {
+      return res.status(400).json({ error: "invalid project id" });
+    }
+    const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+    const snapshotFile = files?.snapshot?.[0] || files?.document?.[0];
+    const rawSnapshot = snapshotFile?.buffer.toString("utf8")
+      || (typeof req.body?.snapshot === "string" ? req.body.snapshot : "")
+      || (typeof req.body?.document === "string" ? req.body.document : "");
+    if (!rawSnapshot) return res.status(400).json({ error: "snapshot is required" });
+    const validatedDocument = validateCanvasDocumentSnapshotInput(rawSnapshot);
+    if (validatedDocument.ok === false) {
+      return res.status(validatedDocument.status).json({
+        error: validatedDocument.error,
+        code: validatedDocument.code,
+      });
+    }
+    const embeddedSchemaVersionInput = isPlainRecord(validatedDocument.snapshot.schema)
+      ? validatedDocument.snapshot.schema.schemaVersion
+      : undefined;
+    const embeddedSchemaVersion = readCanvasDocumentSchemaVersion(validatedDocument.snapshot) ?? undefined;
+    const requestedSchemaInput = req.body?.documentSchemaVersion ?? req.body?.schemaVersion;
+    const requestedSchemaVersion = requestedSchemaInput === undefined ? undefined : Number(requestedSchemaInput);
+    if (
+      (embeddedSchemaVersionInput !== undefined && embeddedSchemaVersion === undefined)
+      || (requestedSchemaVersion !== undefined && (!Number.isSafeInteger(requestedSchemaVersion) || requestedSchemaVersion < 0))
+    ) {
+      return res.status(400).json({ error: "schemaVersion must be a non-negative integer" });
+    }
+    if (
+      embeddedSchemaVersion !== undefined
+      && requestedSchemaVersion !== undefined
+      && embeddedSchemaVersion !== requestedSchemaVersion
+    ) {
+      return res.status(400).json({
+        error: "schemaVersion does not match the uploaded document",
+        code: "CANVAS_SCHEMA_VERSION_MISMATCH",
+      });
+    }
+    const schemaVersion = embeddedSchemaVersion ?? requestedSchemaVersion ?? 0;
+    const viewportInput = parseCanvasViewportInput(req.body?.viewport);
+    if (viewportInput.ok === false) return res.status(400).json({ error: viewportInput.error });
+    const localBusinessLayouts = extractCanvasBusinessLayouts(validatedDocument.snapshot);
+    const requestedName = typeof req.body?.name === "string" && req.body.name.trim()
+      ? req.body.name.trim().slice(0, 80)
+      : "";
+
+    const client = await pool.connect();
+    let clonedProjectId: number | null = null;
+    let clonedProject: ReturnType<typeof mapCanvasProjectRow> | null = null;
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const sourceProject = (await client.query(
+        `SELECT id, name, viewport, default_skill_config
+         FROM write_canvas_projects
+         WHERE id = $1 AND user_id = $2
+         FOR SHARE`,
+        [sourceProjectId, req.session.userId],
+      )).rows[0];
+      if (!sourceProject) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+
+      const projectCount = Number((await client.query(
+        `SELECT COUNT(*)::int AS count FROM write_canvas_projects WHERE user_id = $1`,
+        [req.session.userId],
+      )).rows[0]?.count || 0);
+      if (projectCount >= WRITE_CANVAS_MAX_PROJECTS_PER_USER) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "画布项目数量已达到上限" });
+      }
+
+      const sourceNodes = (await client.query(
+        `SELECT id, kind, title, summary, ref_id, asset_id, agent_id, meta,
+                x, y, width, height, created_at, updated_at
+         FROM write_canvas_nodes
+         WHERE project_id = $1 AND user_id = $2
+         ORDER BY id ASC
+         LIMIT $3
+         FOR SHARE`,
+        [sourceProjectId, req.session.userId, WRITE_CANVAS_MAX_NODES_PER_PROJECT + 1],
+      )).rows;
+      if (sourceNodes.length > WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目节点数量已达到上限" });
+      }
+
+      const sourceAssets = (await client.query(
+        `SELECT id, type, title, content_text, extracted_text, file_name, mime_type,
+                data_url, meta, created_at
+         FROM write_canvas_assets
+         WHERE project_id = $1 AND user_id = $2
+         ORDER BY id ASC
+         LIMIT $3
+         FOR SHARE`,
+        [sourceProjectId, req.session.userId, WRITE_CANVAS_CLONE_MAX_ROWS + 1],
+      )).rows;
+      if (sourceAssets.length > WRITE_CANVAS_CLONE_MAX_ROWS) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目资料数量超过克隆上限" });
+      }
+      let clonedRowCount = 1 + sourceNodes.length + sourceAssets.length;
+      let clonedMessageBytes = 0;
+      let clonedMetadataBytes = Buffer.byteLength(JSON.stringify(sourceProject.default_skill_config || {}), "utf8")
+        + sourceNodes.reduce((total, node) => total + Buffer.byteLength(JSON.stringify(node.meta || {}), "utf8"), 0)
+        + sourceAssets.reduce((total, asset) => total + Buffer.byteLength(JSON.stringify(asset.meta || {}), "utf8"), 0);
+      if (clonedRowCount > WRITE_CANVAS_CLONE_MAX_ROWS || clonedMetadataBytes > WRITE_CANVAS_CLONE_MAX_METADATA_BYTES) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目数据量超过克隆上限" });
+      }
+      const clonedAssetBytes = sourceAssets.reduce((total, asset) => total
+        + Buffer.byteLength(String(asset.data_url || ""), "utf8")
+        + Buffer.byteLength(String(asset.content_text || ""), "utf8")
+        + Buffer.byteLength(String(asset.extracted_text || ""), "utf8"), 0);
+      const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
+      if (storedBytes + clonedAssetBytes > canvasUserStorageMaxBytes) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "画布资料存储额度已用完，请删除旧资料后重试" });
+      }
+
+      const projectRow = (await client.query(
+        `INSERT INTO write_canvas_projects
+           (user_id, name, viewport, tldraw_snapshot, document_snapshot, document_revision,
+            document_schema_version, default_skill_config, last_opened_at)
+         VALUES ($1, $2, $3, '{"store":{}}'::jsonb, '{"store":{}}'::jsonb, 0, $4, $5, NOW())
+         RETURNING id`,
+        [
+          req.session.userId,
+          requestedName || `${String(sourceProject.name || "魔法写作项目").slice(0, 65)} · 副本`,
+          JSON.stringify(viewportInput.viewport || sourceProject.viewport || {}),
+          schemaVersion,
+          JSON.stringify(sourceProject.default_skill_config || {}),
+        ],
+      )).rows[0];
+      clonedProjectId = Number(projectRow.id);
+
+      const assetIdMap = new Map<number, number>();
+      for (const asset of sourceAssets) {
+        const clonedAsset = (await client.query(
+          `INSERT INTO write_canvas_assets
+             (user_id, project_id, type, title, content_text, extracted_text,
+              file_name, mime_type, data_url, meta, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           RETURNING id`,
+          [
+            req.session.userId,
+            clonedProjectId,
+            asset.type,
+            asset.title,
+            asset.content_text,
+            asset.extracted_text,
+            asset.file_name,
+            asset.mime_type,
+            asset.data_url,
+            JSON.stringify(asset.meta || {}),
+            asset.created_at,
+          ],
+        )).rows[0];
+        assetIdMap.set(Number(asset.id), Number(clonedAsset.id));
+      }
+
+      const sourceAgents = (await client.query(
+        `SELECT ai.id,
+                (SELECT template.id
+                 FROM write_agent_templates template
+                 WHERE template.id = ai.template_id AND template.user_id = ai.user_id) AS template_id,
+                ai.name, ai.model, ai.system_prompt, ai.temperature, ai.top_p,
+                ai.max_tokens, ai.skill_config, ai.agent_thread_id, ai.created_at, ai.updated_at
+         FROM write_agent_instances ai
+         WHERE ai.project_id = $1 AND ai.user_id = $2
+         ORDER BY ai.id ASC
+         LIMIT $3
+         FOR SHARE OF ai`,
+        [sourceProjectId, req.session.userId, WRITE_CANVAS_MAX_NODES_PER_PROJECT + 1],
+      )).rows;
+      if (sourceAgents.length > WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目 Agent 数量超过克隆上限" });
+      }
+      clonedRowCount += sourceAgents.length * 2;
+      clonedMetadataBytes += sourceAgents.reduce(
+        (total, agent) => total + Buffer.byteLength(JSON.stringify(agent.skill_config || {}), "utf8"),
+        0,
+      );
+      if (clonedRowCount > WRITE_CANVAS_CLONE_MAX_ROWS || clonedMetadataBytes > WRITE_CANVAS_CLONE_MAX_METADATA_BYTES) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目数据量超过克隆上限" });
+      }
+      const agentIdMap = new Map<number, number>();
+      const threadIdMap = new Map<number, number>();
+      const messageIdsByAgent = new Map<string, number>();
+      const clonedThreadIds: number[] = [];
+      for (const agent of sourceAgents) {
+        const sourceThreadId = Number(agent.agent_thread_id);
+        let sourceThread: Record<string, unknown> | null = null;
+        if (Number.isSafeInteger(sourceThreadId) && sourceThreadId > 0) {
+          sourceThread = (await client.query(
+            `SELECT id, title, state, created_at, updated_at
+             FROM write_agent_threads
+             WHERE id = $1 AND user_id = $2 AND thread_type = 'canvas'
+             FOR SHARE`,
+            [sourceThreadId, req.session.userId],
+          )).rows[0];
+        }
+
+        // Every cloned Agent receives a valid canvas thread before commit. For
+        // pre-thread legacy Agents, migrate the retained legacy history now so
+        // post-commit detail loading remains read-only and retry-safe.
+        const sourceMessages = sourceThread
+          ? (await client.query(
+            `SELECT id, role, content, meta, created_at
+             FROM (
+               SELECT id, role, content, meta, created_at
+               FROM write_agent_messages
+               WHERE thread_id = $1
+               ORDER BY created_at DESC, id DESC
+               LIMIT $2
+             ) recent
+             ORDER BY created_at ASC, id ASC`,
+            [sourceThreadId, WRITE_CANVAS_MAX_MESSAGES_PER_AGENT],
+          )).rows
+          : (await client.query(
+            `SELECT id, role, content, meta, created_at
+             FROM (
+               SELECT id, role, content, meta, created_at
+               FROM write_canvas_agent_messages
+               WHERE user_id = $1 AND agent_id = $2
+                 AND role IN ('user', 'assistant')
+               ORDER BY created_at DESC, id DESC
+               LIMIT $3
+             ) recent
+             ORDER BY created_at ASC, id ASC`,
+            [req.session.userId, agent.id, WRITE_CANVAS_MAX_MESSAGES_PER_AGENT],
+          )).rows;
+        clonedRowCount += sourceMessages.length;
+        clonedMessageBytes += sourceMessages.reduce(
+          (total, sourceMessage) => total + Buffer.byteLength(String(sourceMessage.content || ""), "utf8"),
+          0,
+        );
+        clonedMetadataBytes += Buffer.byteLength(JSON.stringify(sourceThread?.state || {}), "utf8")
+          + sourceMessages.reduce(
+            (total, sourceMessage) => total + Buffer.byteLength(JSON.stringify(sourceMessage.meta || {}), "utf8"),
+            0,
+          );
+        if (
+          clonedRowCount > WRITE_CANVAS_CLONE_MAX_ROWS
+          || clonedMessageBytes > WRITE_CANVAS_CLONE_MAX_MESSAGE_BYTES
+          || clonedMetadataBytes > WRITE_CANVAS_CLONE_MAX_METADATA_BYTES
+        ) {
+          await client.query("ROLLBACK");
+          return res.status(413).json({ error: "项目消息或元数据超过克隆上限" });
+        }
+        const sourceState = normalizeJsonObject(sourceThread?.state);
+        const clonedThread = (await client.query(
+          `INSERT INTO write_agent_threads
+             (user_id, title, summary, state, thread_type, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, 'canvas', $5, $6)
+           RETURNING id`,
+          [
+            req.session.userId,
+            sourceThread?.title || `${String(agent.name || "写作 Agent").slice(0, 70)} · 画布会话`,
+            summarizeCanvasUserInstructions(sourceMessages),
+            JSON.stringify({
+              ...sourceState,
+              // Keep the source Agent identity until the bounded metadata
+              // rewrite below has remapped any message pointers in state.
+              // The marker is stripped by remapCanvasCloneMetadata.
+              __atomflowCloneSourceAgentId: Number(agent.id),
+              canvasAgentId: Number(agent.id),
+              canvasProjectId: clonedProjectId,
+              activatedNodeIds: [],
+              selectedCardIds: [],
+              activationSummary: [],
+              sourceImageIds: [],
+            }),
+            sourceThread?.created_at || agent.created_at,
+            sourceThread?.updated_at || agent.updated_at,
+          ],
+        )).rows[0];
+        const clonedThreadId = Number(clonedThread.id);
+        clonedThreadIds.push(clonedThreadId);
+        if (sourceThread) threadIdMap.set(sourceThreadId, clonedThreadId);
+        if (sourceMessages.length > 0) {
+          await client.query(
+            `INSERT INTO write_agent_messages (thread_id, role, content, meta, created_at)
+             SELECT $1, message.role, message.content,
+                    COALESCE(message.meta, '{}'::jsonb) || jsonb_build_object(
+                      '__atomflowCloneSourceAgentId', $3::bigint,
+                      '__atomflowCloneSourceMessageId', message.source_id
+                    ),
+                    message.created_at
+             FROM jsonb_to_recordset($2::jsonb)
+               AS message(source_id BIGINT, role TEXT, content TEXT, meta JSONB, created_at TIMESTAMPTZ)`,
+            [clonedThreadId, JSON.stringify(sourceMessages.map(sourceMessage => ({
+              ...sourceMessage,
+              source_id: Number(sourceMessage.id),
+            }))), Number(agent.id)],
+          );
+          const clonedMessageMappings = (await client.query(
+            `SELECT id, (meta->>'__atomflowCloneSourceMessageId')::bigint AS source_message_id
+             FROM write_agent_messages
+             WHERE thread_id = $1 AND meta->>'__atomflowCloneSourceAgentId' = $2
+             ORDER BY id ASC`,
+            [clonedThreadId, String(agent.id)],
+          )).rows;
+          for (const mapping of clonedMessageMappings) {
+            messageIdsByAgent.set(`${Number(agent.id)}:${Number(mapping.source_message_id)}`, Number(mapping.id));
+          }
+        }
+
+        const clonedAgent = (await client.query(
+          `INSERT INTO write_agent_instances
+             (user_id, project_id, template_id, name, model, system_prompt,
+              temperature, top_p, max_tokens, skill_config, agent_thread_id,
+              created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           RETURNING id`,
+          [
+            req.session.userId,
+            clonedProjectId,
+            agent.template_id,
+            agent.name,
+            agent.model,
+            agent.system_prompt,
+            agent.temperature,
+            agent.top_p,
+            agent.max_tokens,
+            JSON.stringify(agent.skill_config || {}),
+            clonedThreadId,
+            agent.created_at,
+            agent.updated_at,
+          ],
+        )).rows[0];
+        const clonedAgentId = Number(clonedAgent.id);
+        agentIdMap.set(Number(agent.id), clonedAgentId);
+      }
+
+      const nodeIdMap = new Map<number, number>();
+      for (const node of sourceNodes) {
+        const sourceAssetId = Number(node.asset_id);
+        // Older Agent nodes may have persisted the Agent only in ref_id.
+        // Resolve both representations so the clone never points back to the
+        // source project's Agent instance.
+        const sourceAgentId = Number(
+          node.agent_id ?? (node.kind === "agent" ? node.ref_id : null),
+        );
+        const clonedAssetId = Number.isSafeInteger(sourceAssetId) && sourceAssetId > 0
+          ? assetIdMap.get(sourceAssetId)
+          : null;
+        const clonedAgentId = Number.isSafeInteger(sourceAgentId) && sourceAgentId > 0
+          ? agentIdMap.get(sourceAgentId)
+          : null;
+        if ((sourceAssetId > 0 && clonedAssetId === undefined) || (sourceAgentId > 0 && clonedAgentId === undefined)) {
+          throw new Error("Canvas clone encountered an invalid project relation");
+        }
+        const clonedNode = (await client.query(
+          `INSERT INTO write_canvas_nodes
+             (user_id, project_id, kind, title, summary, ref_id, asset_id, agent_id,
+              meta, x, y, width, height, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+           RETURNING id`,
+          [
+            req.session.userId,
+            clonedProjectId,
+            node.kind,
+            node.title,
+            node.summary,
+            node.kind === "agent" && clonedAgentId ? String(clonedAgentId) : node.ref_id,
+            clonedAssetId ?? null,
+            clonedAgentId ?? null,
+            JSON.stringify(node.meta || {}),
+            node.x,
+            node.y,
+            node.width,
+            node.height,
+            node.created_at,
+            node.updated_at,
+          ],
+        )).rows[0];
+        nodeIdMap.set(Number(node.id), Number(clonedNode.id));
+      }
+      const clonedBusinessLayouts = localBusinessLayouts.flatMap(layout => {
+        const clonedNodeId = nodeIdMap.get(layout.nodeId);
+        return clonedNodeId === undefined ? [] : [{
+          node_id: clonedNodeId,
+          x: layout.x,
+          y: layout.y,
+          width: layout.width,
+          height: layout.height,
+        }];
+      });
+      if (clonedBusinessLayouts.length > 0) {
+        await client.query(
+          `UPDATE write_canvas_nodes AS node
+           SET x = layout.x,
+               y = layout.y,
+               width = layout.width,
+               height = layout.height,
+               updated_at = NOW()
+           FROM jsonb_to_recordset($1::jsonb)
+             AS layout(node_id BIGINT, x REAL, y REAL, width REAL, height REAL)
+           WHERE node.id = layout.node_id
+             AND node.user_id = $2
+             AND node.project_id = $3`,
+          [JSON.stringify(clonedBusinessLayouts), req.session.userId, clonedProjectId],
+        );
+      }
+
+      const sourceEdges = (await client.query(
+        `SELECT id, source_node_id, target_node_id, relation, created_at
+         FROM write_canvas_edges
+         WHERE project_id = $1 AND user_id = $2
+         ORDER BY id ASC
+         LIMIT $3
+         FOR SHARE`,
+        [sourceProjectId, req.session.userId, WRITE_CANVAS_DOCUMENT_MAX_RECORDS + 1],
+      )).rows;
+      if (sourceEdges.length > WRITE_CANVAS_DOCUMENT_MAX_RECORDS) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目上下文连线数量超过克隆上限" });
+      }
+      clonedRowCount += sourceEdges.length;
+      if (clonedRowCount > WRITE_CANVAS_CLONE_MAX_ROWS) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目总记录数超过克隆上限" });
+      }
+      const edgeIdMap = new Map<number, number>();
+      for (const edge of sourceEdges) {
+        const clonedSourceNodeId = nodeIdMap.get(Number(edge.source_node_id));
+        const clonedTargetNodeId = nodeIdMap.get(Number(edge.target_node_id));
+        if (!clonedSourceNodeId || !clonedTargetNodeId) {
+          throw new Error("Canvas clone encountered an invalid edge relation");
+        }
+        const clonedEdge = (await client.query(
+          `INSERT INTO write_canvas_edges
+             (user_id, project_id, source_node_id, target_node_id, relation, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id`,
+          [
+            req.session.userId,
+            clonedProjectId,
+            clonedSourceNodeId,
+            clonedTargetNodeId,
+            edge.relation,
+            edge.created_at,
+          ],
+        )).rows[0];
+        edgeIdMap.set(Number(edge.id), Number(clonedEdge.id));
+      }
+
+      const cloneEntityMaps: CanvasCloneEntityMaps = {
+        sourceProjectId,
+        targetProjectId: clonedProjectId,
+        assetIds: assetIdMap,
+        nodeIds: nodeIdMap,
+        edgeIds: edgeIdMap,
+        agentIds: agentIdMap,
+        threadIds: threadIdMap,
+        messageIdsByAgent,
+      };
+      const clonedNodeMetaRows = (await client.query(
+        `SELECT id, meta
+         FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2
+         ORDER BY id ASC`,
+        [req.session.userId, clonedProjectId],
+      )).rows.map((row: { id: string | number; meta: unknown }) => ({
+        id: Number(row.id),
+        meta: remapCanvasCloneMetadata(row.meta, cloneEntityMaps),
+      }));
+      if (clonedNodeMetaRows.length > 0) {
+        for (let offset = 0; offset < clonedNodeMetaRows.length; offset += WRITE_CANVAS_CLONE_METADATA_BATCH_SIZE) {
+          await client.query(
+            `UPDATE write_canvas_nodes AS node
+             SET meta = remapped.meta
+             FROM jsonb_to_recordset($1::jsonb) AS remapped(id BIGINT, meta JSONB)
+             WHERE node.id = remapped.id AND node.user_id = $2 AND node.project_id = $3`,
+            [
+              JSON.stringify(clonedNodeMetaRows.slice(offset, offset + WRITE_CANVAS_CLONE_METADATA_BATCH_SIZE)),
+              req.session.userId,
+              clonedProjectId,
+            ],
+          );
+        }
+      }
+
+      const clonedAssetIds = [...assetIdMap.values()];
+      if (clonedAssetIds.length > 0) {
+        const clonedAssetMetaRows = (await client.query(
+          `SELECT id, meta
+           FROM write_canvas_assets
+           WHERE user_id = $1 AND project_id = $2 AND id = ANY($3::bigint[])
+           ORDER BY id ASC`,
+          [req.session.userId, clonedProjectId, clonedAssetIds],
+        )).rows.map((row: { id: string | number; meta: unknown }) => ({
+          id: Number(row.id),
+          meta: remapCanvasCloneMetadata(row.meta, cloneEntityMaps),
+        }));
+        for (let offset = 0; offset < clonedAssetMetaRows.length; offset += WRITE_CANVAS_CLONE_METADATA_BATCH_SIZE) {
+          await client.query(
+            `UPDATE write_canvas_assets AS asset
+             SET meta = remapped.meta
+             FROM jsonb_to_recordset($1::jsonb) AS remapped(id BIGINT, meta JSONB)
+             WHERE asset.id = remapped.id AND asset.user_id = $2 AND asset.project_id = $3`,
+            [
+              JSON.stringify(clonedAssetMetaRows.slice(offset, offset + WRITE_CANVAS_CLONE_METADATA_BATCH_SIZE)),
+              req.session.userId,
+              clonedProjectId,
+            ],
+          );
+        }
+      }
+
+      if (clonedThreadIds.length > 0) {
+        const clonedThreadStateRows = (await client.query(
+          `SELECT id, state
+           FROM write_agent_threads
+           WHERE user_id = $1 AND id = ANY($2::bigint[])
+           ORDER BY id ASC`,
+          [req.session.userId, clonedThreadIds],
+        )).rows.map((row: { id: string | number; state: unknown }) => ({
+          id: Number(row.id),
+          state: remapCanvasCloneMetadata(row.state, cloneEntityMaps),
+        }));
+        for (let offset = 0; offset < clonedThreadStateRows.length; offset += WRITE_CANVAS_CLONE_METADATA_BATCH_SIZE) {
+          await client.query(
+            `UPDATE write_agent_threads AS thread
+             SET state = remapped.state
+             FROM jsonb_to_recordset($1::jsonb) AS remapped(id BIGINT, state JSONB)
+             WHERE thread.id = remapped.id AND thread.user_id = $2`,
+            [
+              JSON.stringify(clonedThreadStateRows.slice(offset, offset + WRITE_CANVAS_CLONE_METADATA_BATCH_SIZE)),
+              req.session.userId,
+            ],
+          );
+        }
+
+        const clonedMessageMetaRows = (await client.query(
+          `SELECT message.id, message.meta
+           FROM write_agent_messages AS message
+           JOIN write_agent_threads AS thread ON thread.id = message.thread_id
+           WHERE thread.user_id = $1 AND thread.id = ANY($2::bigint[])
+           ORDER BY message.id ASC`,
+          [req.session.userId, clonedThreadIds],
+        )).rows.map((row: { id: string | number; meta: unknown }) => ({
+          id: Number(row.id),
+          meta: remapCanvasCloneMetadata(row.meta, cloneEntityMaps),
+        }));
+        if (clonedMessageMetaRows.length > 0) {
+          for (let offset = 0; offset < clonedMessageMetaRows.length; offset += WRITE_CANVAS_CLONE_METADATA_BATCH_SIZE) {
+            await client.query(
+              `UPDATE write_agent_messages AS message
+               SET meta = remapped.meta
+               FROM jsonb_to_recordset($1::jsonb) AS remapped(id BIGINT, meta JSONB),
+                    write_agent_threads AS thread
+               WHERE message.id = remapped.id
+                 AND thread.id = message.thread_id
+                 AND thread.user_id = $2
+                 AND thread.id = ANY($3::bigint[])`,
+              [
+                JSON.stringify(clonedMessageMetaRows.slice(offset, offset + WRITE_CANVAS_CLONE_METADATA_BATCH_SIZE)),
+                req.session.userId,
+                clonedThreadIds,
+              ],
+            );
+          }
+        }
+      }
+
+      const remappedSnapshot = remapClonedCanvasDocumentSnapshot(
+        validatedDocument.snapshot,
+        nodeIdMap,
+        edgeIdMap,
+      );
+      const validatedRemappedDocument = validateCanvasDocumentSnapshotInput(remappedSnapshot);
+      if (validatedRemappedDocument.ok === false) {
+        await client.query("ROLLBACK");
+        return res.status(validatedRemappedDocument.status).json({
+          error: validatedRemappedDocument.error,
+          code: validatedRemappedDocument.code,
+        });
+      }
+      const finalizedProjectRow = (await client.query(
+        `UPDATE write_canvas_projects
+         SET tldraw_snapshot = $1,
+             document_snapshot = $1,
+             document_revision = 1,
+             document_schema_version = $2,
+             updated_at = NOW(),
+             last_opened_at = NOW()
+         WHERE id = $3 AND user_id = $4
+         RETURNING id, name, viewport, tldraw_snapshot AS "documentSnapshot",
+                   document_revision AS "documentRevision", document_schema_version AS "documentSchemaVersion",
+                   default_skill_config AS "defaultSkillConfig",
+                   created_at AS "createdAt", updated_at AS "updatedAt", last_opened_at AS "lastOpenedAt"`,
+        [JSON.stringify(validatedRemappedDocument.snapshot), schemaVersion, clonedProjectId, req.session.userId],
+      )).rows[0];
+      clonedProject = mapCanvasProjectRow(finalizedProjectRow);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    if (!clonedProjectId || !clonedProject) throw new Error("Canvas clone failed to create the target project");
+    return res.json({ project: clonedProject });
+  }));
+
+  app.post("/api/write/canvas/projects/:id/citations", requireAuth, asyncHandler(async (req, res) => {
+    const projectId = Number(req.params.id);
+    if (!Number.isSafeInteger(projectId) || projectId <= 0) return res.status(400).json({ error: "invalid project id" });
+    const captureId = typeof req.body?.captureId === "string" ? req.body.captureId.trim() : "";
+    if (!captureId || captureId.length > 128) return res.status(400).json({ error: "captureId is required" });
+    const targetAgentNodeId = Number(req.body?.targetAgentNodeId);
+    const identity = isPlainRecord(req.body?.articleIdentity)
+      ? req.body.articleIdentity
+      : isPlainRecord(req.body?.article) ? req.body.article : {};
+    const articleId = Number(identity.id ?? req.body?.articleId);
+    const sourceUrl = typeof (identity.url ?? req.body?.sourceUrl) === "string"
+      ? String(identity.url ?? req.body?.sourceUrl).trim().slice(0, 2048)
+      : "";
+    const sourceName = typeof (identity.source ?? req.body?.sourceName) === "string"
+      ? String(identity.source ?? req.body?.sourceName).trim().slice(0, 200)
+      : "";
+    const sourceTitle = typeof (identity.title ?? req.body?.sourceTitle) === "string"
+      ? String(identity.title ?? req.body?.sourceTitle).trim().slice(0, 500)
+      : "";
+    if (!Number.isSafeInteger(articleId) && !sourceUrl && !(sourceName && sourceTitle)) {
+      return res.status(400).json({ error: "article identity is required" });
+    }
+    const lookupArticleId = Number.isSafeInteger(articleId) ? articleId : null;
+    const normalizedSourceUrl = normalizeArticleUrl(sourceUrl) || sourceUrl;
+    const stableArticleIdentity = citationArticleIdentity({
+      articleId: lookupArticleId ?? undefined,
+      articleTitle: sourceTitle,
+      source: sourceName,
+      sourceUrl: normalizedSourceUrl,
+    });
+    const requestedStableIdentity = typeof identity.stableIdentity === "string"
+      ? identity.stableIdentity.trim()
+      : "";
+    if (requestedStableIdentity && requestedStableIdentity !== stableArticleIdentity) {
+      return res.status(400).json({
+        error: "article stable identity does not match the supplied source",
+        code: "CITATION_ARTICLE_IDENTITY_MISMATCH",
+      });
+    }
+    const rawSelection = isPlainRecord(req.body?.selection) ? req.body.selection : {};
+    const exact = typeof rawSelection.exact === "string" ? rawSelection.exact : "";
+    if (!exact.trim()) return res.status(400).json({ error: "selection.exact is required" });
+    if (exact.length > 2000) {
+      return res.status(400).json({
+        error: "selection.exact cannot exceed 2000 characters",
+        code: "CITATION_SELECTION_TOO_LARGE",
+      });
+    }
+    const selection = {
+      exact,
+      prefix: typeof rawSelection.prefix === "string" ? rawSelection.prefix.slice(-120) : "",
+      suffix: typeof rawSelection.suffix === "string" ? rawSelection.suffix.slice(0, 120) : "",
+      paragraph: typeof rawSelection.paragraph === "string" ? rawSelection.paragraph.slice(0, 8000) : "",
+      heading: typeof rawSelection.heading === "string" ? rawSelection.heading.trim().slice(0, 500) : "",
+      capturedAt: typeof rawSelection.capturedAt === "string" && !Number.isNaN(Date.parse(rawSelection.capturedAt))
+        ? new Date(rawSelection.capturedAt).toISOString()
+        : new Date().toISOString(),
+    };
+    const citationMatchesRequest = (row: Record<string, unknown>) => {
+      const meta = isPlainRecord(row.meta) ? row.meta : {};
+      const storedArticle = isPlainRecord(meta.article) ? meta.article : {};
+      const storedSelection = isPlainRecord(meta.selection) ? meta.selection : {};
+      const storedStableIdentity = typeof storedArticle.stableIdentity === "string"
+        ? storedArticle.stableIdentity
+        : citationArticleIdentity({
+          articleId: Number.isSafeInteger(Number(storedArticle.id)) ? Number(storedArticle.id) : undefined,
+          articleTitle: typeof storedArticle.title === "string" ? storedArticle.title : undefined,
+          source: typeof storedArticle.source === "string" ? storedArticle.source : undefined,
+          sourceUrl: typeof storedArticle.url === "string" ? storedArticle.url : undefined,
+        });
+      const identityMatches = storedStableIdentity === stableArticleIdentity;
+      return identityMatches
+        && storedSelection.exact === selection.exact
+        && (storedSelection.prefix || "") === selection.prefix
+        && (storedSelection.suffix || "") === selection.suffix
+        && (storedSelection.paragraph || "") === selection.paragraph
+        && (storedSelection.heading || "") === selection.heading;
+    };
+
+    // A committed citation is the durable source snapshot. Resolve it before
+    // touching the live article source so a lost response remains retryable
+    // even after an RSS item or subscription has disappeared.
+    const existingClient = await pool.connect();
+    let existingCitationNode: Record<string, unknown> | null = null;
+    let existingCitationEdge: Record<string, unknown> | null = null;
+    try {
+      await existingClient.query("BEGIN");
+      await lockCanvasUser(existingClient, req.session.userId);
+      const project = (await existingClient.query(
+        `SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [projectId, req.session.userId],
+      )).rows[0];
+      if (!project) {
+        await existingClient.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      existingCitationNode = (await existingClient.query(
+        `SELECT id, project_id AS "projectId", kind, title, summary, ref_id AS "refId",
+                meta, x, y, width, height, created_at AS "createdAt", updated_at AS "updatedAt"
+         FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND kind = 'citation' AND ref_id = $3
+         FOR UPDATE`,
+        [req.session.userId, projectId, captureId],
+      )).rows[0] || null;
+      if (existingCitationNode && !citationMatchesRequest(existingCitationNode)) {
+        await existingClient.query("ROLLBACK");
+        return res.status(409).json({
+          error: "captureId has already been used for a different citation",
+          code: "CITATION_CAPTURE_ID_REUSED",
+        });
+      }
+      if (existingCitationNode && Number.isSafeInteger(targetAgentNodeId) && targetAgentNodeId > 0) {
+        const target = (await existingClient.query(
+          `SELECT id FROM write_canvas_nodes
+           WHERE id = $1 AND user_id = $2 AND project_id = $3 AND kind = 'agent'
+           FOR SHARE`,
+          [targetAgentNodeId, req.session.userId, projectId],
+        )).rows[0];
+        if (!target) {
+          await existingClient.query("ROLLBACK");
+          return res.status(404).json({ error: "target agent node not found" });
+        }
+        existingCitationEdge = (await existingClient.query(
+          `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+           VALUES ($1, $2, $3, $4, 'context')
+           ON CONFLICT (project_id, source_node_id, target_node_id, relation)
+           DO UPDATE SET relation = EXCLUDED.relation
+           RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                     target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+          [req.session.userId, projectId, Number(existingCitationNode.id), targetAgentNodeId],
+        )).rows[0];
+      }
+      await existingClient.query("COMMIT");
+    } catch (error) {
+      await existingClient.query("ROLLBACK");
+      throw error;
+    } finally {
+      existingClient.release();
+    }
+    if (existingCitationNode) {
+      return res.json({
+        node: mapCanvasNodeRow(existingCitationNode),
+        edge: existingCitationEdge ? mapCanvasEdgeRow(existingCitationEdge) : null,
+        created: false,
+      });
+    }
+
+    let article = sourceUrl
+      ? articles.find(candidate => {
+        if (!candidate.url) return false;
+        return candidate.url.trim() === sourceUrl
+          || normalizeArticleUrl(candidate.url) === normalizedSourceUrl;
+      })
+      : undefined;
+    if (!article && !sourceUrl && lookupArticleId !== null) {
+      article = articles.find(candidate => (
+        candidate.id === lookupArticleId
+        && (!sourceName || candidate.source === sourceName)
+      ));
+    }
+    if (!article && sourceName && sourceTitle) {
+      article = findArticleByIdentity(articles, { source: sourceName, title: sourceTitle });
+    }
+    const lookupParams = [
+      req.session.userId,
+      sourceUrl,
+      normalizedSourceUrl,
+      sourceName,
+      sourceTitle,
+      sourceUrl ? null : lookupArticleId,
+    ];
+    if (!article) {
+      const row = (await pool.query(
+        `SELECT id, source, source_icon, topic, title, excerpt, content, url,
+                audio_url, audio_duration, published_at, time_str
+         FROM user_articles
+         WHERE user_id = $1
+           AND (
+             ($2::text <> '' AND (url = $2 OR url = $3))
+             OR ($6::bigint IS NOT NULL AND id = $6 AND ($4::text = '' OR source = $4))
+             OR ($4::text <> '' AND $5::text <> '' AND source = $4 AND title = $5)
+           )
+         ORDER BY CASE
+           WHEN $2::text <> '' AND (url = $2 OR url = $3) THEN 0
+           WHEN $6::bigint IS NOT NULL AND id = $6 AND ($4::text = '' OR source = $4) THEN 1
+           WHEN $4::text <> '' AND $5::text <> '' AND source = $4 AND title = $5 THEN 2
+           ELSE 2
+         END
+         LIMIT 1`,
+        lookupParams,
+      )).rows[0];
+      if (row) {
+        article = {
+          id: Number(row.id),
+          saved: false,
+          source: row.source,
+          sourceIcon: row.source_icon || undefined,
+          topic: row.topic,
+          title: row.title,
+          excerpt: row.excerpt,
+          content: row.content,
+          url: row.url || undefined,
+          audioUrl: row.audio_url || undefined,
+          audioDuration: row.audio_duration || undefined,
+          publishedAt: row.published_at ? Number(row.published_at) : undefined,
+          time: row.time_str || "",
+          cards: [],
+        };
+      }
+    }
+    if (!article) {
+      const row = (await pool.query(
+        `SELECT id, source, source_icon, topic, title, excerpt, content, url,
+                audio_url, audio_duration, published_at
+         FROM saved_articles
+         WHERE user_id = $1
+           AND (
+             ($2::text <> '' AND (url = $2 OR url = $3))
+             OR ($6::bigint IS NOT NULL AND id = $6 AND ($4::text = '' OR source = $4))
+             OR ($4::text <> '' AND $5::text <> '' AND source = $4 AND title = $5)
+           )
+         ORDER BY CASE
+           WHEN $2::text <> '' AND (url = $2 OR url = $3) THEN 0
+           WHEN $6::bigint IS NOT NULL AND id = $6 AND ($4::text = '' OR source = $4) THEN 1
+           WHEN $4::text <> '' AND $5::text <> '' AND source = $4 AND title = $5 THEN 2
+           ELSE 2
+         END, saved_at DESC
+         LIMIT 1`,
+        lookupParams,
+      )).rows[0];
+      if (row) {
+        article = {
+          id: Number(row.id),
+          saved: true,
+          source: row.source,
+          sourceIcon: row.source_icon || undefined,
+          topic: row.topic,
+          title: row.title,
+          excerpt: row.excerpt,
+          content: row.content,
+          url: row.url || undefined,
+          audioUrl: row.audio_url || undefined,
+          audioDuration: row.audio_duration || undefined,
+          publishedAt: row.published_at ? Number(row.published_at) : undefined,
+          time: "",
+          cards: [],
+        };
+      }
+    }
+    if (!article) return res.status(404).json({ error: "article not found" });
+
+    const rawPosition = isPlainRecord(req.body?.position) ? req.body.position : {};
+    const x = clampNumber(rawPosition.x, 120, -100000, 100000);
+    const y = clampNumber(rawPosition.y, 120, -100000, 100000);
+    const articleSnapshot = {
+      id: article.id,
+      stableIdentity: stableArticleIdentity,
+      title: article.title.slice(0, 500),
+      source: article.source.slice(0, 200),
+      url: article.url?.slice(0, 2048),
+      topic: article.topic.slice(0, 200),
+      excerpt: article.excerpt.slice(0, 2000),
+      publishedAt: article.publishedAt,
+      audioUrl: article.audioUrl?.slice(0, 2048),
+      audioDuration: article.audioDuration?.slice(0, 100),
+      fetchedAt: new Date().toISOString(),
+    };
+    const nodeMeta = { captureId, article: articleSnapshot, selection };
+
+    const client = await pool.connect();
+    let nodeRow: Record<string, unknown>;
+    let edgeRow: Record<string, unknown> | null = null;
+    let created = false;
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const project = (await client.query(
+        `SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [projectId, req.session.userId],
+      )).rows[0];
+      if (!project) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const existing = (await client.query(
+        `SELECT id, project_id AS "projectId", kind, title, summary, ref_id AS "refId",
+                meta, x, y, width, height, created_at AS "createdAt", updated_at AS "updatedAt"
+         FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND kind = 'citation' AND ref_id = $3
+         FOR UPDATE`,
+        [req.session.userId, projectId, captureId],
+      )).rows[0];
+      if (existing) {
+        if (!citationMatchesRequest(existing)) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error: "captureId has already been used for a different citation",
+            code: "CITATION_CAPTURE_ID_REUSED",
+          });
+        }
+        nodeRow = existing;
+      } else {
+        const nodeCount = Number((await client.query(
+          `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
+          [projectId, req.session.userId],
+        )).rows[0]?.count || 0);
+        if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+          await client.query("ROLLBACK");
+          return res.status(413).json({ error: "项目节点数量已达到上限" });
+        }
+        nodeRow = (await client.query(
+          `INSERT INTO write_canvas_nodes
+             (user_id, project_id, kind, title, summary, ref_id, meta, x, y, width, height)
+           VALUES ($1, $2, 'citation', $3, $4, $5, $6, $7, $8, 320, 190)
+           ON CONFLICT DO NOTHING
+           RETURNING id, project_id AS "projectId", kind, title, summary, ref_id AS "refId",
+                     meta, x, y, width, height, created_at AS "createdAt", updated_at AS "updatedAt"`,
+          [
+            req.session.userId,
+            projectId,
+            selection.heading || article.title,
+            exact.slice(0, 500),
+            captureId,
+            JSON.stringify(nodeMeta),
+            x,
+            y,
+          ],
+        )).rows[0];
+        if (!nodeRow) {
+          nodeRow = (await client.query(
+            `SELECT id, project_id AS "projectId", kind, title, summary, ref_id AS "refId",
+                    meta, x, y, width, height, created_at AS "createdAt", updated_at AS "updatedAt"
+             FROM write_canvas_nodes
+             WHERE user_id = $1 AND project_id = $2 AND kind = 'citation' AND ref_id = $3`,
+            [req.session.userId, projectId, captureId],
+          )).rows[0];
+        } else {
+          created = true;
+        }
+      }
+      if (Number.isSafeInteger(targetAgentNodeId) && targetAgentNodeId > 0) {
+        const target = (await client.query(
+          `SELECT id FROM write_canvas_nodes
+           WHERE id = $1 AND user_id = $2 AND project_id = $3 AND kind = 'agent'
+           FOR SHARE`,
+          [targetAgentNodeId, req.session.userId, projectId],
+        )).rows[0];
+        if (!target) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "target agent node not found" });
+        }
+        edgeRow = (await client.query(
+          `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+           VALUES ($1, $2, $3, $4, 'context')
+           ON CONFLICT (project_id, source_node_id, target_node_id, relation)
+           DO UPDATE SET relation = EXCLUDED.relation
+           RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                     target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+          [req.session.userId, projectId, Number(nodeRow.id), targetAgentNodeId],
+        )).rows[0];
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return res.json({
+      node: mapCanvasNodeRow(nodeRow),
+      edge: edgeRow ? mapCanvasEdgeRow(edgeRow) : null,
+      created,
+    });
+  }));
+
+  app.delete("/api/write/canvas/projects/:id", requireAuth, asyncHandler(async (req, res) => {
+    const projectId = Number(req.params.id);
+    if (!Number.isSafeInteger(projectId) || projectId <= 0) return res.status(400).json({ error: "invalid project id" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const agentThreadIds = (await client.query(
+        `SELECT agent_thread_id FROM write_agent_instances
+         WHERE project_id = $1 AND user_id = $2 AND agent_thread_id IS NOT NULL
+         FOR UPDATE`,
+        [projectId, req.session.userId],
+      )).rows.map(row => Number(row.agent_thread_id));
+      if (await hasActiveCanvasAgentRun(client, req.session.userId, { projectId })) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          code: "CANVAS_AGENT_RUN_ACTIVE",
+          error: "项目中仍有 Agent 正在生成内容，请等待完成后再删除",
+          retryable: true,
+        });
+      }
       const result = await client.query(
         `DELETE FROM write_canvas_projects WHERE id = $1 AND user_id = $2`,
         [projectId, req.session.userId]
@@ -7368,14 +10403,10 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: "project not found" });
       }
-      const remaining = (await client.query(
-        `SELECT id FROM write_canvas_projects WHERE user_id = $1 LIMIT 1`,
-        [req.session.userId]
-      )).rows[0];
-      if (!remaining) {
+      if (agentThreadIds.length > 0) {
         await client.query(
-          `INSERT INTO write_canvas_projects (user_id, name) VALUES ($1, '我的魔法写作项目')`,
-          [req.session.userId]
+          `DELETE FROM write_agent_threads WHERE user_id = $1 AND id = ANY($2::bigint[])`,
+          [req.session.userId, agentThreadIds],
         );
       }
       await client.query("COMMIT");
@@ -7393,6 +10424,12 @@ async function startServer() {
     const kind = normalizeCanvasNodeKind(req.body?.kind);
     if (!Number.isFinite(projectId)) return res.status(400).json({ error: "invalid project id" });
     if (!kind) return res.status(400).json({ error: "invalid node kind" });
+    const requestId = typeof req.body?.requestId === "string" ? req.body.requestId.trim() : "";
+    if (requestId && !REQUEST_ID_PATTERN.test(requestId)) return res.status(400).json({ error: "requestId must be a UUID" });
+    const requestAction = kind === "podcast_episode" ? "add_podcast_episode" : "create_canvas_node";
+    if (kind === "citation") {
+      return res.status(400).json({ error: "citation nodes must be created through the citations API" });
+    }
     const x = clampNumber(req.body?.x, 120, -100000, 100000);
     const y = clampNumber(req.body?.y, 120, -100000, 100000);
     const width = clampNumber(req.body?.width, kind === "agent" ? 360 : 280, 160, 1200);
@@ -7413,6 +10450,7 @@ async function startServer() {
       return res.status(400).json({ error: "assetId is required for uploaded file or image nodes" });
     }
 
+    let createdNodeId: number | null = null;
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -7422,10 +10460,30 @@ async function startServer() {
       };
       await lockCanvasUser(client, req.session.userId);
       const project = (await client.query(
-        `SELECT id FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        `SELECT id, default_skill_config FROM write_canvas_projects WHERE id = $1 AND user_id = $2 FOR UPDATE`,
         [projectId, req.session.userId]
       )).rows[0];
       if (!project) return await fail(404, "project not found");
+      if (requestId) {
+        const existing = (await client.query(
+          `SELECT n.id, n.project_id AS "projectId", n.kind, n.title, n.summary,
+                  n.ref_id AS "refId", n.asset_id AS "assetId", n.agent_id AS "agentId",
+                  n.meta, n.x, n.y, n.width, n.height,
+                  n.created_at AS "createdAt", n.updated_at AS "updatedAt"
+           FROM write_canvas_action_requests r
+           JOIN write_canvas_nodes n ON n.id = r.result_node_id AND n.user_id = r.user_id
+           WHERE r.user_id = $1 AND r.request_id = $2 AND r.action = $3
+           FOR SHARE OF r, n`,
+          [req.session.userId, requestId, requestAction],
+        )).rows[0];
+        if (existing) {
+          if (Number(existing.projectId) !== projectId) {
+            return await fail(409, "requestId has already been used for a different project");
+          }
+          await client.query("COMMIT");
+          return res.json({ node: mapCanvasNodeRow(existing), reused: true });
+        }
+      }
       const nodeCount = Number((await client.query(
         `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
         [projectId, req.session.userId],
@@ -7442,10 +10500,14 @@ async function startServer() {
       const agentName = title || template?.name || defaults.name;
       const agentModel = resolveAllowedCanvasAgentModel(req.body?.model, template?.model || defaults.model);
       if (!agentModel) return await fail(400, "该模型未被服务器允许");
+      const requestedSkillConfig = Object.prototype.hasOwnProperty.call(req.body || {}, "skillConfig")
+        ? req.body.skillConfig
+        : template?.skill_config;
+      const skillConfig = await filterCanvasSkillConfig(client, req.session.userId, requestedSkillConfig);
       const row = (await client.query(
         `INSERT INTO write_agent_instances
-           (user_id, project_id, template_id, name, model, system_prompt, temperature, top_p, max_tokens)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           (user_id, project_id, template_id, name, model, system_prompt, temperature, top_p, max_tokens, skill_config)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING id`,
         [
           req.session.userId,
@@ -7456,7 +10518,8 @@ async function startServer() {
           req.body?.systemPrompt || template?.system_prompt || defaults.systemPrompt,
           clampNumber(req.body?.temperature ?? template?.temperature, defaults.temperature, 0, 2),
           clampNumber(req.body?.topP ?? template?.top_p, defaults.topP, 0.01, 1),
-          Math.round(clampNumber(req.body?.maxTokens ?? template?.max_tokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens()))
+          Math.round(clampNumber(req.body?.maxTokens ?? template?.max_tokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens())),
+          JSON.stringify(skillConfig),
         ]
       )).rows[0];
       agentId = Number(row.id);
@@ -7491,8 +10554,12 @@ async function startServer() {
       title = title || asset.title || "上传资料";
       summary = summary || normalizePlainText(asset.extracted_text || "").slice(0, 180);
       } else if (["saved_article", "atom_card", "note"].includes(kind)) {
-      const referenceId = Number(refId);
-      if (!Number.isSafeInteger(referenceId) || referenceId <= 0) return await fail(400, "valid refId is required");
+      const referenceId = kind === "atom_card" ? String(refId || "").trim() : Number(refId);
+      if (kind === "atom_card") {
+        if (!referenceId || String(referenceId).length > 128) return await fail(400, "valid refId is required");
+      } else if (!Number.isSafeInteger(referenceId) || Number(referenceId) <= 0) {
+        return await fail(400, "valid refId is required");
+      }
       const table = kind === "saved_article" ? "saved_articles" : kind === "atom_card" ? "saved_cards" : "notes";
       const reference = (await client.query(
         `SELECT id FROM ${table} WHERE id = $1 AND user_id = $2`,
@@ -7500,6 +10567,19 @@ async function startServer() {
       )).rows[0];
       if (!reference) return await fail(404, "referenced item not found");
       refId = String(referenceId);
+      } else if (kind === "podcast_episode") {
+      const episode = isPlainRecord(meta.episode) ? meta.episode : meta;
+      const audioUrl = typeof episode.audioUrl === "string" ? episode.audioUrl.trim().slice(0, 2048) : "";
+      if (audioUrl && !/^https?:\/\//i.test(audioUrl)) return await fail(400, "podcast audioUrl must use http or https");
+      const episodeTitle = typeof episode.title === "string" ? episode.title.trim().slice(0, 500) : title;
+      const episodeUrl = typeof episode.sourceUrl === "string"
+        ? episode.sourceUrl.trim().slice(0, 2048)
+        : typeof episode.url === "string" ? episode.url.trim().slice(0, 2048) : "";
+      title = title || episodeTitle || "播客单集";
+      summary = summary || (typeof episode.excerpt === "string" ? episode.excerpt.trim().slice(0, 500) : "");
+      refId = refId?.slice(0, 128) || createHash("sha256")
+        .update(`${episodeUrl}|${audioUrl}|${title}`, "utf8")
+        .digest("hex");
       }
 
       const nodeRow = (await client.query(
@@ -7523,83 +10603,156 @@ async function startServer() {
         height
       ]
       )).rows[0];
+      createdNodeId = Number(nodeRow.id);
+      if (requestId) {
+        await client.query(
+          `INSERT INTO write_canvas_action_requests (user_id, request_id, action, result_node_id)
+           VALUES ($1, $2, $3, $4)`,
+          [req.session.userId, requestId, requestAction, createdNodeId],
+        );
+      }
       await client.query("COMMIT");
-    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, projectId);
-    const node = detail?.nodes.find(item => item.id === Number(nodeRow.id));
-    res.json({ node });
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
     } finally {
       client.release();
     }
+    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, projectId);
+    const node = detail?.nodes.find(item => item.id === createdNodeId);
+    res.json({ node, reused: false });
   }));
 
   app.put("/api/write/canvas/nodes/:id", requireAuth, asyncHandler(async (req, res) => {
     const nodeId = Number(req.params.id);
     if (!Number.isFinite(nodeId)) return res.status(400).json({ error: "invalid node id" });
-    const current = (await pool.query(
-      `SELECT id, project_id, agent_id FROM write_canvas_nodes WHERE id = $1 AND user_id = $2`,
-      [nodeId, req.session.userId]
-    )).rows[0];
-    if (!current) return res.status(404).json({ error: "node not found" });
-    const requestedAgentModel = current.agent_id && typeof req.body?.model === "string" && req.body.model.trim()
-      ? resolveAllowedCanvasAgentModel(req.body.model, req.body.model)
-      : null;
-    if (current.agent_id && typeof req.body?.model === "string" && req.body.model.trim() && !requestedAgentModel) {
-      return res.status(400).json({ error: "该模型未被服务器允许" });
-    }
     const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 120) : null;
     const summary = typeof req.body?.summary === "string" ? req.body.summary.trim().slice(0, 500) : null;
+    const hasMetaUpdate = Object.prototype.hasOwnProperty.call(req.body || {}, "meta");
     const meta = isPlainRecord(req.body?.meta) ? req.body.meta : null;
-    await pool.query(
-      `UPDATE write_canvas_nodes
-       SET title = COALESCE($1, title),
-           summary = COALESCE($2, summary),
-           meta = COALESCE($3, meta),
-           x = COALESCE($4, x),
-           y = COALESCE($5, y),
-           width = COALESCE($6, width),
-           height = COALESCE($7, height),
-           updated_at = NOW()
-       WHERE id = $8 AND user_id = $9`,
-      [
-        title,
-        summary,
-        meta ? JSON.stringify(meta) : null,
-        req.body?.x === undefined ? null : clampNumber(req.body.x, 0, -100000, 100000),
-        req.body?.y === undefined ? null : clampNumber(req.body.y, 0, -100000, 100000),
-        req.body?.width === undefined ? null : clampNumber(req.body.width, 280, 160, 1200),
-        req.body?.height === undefined ? null : clampNumber(req.body.height, 180, 120, 1000),
-        nodeId,
-        req.session.userId
-      ]
-    );
-    if (current.agent_id) {
-      const defaults = getDefaultCanvasAgentConfig();
-      await pool.query(
-        `UPDATE write_agent_instances
-         SET name = COALESCE($1, name),
-             model = COALESCE($2, model),
-             system_prompt = COALESCE($3, system_prompt),
-             temperature = COALESCE($4, temperature),
-             top_p = COALESCE($5, top_p),
-             max_tokens = COALESCE($6, max_tokens),
+    let projectId: number | null = null;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const owner = (await client.query(
+        `SELECT project_id
+         FROM write_canvas_nodes
+         WHERE id = $1 AND user_id = $2`,
+        [nodeId, req.session.userId],
+      )).rows[0];
+      if (!owner) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "node not found" });
+      }
+      const project = (await client.query(
+        `SELECT id
+         FROM write_canvas_projects
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [owner.project_id, req.session.userId],
+      )).rows[0];
+      if (!project) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const current = (await client.query(
+        `SELECT id, project_id, kind, agent_id
+         FROM write_canvas_nodes
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [nodeId, req.session.userId],
+      )).rows[0];
+      if (!current) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "node not found" });
+      }
+      projectId = Number(current.project_id);
+      if (["citation", "podcast_episode", "result"].includes(String(current.kind)) && hasMetaUpdate) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "provenance metadata cannot be edited through the generic node API" });
+      }
+      const requestedAgentModel = current.agent_id && typeof req.body?.model === "string" && req.body.model.trim()
+        ? resolveAllowedCanvasAgentModel(req.body.model, req.body.model)
+        : null;
+      if (current.agent_id && typeof req.body?.model === "string" && req.body.model.trim() && !requestedAgentModel) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "该模型未被服务器允许" });
+      }
+      const hasSkillConfig = current.agent_id && Object.prototype.hasOwnProperty.call(req.body || {}, "skillConfig");
+      const skillConfig = hasSkillConfig
+        ? await filterCanvasSkillConfig(client, req.session.userId, req.body?.skillConfig)
+        : null;
+      if (current.agent_id) {
+        const lockedAgent = (await client.query(
+          `SELECT id
+           FROM write_agent_instances
+           WHERE id = $1 AND user_id = $2 AND project_id = $3
+           FOR UPDATE`,
+          [current.agent_id, req.session.userId, projectId],
+        )).rows[0];
+        if (!lockedAgent) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "agent not found" });
+        }
+      }
+      await client.query(
+        `UPDATE write_canvas_nodes
+         SET title = COALESCE($1, title),
+             summary = COALESCE($2, summary),
+             meta = COALESCE($3, meta),
+             x = COALESCE($4, x),
+             y = COALESCE($5, y),
+             width = COALESCE($6, width),
+             height = COALESCE($7, height),
              updated_at = NOW()
-         WHERE id = $7 AND user_id = $8`,
+         WHERE id = $8 AND user_id = $9`,
         [
           title,
-          requestedAgentModel,
-          typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : null,
-          req.body?.temperature === undefined ? null : clampNumber(req.body.temperature, defaults.temperature, 0, 2),
-          req.body?.topP === undefined ? null : clampNumber(req.body.topP, defaults.topP, 0.01, 1),
-          req.body?.maxTokens === undefined ? null : Math.round(clampNumber(req.body.maxTokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens())),
-          current.agent_id,
-          req.session.userId
-        ]
+          summary,
+          meta ? JSON.stringify(meta) : null,
+          req.body?.x === undefined ? null : clampNumber(req.body.x, 0, -100000, 100000),
+          req.body?.y === undefined ? null : clampNumber(req.body.y, 0, -100000, 100000),
+          req.body?.width === undefined ? null : clampNumber(req.body.width, 280, 160, 1200),
+          req.body?.height === undefined ? null : clampNumber(req.body.height, 180, 120, 1000),
+          nodeId,
+          req.session.userId,
+        ],
       );
+      if (current.agent_id) {
+        const defaults = getDefaultCanvasAgentConfig();
+        await client.query(
+          `UPDATE write_agent_instances
+           SET name = COALESCE($1, name),
+               model = COALESCE($2, model),
+               system_prompt = COALESCE($3, system_prompt),
+               temperature = COALESCE($4, temperature),
+               top_p = COALESCE($5, top_p),
+               max_tokens = COALESCE($6, max_tokens),
+               skill_config = COALESCE($7, skill_config),
+               updated_at = NOW()
+           WHERE id = $8 AND user_id = $9`,
+          [
+            title,
+            requestedAgentModel,
+            typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : null,
+            req.body?.temperature === undefined ? null : clampNumber(req.body.temperature, defaults.temperature, 0, 2),
+            req.body?.topP === undefined ? null : clampNumber(req.body.topP, defaults.topP, 0.01, 1),
+            req.body?.maxTokens === undefined ? null : Math.round(clampNumber(req.body.maxTokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens())),
+            skillConfig ? JSON.stringify(skillConfig) : null,
+            current.agent_id,
+            req.session.userId,
+          ],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
     }
-    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, Number(current.project_id));
+    const detail = await fetchCanvasProjectDetail(pool, req.session.userId, Number(projectId));
     const node = detail?.nodes.find(item => item.id === nodeId);
     res.json({ node });
   }));
@@ -7611,6 +10764,28 @@ async function startServer() {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const owner = (await client.query(
+        `SELECT project_id
+         FROM write_canvas_nodes
+         WHERE id = $1 AND user_id = $2`,
+        [nodeId, req.session.userId],
+      )).rows[0];
+      if (!owner) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "node not found" });
+      }
+      const project = (await client.query(
+        `SELECT id
+         FROM write_canvas_projects
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [owner.project_id, req.session.userId],
+      )).rows[0];
+      if (!project) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
       const current = (await client.query(
         `SELECT id, agent_id, asset_id
          FROM write_canvas_nodes
@@ -7621,6 +10796,25 @@ async function startServer() {
       if (!current) {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: "node not found" });
+      }
+      let agentThreadId: number | null = null;
+      if (current.agent_id) {
+        const agent = (await client.query(
+          `SELECT id, agent_thread_id
+           FROM write_agent_instances
+           WHERE id = $1 AND user_id = $2 AND project_id = $3
+           FOR UPDATE`,
+          [current.agent_id, req.session.userId, owner.project_id],
+        )).rows[0];
+        agentThreadId = agent?.agent_thread_id ? Number(agent.agent_thread_id) : null;
+        if (agent && await hasActiveCanvasAgentRun(client, req.session.userId, { agentId: Number(agent.id) })) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            code: "CANVAS_AGENT_RUN_ACTIVE",
+            error: "该 Agent 正在生成内容，请等待完成后再删除",
+            retryable: true,
+          });
+        }
       }
       if (current.asset_id) {
         await client.query(
@@ -7643,6 +10837,12 @@ async function startServer() {
              )`,
           [current.agent_id, req.session.userId]
         );
+        if (agentThreadId) {
+          await client.query(
+            `DELETE FROM write_agent_threads WHERE id = $1 AND user_id = $2`,
+            [agentThreadId, req.session.userId],
+          );
+        }
       }
       if (current.asset_id) {
         await client.query(
@@ -7669,27 +10869,150 @@ async function startServer() {
     const projectId = Number(req.body?.projectId);
     const sourceNodeId = Number(req.body?.sourceNodeId);
     const targetNodeId = Number(req.body?.targetNodeId);
-    if (![projectId, sourceNodeId, targetNodeId].every(Number.isFinite)) {
+    if (![projectId, sourceNodeId, targetNodeId].every(value => Number.isSafeInteger(value) && value > 0)) {
       return res.status(400).json({ error: "projectId, sourceNodeId and targetNodeId are required" });
     }
     if (sourceNodeId === targetNodeId) return res.status(400).json({ error: "cannot connect node to itself" });
-    const nodes = (await pool.query(
-      `SELECT id, kind FROM write_canvas_nodes
-       WHERE user_id = $1 AND project_id = $2 AND id = ANY($3::bigint[])`,
-      [req.session.userId, projectId, [sourceNodeId, targetNodeId]]
-    )).rows;
-    if (nodes.length !== 2) return res.status(404).json({ error: "nodes not found" });
-    const target = nodes.find(node => Number(node.id) === targetNodeId);
-    if (target?.kind !== "agent") return res.status(400).json({ error: "target node must be an agent" });
-    const row = (await pool.query(
-      `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
-       VALUES ($1, $2, $3, $4, 'context')
-       ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO UPDATE SET relation = EXCLUDED.relation
-       RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
-                 target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
-      [req.session.userId, projectId, sourceNodeId, targetNodeId]
-    )).rows[0];
-    res.json({ edge: mapCanvasEdgeRow(row) });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const project = (await client.query(
+        `SELECT id FROM write_canvas_projects
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [projectId, req.session.userId],
+      )).rows[0];
+      if (!project) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const nodes = (await client.query(
+        `SELECT id, kind FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND id = ANY($3::bigint[])
+         ORDER BY id ASC
+         FOR SHARE`,
+        [req.session.userId, projectId, [sourceNodeId, targetNodeId]],
+      )).rows;
+      const source = nodes.find(node => Number(node.id) === sourceNodeId);
+      const target = nodes.find(node => Number(node.id) === targetNodeId);
+      if (nodes.length !== 2 || !source || !target) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "nodes not found" });
+      }
+      if (source.kind === "agent" || target.kind !== "agent") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "context must connect material to an agent" });
+      }
+      const row = (await client.query(
+        `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+         VALUES ($1, $2, $3, $4, 'context')
+         ON CONFLICT (project_id, source_node_id, target_node_id, relation)
+         DO UPDATE SET relation = EXCLUDED.relation
+         RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                   target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+        [req.session.userId, projectId, sourceNodeId, targetNodeId],
+      )).rows[0];
+      await client.query("COMMIT");
+      return res.json({ edge: mapCanvasEdgeRow(row) });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.put("/api/write/canvas/edges/:id", requireAuth, asyncHandler(async (req, res) => {
+    const edgeId = Number(req.params.id);
+    const projectId = Number(req.body?.projectId);
+    const sourceNodeId = Number(req.body?.sourceNodeId);
+    const targetNodeId = Number(req.body?.targetNodeId);
+    if (![edgeId, projectId, sourceNodeId, targetNodeId].every(value => Number.isSafeInteger(value) && value > 0)) {
+      return res.status(400).json({ error: "edge id and valid endpoints are required" });
+    }
+    if (sourceNodeId === targetNodeId) return res.status(400).json({ error: "cannot connect node to itself" });
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const project = (await client.query(
+        `SELECT id FROM write_canvas_projects
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [projectId, req.session.userId],
+      )).rows[0];
+      if (!project) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "project not found" });
+      }
+      const nodes = (await client.query(
+        `SELECT id, kind FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND id = ANY($3::bigint[])
+         ORDER BY id ASC
+         FOR SHARE`,
+        [req.session.userId, projectId, [sourceNodeId, targetNodeId]],
+      )).rows;
+      const source = nodes.find(node => Number(node.id) === sourceNodeId);
+      const target = nodes.find(node => Number(node.id) === targetNodeId);
+      if (nodes.length !== 2 || !source || !target) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "nodes not found" });
+      }
+      if (source.kind === "agent" || target.kind !== "agent") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "context must connect material to an agent" });
+      }
+
+      // Keep the global canvas lock order consistent with clone and other
+      // project mutations: user -> project -> sorted nodes -> edge rows.
+      const current = (await client.query(
+        `SELECT id, project_id
+         FROM write_canvas_edges
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [edgeId, req.session.userId],
+      )).rows[0];
+      if (!current || Number(current.project_id) !== projectId) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "edge not found" });
+      }
+
+      const existing = (await client.query(
+        `SELECT id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                target_node_id AS "targetNodeId", relation, created_at AS "createdAt"
+         FROM write_canvas_edges
+         WHERE user_id = $1 AND project_id = $2 AND source_node_id = $3
+           AND target_node_id = $4 AND relation = 'context' AND id <> $5
+         FOR UPDATE`,
+        [req.session.userId, projectId, sourceNodeId, targetNodeId, edgeId],
+      )).rows[0];
+      let row: Record<string, unknown>;
+      if (existing) {
+        await client.query(
+          `DELETE FROM write_canvas_edges WHERE id = $1 AND user_id = $2`,
+          [edgeId, req.session.userId],
+        );
+        row = existing;
+      } else {
+        row = (await client.query(
+          `UPDATE write_canvas_edges
+           SET source_node_id = $1, target_node_id = $2
+           WHERE id = $3 AND user_id = $4 AND project_id = $5
+           RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                     target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+          [sourceNodeId, targetNodeId, edgeId, req.session.userId, projectId],
+        )).rows[0];
+      }
+      await client.query("COMMIT");
+      return res.json({ edge: mapCanvasEdgeRow(row) });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }));
 
   app.delete("/api/write/canvas/edges", requireAuth, asyncHandler(async (req, res) => {
@@ -7814,16 +11137,24 @@ async function startServer() {
   }));
 
   app.get("/api/write/agent/templates", requireAuth, asyncHandler(async (req, res) => {
-    const rows = (await pool.query(
+    const [rowsResult, availableSkills] = await Promise.all([
+      pool.query(
       `SELECT id, name, model, system_prompt AS "systemPrompt", temperature, top_p AS "topP",
-              max_tokens AS "maxTokens", created_at AS "createdAt", updated_at AS "updatedAt"
+              max_tokens AS "maxTokens", skill_config AS "skillConfig",
+              created_at AS "createdAt", updated_at AS "updatedAt"
        FROM write_agent_templates
        WHERE user_id = $1
        ORDER BY updated_at DESC
        LIMIT 100`,
-      [req.session.userId]
-    )).rows.map(mapAgentTemplateRow);
-    res.json({ templates: rows });
+      [req.session.userId],
+      ),
+      fetchWriteAgentSkills(pool, req.session.userId),
+    ]);
+    const templates = rowsResult.rows.map(row => {
+      const effective = resolveEffectiveCanvasSkillsFromAvailable(availableSkills, row.skillConfig, undefined, "inherit");
+      return mapAgentTemplateRow({ ...row, ...effective });
+    });
+    res.json({ templates });
   }));
 
   app.post("/api/write/agent/templates", requireAuth, asyncHandler(async (req, res) => {
@@ -7831,16 +11162,19 @@ async function startServer() {
     const name = typeof req.body?.name === "string" && req.body.name.trim() ? req.body.name.trim().slice(0, 60) : "写作 Agent 模板";
     const templateModel = resolveAllowedCanvasAgentModel(req.body?.model, defaults.model);
     if (!templateModel) return res.status(400).json({ error: "该模型未被服务器允许" });
+    const skillConfig = await filterCanvasSkillConfig(pool, req.session.userId, req.body?.skillConfig);
+    const effective = await resolveEffectiveCanvasSkills(pool, req.session.userId, skillConfig, undefined, "inherit");
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
       await lockCanvasUser(client, req.session.userId);
       const row = (await client.query(
-        `INSERT INTO write_agent_templates (user_id, name, model, system_prompt, temperature, top_p, max_tokens)
-         SELECT $1, $2, $3, $4, $5, $6, $7
+        `INSERT INTO write_agent_templates (user_id, name, model, system_prompt, temperature, top_p, max_tokens, skill_config)
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8
          WHERE (SELECT COUNT(*) FROM write_agent_templates WHERE user_id = $1) < 100
          RETURNING id, name, model, system_prompt AS "systemPrompt", temperature, top_p AS "topP",
-                   max_tokens AS "maxTokens", created_at AS "createdAt", updated_at AS "updatedAt"`,
+                   max_tokens AS "maxTokens", skill_config AS "skillConfig",
+                   created_at AS "createdAt", updated_at AS "updatedAt"`,
         [
           req.session.userId,
           name,
@@ -7848,7 +11182,8 @@ async function startServer() {
           typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : defaults.systemPrompt,
           clampNumber(req.body?.temperature, defaults.temperature, 0, 2),
           clampNumber(req.body?.topP, defaults.topP, 0.01, 1),
-          Math.round(clampNumber(req.body?.maxTokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens()))
+          Math.round(clampNumber(req.body?.maxTokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens())),
+          JSON.stringify(skillConfig),
         ]
       )).rows[0];
       if (!row) {
@@ -7856,7 +11191,7 @@ async function startServer() {
         return res.status(413).json({ error: "Agent 模板数量已达到上限" });
       }
       await client.query("COMMIT");
-      res.json({ template: mapAgentTemplateRow(row) });
+      res.json({ template: mapAgentTemplateRow({ ...row, ...effective }) });
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -7865,100 +11200,394 @@ async function startServer() {
     }
   }));
 
-  app.post("/api/write/canvas/agents/:id/chat/stream", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, canvasAgentConcurrencyMiddleware, asyncHandler(async (req, res) => {
-    const agentId = Number(req.params.id);
-    if (!Number.isFinite(agentId)) return res.status(400).json({ error: "invalid agent id" });
-    const message = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH) : "";
-    if (!message) return res.status(400).json({ error: "message is required" });
-    const agentRow = await getCanvasAgentNode(pool, req.session.userId, agentId);
-    if (!agentRow) return res.status(404).json({ error: "agent not found" });
-    if (!getOpenAIWriteAgentConfig()) {
-      return res.status(500).json({ error: "Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL" });
+  app.put("/api/write/agent/templates/:id", requireAuth, asyncHandler(async (req, res) => {
+    const templateId = Number(req.params.id);
+    if (!Number.isSafeInteger(templateId) || templateId <= 0) return res.status(400).json({ error: "invalid template id" });
+    const defaults = getDefaultCanvasAgentConfig();
+    const requestedModel = typeof req.body?.model === "string" && req.body.model.trim()
+      ? resolveAllowedCanvasAgentModel(req.body.model, req.body.model)
+      : null;
+    if (typeof req.body?.model === "string" && req.body.model.trim() && !requestedModel) {
+      return res.status(400).json({ error: "该模型未被服务器允许" });
     }
-    if (!isAllowedCanvasAgentModel(agentRow.model)) {
-      return res.status(400).json({ error: "该 Agent 使用的模型未被服务器允许，请先更新模型设置" });
-    }
+    const hasSkillConfig = Object.prototype.hasOwnProperty.call(req.body || {}, "skillConfig");
+    const skillConfig = hasSkillConfig
+      ? await filterCanvasSkillConfig(pool, req.session.userId, req.body.skillConfig)
+      : null;
+    const row = (await pool.query(
+      `UPDATE write_agent_templates
+       SET name = COALESCE($1, name), model = COALESCE($2, model),
+           system_prompt = COALESCE($3, system_prompt), temperature = COALESCE($4, temperature),
+           top_p = COALESCE($5, top_p), max_tokens = COALESCE($6, max_tokens),
+           skill_config = COALESCE($7, skill_config), updated_at = NOW()
+       WHERE id = $8 AND user_id = $9
+       RETURNING id, name, model, system_prompt AS "systemPrompt", temperature, top_p AS "topP",
+                 max_tokens AS "maxTokens", skill_config AS "skillConfig",
+                 created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [
+        typeof req.body?.name === "string" && req.body.name.trim() ? req.body.name.trim().slice(0, 60) : null,
+        requestedModel,
+        typeof req.body?.systemPrompt === "string" ? req.body.systemPrompt.slice(0, 8000) : null,
+        req.body?.temperature === undefined ? null : clampNumber(req.body.temperature, defaults.temperature, 0, 2),
+        req.body?.topP === undefined ? null : clampNumber(req.body.topP, defaults.topP, 0.01, 1),
+        req.body?.maxTokens === undefined ? null : Math.round(clampNumber(req.body.maxTokens, defaults.maxTokens, 128, getCanvasAgentMaxOutputTokens())),
+        skillConfig ? JSON.stringify(skillConfig) : null,
+        templateId,
+        req.session.userId,
+      ],
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: "template not found" });
+    const effective = await resolveEffectiveCanvasSkills(pool, req.session.userId, row.skillConfig, undefined, "inherit");
+    return res.json({ template: mapAgentTemplateRow({ ...row, ...effective }) });
+  }));
 
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.flushHeaders?.();
+  app.get("/api/write/canvas/agents/:id/skills", requireAuth, asyncHandler(async (req, res) => {
+    const agentId = Number(req.params.id);
+    if (!Number.isSafeInteger(agentId) || agentId <= 0) return res.status(400).json({ error: "invalid agent id" });
+    const row = (await pool.query(
+      `SELECT ai.skill_config AS "skillConfig", p.default_skill_config AS "projectDefaultSkillConfig"
+       FROM write_agent_instances ai
+       JOIN write_canvas_projects p ON p.id = ai.project_id AND p.user_id = ai.user_id
+       WHERE ai.id = $1 AND ai.user_id = $2`,
+      [agentId, req.session.userId],
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: "agent not found" });
+    return res.json(await resolveEffectiveCanvasSkills(
+      pool,
+      req.session.userId,
+      row.skillConfig,
+      row.projectDefaultSkillConfig,
+      "inherit",
+    ));
+  }));
+
+  app.post("/api/write/canvas/agents/:id/recall/confirm", requireAuth, asyncHandler(async (req, res) => {
+    const agentId = Number(req.params.id);
+    if (!Number.isSafeInteger(agentId) || agentId <= 0) return res.status(400).json({ error: "invalid agent id" });
+    const requestedIds: unknown[] = Array.isArray(req.body?.cardIds)
+      ? req.body.cardIds
+      : Array.isArray(req.body?.candidateCardIds) ? req.body.candidateCardIds : [];
+    const cardIds: string[] = Array.from(new Set<string>(requestedIds
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0 && value.trim().length <= 128)
+      .map(value => value.trim())))
+      .slice(0, 8);
+    if (cardIds.length === 0) return res.status(400).json({ error: "cardIds is required" });
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const agent = (await client.query(
+        `SELECT n.id AS node_id, n.project_id, n.x, n.y, n.width
+         FROM write_agent_instances ai
+         JOIN write_canvas_nodes n
+           ON n.agent_id = ai.id AND n.user_id = ai.user_id AND n.project_id = ai.project_id
+         WHERE ai.id = $1 AND ai.user_id = $2 AND n.kind = 'agent'
+         FOR UPDATE OF ai, n`,
+        [agentId, req.session.userId],
+      )).rows[0];
+      if (!agent) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "agent not found" });
+      }
+      const cards = (await client.query(
+        `SELECT id, type, content, summary, tags, article_title, saved_article_id
+         FROM saved_cards
+         WHERE user_id = $1 AND id = ANY($2::text[])`,
+        [req.session.userId, cardIds],
+      )).rows;
+      const cardsById = new Map(cards.map(card => [String(card.id), card]));
+      const missingCardIds = cardIds.filter(id => !cardsById.has(id));
+      if (missingCardIds.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "one or more cards were not found", missingCardIds });
+      }
+      const existingRows = (await client.query(
+        `SELECT id, project_id AS "projectId", kind, title, summary, ref_id AS "refId",
+                meta, x, y, width, height, created_at AS "createdAt", updated_at AS "updatedAt"
+         FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND kind = 'atom_card' AND ref_id = ANY($3::text[])
+         ORDER BY id ASC
+         FOR UPDATE`,
+        [req.session.userId, Number(agent.project_id), cardIds],
+      )).rows;
+      const existingByRefId = new Map(existingRows.map(row => [String(row.refId), row]));
+      const newCardCount = cardIds.filter(id => !existingByRefId.has(id)).length;
+      const nodeCount = Number((await client.query(
+        `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE user_id = $1 AND project_id = $2`,
+        [req.session.userId, Number(agent.project_id)],
+      )).rows[0]?.count || 0);
+      if (nodeCount + newCardCount > WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+        await client.query("ROLLBACK");
+        return res.status(413).json({ error: "项目节点数量已达到上限" });
+      }
+
+      const nodes: ReturnType<typeof mapCanvasNodeRow>[] = [];
+      const edges: ReturnType<typeof mapCanvasEdgeRow>[] = [];
+      const createdCardIds: string[] = [];
+      const reusedCardIds: string[] = [];
+      for (const [index, cardId] of cardIds.entries()) {
+        const card = cardsById.get(cardId);
+        let nodeRow = existingByRefId.get(cardId);
+        if (!nodeRow) {
+          nodeRow = (await client.query(
+            `INSERT INTO write_canvas_nodes
+               (user_id, project_id, kind, title, summary, ref_id, meta, x, y, width, height)
+             VALUES ($1, $2, 'atom_card', $3, $4, $5, $6, $7, $8, 300, 180)
+             RETURNING id, project_id AS "projectId", kind, title, summary, ref_id AS "refId",
+                       meta, x, y, width, height, created_at AS "createdAt", updated_at AS "updatedAt"`,
+            [
+              req.session.userId,
+              Number(agent.project_id),
+              `${String(card.type || "原子卡")} · ${String(card.article_title || "知识卡片")}`.slice(0, 120),
+              normalizePlainText(card.summary || card.content || "").slice(0, 500),
+              cardId,
+              JSON.stringify({
+                confirmedGlobalRecall: true,
+                card: {
+                  id: cardId,
+                  type: card.type,
+                  articleTitle: card.article_title,
+                  savedArticleId: card.saved_article_id ? Number(card.saved_article_id) : undefined,
+                },
+              }),
+              Number(agent.x) - 380 - (index % 3) * 28,
+              Number(agent.y) + index * 200,
+            ],
+          )).rows[0];
+          existingByRefId.set(cardId, nodeRow);
+          createdCardIds.push(cardId);
+        } else {
+          reusedCardIds.push(cardId);
+        }
+        const edgeRow = (await client.query(
+          `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+           VALUES ($1, $2, $3, $4, 'context')
+           ON CONFLICT (project_id, source_node_id, target_node_id, relation)
+           DO UPDATE SET relation = EXCLUDED.relation
+           RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                     target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+          [req.session.userId, Number(agent.project_id), Number(nodeRow.id), Number(agent.node_id)],
+        )).rows[0];
+        nodes.push(mapCanvasNodeRow(nodeRow));
+        edges.push(mapCanvasEdgeRow(edgeRow));
+      }
+      await client.query("COMMIT");
+      return res.json({
+        confirmed: cardIds,
+        createdCardIds,
+        reusedCardIds,
+        nodes,
+        edges,
+        usableOnNextGeneration: true,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.post("/api/write/canvas/agents/:id/chat/stream", requireAuth, paidOperationLimiter, canvasAgentChatValidationMiddleware, canvasCreateArticleReplayMiddleware, canvasAgentExecutionValidationMiddleware, canvasAgentContextValidationMiddleware, paidConcurrencyMiddleware, canvasAgentConcurrencyMiddleware, canvasCreateArticleClaimMiddleware, canvasCreateArticleNoteRecoveryMiddleware, canvasAgentExecutionLeaseMiddleware, canvasAgentDailyBudgetMiddleware, asyncHandler(async (req, res) => {
+    const runId = String(res.locals.canvasAgentRunId || randomUUID());
+    if (billingService && billingConfig.enabled) {
+      await billingService.recordUsage(req.session.userId!, `canvas-agent:${req.params.id}:${runId}`, "canvas_agent_chat");
+    }
+    const prepared = res.locals.canvasAgentChat;
+    const { userId, agentId, agentRow, message, focusedTopic, isCreateArticle, requestId, creationKey } = prepared;
+
     const send = (type: string, data: unknown) => {
       res.write(`event: ${type}\n`);
       res.write(`data: ${JSON.stringify(data)}\n\n`);
     };
 
-    const runId = randomUUID();
     const requestAbortController = new AbortController();
-    res.once("close", () => {
+    const abortDisconnectedRequest = () => {
       if (!res.writableFinished) requestAbortController.abort(new Error("Client disconnected"));
-    });
+    };
+    req.once("aborted", abortDisconnectedRequest);
+    res.once("close", abortDisconnectedRequest);
+    if (req.aborted || res.destroyed) abortDisconnectedRequest();
+    const configuredDeadlineAt = Number(res.locals.canvasAgentRunDeadlineAt);
+    const runDeadlineAt = Number.isFinite(configuredDeadlineAt)
+      ? configuredDeadlineAt
+      : Date.now() + canvasAgentRunDeadlineMs;
+    const runDeadlineRemainingMs = runDeadlineAt - Date.now();
+    const runDeadlineTimer = runDeadlineRemainingMs > 0
+      ? setTimeout(
+        () => requestAbortController.abort(new Error("Canvas Agent run deadline exceeded")),
+        runDeadlineRemainingMs,
+      )
+      : null;
+    runDeadlineTimer?.unref();
+    if (runDeadlineRemainingMs <= 0) {
+      requestAbortController.abort(new Error("Canvas Agent run deadline exceeded"));
+    }
     try {
+      requestAbortController.signal.throwIfAborted();
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
       send("partial_status", { runId, message: "读取画布连线上下文" });
-      const contexts = await resolveCanvasContextItems(pool, req.session.userId, Number(agentRow.node_id), Number(agentRow.project_id));
-      const previousMessages = (await pool.query(
-        `SELECT role, content
-         FROM write_canvas_agent_messages
-         WHERE user_id = $1 AND agent_id = $2
-         ORDER BY created_at DESC
-         LIMIT 10`,
-        [req.session.userId, agentId]
-      )).rows.reverse().filter(row => row.role === "user" || row.role === "assistant");
-      await pool.query(
-        `INSERT INTO write_canvas_agent_messages (user_id, agent_id, role, content, meta)
-         VALUES ($1, $2, 'user', $3, $4)`,
-        [req.session.userId, agentId, message, JSON.stringify({ runId })]
+      const contexts = Array.isArray(res.locals.canvasAgentContexts)
+        ? res.locals.canvasAgentContexts as CanvasContextItem[]
+        : await resolveCanvasContextItems(pool, userId, Number(agentRow.node_id), Number(agentRow.project_id));
+      const threadId = await ensureCanvasAgentThread(pool, userId, agentId);
+      if (!threadId) throw new Error("Canvas Agent thread could not be created");
+      if (!isCreateArticle) {
+        const leaseBound = await updateCanvasAgentExecutionLeaseThread({ userId, agentId, runId, threadId });
+        if (!leaseBound) throw new Error("Canvas Agent execution lease expired before provider invocation");
+      }
+      const allUserCards = await fetchUserSavedCards(pool, userId);
+      const linkedAtomCardIds = new Set(
+        contexts
+          .filter(context => context.kind === "atom_card" && context.refId)
+          .map(context => String(context.refId)),
       );
-      send("partial_status", { runId, message: `已连接 ${contexts.length} 个上下文节点` });
-      const completion = await requestCanvasAgentCompletion({
-        model: agentRow.model,
-        systemPrompt: agentRow.system_prompt,
+      const linkedCards = allUserCards.filter(card => linkedAtomCardIds.has(String(card.id)));
+      const connectedSyntheticCards = canvasContextsToWritingCards(
+        contexts.filter(context => context.kind !== "atom_card"),
+      );
+      const authorizedCards = [
+        ...linkedCards,
+        ...connectedSyntheticCards,
+      ];
+      const authorizedImages = contexts.flatMap(context => context.imageDataUrl ? [context.imageDataUrl] : []);
+      const authorizedIds = new Set(authorizedCards.map(card => String(card.id)));
+      const globalRecallCandidates = toolRecallCards(message, allUserCards, Array.from(authorizedIds))
+        .slice(0, 5)
+        .map(card => ({
+          cardId: String(card.id),
+          type: card.type,
+          title: card.articleTitle || "知识卡片",
+          preview: String(card.summary || card.content || "").slice(0, 180),
+          requiresConfirmation: true,
+          confirmationEndpoint: `/api/write/canvas/agents/${agentId}/recall/confirm`,
+        }));
+      const effectiveSkills = await resolveEffectiveCanvasSkills(
+        pool,
+        userId,
+        agentRow.skill_config,
+        agentRow.project_default_skill_config,
+        "inherit",
+      );
+      send("partial_status", {
+        runId,
+        message: `已连接 ${contexts.length} 个授权上下文节点`,
+        globalRecallCandidates,
+      });
+      requestAbortController.signal.throwIfAborted();
+      const graphState = await runOpenAIWriteAgentRuntime(pool, {
+        userId,
+        threadId,
+        threadType: "canvas",
         message,
-        contexts,
-        previousMessages,
+        isCreateArticle,
+        userState: {
+          focusedTopic,
+          activatedNodeIds: authorizedCards.map(card => String(card.id)),
+          selectedCardIds: authorizedCards.map(card => String(card.id)),
+          selectedSkillIds: effectiveSkills.effectiveSkillConfig.skillIds,
+          selectedStyleSkillId: effectiveSkills.effectiveSkillConfig.primaryStyleSkillId,
+          activationSummary: contexts.slice(0, 8).map(context => `${context.kind} · ${context.title}`),
+        },
+        authorizedCards,
+        authorizedImages,
+        agentSystemPrompt: agentRow.system_prompt,
+        model: agentRow.model,
         temperature: Number(agentRow.temperature),
         topP: Number(agentRow.top_p),
         maxTokens: Number(agentRow.max_tokens),
+        runId,
+        creationKey,
+        requestKey: isCreateArticle ? creationKey : undefined,
         signal: requestAbortController.signal,
-      });
-      const assistantRow = (await pool.query(
-        `INSERT INTO write_canvas_agent_messages (user_id, agent_id, role, content, meta)
-         VALUES ($1, $2, 'assistant', $3, $4)
-         RETURNING id, agent_id AS "agentId", role, content, meta, created_at AS "createdAt"`,
-        [
-          req.session.userId,
-          agentId,
-          completion.content,
-          JSON.stringify({
+        onProviderBoundary: isCreateArticle
+          ? () => renewCanvasCreateArticleRunLease({ userId, agentId, requestId, runId })
+          : () => renewCanvasAgentExecutionLease({ userId, agentId, runId }),
+        onBeforeProvider: isCreateArticle
+          ? () => beginCanvasCreateArticleProviderAttempt({ userId, agentId, requestId, runId })
+          : undefined,
+        onStep: async event => {
+          requestAbortController.signal.throwIfAborted();
+          send(event.type, {
             runId,
-            model: completion.model,
-            provider: completion.provider,
-            contextNodeIds: contexts.map(item => item.nodeId),
-            usedImages: completion.usedImages
-          })
-        ]
-      )).rows[0];
-      await pool.query(
-        `DELETE FROM write_canvas_agent_messages
-         WHERE user_id = $1 AND agent_id = $2 AND id IN (
-           SELECT id FROM write_canvas_agent_messages
-           WHERE user_id = $1 AND agent_id = $2
-           ORDER BY created_at DESC, id DESC
-           OFFSET $3
-         )`,
-        [req.session.userId, agentId, WRITE_CANVAS_MAX_MESSAGES_PER_AGENT],
-      );
-      send("final", {
+            node: event.node,
+            message: event.message,
+            ...(event.data && typeof event.data === "object" ? event.data as Record<string, unknown> : { data: event.data }),
+          });
+        },
+      });
+      requestAbortController.signal.throwIfAborted();
+      const note = graphState.persistedDraftNote || null;
+      const noteNode = note
+        ? await ensureCanvasGeneratedNoteNode(
+          pool,
+          userId,
+          agentId,
+          note,
+          threadId,
+          runId,
+        )
+        : null;
+      const assistantRow = {
+        id: Number(graphState.assistantMessageId || graphState.toolPayload?.messageId),
+        agentId,
+        role: "assistant" as const,
+        content: graphState.assistantContent,
+        meta: graphState.toolPayload || {},
+        createdAt: new Date().toISOString(),
+      };
+      const finalPayload = {
         runId,
         message: mapCanvasMessageRow(assistantRow),
+        threadId,
+        threadState: graphState.mergedState,
+        toolResult: graphState.toolPayload,
+        uiBlocks: graphState.uiBlocks || [],
+        choices: graphState.choices || [],
+        sources: graphState.sources,
+        note,
+        noteNode,
         context: {
           nodes: contexts.map(item => ({ nodeId: item.nodeId, kind: item.kind, title: item.title })),
-          usedImages: completion.usedImages
-        }
-      });
+          usedImages: Number(graphState.toolPayload?.usedImages) || 0,
+          authorizedCardIds: Array.from(authorizedIds),
+          globalRecallCandidates,
+          globalRecallRequiresConfirmation: globalRecallCandidates.length > 0,
+          globalRecallConfirmationEndpoint: `/api/write/canvas/agents/${agentId}/recall/confirm`,
+        },
+      };
+      if (isCreateArticle) {
+        await completeCanvasRunRequest({
+          userId,
+          agentId,
+          requestId,
+          runId,
+          payload: finalPayload,
+          noteId: note ? Number(note.id) : undefined,
+          threadId,
+        });
+      } else if (typeof res.locals.releaseCanvasAgentExecutionLease === "function") {
+        await res.locals.releaseCanvasAgentExecutionLease();
+      }
+      send("final", finalPayload);
       res.end();
     } catch (error) {
-      logger.error({ err: error, module: "canvas-agent", runId, agentId, userId: req.session.userId }, "Canvas agent failed");
+      if (isCreateArticle) {
+        try {
+          await failCanvasRunRequest({ userId, agentId, requestId, runId, error });
+        } catch (persistenceError) {
+          logger.error({ err: persistenceError, module: "canvas-agent", runId, agentId, userId }, "Failed to persist canvas run failure");
+        }
+      } else if (typeof res.locals.releaseCanvasAgentExecutionLease === "function") {
+        await res.locals.releaseCanvasAgentExecutionLease();
+      }
+      if (!requestAbortController.signal.aborted) {
+        logger.error({ err: error, module: "canvas-agent", runId, agentId, userId }, "Canvas agent failed");
+      }
       if (!res.destroyed && !res.writableEnded) {
         send("error", {
           runId,
@@ -7967,6 +11596,10 @@ async function startServer() {
         res.end();
       }
     } finally {
+      if (runDeadlineTimer) clearTimeout(runDeadlineTimer);
+      if (typeof res.locals.releaseCanvasAgentExecutionLease === "function") {
+        await res.locals.releaseCanvasAgentExecutionLease();
+      }
       if (typeof res.locals.releaseCanvasAgentConcurrency === "function") res.locals.releaseCanvasAgentConcurrency();
       if (typeof res.locals.releasePaidConcurrency === "function") res.locals.releasePaidConcurrency();
     }
@@ -7974,27 +11607,64 @@ async function startServer() {
 
   app.post("/api/write/canvas/agents/:id/save-result", requireAuth, asyncHandler(async (req, res) => {
     const agentId = Number(req.params.id);
-    if (!Number.isFinite(agentId)) return res.status(400).json({ error: "invalid agent id" });
+    if (!Number.isSafeInteger(agentId) || agentId <= 0) return res.status(400).json({ error: "invalid agent id" });
     const agentRow = await getCanvasAgentNode(pool, req.session.userId, agentId);
     if (!agentRow) return res.status(404).json({ error: "agent not found" });
-    let content = typeof req.body?.content === "string" ? req.body.content.trim() : "";
-    const messageId = Number(req.body?.messageId);
-    if (!content && Number.isFinite(messageId)) {
-      const messageRow = (await pool.query(
-        `SELECT content FROM write_canvas_agent_messages
-         WHERE id = $1 AND agent_id = $2 AND user_id = $3 AND role = 'assistant'`,
-        [messageId, agentId, req.session.userId]
-      )).rows[0];
-      content = messageRow?.content || "";
+    const hasMessageId = req.body?.messageId !== undefined && req.body?.messageId !== null && req.body?.messageId !== "";
+    const parsedMessageId = Number(req.body?.messageId);
+    if (hasMessageId && (!Number.isSafeInteger(parsedMessageId) || parsedMessageId <= 0)) {
+      return res.status(400).json({ error: "invalid messageId" });
     }
-    if (!content) return res.status(400).json({ error: "content or messageId is required" });
+    const messageId = hasMessageId ? parsedMessageId : null;
+    const requestId = typeof req.body?.requestId === "string" ? req.body.requestId.trim() : "";
+    if (!messageId && (!requestId || requestId.length > 128)) {
+      return res.status(400).json({ error: "requestId is required when saving direct content" });
+    }
+    const resultKey = messageId ? `message:${messageId}` : `request:${requestId}`;
+    const existingResult = (await pool.query(
+      `SELECT id
+       FROM write_canvas_nodes
+       WHERE user_id = $1 AND project_id = $2 AND kind = 'result'
+         AND meta->>'sourceAgentId' = $3 AND meta->>'resultKey' = $4`,
+      [req.session.userId, Number(agentRow.project_id), String(agentId), resultKey],
+    )).rows[0];
+    let content = "";
+    if (!existingResult && messageId) {
+      const threadId = await ensureCanvasAgentThread(pool, req.session.userId, agentId);
+      let messageRow = threadId ? (await pool.query(
+        `SELECT wam.content FROM write_agent_messages wam
+         JOIN write_agent_threads wat ON wat.id = wam.thread_id
+         WHERE wam.id = $1 AND wam.thread_id = $2 AND wat.user_id = $3 AND wam.role = 'assistant'`,
+        [messageId, threadId, req.session.userId]
+      )).rows[0] : null;
+      // A short compatibility window keeps old message ids usable after lazy
+      // migration; new writes only use write_agent_messages.
+      if (!messageRow) {
+        messageRow = (await pool.query(
+          `SELECT content FROM write_canvas_agent_messages
+           WHERE id = $1 AND agent_id = $2 AND user_id = $3 AND role = 'assistant'`,
+          [messageId, agentId, req.session.userId],
+        )).rows[0];
+      }
+      content = messageRow?.content || "";
+    } else if (!existingResult) {
+      content = typeof req.body?.content === "string" ? req.body.content.trim() : "";
+    }
+    if (!content && !existingResult) return res.status(400).json({ error: "content or messageId is required" });
     content = content.slice(0, WRITE_AGENT_MAX_MESSAGE_LENGTH);
+    const resultMeta = {
+      sourceAgentId: agentId,
+      messageId,
+      ...(!messageId ? { requestId } : {}),
+      resultKey,
+    };
     const title = typeof req.body?.title === "string" && req.body.title.trim()
       ? req.body.title.trim().slice(0, 120)
       : "Agent 输出";
     const client = await pool.connect();
     let nodeId: number;
     let edgeRow: Record<string, unknown>;
+    let created = false;
     try {
       await client.query("BEGIN");
       await lockCanvasUser(client, req.session.userId);
@@ -8018,56 +11688,87 @@ async function startServer() {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: "agent not found" });
       }
-      const nodeCount = Number((await client.query(
-        `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
-        [lockedAgent.project_id, req.session.userId],
-      )).rows[0]?.count || 0);
-      if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
-        await client.query("ROLLBACK");
-        return res.status(413).json({ error: "项目节点数量已达到上限" });
-      }
-      const newAssetBytes = Buffer.byteLength(content, "utf8") * 2;
-      const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
-      if (storedBytes + newAssetBytes > canvasUserStorageMaxBytes) {
-        await client.query("ROLLBACK");
-        return res.status(413).json({ error: "画布资料存储额度已用完，请删除旧资料后重试" });
-      }
-      const assetRow = (await client.query(
-        `INSERT INTO write_canvas_assets (user_id, project_id, type, title, content_text, extracted_text, meta)
-         VALUES ($1, $2, 'text', $3, $4, $4, $5)
-         RETURNING id`,
-        [req.session.userId, lockedAgent.project_id, title, content, JSON.stringify({ sourceAgentId: agentId, messageId: Number.isFinite(messageId) ? messageId : null })]
+      const existingNode = (await client.query(
+        `SELECT id
+         FROM write_canvas_nodes
+         WHERE user_id = $1 AND project_id = $2 AND kind = 'result'
+           AND meta->>'sourceAgentId' = $3 AND meta->>'resultKey' = $4
+         FOR UPDATE`,
+        [req.session.userId, lockedAgent.project_id, String(agentId), resultKey],
       )).rows[0];
-      const nodeRow = (await client.query(
-        `INSERT INTO write_canvas_nodes
-           (user_id, project_id, kind, title, summary, asset_id, meta, x, y, width, height)
-         SELECT $1, n.project_id, 'result', $2, $3, $4, $5, n.x + 420, n.y + 40, 320, 220
-         FROM write_canvas_nodes n
-         WHERE n.id = $6 AND n.user_id = $1
-         RETURNING id`,
-        [
-          req.session.userId,
-          title,
-          normalizePlainText(content).slice(0, 180),
-          Number(assetRow.id),
-          JSON.stringify({ sourceAgentId: agentId, messageId: Number.isFinite(messageId) ? messageId : null }),
-          Number(lockedAgent.node_id)
-        ]
-      )).rows[0];
-      if (!nodeRow) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ error: "agent node not found" });
+      if (existingNode) {
+        nodeId = Number(existingNode.id);
+        edgeRow = (await client.query(
+          `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+           VALUES ($1, $2, $3, $4, 'context')
+           ON CONFLICT (project_id, source_node_id, target_node_id, relation)
+           DO UPDATE SET relation = EXCLUDED.relation
+           RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                     target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+          [req.session.userId, lockedAgent.project_id, nodeId, Number(lockedAgent.node_id)],
+        )).rows[0];
+        await client.query("COMMIT");
+      } else {
+        // The optimistic lookup above lets retries succeed even after their source
+        // message is gone. Re-check the captured payload after taking the user and
+        // project locks so a concurrent result deletion cannot create an empty
+        // replacement asset.
+        if (!content) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({ error: "来源消息已不可用，请重新生成后再保存" });
+        }
+        const nodeCount = Number((await client.query(
+          `SELECT COUNT(*)::int AS count FROM write_canvas_nodes WHERE project_id = $1 AND user_id = $2`,
+          [lockedAgent.project_id, req.session.userId],
+        )).rows[0]?.count || 0);
+        if (nodeCount >= WRITE_CANVAS_MAX_NODES_PER_PROJECT) {
+          await client.query("ROLLBACK");
+          return res.status(413).json({ error: "项目节点数量已达到上限" });
+        }
+        const newAssetBytes = Buffer.byteLength(content, "utf8") * 2;
+        const storedBytes = await getCanvasStoredBytes(client, req.session.userId);
+        if (storedBytes + newAssetBytes > canvasUserStorageMaxBytes) {
+          await client.query("ROLLBACK");
+          return res.status(413).json({ error: "画布资料存储额度已用完，请删除旧资料后重试" });
+        }
+        const assetRow = (await client.query(
+          `INSERT INTO write_canvas_assets (user_id, project_id, type, title, content_text, extracted_text, meta)
+           VALUES ($1, $2, 'text', $3, $4, $4, $5)
+           RETURNING id`,
+          [req.session.userId, lockedAgent.project_id, title, content, JSON.stringify(resultMeta)]
+        )).rows[0];
+        const nodeRow = (await client.query(
+          `INSERT INTO write_canvas_nodes
+             (user_id, project_id, kind, title, summary, asset_id, meta, x, y, width, height)
+           SELECT $1, n.project_id, 'result', $2, $3, $4, $5, n.x + 420, n.y + 40, 320, 220
+           FROM write_canvas_nodes n
+           WHERE n.id = $6 AND n.user_id = $1
+           RETURNING id`,
+          [
+            req.session.userId,
+            title,
+            normalizePlainText(content).slice(0, 180),
+            Number(assetRow.id),
+            JSON.stringify(resultMeta),
+            Number(lockedAgent.node_id)
+          ]
+        )).rows[0];
+        if (!nodeRow) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "agent node not found" });
+        }
+        nodeId = Number(nodeRow.id);
+        created = true;
+        edgeRow = (await client.query(
+          `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
+           VALUES ($1, $2, $3, $4, 'context')
+           ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO UPDATE SET relation = EXCLUDED.relation
+           RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
+                     target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
+          [req.session.userId, lockedAgent.project_id, nodeId, Number(lockedAgent.node_id)]
+        )).rows[0];
+        await client.query("COMMIT");
       }
-      nodeId = Number(nodeRow.id);
-      edgeRow = (await client.query(
-        `INSERT INTO write_canvas_edges (user_id, project_id, source_node_id, target_node_id, relation)
-         VALUES ($1, $2, $3, $4, 'context')
-         ON CONFLICT (project_id, source_node_id, target_node_id, relation) DO UPDATE SET relation = EXCLUDED.relation
-         RETURNING id, project_id AS "projectId", source_node_id AS "sourceNodeId",
-                   target_node_id AS "targetNodeId", relation, created_at AS "createdAt"`,
-        [req.session.userId, lockedAgent.project_id, nodeId, Number(lockedAgent.node_id)]
-      )).rows[0];
-      await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -8077,12 +11778,13 @@ async function startServer() {
     const detail = await fetchCanvasProjectDetail(pool, req.session.userId, Number(agentRow.project_id));
     res.json({
       node: detail?.nodes.find(item => item.id === nodeId),
-      edge: mapCanvasEdgeRow(edgeRow)
+      edge: mapCanvasEdgeRow(edgeRow),
+      created,
     });
   }));
 
   app.get("/api/write/agent/threads", requireAuth, asyncHandler(async (req, res) => {
-    const threadType = req.query.type === 'skill' ? 'skill' : 'chat';
+    const threadType = req.query.type === 'skill' ? 'skill' : req.query.type === 'canvas' ? 'canvas' : 'chat';
     const rows = (await pool.query(
       `SELECT id, title, summary, state, thread_type, created_at, updated_at
        FROM write_agent_threads
@@ -8096,7 +11798,7 @@ async function startServer() {
 
   app.post("/api/write/agent/threads", requireAuth, asyncHandler(async (req, res) => {
     const { title, threadType } = req.body || {};
-    const normalizedType = threadType === 'skill' ? 'skill' : 'chat';
+    const normalizedType = threadType === 'skill' ? 'skill' : threadType === 'canvas' ? 'canvas' : 'chat';
     const row = (await pool.query(
       `INSERT INTO write_agent_threads (user_id, title, thread_type)
        VALUES ($1, $2, $3)
@@ -8109,12 +11811,64 @@ async function startServer() {
   app.delete("/api/write/agent/threads/:id", requireAuth, asyncHandler(async (req, res) => {
     const threadId = Number(req.params.id);
     if (!Number.isSafeInteger(threadId) || threadId <= 0) return res.status(400).json({ error: "invalid thread id" });
-    const result = await pool.query(
-      `DELETE FROM write_agent_threads WHERE id = $1 AND user_id = $2`,
-      [threadId, req.session.userId],
-    );
-    if (result.rowCount !== 1) return res.status(404).json({ error: "thread not found" });
-    return res.json({ success: true });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockCanvasUser(client, req.session.userId);
+      const thread = (await client.query(
+        `SELECT id, thread_type
+         FROM write_agent_threads
+         WHERE id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [threadId, req.session.userId],
+      )).rows[0];
+      if (!thread) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "thread not found" });
+      }
+      const boundAgents = (await client.query(
+        `SELECT id
+         FROM write_agent_instances
+         WHERE user_id = $1 AND agent_thread_id = $2
+         ORDER BY id
+         FOR UPDATE`,
+        [req.session.userId, threadId],
+      )).rows;
+      if (boundAgents.length > 0) {
+        let hasActiveRun = false;
+        for (const agent of boundAgents) {
+          if (await hasActiveCanvasAgentRun(client, req.session.userId, { agentId: Number(agent.id) })) {
+            hasActiveRun = true;
+            break;
+          }
+        }
+        if (hasActiveRun) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            code: "CANVAS_AGENT_RUN_ACTIVE",
+            error: "该画布会话仍有 Agent 正在生成内容，请等待完成",
+            retryable: true,
+          });
+        }
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          code: "CANVAS_THREAD_MANAGED",
+          error: "画布 Agent 会话由所属项目管理，请从画布删除 Agent 或项目",
+          retryable: false,
+        });
+      }
+      await client.query(
+        `DELETE FROM write_agent_threads WHERE id = $1 AND user_id = $2`,
+        [threadId, req.session.userId],
+      );
+      await client.query("COMMIT");
+      return res.json({ success: true });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }));
 
   app.get("/api/write/agent/threads/:id/messages", requireAuth, asyncHandler(async (req, res) => {
@@ -8284,18 +12038,21 @@ async function startServer() {
 	    res.json({ success: true });
 	  }));
 
-	  app.post("/api/write/agent/skills/generate", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
-	    const { userInput, sampleText } = req.body;
+		  app.post("/api/write/agent/skills/generate", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+		    const { userInput, sampleText } = req.body;
 
 	    if (!userInput || typeof userInput !== "string" || userInput.trim().length < 5) {
 	      return res.status(400).json({ error: "userInput is required and must be at least 5 characters" });
 	    }
 
-	    if (sampleText !== undefined && typeof sampleText !== "string") {
-	      return res.status(400).json({ error: "sampleText must be a string if provided" });
-	    }
+		    if (sampleText !== undefined && typeof sampleText !== "string") {
+		      return res.status(400).json({ error: "sampleText must be a string if provided" });
+		    }
+		    if (billingService && billingConfig.enabled) {
+		      await billingService.recordUsage(req.session.userId!, `skill-generate:${randomUUID()}`, "skill_generate");
+		    }
 
-	    const result = await runSkillCreationGraph(pool, {
+		    const result = await runSkillCreationGraph(pool, {
 	      userId: req.session.userId!,
 	      userInput: userInput.trim(),
 	      sampleText: sampleText?.trim(),
@@ -8416,6 +12173,10 @@ async function startServer() {
     const normalizedMessage = isCreateArticle
       ? (typeof message === 'string' && message.trim() ? message.trim() : '请根据当前对话和激活网络创建一篇文章')
       : message.trim();
+    const requestId = typeof body?.requestId === 'string' ? body.requestId.trim() : '';
+    if (isCreateArticle && (!requestId || requestId.length > 128)) {
+      return { error: 'requestId is required for create_article' };
+    }
     const graphUserState: WriteAgentState = {
       focusedTopic: typeof focusedTopic === 'string' ? focusedTopic : undefined,
       activatedNodeIds: Array.isArray(activatedNodeIds) ? activatedNodeIds.filter((id): id is string => typeof id === 'string') : undefined,
@@ -8433,6 +12194,7 @@ async function startServer() {
       threadId: threadId ? Number(threadId) : undefined,
       normalizedMessage,
       isCreateArticle,
+      requestId: requestId || undefined,
       graphUserState
     };
   };
@@ -8467,12 +12229,15 @@ async function startServer() {
     }
   });
 
-  app.post("/api/write/agent/chat/stream", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/write/agent/chat/stream", requireAuth, paidOperationLimiter, writingAgentDailyBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const runId = randomUUID();
     const parsed = buildWriteAgentRequest(req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
     if (!getOpenAIWriteAgentConfig()) {
       return res.status(500).json({ error: 'Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL' });
+    }
+    if (billingService && billingConfig.enabled) {
+      await billingService.recordUsage(req.session.userId!, `write-agent:${runId}`, "write_agent_chat");
     }
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -8484,17 +12249,25 @@ async function startServer() {
       res.write(`event: ${type}\n`);
       res.write(`data: ${JSON.stringify(data)}\n\n`);
     };
+    const requestAbortController = new AbortController();
+    res.once('close', () => {
+      if (!res.writableFinished) requestAbortController.abort(new Error('Client disconnected'));
+    });
 
     try {
       send('partial_status', { runId, message: '启动写作 Agent' });
       const graphState = await runOpenAIWriteAgentRuntime(pool, {
         userId: req.session.userId,
         threadId: parsed.threadId,
+        threadType: "chat",
         message: parsed.normalizedMessage,
         isCreateArticle: parsed.isCreateArticle,
         userState: parsed.graphUserState,
         runId,
+        creationKey: parsed.isCreateArticle ? `write:${parsed.requestId}` : undefined,
+        signal: requestAbortController.signal,
         onStep: async event => {
+          requestAbortController.signal.throwIfAborted();
           send(event.type, {
             runId,
             node: event.node,
@@ -8515,30 +12288,45 @@ async function startServer() {
       send('final', buildWriteAgentResponse(graphState));
       res.end();
     } catch (error) {
-      logger.error({ err: error, module: "write-agent-stream", runId, userId: req.session.userId }, "Streaming write agent failed");
-      send('error', {
-        runId,
-        message: error instanceof Error && error.message ? error.message : '写作助手暂时不可用'
-      });
-      res.end();
+      if (!requestAbortController.signal.aborted) {
+        logger.error({ err: error, module: "write-agent-stream", runId, userId: req.session.userId }, "Streaming write agent failed");
+      }
+      if (!res.destroyed && !res.writableEnded) {
+        send('error', {
+          runId,
+          message: error instanceof Error && error.message ? error.message : '写作助手暂时不可用'
+        });
+        res.end();
+      }
     }
   }));
 
-  app.post("/api/write/agent/chat", requireAuth, paidOperationLimiter, dailyPaidOperationBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
+  app.post("/api/write/agent/chat", requireAuth, paidOperationLimiter, writingAgentDailyBudgetMiddleware, paidConcurrencyMiddleware, asyncHandler(async (req, res) => {
     const runId = randomUUID();
     const parsed = buildWriteAgentRequest(req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
     if (!getOpenAIWriteAgentConfig()) {
       return res.status(500).json({ error: 'Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL' });
     }
+    if (billingService && billingConfig.enabled) {
+      await billingService.recordUsage(req.session.userId!, `write-agent:${runId}`, "write_agent_chat");
+    }
 
+    const requestAbortController = new AbortController();
+    req.once('aborted', () => requestAbortController.abort(new Error('Client disconnected')));
+    res.once('close', () => {
+      if (!res.writableFinished) requestAbortController.abort(new Error('Client disconnected'));
+    });
     const graphState = await runOpenAIWriteAgentRuntime(pool, {
       userId: req.session.userId,
       threadId: parsed.threadId,
+      threadType: "chat",
       message: parsed.normalizedMessage,
       isCreateArticle: parsed.isCreateArticle,
       userState: parsed.graphUserState,
-      runId
+      runId,
+      creationKey: parsed.isCreateArticle ? `write:${parsed.requestId}` : undefined,
+      signal: requestAbortController.signal,
     });
 
     logger.info({
@@ -8916,7 +12704,7 @@ async function startServer() {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ module: "server", signal }, "Graceful shutdown started");
-    clearInterval(feedRefreshTimer);
+    rssRuntime?.shutdown();
     clearInterval(verificationCleanupTimer);
     for (const client of wss.clients) client.close(1012, "Server restarting");
 

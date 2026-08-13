@@ -41,6 +41,8 @@ const itemKey = (url: string | undefined, source: string, title: string) =>
   normalize(url)
     ? `url:${normalize(url)}`
     : `title:${normalize(source).toLocaleLowerCase()}::${normalize(title).toLocaleLowerCase()}`;
+const previewItemId = (article: Article, source: string) =>
+  `article:${article.id}:${encodeURIComponent(itemKey(article.url, source, article.title))}`;
 
 const textSummary = (value?: string) => {
   const text = normalize(value)
@@ -84,15 +86,16 @@ export function buildPodcastPreviewItems(
   const subscriptionItems = articles.map(article => {
     const saved = matchSavedArticle(article, savedArticles);
     if (saved) consumedSavedIds.add(saved.id);
-    const audioUrl = normalize(article.audioUrl) || undefined;
+    const audioUrl = normalize(article.audioUrl) || normalize(saved?.audioUrl) || undefined;
+    const source = getDisplaySource(article);
     return {
-      id: `article:${article.id}`,
+      id: previewItemId(article, source),
       articleId: article.id,
       savedArticleId: saved?.id,
       origin: "subscription" as const,
       kind: audioUrl ? "native_episode" as const : "article_pending" as const,
       title: normalize(article.title) || "未命名内容",
-      source: getDisplaySource(article),
+      source,
       topic: normalize(article.topic) || "未分类",
       publishedAt: isoOrEmpty(article.publishedAt),
       publishedAtMs: timestampOf(article.publishedAt),
@@ -102,7 +105,9 @@ export function buildPodcastPreviewItems(
       imageUrl: article.sourceImages?.[0] || saved?.sourceImages?.[0] || article.sourceIcon,
       sourceUrl: normalize(article.url) || saved?.url,
       audioUrl,
-      audioDuration: audioUrl ? normalize(article.audioDuration) || undefined : undefined,
+      audioDuration: audioUrl
+        ? normalize(article.audioDuration) || normalize(saved?.audioDuration) || undefined
+        : undefined,
       isSaved: article.saved || Boolean(saved),
     };
   });
@@ -111,11 +116,12 @@ export function buildPodcastPreviewItems(
     .filter(saved => !consumedSavedIds.has(saved.id))
     .map(saved => {
       const publishedAtMs = timestampOf(saved.publishedAt ?? saved.savedAt);
+      const audioUrl = normalize(saved.audioUrl) || undefined;
       return {
         id: `saved:${saved.id}`,
         savedArticleId: saved.id,
         origin: "saved" as const,
-        kind: "article_pending" as const,
+        kind: audioUrl ? "native_episode" as const : "article_pending" as const,
         title: normalize(saved.title) || "未命名收藏",
         source: normalize(saved.source) || "未知来源",
         topic: normalize(saved.topic) || "未分类",
@@ -126,6 +132,8 @@ export function buildPodcastPreviewItems(
         contextBasis: "rss_summary" as const,
         imageUrl: saved.sourceImages?.[0] || saved.sourceIcon,
         sourceUrl: normalize(saved.url) || undefined,
+        audioUrl,
+        audioDuration: audioUrl ? normalize(saved.audioDuration) || undefined : undefined,
         isSaved: true,
       };
     });

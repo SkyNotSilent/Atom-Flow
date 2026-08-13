@@ -41,6 +41,8 @@ const savedArticles: SavedArticle[] = [
     topic: "产品",
     excerpt: "收藏版本摘要",
     sourceImages: ["https://cdn.example.com/article-cover.jpg"],
+    audioUrl: "https://cdn.example.com/matched-saved.mp3",
+    audioDuration: "18:20",
     publishedAt: now - 40 * 60 * 1000,
     savedAt: new Date(now - 20 * 60 * 1000).toISOString(),
   },
@@ -51,6 +53,8 @@ const savedArticles: SavedArticle[] = [
     source: "少数派",
     topic: "效率",
     excerpt: "旧收藏仍可进入为你生成候选。",
+    audioUrl: "https://cdn.example.com/saved-only.mp3",
+    audioDuration: "42:05",
     publishedAt: now - 20 * 24 * 60 * 60 * 1000,
     savedAt: new Date(now - 10 * 60 * 1000).toISOString(),
   },
@@ -59,6 +63,12 @@ const savedArticles: SavedArticle[] = [
 const items = buildPodcastPreviewItems(articles, savedArticles);
 assert.equal(items.length, 3);
 
+const collidingIdItems = buildPodcastPreviewItems([
+  baseArticle({ id: 7, title: "内置文章", url: "https://example.com/builtin" }),
+  baseArticle({ id: 7, title: "用户订阅文章", url: "https://example.com/custom" }),
+], []);
+assert.equal(new Set(collidingIdItems.map(item => item.id)).size, 2, "podcast browsing ids must remain unique when article ids collide across stores");
+
 const native = items.find(item => item.articleId === 11);
 assert.equal(native?.kind, "native_episode");
 assert.equal(native?.audioUrl, "https://cdn.example.com/episode.mp3");
@@ -66,17 +76,20 @@ assert.equal(native?.audioDuration, "25:12");
 assert.equal(native?.contextBasis, "rss_summary");
 
 const matched = items.find(item => item.articleId === 12);
-assert.equal(matched?.kind, "article_pending");
+assert.equal(matched?.kind, "native_episode");
 assert.equal(matched?.savedArticleId, 201);
 assert.equal(matched?.isSaved, true);
 assert.equal(matched?.imageUrl, "https://cdn.example.com/article-cover.jpg");
-assert.equal(matched?.audioUrl, undefined);
+assert.equal(matched?.audioUrl, "https://cdn.example.com/matched-saved.mp3");
+assert.equal(matched?.audioDuration, "18:20");
 
 const savedOnly = items.find(item => item.savedArticleId === 202);
 assert.equal(savedOnly?.origin, "saved");
 assert.equal(savedOnly?.articleId, undefined);
 assert.equal(savedOnly?.isSaved, true);
-assert.equal(savedOnly?.kind, "article_pending");
+assert.equal(savedOnly?.kind, "native_episode");
+assert.equal(savedOnly?.audioUrl, "https://cdn.example.com/saved-only.mp3");
+assert.equal(savedOnly?.audioDuration, "42:05");
 
 assert.equal(filterPodcastItems(items, "for_you", "today", now).length, 3);
 assert.deepEqual(filterPodcastItems(items, "short", "today", now), []);
