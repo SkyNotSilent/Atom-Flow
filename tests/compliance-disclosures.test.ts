@@ -17,6 +17,8 @@ assert.match(server, /app\.get\("\/legal\/:document"/, "The deployed instance mu
 assert.match(server, /DEPLOYMENT_OPERATOR_NAME/, "Production legal documents must use deployment identity variables");
 assert.match(server, /DATA_HOSTING_REGION/, "Production legal documents must identify their storage region");
 assert.match(server, /LEGAL_PLACEHOLDER_PATTERN/, "Production must reject unresolved legal placeholders");
+assert.match(server, /validateProductionLegalConfiguration\(appUrl, billingConfig\.enabled\)/, "Legal configuration must be gated by the live billing switch");
+assert.match(server, /if \(!isProduction \|\| !billingEnabled\) return;/, "Billing-disabled production must remain deployable without live legal metadata");
 assert.match(server, /your-domain\\\.example\|replace-/, "Production must reject example public origins");
 assert.doesNotMatch(login, /github\.com\/SkyNotSilent\/Atom-Flow\/blob\/main\/(PRIVACY|TERMS)\.md/, "Login legal links must be instance-owned");
 assert.match(login, /href="\/legal\/privacy"/);

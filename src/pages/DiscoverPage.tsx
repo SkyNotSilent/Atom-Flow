@@ -4,6 +4,7 @@ import { Check, Plus } from 'lucide-react';
 import { cn } from '../components/Nav';
 import { logger } from '../utils/logger';
 import { OFFICIAL_SOURCE_ICON_URLS } from '../data/sourceIcons';
+import { getProxiedFaviconUrl } from '../utils/proxiedMedia';
 
 interface SourceRecommendation {
   name: string;
@@ -123,6 +124,8 @@ export const DiscoverPage: React.FC = () => {
       }));
 
       setAddedSources(prev => new Set(prev).add(source.name));
+      window.dispatchEvent(new Event('atomflow:source-layout-changed'));
+      await reloadArticles();
       showToast(`已添加 ${source.name}`);
       window.dispatchEvent(new Event('atomflow:preferences-loaded'));
     } catch (error) {
@@ -191,13 +194,11 @@ export const DiscoverPage: React.FC = () => {
       }));
 
       setAddedSources(prev => new Set(prev).add(sourceName));
+      window.dispatchEvent(new Event('atomflow:source-layout-changed'));
       await reloadArticles();
       showToast(`已添加 ${sourceName}`);
       setCustomInput('');
       setCustomAlias('');
-      
-      // 触发页面刷新以更新导航栏
-      window.location.reload();
     } catch (error) {
       logger.error('Failed to add custom source', { error, source: sourceName });
       showToast('添加失败，请检查链接是否正确');
@@ -305,7 +306,7 @@ export const DiscoverPage: React.FC = () => {
                 >
                   {source.icon ? (
                     <img 
-                      src={source.icon} 
+                      src={getProxiedFaviconUrl(source.icon)}
                       alt={source.name}
                       className="w-8 h-8 object-contain"
                       onError={(e) => {

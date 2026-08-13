@@ -184,7 +184,7 @@ npx tsx tests/subscriptions.test.ts
 1. 从 GitHub 创建 Railway 服务并添加 PostgreSQL。
 2. 在 Railway Variables 中配置 `DATABASE_URL`、强随机 `SESSION_SECRET`、AI 配置、`APP_URL` 和精确的 `ALLOWED_ORIGINS`。
 3. 如启用魔法写作画布，配置与实际授权匹配的 `VITE_TLDRAW_LICENSE_KEY`。
-4. 使用 `railway.json` 的 `/api/health` 健康检查，并等待部署和 CI 通过。
+4. 使用 `railway.json` 的 `/api/health` 健康检查。每次推送或合并到远程仓库后，Railway 会自动部署；必须持续查看 Railway 部署状态和日志，确认部署成功、`/api/health` 通过并完成线上地址的基础烟测后，才算本次发布完成。GitHub CI 通过不能替代 Railway 部署验证。
 5. 公共发布前完成 WAF/边缘限流、监控告警、数据库备份恢复演练和供应商审查。
 
 当前进程内 RSS 状态、限流和任务协调不适合多副本共享。完成 Redis/队列/共享对象存储迁移和负载测试前，保持单 Web 副本。

@@ -31,6 +31,17 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
   const emailInputRef = useRef<HTMLInputElement>(null);
   const codeInputRef = useRef<HTMLInputElement>(null);
   const passwordInputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      return;
+    }
+    previousFocusRef.current?.focus();
+    previousFocusRef.current = null;
+  }, [isOpen]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -228,8 +239,22 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
   return (
     <div className="fixed inset-0 z-[140] bg-black/30 flex items-center justify-center p-4" onClick={onClose}>
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="login-dialog-title"
         className="w-full max-w-[380px] max-h-[calc(100vh-2rem)] overflow-y-auto rounded-2xl border border-border bg-surface shadow-[0_20px_50px_rgba(0,0,0,0.2)]"
         onClick={e => e.stopPropagation()}
+        onKeyDown={event => {
+          if (event.key === 'Escape') { event.preventDefault(); onClose(); return; }
+          if (event.key !== 'Tab') return;
+          const focusable = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), a[href]') || []);
+          if (focusable.length === 0) return;
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+        }}
       >
         {/* Header */}
         <div className="px-5 py-4 border-b border-border flex items-center justify-between">
@@ -237,16 +262,18 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
             {showBackButton && (
               <button
                 onClick={goBack}
-                className="w-7 h-7 rounded-md hover:bg-surface2 text-text3 flex items-center justify-center"
+                className="w-11 h-11 -ml-2 rounded-lg hover:bg-surface2 text-text3 flex items-center justify-center focus-visible:ring-2 focus-visible:ring-accent"
+                aria-label="返回上一步"
               >
                 <ArrowLeft size={14} />
               </button>
             )}
-            <div className="text-[15px] font-semibold text-text-main">{title}</div>
+            <div id="login-dialog-title" className="text-[15px] font-semibold text-text-main">{title}</div>
           </div>
           <button
             onClick={onClose}
-            className="w-7 h-7 rounded-md hover:bg-surface2 text-text3 flex items-center justify-center"
+            className="w-11 h-11 -mr-2 rounded-lg hover:bg-surface2 text-text3 flex items-center justify-center focus-visible:ring-2 focus-visible:ring-accent"
+            aria-label="关闭登录对话框"
           >
             <X size={14} />
           </button>

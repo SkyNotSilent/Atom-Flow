@@ -17,6 +17,31 @@
   box-shadow: 0 0 0 2px #dceaff;
 }
 
+.atomflow-write-context {
+  min-width: var(--write-context-width, 420px);
+  max-width: var(--write-context-width, 420px);
+  transition: width 160ms ease, min-width 160ms ease, max-width 160ms ease, opacity 120ms ease;
+}
+
+.atomflow-write-context-collapsed .atomflow-write-context {
+  width: 0 !important;
+  min-width: 0 !important;
+  max-width: 0 !important;
+  border: 0 !important;
+  opacity: 0;
+  pointer-events: none;
+}
+
+@media (max-width: 1279px) {
+  .atomflow-write-context.atomflow-write-context-mobile-open {
+    width: min(100vw, 420px) !important;
+    min-width: min(100vw, 420px) !important;
+    max-width: min(100vw, 420px) !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+  }
+}
+
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-serif: "Noto Serif SC", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;

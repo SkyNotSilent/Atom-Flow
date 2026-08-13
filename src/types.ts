@@ -1,3 +1,5 @@
+export type AppTab = "feed" | "discover" | "knowledge" | "write" | "podcast";
+
 export interface User {
   id: number;
   email: string;
@@ -5,6 +7,50 @@ export interface User {
   avatar_url: string | null;
   has_password?: boolean;
 }
+
+export type BillingAccess = 'full' | 'read_only' | 'none';
+
+export type PaddleSubscriptionStatus =
+  | 'active'
+  | 'trialing'
+  | 'past_due'
+  | 'paused'
+  | 'canceled';
+
+export type BillingPlanCode = 'pro_monthly' | 'pro_yearly';
+
+export interface BillingPlan {
+  code: BillingPlanCode;
+  name: string;
+  priceCny: number;
+  interval: 'month' | 'year';
+  currency: 'CNY';
+  savingsCny?: number;
+}
+
+export interface BillingStatus {
+  enabled: boolean;
+  access: BillingAccess;
+  subscriptionStatus: PaddleSubscriptionStatus | null;
+  planCode: BillingPlanCode | null;
+  currentPeriodEnd: string | null;
+  scheduledCancelAt: string | null;
+  hasLegacyWriteData: boolean;
+  hasBillingCustomer: boolean;
+  paymentActionRequired: boolean;
+}
+
+export type BillingPendingIntent =
+  | { kind: 'open_write' }
+  | { kind: 'open_project'; projectId: number }
+  | {
+    kind: 'add_podcast_episode';
+    episodeId: string;
+    articleId?: number;
+    savedArticleId?: number;
+    sourceUrl?: string;
+    preferredProjectId?: number;
+  };
 
 export interface NoteActivationNode {
   id: string;
@@ -21,6 +67,10 @@ export interface NoteActivationNode {
   sourceName?: string;
   sourceUrl?: string;
   sourceImages?: string[];
+  canvasNodeId?: number;
+  captureId?: string;
+  citationPrefix?: string;
+  citationSuffix?: string;
   tags: string[];
 }
 
@@ -34,6 +84,11 @@ export interface NoteSourceReference {
   citationContext?: string;
   sourceImages?: string[];
   savedAt?: string;
+  canvasNodeId?: number;
+  captureId?: string;
+  exact?: string;
+  prefix?: string;
+  suffix?: string;
 }
 
 export interface NoteOutlineSection {
@@ -103,6 +158,8 @@ export interface SavedArticle {
   citationContext?: string;
   sourceImages?: string[];
   content?: string;
+  audioUrl?: string;
+  audioDuration?: string;
   publishedAt?: number;
   savedAt: string;
 }
@@ -183,7 +240,7 @@ export interface WriteAgentThread {
   title: string;
   summary?: string;
   state?: WriteAgentThreadState;
-  thread_type: 'chat' | 'skill';
+  thread_type: 'chat' | 'skill' | 'canvas';
   created_at: string;
   updated_at: string;
 }
@@ -220,14 +277,77 @@ export type WriteCanvasNodeKind =
   | 'asset_image'
   | 'saved_article'
   | 'atom_card'
+  | 'citation'
+  | 'podcast_episode'
   | 'note'
   | 'agent'
   | 'result';
+
+export interface WriteCanvasDocumentSnapshot {
+  store: Record<string, unknown>;
+  schema?: Record<string, unknown>;
+}
+
+export interface WriteCanvasCitationMeta {
+  captureId: string;
+  article: {
+    id: number;
+    stableIdentity?: string;
+    title: string;
+    source: string;
+    url?: string;
+    topic?: string;
+    excerpt?: string;
+    publishedAt?: number;
+    audioUrl?: string;
+    audioDuration?: string;
+    fetchedAt: string;
+  };
+  selection: {
+    exact: string;
+    prefix: string;
+    suffix: string;
+    paragraph?: string;
+    heading?: string;
+    capturedAt: string;
+  };
+}
+
+export interface WriteCanvasPodcastMeta {
+  episodeId: string;
+  articleId?: number;
+  savedArticleId?: number;
+  source: string;
+  sourceUrl?: string;
+  audioUrl?: string;
+  audioDuration?: string;
+  publishedAt: string;
+  contextBasis: 'rss_summary';
+}
+
+export interface WriteSkillSelection {
+  mode: 'inherit' | 'override';
+  inherit: boolean;
+  skillIds: Array<number | string>;
+  primaryStyleSkillId?: number | string;
+}
+
+export type WriteCanvasSkillConfig = WriteSkillSelection;
 
 export interface WriteCanvasProject {
   id: number;
   name: string;
   viewport?: Record<string, unknown>;
+  documentSnapshot?: WriteCanvasDocumentSnapshot | null;
+  documentRevision: number;
+  documentSchemaVersion: number;
+  /** Backward-compatible aliases while the tldraw client migrates. */
+  tldrawSnapshot?: WriteCanvasDocumentSnapshot | null;
+  tldrawRevision?: number;
+  tldrawSchemaVersion?: number;
+  defaultSkillConfig: WriteCanvasSkillConfig;
+  effectiveSkillConfig?: WriteCanvasSkillConfig;
+  effectiveSkills?: WriteAgentSkillSnapshot[];
   createdAt: string;
   updatedAt: string;
   lastOpenedAt: string;
@@ -254,6 +374,9 @@ export interface WriteAgentTemplate {
   temperature: number;
   topP: number;
   maxTokens: number;
+  skillConfig: WriteCanvasSkillConfig;
+  effectiveSkillConfig?: WriteCanvasSkillConfig;
+  effectiveSkills?: WriteAgentSkillSnapshot[];
   createdAt: string;
   updatedAt: string;
 }
@@ -268,6 +391,10 @@ export interface WriteAgentInstance {
   temperature: number;
   topP: number;
   maxTokens: number;
+  threadId?: number | null;
+  skillConfig: WriteCanvasSkillConfig;
+  effectiveSkillConfig?: WriteCanvasSkillConfig;
+  effectiveSkills?: WriteAgentSkillSnapshot[];
   createdAt: string;
   updatedAt: string;
 }
@@ -465,6 +592,8 @@ export interface WriteAgentSourceArticle {
   url?: string;
   citationContext?: string;
   imageUrls?: string[];
+  canvasNodeId?: number;
+  captureId?: string;
 }
 
 export interface WriteAgentSources {
@@ -474,6 +603,11 @@ export interface WriteAgentSources {
     cardId: string;
     articleTitle?: string;
     quote: string;
+    sourceUrl?: string;
+    canvasNodeId?: number;
+    captureId?: string;
+    prefix?: string;
+    suffix?: string;
   }>;
   images: Array<{
     id: string;

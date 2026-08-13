@@ -2,44 +2,54 @@
  * Test suite for knowledge base deduplication fixes
  *
  * Tests the following bug fixes:
- * 1. URL normalization (removes query params, hash, trailing slash)
+ * 1. URL normalization (removes tracking params, hash, trailing slash)
  * 2. Content hash for articles without URL
  * 3. saved_article_id based duplicate detection (not article_id)
  */
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { findArticleByIdentity, normalizeArticleUrl } from '../src/utils/articleIdentity';
 
 describe('Knowledge Base Deduplication', () => {
   const BASE_URL = process.env.API_BASE ?? 'http://localhost:1000';
 
   describe('URL Normalization', () => {
-    it('should treat URLs with different query params as same article', async () => {
-      // This test would require actual server running
-      // For now, we document the expected behavior
+    it('should remove known tracking params without deleting semantic identity', () => {
       const url1 = 'https://example.com/article?utm_source=twitter';
       const url2 = 'https://example.com/article?utm_source=facebook';
       const url3 = 'https://example.com/article';
+      assert.equal(normalizeArticleUrl(url1), normalizeArticleUrl(url2));
+      assert.equal(normalizeArticleUrl(url2), normalizeArticleUrl(url3));
 
-      // All three should normalize to: https://example.com/article
-      // And should be treated as the same article in saved_articles table
-      assert.equal(true, true); // Placeholder
+      const semantic1 = 'https://mp.weixin.qq.com/s?__biz=abc&mid=1';
+      const semantic2 = 'https://mp.weixin.qq.com/s?__biz=abc&mid=2';
+      assert.notEqual(normalizeArticleUrl(semantic1), normalizeArticleUrl(semantic2));
     });
 
-    it('should treat URLs with/without trailing slash as same', async () => {
+    it('should treat URLs with/without trailing slash as same', () => {
       const url1 = 'https://example.com/article/';
       const url2 = 'https://example.com/article';
-
-      // Both should normalize to: https://example.com/article
-      assert.equal(true, true); // Placeholder
+      assert.equal(normalizeArticleUrl(url1), normalizeArticleUrl(url2));
     });
 
-    it('should treat URLs with different hash fragments as same', async () => {
+    it('should treat URLs with different hash fragments as same', () => {
       const url1 = 'https://example.com/article#section1';
       const url2 = 'https://example.com/article#section2';
+      assert.equal(normalizeArticleUrl(url1), normalizeArticleUrl(url2));
+    });
 
-      // Both should normalize to: https://example.com/article
-      assert.equal(true, true); // Placeholder
+    it('should not fall back to a same-title article when a URL identity is present', () => {
+      const sameTitle = [
+        { id: 1, source: '来源甲', title: '同名文章', url: 'https://example.com/a' },
+        { id: 2, source: '来源乙', title: '同名文章', url: 'https://example.com/b' },
+      ];
+      assert.equal(findArticleByIdentity(sameTitle, {
+        id: 1,
+        source: '来源甲',
+        title: '同名文章',
+        url: 'https://example.com/missing',
+      }), undefined);
     });
   });
 

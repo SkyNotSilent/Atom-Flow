@@ -9,9 +9,10 @@ interface InspirationButtonProps {
   articleId?: number;
   savedArticleId?: number;
   compact?: boolean;
+  label?: string;
 }
 
-export function InspirationButton({ articleTitle, articleId, savedArticleId, compact }: InspirationButtonProps) {
+export function InspirationButton({ articleTitle, articleId, savedArticleId, compact, label = '记录灵感' }: InspirationButtonProps) {
   const { addCard, showToast, user, loginAndDo } = useAppContext();
   const { isRecording, transcript, isSupported: micSupported, error, startRecording, stopRecording, resetTranscript } = useSpeechRecognition();
   const [open, setOpen] = useState(false);
@@ -106,7 +107,11 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
         origin: 'manual',
         savedArticleId,
       };
-      await addCard(card);
+      const succeeded = await addCard(card);
+      if (!succeeded) {
+        showToast('保存失败，请重试');
+        return;
+      }
       showToast('灵感已记录 ✨');
       handleClose();
     } catch {
@@ -131,25 +136,25 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
     <div className="relative" ref={panelRef}>
       <button
         onClick={handleOpen}
-        title="记录灵感"
+        title={label}
         className={`px-3 py-1.5 rounded-lg text-[12px] sm:text-[13px] font-medium flex items-center gap-1 transition-colors border border-border text-text2 hover:bg-surface2`}
       >
         <Lightbulb size={14} />
         {compact ? (
-          <span className="hidden sm:inline">记录灵感</span>
+          <span className="hidden sm:inline">{label}</span>
         ) : (
-          <span>记录灵感</span>
+          <span>{label}</span>
         )}
       </button>
 
       {open && (
         <div className="absolute right-0 top-full mt-2 z-50 w-[320px] sm:w-[360px] bg-surface rounded-xl shadow-lg border border-border p-3 animate-in fade-in slide-in-from-top-2 duration-200">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-medium text-text1 flex items-center gap-1.5">
+            <span className="text-sm font-medium text-text-main flex items-center gap-1.5">
               <Lightbulb size={15} className="text-yellow-500" />
-              记录灵感
+              {label}
             </span>
-            <button onClick={handleClose} className="text-text3 hover:text-text1 p-0.5 rounded">
+            <button onClick={handleClose} className="text-text3 hover:text-text-main p-0.5 rounded">
               <X size={16} />
             </button>
           </div>
@@ -161,7 +166,7 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
             onKeyDown={handleKeyDown}
             placeholder="写下你此刻的灵感..."
             rows={3}
-            className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm text-text1 placeholder:text-text3 focus:outline-none focus:ring-1 focus:ring-primary"
+            className="w-full resize-none rounded-lg border border-border bg-bg px-3 py-2 text-sm text-text-main placeholder:text-text3 focus:outline-none focus:ring-1 focus:ring-accent"
           />
 
           {isRecording && (
@@ -175,8 +180,8 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
             <div className="mt-2 rounded-lg border border-border bg-surface2 p-2 text-[11px] leading-4 text-text2">
               <p>开始后，音频将实时发送给当前实例配置的语音识别服务；停止录音后不再发送。</p>
               <div className="mt-2 flex justify-end gap-2">
-                <button type="button" onClick={() => setShowMicNotice(false)} className="px-2 py-1 text-text3 hover:text-text1">取消</button>
-                <button type="button" onClick={confirmMicStart} className="rounded-md bg-primary px-2 py-1 font-medium text-white">开始听写</button>
+                <button type="button" onClick={() => setShowMicNotice(false)} className="px-2 py-1 text-text3 hover:text-text-main">取消</button>
+                <button type="button" onClick={confirmMicStart} className="rounded-md bg-accent px-2 py-1 font-medium text-white">开始听写</button>
               </div>
             </div>
           )}
@@ -190,7 +195,7 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
                   className={`p-1.5 rounded-lg transition-colors ${
                     isRecording
                       ? 'bg-red-50 dark:bg-red-900/20 text-red-500'
-                      : 'text-text3 hover:text-text1 hover:bg-surface2'
+                      : 'text-text3 hover:text-text-main hover:bg-surface2'
                   }`}
                 >
                   <Mic size={16} />
@@ -201,7 +206,7 @@ export function InspirationButton({ articleTitle, articleId, savedArticleId, com
             <button
               onClick={handleSave}
               disabled={saving || !text.trim()}
-              className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-primary text-white hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-accent text-white hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               <Send size={13} />
               {saving ? '保存中...' : '保存'}

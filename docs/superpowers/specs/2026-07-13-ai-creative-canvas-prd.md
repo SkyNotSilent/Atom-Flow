@@ -60,4 +60,3 @@ Only `context` changes model input. Removing another relation affects lineage or
 - Reordering outline sections reorders the corresponding body sections.
 - Only explicit `context` connections enter Agent requests.
 - Desktop supports the complete workflow; narrow screens use full-screen sheets for inspectors and document editing.
-

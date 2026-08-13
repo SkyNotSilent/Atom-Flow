@@ -14,7 +14,7 @@ const root = path.resolve(testDir, "..");
 const vite = await createServer({ root, appType: "custom", server: { middlewareMode: true } });
 const readerModule = await vite.ssrLoadModule("/src/components/ReaderModal.tsx") as Record<string, unknown>;
 const sanitizeArticleHtml = readerModule.sanitizeArticleHtml;
-const isArticleHtml = readerModule.isArticleHtml;
+const isArticleHtml = readerModule.looksLikeArticleHtml;
 
 assert.equal(typeof sanitizeArticleHtml, "function", "ReaderModal must export its article HTML sanitizer for regression coverage");
 if (typeof sanitizeArticleHtml !== "function") {
@@ -26,7 +26,7 @@ if (typeof isArticleHtml !== "function") {
 }
 
 assert.equal(isArticleHtml("<p>正文 <strong>重点</strong></p>"), true);
-assert.equal(isArticleHtml("<script>alert(1)</script><p>正文</p>"), true);
+assert.equal(isArticleHtml("<script>alert(1)</script><p>正文</p>"), false);
 assert.equal(isArticleHtml("# 标题\n\n**正文**"), false);
 assert.equal(isArticleHtml("# HTML 示例\n\n```html\n<p>示例</p>\n```"), false);
 assert.equal(isArticleHtml("阅读 <https://example.com/source>"), false);
@@ -66,7 +66,7 @@ assert.equal(
   "/api/image-proxy?url=https%3A%2F%2Fcdn.example.com%2Fphoto.jpg&referer=https%3A%2F%2Fexample.com%2Farticles%2Freader",
 );
 assert.equal(document.querySelector('img[alt="Article photo"]')?.getAttribute("referrerpolicy"), "no-referrer");
-assert.equal(document.querySelector('img[alt="Article photo"]')?.getAttribute("loading"), "lazy");
+assert.equal(document.querySelector('img[alt="Article photo"]')?.getAttribute("loading"), null);
 assert.equal(
   document.querySelector('img[alt="Relative article photo"]')?.getAttribute("src"),
   "/api/image-proxy?url=https%3A%2F%2Fexample.com%2Frelative-photo.jpg&referer=https%3A%2F%2Fexample.com%2Farticles%2Freader",
@@ -75,7 +75,7 @@ assert.equal(document.querySelector('img[alt="Dangerous data image"]')?.hasAttri
 assert.equal(document.querySelector("a")?.getAttribute("href"), "https://example.com/source");
 assert.equal(document.querySelectorAll("a")[1]?.hasAttribute("href"), false);
 
-const readerSource = readFileSync(path.join(testDir, "../src/components/ReaderModal.tsx"), "utf8");
+const readerSource = readFileSync(path.join(testDir, "../src/components/reader/ArticleReader.tsx"), "utf8");
 assert.doesNotMatch(readerSource, /rehypeRaw/, "ReactMarkdown must not parse untrusted raw HTML");
 assert.equal((readerSource.match(/dangerouslySetInnerHTML/g) || []).length, 1);
 assert.match(
@@ -85,7 +85,7 @@ assert.match(
 );
 assert.match(
   readerSource,
-  /articleContentIsHtml\s*\?\s*\([\s\S]*<SafeArticleHtml[\s\S]*:\s*\([\s\S]*<ReactMarkdown/,
+  /currentArticle\.markdownContent && !markdownIsHtml\s*\?\s*\([\s\S]*<ReactMarkdown[\s\S]*:\s*\([\s\S]*dangerouslySetInnerHTML/,
   "RSS HTML must use the sanitized HTML branch while Markdown stays in ReactMarkdown",
 );
 

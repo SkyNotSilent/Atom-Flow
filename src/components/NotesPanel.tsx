@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { Article, Note, NoteSourceReference } from '../types';
 import { cn } from './Nav';
-import { ChevronLeft, ChevronRight, FileText, Network, Plus, Trash2, ExternalLink, Bold, Italic, Underline as UnderlineIcon, Strikethrough, Heading1, Heading2, Heading3, Quote, List, ListOrdered, Table as TableIcon, Minus, Undo2, Redo2 } from 'lucide-react';
+import { ChevronLeft, ChevronRight, FileText, Network, Plus, Trash2, ExternalLink, Bold, Italic, Underline as UnderlineIcon, Strikethrough, Heading1, Heading2, Heading3, Quote, List, ListOrdered, Table as TableIcon, Minus, Undo2, Redo2, Download } from 'lucide-react';
 import { useEditor, EditorContent } from '@tiptap/react';
 import { StarterKit } from '@tiptap/starter-kit';
 import { Table as TableExt } from '@tiptap/extension-table';
@@ -14,6 +14,7 @@ import { Underline as UnderlineExt } from '@tiptap/extension-underline';
 import { TextAlign } from '@tiptap/extension-text-align';
 import { Highlight } from '@tiptap/extension-highlight';
 import { Link } from '@tiptap/extension-link';
+import { protectDraft } from '../billing/draftVault';
 
 const ToolbarButton: React.FC<{
   onClick: () => void;
@@ -39,15 +40,104 @@ const ToolbarButton: React.FC<{
 const Divider = () => <div className="mx-1 h-5 w-px bg-border" />;
 
 export const NotesPanel: React.FC = () => {
-  const { notes, createNote, updateNote, deleteNote, showToast, setReadingArticle, setActiveSource, articles } = useAppContext();
+  const { user, billingState, notes, createNote, updateNote, deleteNote, showToast, setReadingArticle, setActiveSource, articles } = useAppContext();
+  const canWrite = billingState.phase === 'ready' && billingState.status.access === 'full';
   const [activeNoteId, setActiveNoteId] = useState<number | null>(null);
   const [title, setTitle] = useState('');
   const [isLibraryCollapsed, setIsLibraryCollapsed] = useState(() => window.localStorage.getItem('atomflow:notes-library-collapsed') === 'true');
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
   const titleRef = useRef('');
+  const activeNoteIdRef = useRef<number | null>(null);
   const saveTimerRef = useRef<number | null>(null);
+  const pendingSaveRef = useRef<{ noteId: number; data: { title?: string; content?: string } } | null>(null);
+  const saveInFlightRef = useRef<Promise<boolean> | null>(null);
+  const saveFailureNotifiedRef = useRef(false);
+  const isMountedRef = useRef(true);
+  const updateNoteRef = useRef(updateNote);
+  const showToastRef = useRef(showToast);
   const titleInputRef = useRef<HTMLInputElement>(null);
+  const hasAutoSelectedInitialNoteRef = useRef(false);
+  const canWriteRef = useRef(canWrite);
 
   const activeNote = notes.find(n => n.id === activeNoteId) || null;
+
+  useEffect(() => {
+    updateNoteRef.current = updateNote;
+  }, [updateNote]);
+
+  useEffect(() => {
+    showToastRef.current = showToast;
+  }, [showToast]);
+
+  const flushPendingSave = useCallback(async (): Promise<boolean> => {
+    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = null;
+
+    if (!canWriteRef.current) {
+      pendingSaveRef.current = null;
+      return true;
+    }
+    while (true) {
+      if (saveInFlightRef.current) {
+        const successful = await saveInFlightRef.current;
+        if (!successful) return false;
+        continue;
+      }
+
+      const pending = pendingSaveRef.current;
+      if (!pending) return true;
+      const saveRequest = updateNoteRef.current(pending.noteId, pending.data);
+      saveInFlightRef.current = saveRequest;
+      const successful = await saveRequest;
+      if (saveInFlightRef.current === saveRequest) saveInFlightRef.current = null;
+
+      if (!successful) {
+        if (isMountedRef.current && !saveFailureNotifiedRef.current) {
+          saveFailureNotifiedRef.current = true;
+          showToastRef.current('文章保存失败，草稿已保留，稍后会继续重试');
+        }
+        return false;
+      }
+
+      saveFailureNotifiedRef.current = false;
+      if (pendingSaveRef.current === pending) pendingSaveRef.current = null;
+    }
+  }, []);
+
+  const selectActiveNote = useCallback(async (noteId: number | null): Promise<boolean> => {
+    if (activeNoteIdRef.current === noteId) return true;
+    if (!await flushPendingSave()) return false;
+    if (!isMountedRef.current) return false;
+    activeNoteIdRef.current = noteId;
+    setActiveNoteId(noteId);
+    return true;
+  }, [flushPendingSave]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    const flushWhenPageLeaves = () => {
+      void flushPendingSave();
+    };
+    const flushWhenHidden = () => {
+      if (document.visibilityState === 'hidden') flushWhenPageLeaves();
+    };
+    const flushBeforeAccountLeave = (event: Event) => {
+      const waitUntil = (event as CustomEvent<{ waitUntil?: (pending: Promise<boolean>) => void }>).detail?.waitUntil;
+      waitUntil?.(flushPendingSave());
+    };
+    window.addEventListener('pagehide', flushWhenPageLeaves);
+    window.addEventListener('atomflow:before-account-leave', flushBeforeAccountLeave);
+    window.addEventListener('atomflow:before-write-leave', flushBeforeAccountLeave);
+    document.addEventListener('visibilitychange', flushWhenHidden);
+    return () => {
+      isMountedRef.current = false;
+      window.removeEventListener('pagehide', flushWhenPageLeaves);
+      window.removeEventListener('atomflow:before-account-leave', flushBeforeAccountLeave);
+      window.removeEventListener('atomflow:before-write-leave', flushBeforeAccountLeave);
+      document.removeEventListener('visibilitychange', flushWhenHidden);
+      flushWhenPageLeaves();
+    };
+  }, [flushPendingSave]);
 
   const editor = useEditor({
     extensions: [
@@ -71,63 +161,111 @@ export const NotesPanel: React.FC = () => {
       },
     },
     onUpdate: ({ editor: ed }) => {
-      if (!activeNoteId) return;
+      if (!canWriteRef.current) return;
+      const noteId = activeNoteIdRef.current;
+      if (!noteId) return;
       const html = ed.getHTML();
-      debouncedSave(activeNoteId, { title: titleRef.current, content: html });
+      debouncedSave(noteId, { title: titleRef.current, content: html });
     },
   });
+
+  useEffect(() => {
+    const wasWritable = canWriteRef.current;
+    canWriteRef.current = canWrite;
+    editor?.setEditable(canWrite);
+    if (!canWrite && wasWritable) {
+      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+      const noteId = activeNoteIdRef.current;
+      if (user && noteId && editor) {
+        void protectDraft({
+          id: `article:${user.id}:${noteId}:${Date.now()}`,
+          userId: user.id,
+          kind: 'article',
+          createdAt: new Date().toISOString(),
+          payload: { noteId, title: titleRef.current, content: editor.getHTML() },
+        }).then(saved => showToast(saved
+          ? '订阅状态已变更，未保存文章已备份到本机'
+          : '订阅状态已变更，请立即复制未保存文章'));
+      }
+      pendingSaveRef.current = null;
+    }
+  }, [canWrite, editor, showToast, user]);
 
   // Load content when active note changes
   useEffect(() => {
     if (activeNote && editor) {
+      // A save response can update context while the user has already typed a
+      // newer draft. Keep the editor as the source of truth until that draft is
+      // durably acknowledged, otherwise the older response would rewind it.
+      if (pendingSaveRef.current?.noteId === activeNote.id) return;
       setTitle(activeNote.title);
       titleRef.current = activeNote.title;
       // Only set content if it actually differs to avoid cursor jump
       if (editor.getHTML() !== activeNote.content) {
-        editor.commands.setContent(activeNote.content || '');
+        editor.commands.setContent(activeNote.content || '', { emitUpdate: false });
       }
     } else if (!activeNote && editor) {
       setTitle('');
       titleRef.current = '';
-      editor.commands.setContent('');
+      editor.commands.setContent('', { emitUpdate: false });
     }
   }, [activeNoteId, activeNote]);
 
   // Auto-select first note on mount
   useEffect(() => {
-    if (notes.length > 0 && activeNoteId === null) {
-      setActiveNoteId(notes[0].id);
+    if (notes.length === 0) {
+      hasAutoSelectedInitialNoteRef.current = false;
+      return;
     }
-  }, [notes]);
+    if (activeNoteId === null && !hasAutoSelectedInitialNoteRef.current) {
+      hasAutoSelectedInitialNoteRef.current = true;
+      void selectActiveNote(notes[0].id);
+    }
+  }, [notes, selectActiveNote]);
 
   useEffect(() => {
     window.localStorage.setItem('atomflow:notes-library-collapsed', String(isLibraryCollapsed));
   }, [isLibraryCollapsed]);
 
   useEffect(() => {
-    const openPendingNote = () => {
+    const syncMobileLayout = () => setIsMobile(window.innerWidth < 768);
+    syncMobileLayout();
+    window.addEventListener('resize', syncMobileLayout);
+    return () => window.removeEventListener('resize', syncMobileLayout);
+  }, []);
+
+  useEffect(() => {
+    const openPendingNote = async () => {
       const pendingId = Number(window.localStorage.getItem('atomflow:open-note-id'));
       if (!pendingId) return;
       if (notes.some(note => note.id === pendingId)) {
-        setActiveNoteId(pendingId);
-        window.localStorage.removeItem('atomflow:open-note-id');
+        if (await selectActiveNote(pendingId)) {
+          window.localStorage.removeItem('atomflow:open-note-id');
+        }
       }
     };
 
-    openPendingNote();
-    window.addEventListener('atomflow:open-note', openPendingNote);
-    return () => window.removeEventListener('atomflow:open-note', openPendingNote);
-  }, [notes]);
+    void openPendingNote();
+    const handleOpenPendingNote = () => void openPendingNote();
+    window.addEventListener('atomflow:open-note', handleOpenPendingNote);
+    return () => window.removeEventListener('atomflow:open-note', handleOpenPendingNote);
+  }, [notes, selectActiveNote]);
 
   // Debounced auto-save
   const debouncedSave = useCallback((noteId: number, data: { title?: string; content?: string }) => {
+    if (!canWriteRef.current) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    pendingSaveRef.current = { noteId, data };
+    saveFailureNotifiedRef.current = false;
     saveTimerRef.current = window.setTimeout(() => {
-      updateNote(noteId, data);
+      saveTimerRef.current = null;
+      void flushPendingSave();
     }, 800);
-  }, [updateNote]);
+  }, [flushPendingSave]);
 
   const handleTitleChange = (value: string) => {
+    if (!canWrite) return;
     setTitle(value);
     titleRef.current = value;
     if (activeNoteId && editor) {
@@ -136,19 +274,31 @@ export const NotesPanel: React.FC = () => {
   };
 
   const handleCreate = async () => {
+    if (!canWrite) return;
+    if (!await flushPendingSave()) return;
     const note = await createNote();
     if (note) {
+      activeNoteIdRef.current = note.id;
       setActiveNoteId(note.id);
       setTimeout(() => titleInputRef.current?.focus(), 100);
     }
   };
 
   const handleDelete = async (id: number) => {
+    if (!canWrite) return;
     if (!window.confirm('确定要删除这篇文章吗？')) return;
+    if (!await flushPendingSave()) return;
+    if (pendingSaveRef.current?.noteId === id) {
+      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+      pendingSaveRef.current = null;
+    }
     await deleteNote(id);
     if (activeNoteId === id) {
       const remaining = notes.filter(n => n.id !== id);
-      setActiveNoteId(remaining.length > 0 ? remaining[0].id : null);
+      const nextId = remaining.length > 0 ? remaining[0].id : null;
+      activeNoteIdRef.current = nextId;
+      setActiveNoteId(nextId);
     }
     showToast('文章已删除');
   };
@@ -232,15 +382,29 @@ export const NotesPanel: React.FC = () => {
     editor.chain().focus().extendMarkRange('link').setLink({ href: url }).run();
   };
 
+  const downloadActiveNote = () => {
+    if (!activeNote || !editor) return;
+    const blob = new Blob([`<!doctype html><meta charset="utf-8"><title>${title || '无标题文章'}</title><article>${editor.getHTML()}</article>`], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${(title || '无标题文章').replace(/[\\/:*?"<>|]/g, '-').slice(0, 80)}.html`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const libraryCollapsed = !isMobile && isLibraryCollapsed;
+
   return (
-    <div className="flex h-full">
+    <div className="flex h-full min-w-0">
       <div
         className={cn(
-          "border-r border-border flex flex-col shrink-0 bg-bg/40 transition-[width] duration-200",
-          isLibraryCollapsed ? "w-12" : "w-[280px]"
+          "border-r border-border flex-col shrink-0 bg-bg/40 transition-[width] duration-200",
+          activeNote ? "hidden md:flex" : "flex w-full",
+          libraryCollapsed ? "md:w-12" : "md:w-[280px]"
         )}
       >
-        {isLibraryCollapsed ? (
+        {libraryCollapsed ? (
           <div className="flex h-full flex-col items-center gap-2 py-3">
             <button
               onClick={() => setIsLibraryCollapsed(false)}
@@ -249,13 +413,13 @@ export const NotesPanel: React.FC = () => {
             >
               <ChevronRight size={16} />
             </button>
-            <button
+            {canWrite ? <button
               onClick={() => void handleCreate()}
               className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent text-white transition-opacity hover:opacity-90"
               title="新建文章"
             >
               <Plus size={15} />
-            </button>
+            </button> : null}
             <div className="mt-2 flex flex-col items-center gap-1 text-text3">
               <FileText size={15} />
               <span className="text-[10px] leading-none">{notes.length}</span>
@@ -276,13 +440,13 @@ export const NotesPanel: React.FC = () => {
                 >
                   <ChevronLeft size={15} />
                 </button>
-                <button
+                {canWrite ? <button
                   onClick={() => void handleCreate()}
                   className="w-7 h-7 rounded-lg bg-accent text-white flex items-center justify-center hover:opacity-90 transition-opacity"
                   title="新建文章"
                 >
                   <Plus size={14} />
-                </button>
+                </button> : null}
               </div>
             </div>
             <div className="flex-1 overflow-y-auto">
@@ -290,18 +454,18 @@ export const NotesPanel: React.FC = () => {
                 <div className="flex flex-col items-center justify-center py-12 text-text3">
                   <FileText size={32} className="mb-3 opacity-30" />
                   <p className="text-[13px]">暂无文章</p>
-                  <button
+                  {canWrite ? <button
                     onClick={() => void handleCreate()}
                     className="mt-3 text-[13px] text-accent hover:underline"
                   >
                     创建第一篇文章
-                  </button>
+                  </button> : null}
                 </div>
               ) : (
                 notes.map(note => (
                   <div
                     key={note.id}
-                    onClick={() => setActiveNoteId(note.id)}
+                    onClick={() => void selectActiveNote(note.id)}
                     className={cn(
                       "px-3 py-2.5 border-b border-border cursor-pointer transition-colors group",
                       activeNoteId === note.id
@@ -316,12 +480,12 @@ export const NotesPanel: React.FC = () => {
                       )}>
                         {note.title || (note.content ? note.content.replace(/<[^>]*>/g, '').slice(0, 20) + '...' : '无标题文章')}
                       </div>
-                      <button
+                      {canWrite ? <button
                         onClick={e => { e.stopPropagation(); void handleDelete(note.id); }}
                         className="w-5 h-5 rounded flex items-center justify-center text-text3 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all shrink-0"
                       >
                         <Trash2 size={12} />
-                      </button>
+                      </button> : null}
                     </div>
                     <div className="text-[11px] text-text3 truncate mt-0.5">
                       {note.content ? note.content.replace(/<[^>]*>/g, '').slice(0, 58) : '空白文章'}
@@ -343,22 +507,34 @@ export const NotesPanel: React.FC = () => {
         )}
       </div>
 
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className={cn("min-w-0 flex-1 flex-col", activeNote ? "flex" : "hidden md:flex")}>
         {activeNote ? (
           <>
             <div className="px-6 pt-4 pb-2 border-b border-border shrink-0">
+              <button
+                type="button"
+                onClick={() => void selectActiveNote(null)}
+                className="mb-3 inline-flex items-center gap-1 rounded-lg px-2 py-1.5 text-[12px] text-text2 hover:bg-surface2 md:hidden"
+              >
+                <ChevronLeft size={15} />
+                文章库
+              </button>
               <input
                 ref={titleInputRef}
                 type="text"
                 value={title}
+                readOnly={!canWrite}
                 onChange={e => handleTitleChange(e.target.value)}
                 placeholder="请输入文章标题..."
                 className="w-full text-[24px] font-serif font-bold text-text-main bg-transparent outline-none placeholder:text-text3/60 focus:placeholder:text-text3/40"
               />
-              <div className="mt-1 mb-3 text-[11px] text-text3">自动保存 · 最近更新 {formatDate(activeNote.updated_at)}</div>
+              <div className="mt-1 mb-3 flex items-center justify-between gap-3 text-[11px] text-text3">
+                <span>{canWrite ? '自动保存' : '只读 · 可选择文字复制'} · 最近更新 {formatDate(activeNote.updated_at)}</span>
+                {!canWrite ? <button type="button" onClick={downloadActiveNote} className="inline-flex min-h-9 shrink-0 items-center gap-1 rounded-lg border border-border bg-surface px-2.5 text-[11px] text-accent"><Download size={13} />下载 HTML</button> : null}
+              </div>
 
               {/* Toolbar */}
-              {editor && (
+              {editor && canWrite && (
                 <div className="mb-2 flex flex-wrap items-center gap-0.5">
                   <ToolbarButton onClick={() => editor.chain().focus().undo().run()} disabled={!editor.can().undo()} title="撤销">
                     <Undo2 size={14} />

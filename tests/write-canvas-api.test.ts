@@ -4,6 +4,7 @@ import path from "node:path";
 
 const root = process.cwd();
 const server = readFileSync(path.join(root, "server.ts"), "utf-8");
+const migrations = readFileSync(path.join(root, "src", "server", "databaseMigrations.ts"), "utf-8");
 const types = readFileSync(path.join(root, "src", "types.ts"), "utf-8");
 const canvas = readFileSync(path.join(root, "src", "pages", "MagicWritingCanvas.tsx"), "utf-8");
 const addDrawerPath = path.join(root, "src", "components", "write-canvas", "CanvasAddDrawer.tsx");
@@ -25,6 +26,28 @@ const assertOrdered = (source: string, before: string, after: string, message: s
   const afterIndex = source.indexOf(after);
   assert.ok(beforeIndex >= 0 && afterIndex >= 0 && beforeIndex < afterIndex, message);
 };
+
+const cloneRoute = routeSegment(
+  'app.post("/api/write/canvas/projects/:id/clone"',
+  'app.delete("/api/write/canvas/projects/:id"',
+);
+const citationRoute = routeSegment(
+  'app.post("/api/write/canvas/projects/:id/citations"',
+  'app.post("/api/write/canvas/projects/:id/nodes"',
+);
+assert.match(cloneRoute, /validateCanvasDocumentSnapshotInput/, "project clone must validate the uploaded local document");
+assert.match(cloneRoute, /assetIds[\s\S]*agentIds[\s\S]*nodeIds/, "project clone must remap assets, agents and business nodes");
+assert.match(cloneRoute, /write_canvas_edges/, "project clone must preserve business-node connections");
+assert.match(cloneRoute, /CANVAS_CLONE_UNSUPPORTED_STATE/, "clone must refuse complex graph state until it can be copied losslessly");
+assert.match(cloneRoute, /write_canvas_documents[\s\S]*write_canvas_agent_groups[\s\S]*write_agent_instances/, "clone preflight must include documents, Agent groups, runs and threads");
+assert.match(cloneRoute, /write_canvas_agent_messages message[\s\S]*write_canvas_agent_run_requests request/, "clone preflight must reject legacy messages and idempotent Agent run requests owned through project Agents");
+assert.match(cloneRoute, /WRITE_CANVAS_CLONE_MAX_ROWS[\s\S]*WRITE_CANVAS_CLONE_MAX_METADATA_BYTES/, "clone must reject excessive row and metadata volume before inserting the destination project");
+assert.match(cloneRoute, /assertCanvasStorageQuota[\s\S]*INSERT INTO write_canvas_projects/, "clone must reserve storage capacity before the first durable insert");
+assert.match(citationRoute, /citationArticleIdentity/, "citation capture must recompute stable article identity on the server");
+assert.match(citationRoute, /kind='citation' AND ref_id=\$3/, "citation captureId must be idempotent per project");
+assert.match(citationRoute, /targetAgentNodeId[\s\S]*'context'/, "citation capture must optionally connect the exact excerpt to an owned Agent");
+assert.match(citationRoute, /if \(!row\)[\s\S]*WRITE_CANVAS_MAX_NODES_PER_PROJECT[\s\S]*assertCanvasStorageQuota/, "citation nodes must consume capacity only when newly created");
+assert.match(citationRoute, /if \(!existingEdge\)[\s\S]*WRITE_CANVAS_MAX_EDGES_PER_PROJECT[\s\S]*assertCanvasStorageQuota/, "citation edges must consume capacity only when newly created");
 const genericNodeCreateRoute = routeSegment(
   'app.post("/api/write/canvas/projects/:id/nodes"',
   'app.put("/api/write/canvas/nodes/:id"',
@@ -65,24 +88,28 @@ const edgeReplaceRoute = routeSegment(
   'app.post("/api/write/canvas/edges/replace"',
   'app.delete("/api/write/canvas/edges"',
 );
+const projectDocumentRoute = routeSegment(
+  'app.put("/api/write/canvas/projects/:id/document"',
+  'app.delete("/api/write/canvas/projects/:id"',
+);
 
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_projects/, "canvas projects table must exist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_nodes/, "canvas nodes table must exist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_edges/, "canvas edges table must exist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_agent_templates/, "agent templates table must exist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_agent_instances/, "agent instances table must exist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_assets/, "canvas assets table must exist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_agent_messages/, "canvas agent messages table must exist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_documents/, "canvas documents table must exist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_document_versions/, "canvas document version table must exist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_document_sections/, "canvas document section table must exist");
-assert.match(server, /node_role/, "canvas nodes must persist semantic roles");
-assert.match(server, /content_type/, "canvas nodes must persist content types");
-assert.match(server, /document_id/, "canvas nodes must link documents");
-assert.match(server, /CASE kind/, "existing canvas nodes must receive deterministic semantic backfills");
-assert.match(server, /relation IN \('context', 'derived_from', 'generated', 'structure'\)/, "canvas edges must allow the complete relation vocabulary");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_projects/, "canvas projects table must exist");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_nodes/, "canvas nodes table must exist");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_edges/, "canvas edges table must exist");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_agent_templates/, "agent templates table must exist");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_agent_instances/, "agent instances table must exist");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_assets/, "canvas assets table must exist");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_agent_messages/, "canvas agent messages table must exist");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_documents/, "canvas documents table must exist");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_document_versions/, "canvas document version table must exist");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_document_sections/, "canvas document section table must exist");
+assert.match(migrations, /node_role/, "canvas nodes must persist semantic roles");
+assert.match(migrations, /content_type/, "canvas nodes must persist content types");
+assert.match(migrations, /document_id/, "canvas nodes must link documents");
+assert.match(migrations, /CASE kind/, "existing canvas nodes must receive deterministic semantic backfills");
+assert.match(migrations, /relation IN \('context',\s*'derived_from',\s*'generated',\s*'structure'\)/, "canvas edges must allow the complete relation vocabulary");
 assertOrdered(
-  server,
+  migrations,
   "ALTER TABLE write_canvas_edges DROP CONSTRAINT write_canvas_edges_relation_check",
   "SET relation = 'derived_from'",
   "the legacy context-only relation constraint must be widened before relation backfills run",
@@ -90,6 +117,18 @@ assertOrdered(
 
 assert.match(server, /app\.get\("\/api\/write\/canvas\/projects", requireAuth/, "project list route must require auth");
 assert.match(server, /app\.post\("\/api\/write\/canvas\/projects", requireAuth/, "project create route must require auth");
+assert.match(server, /app\.put\("\/api\/write\/canvas\/projects\/:id\/document", requireAuth, canvasDocumentMultipart/, "revisioned project documents must require auth and bounded multipart parsing");
+assert.match(server, /app\.use\("\/api\/write", requireAuth,[\s\S]{0,220}requireMagicWritingFullAccess/, "project document writes must retain the full-access billing gate");
+assert.match(server, /const mapCanvasProjectRow[\s\S]{0,700}documentSnapshot[\s\S]{0,300}documentRevision[\s\S]{0,300}documentSchemaVersion/, "project mapping must expose the persisted document state");
+assert.match(server, /COALESCE\(tldraw_snapshot, document_snapshot\) AS "documentSnapshot"/, "project detail and mutation queries must select the document snapshot");
+assert.match(server, /document_revision AS "documentRevision"/, "project queries must select the optimistic revision");
+assert.match(server, /document_schema_version AS "documentSchemaVersion"/, "project queries must select the tldraw schema version");
+assert.match(projectDocumentRoute, /validateCanvasDocumentSnapshotInput\(rawSnapshot\)/, "document saves must validate the bounded snapshot");
+assert.match(projectDocumentRoute, /WHERE id = \$1 AND user_id = \$2[\s\S]{0,80}FOR UPDATE/, "document saves must lock only the authenticated user's project");
+assert.match(projectDocumentRoute, /currentRevision !== baseRevision[\s\S]{0,220}CANVAS_REVISION_CONFLICT/, "stale project documents must return an explicit optimistic conflict");
+assert.match(projectDocumentRoute, /UPDATE write_canvas_nodes AS node[\s\S]{0,650}node\.user_id = \$2[\s\S]{0,120}node\.project_id = \$3/, "snapshot geometry updates must preserve tenant and project ownership");
+assert.match(projectDocumentRoute, /tldraw_snapshot = \$1::jsonb,[\s\S]{0,100}document_snapshot = \$1::jsonb/, "canonical and rollback-window snapshots must update together");
+assert.match(projectDocumentRoute, /document_revision = document_revision \+ 1/, "successful document writes must advance the revision atomically");
 assert.match(server, /app\.post\("\/api\/write\/canvas\/projects\/:id\/nodes", requireAuth/, "node create route must require auth");
 assert.match(server, /app\.delete\("\/api\/write\/canvas\/nodes\/:id", requireAuth/, "node delete route must require auth");
 assert.match(server, /app\.post\("\/api\/write\/canvas\/edges", requireAuth/, "edge create route must require auth");
@@ -124,9 +163,9 @@ assert.match(server, /content_type, business_ref[\s\S]{0,800}'document_section'[
 assert.match(server, /const dataUrl = `data:\$\{req\.file\.mimetype\};base64/, "all uploaded originals must be retained even when extraction fails");
 assert.match(server, /'dataUrl', CASE WHEN a\.type = 'image' THEN '\/api\/write\/canvas\/assets\/' \|\| a\.id \|\| '\/original'/, "project detail must serve image previews without embedding original base64 payloads");
 assert.match(server, /extractionError \? "failed" : "ready"/, "failed extraction must be visible on the material node");
-assert.match(server, /write_canvas_nodes_project_owner_fkey/, "nodes must enforce project ownership in the database");
-assert.match(server, /write_canvas_edges_source_owner_fkey/, "edges must enforce source-node tenant ownership in the database");
-assert.match(server, /write_canvas_documents_current_version_owner_fkey/, "document versions must enforce tenant ownership in the database");
+assert.match(migrations, /write_canvas_nodes_project_owner_fkey/, "nodes must enforce project ownership in the database");
+assert.match(migrations, /write_canvas_edges_source_owner_fkey/, "edges must enforce source-node tenant ownership in the database");
+assert.match(migrations, /write_canvas_documents_current_version_owner_fkey/, "document versions must enforce tenant ownership in the database");
 assert.match(server, /FROM write_canvas_agent_messages WHERE user_id = \$1/, "Agent messages must be included in canvas storage accounting");
 assert.match(server, /COALESCE\(meta->>'status', 'completed'\) = 'completed'/, "failed and pending Agent turns must stay out of subsequent history");
 assert.match(server, /const previousMessages = \(await pool\.query\([\s\S]{0,900}assertCanvasAggregateContextWithinLimit\(contexts, message, agentRow\.system_prompt, previousMessages\)/, "Agent history must be loaded before aggregate context validation");
@@ -191,9 +230,9 @@ assert.match(canvas, /getArrowBindings/, "canvas edges must use tldraw arrow bin
 assert.doesNotMatch(canvas, /w-\[300px\].*shrink-0/, "canvas must not reserve a fixed left rail");
 assert.doesNotMatch(canvas, /w-\[360px\].*shrink-0/, "canvas must not reserve a fixed right inspector rail");
 assert.match(canvasUi, /保存到画布/, "assistant outputs must be manually saved to canvas");
-assert.match(canvas, /let receivedTerminal = false/, "single-Agent streams must track whether a terminal SSE event arrived");
-assert.match(canvas, /if \(!receivedTerminal\) throw new Error\(/, "premature single-Agent EOF must be surfaced as a failure");
-assert.match(canvas, /setAgentInput\(current => current\.trim\(\) \? current : message\)/, "failed single-Agent sends must restore the user's prompt without overwriting new input");
+assert.match(canvas, /let received(?:Terminal|Final) = false/, "single-Agent streams must track whether a terminal SSE event arrived");
+assert.match(canvas, /if \(!received(?:Terminal|Final)\) throw new Error\(/, "premature single-Agent EOF must be surfaced as a failure");
+assert.match(canvas, /setAgentInput\(current => (?:current\.trim\(\) \? current : message|current \|\| message)\)/, "failed single-Agent sends must restore the user's prompt without overwriting new input");
 
 if (process.env.RUN_REAL_CANVAS_TESTS === "true") {
   const base = process.env.API_BASE || "http://localhost:1000";

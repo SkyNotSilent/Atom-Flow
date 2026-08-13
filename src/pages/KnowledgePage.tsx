@@ -263,6 +263,7 @@ export const KnowledgePage: React.FC = () => {
 const EditModal = ({ card, onClose }: { card: Partial<AtomCard>, onClose: () => void }) => {
   const { updateCard, addCard, deleteCard, showToast } = useAppContext();
   const [formData, setFormData] = useState(card);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const isNew = !card.id;
   const getTextRows = (value?: string, minRows = 3) => {
     if (!value) return minRows;
@@ -272,16 +273,39 @@ const EditModal = ({ card, onClose }: { card: Partial<AtomCard>, onClose: () => 
     );
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!formData.content) return showToast('内容不能为空');
-    if (isNew) {
-      addCard({ ...formData, id: Math.random().toString(36).substr(2, 9), articleTitle: formData.articleTitle || '手动录入' } as AtomCard);
-      showToast('✓ 卡片已创建');
-    } else {
-      updateCard(card.id!, formData);
-      showToast('✓ 卡片已更新');
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const succeeded = isNew
+        ? await addCard({ ...formData, id: Math.random().toString(36).substr(2, 9), articleTitle: formData.articleTitle || '手动录入' } as AtomCard)
+        : await updateCard(card.id!, formData);
+      if (!succeeded) {
+        showToast(isNew ? '卡片创建失败，请重试' : '卡片更新失败，请重试');
+        return;
+      }
+      showToast(isNew ? '✓ 卡片已创建' : '✓ 卡片已更新');
+      onClose();
+    } finally {
+      setIsSubmitting(false);
     }
-    onClose();
+  };
+
+  const handleDelete = async () => {
+    if (!card.id || isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const succeeded = await deleteCard(card.id);
+      if (!succeeded) {
+        showToast('卡片删除失败，请重试');
+        return;
+      }
+      showToast('已删除卡片');
+      onClose();
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -373,11 +397,11 @@ const EditModal = ({ card, onClose }: { card: Partial<AtomCard>, onClose: () => 
 
         <div className="flex justify-between items-center mt-6">
           {!isNew ? (
-            <button onClick={() => { deleteCard(card.id!); onClose(); showToast('已删除卡片'); }} className="text-red-500 text-sm hover:underline">删除卡片</button>
+            <button onClick={() => void handleDelete()} disabled={isSubmitting} className="text-red-500 text-sm hover:underline disabled:opacity-50">删除卡片</button>
           ) : <div></div>}
           <div className="flex gap-2">
-            <button onClick={onClose} className="px-4 py-2 rounded-lg text-sm text-text2 hover:bg-surface2">取消</button>
-            <button onClick={handleSave} className="px-4 py-2 rounded-lg text-sm bg-accent text-white hover:bg-opacity-90">保存</button>
+            <button onClick={onClose} disabled={isSubmitting} className="px-4 py-2 rounded-lg text-sm text-text2 hover:bg-surface2 disabled:opacity-50">取消</button>
+            <button onClick={() => void handleSave()} disabled={isSubmitting} className="px-4 py-2 rounded-lg text-sm bg-accent text-white hover:bg-opacity-90 disabled:opacity-50">{isSubmitting ? '保存中...' : '保存'}</button>
           </div>
         </div>
       </div>

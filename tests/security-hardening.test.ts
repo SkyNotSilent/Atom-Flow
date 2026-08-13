@@ -423,6 +423,7 @@ await assert.rejects(
 const root = process.cwd();
 const server = readFileSync(path.join(root, "server.ts"), "utf8");
 const securitySource = readFileSync(path.join(root, "src/server/security.ts"), "utf8");
+const migrationSource = readFileSync(path.join(root, "src/server/databaseMigrations.ts"), "utf8");
 const contentSecuritySource = readFileSync(path.join(root, "src/server/contentSecurity.ts"), "utf8");
 const csrfFetchSource = readFileSync(path.join(root, "src/utils/csrfFetch.ts"), "utf8");
 const mainSource = readFileSync(path.join(root, "src/main.tsx"), "utf8");
@@ -440,7 +441,7 @@ assert.match(server, /app\.disable\(["']x-powered-by["']\)/, "Express fingerprin
 assert.match(server, /express\.json\(\{\s*limit:/, "JSON request size must be explicit");
 assert.match(server, /app\.use\(["']\/api["'], apiLimiter\)/, "API routes must have a general limiter");
 assert.match(server, /app\.use\(["']\/api["'], mutationOriginGuard\)/, "API mutations must enforce production origin policy");
-assert.match(server, /directives:\s*buildContentSecurityDirectives\(isProduction\)/, "Helmet CSP must use the tested shared directive builder");
+assert.match(server, /baseSecurityDirectives = buildContentSecurityDirectives\(isProduction\)/, "Helmet CSP must use the tested shared directive builder");
 assert.match(server, /sameSite:\s*["']lax["']/, "Session cookies must retain same-site CSRF defense without breaking external navigation");
 assert.match(server, /csrfToken\?: string/, "Session state must carry a server-generated CSRF token");
 assert.match(server, /app\.get\(["']\/api\/csrf-token["']/, "The browser must have a same-origin CSRF token bootstrap endpoint");
@@ -485,8 +486,8 @@ assert.doesNotMatch(server, /app\.post\(["']\/api\/articles\/refresh-cache["']/,
 assert.match(server, /app\.post\(["']\/api\/translate["'], requireAuth, paidOperationLimiter,/, "Translation spend must be limited");
 assert.match(server, /app\.post\(["']\/api\/write\/canvas\/agents\/:id\/chat\/stream["'], requireAuth, paidOperationLimiter,/, "Canvas Agent spend must be limited");
 assert.match(server, /app\.post\(["']\/api\/write\/agent\/chat\/stream["'], requireAuth, paidOperationLimiter,/, "Writing Agent spend must be limited");
-assert.match(server, /connectionTimeoutMillis:/, "PostgreSQL connection acquisition must be bounded");
-assert.match(server, /idleTimeoutMillis:/, "Idle PostgreSQL connections must be bounded");
+assert.match(migrationSource, /connectionTimeoutMillis:/, "PostgreSQL connection acquisition must be bounded");
+assert.match(migrationSource, /idleTimeoutMillis:/, "Idle PostgreSQL connections must be bounded");
 assert.match(server, /await validatePublicHttpUrl\(input, \{ allowedPorts: PUBLIC_WEB_PORTS \}\)/, "Custom RSS targets must be checked before parsing");
 assert.match(server, /validatePublicHttpUrl\(input, \{ allowedPorts: PUBLIC_WEB_PORTS \}\)/, "Custom RSS targets must be restricted to normal web ports");
 assert.match(server, /fetchBoundedPublicResource\(/, "Remote proxy responses must have redirect, timeout, DNS and byte boundaries");
@@ -502,11 +503,11 @@ assert.match(server, /asrSessionTimeout/, "ASR sessions must have a maximum dura
 assert.match(server, /instanceof multer\.MulterError/, "Multipart limit failures must be handled explicitly");
 assert.match(server, /entity\.too\.large/, "Oversized JSON bodies must return a payload error instead of 500");
 assert.match(server, /let schemaReady = false/, "Readiness must distinguish a connected database from a completed schema migration");
-assert.match(server, /schemaReady = true/, "Successful schema migration must mark the service ready");
-assert.match(server, /if \(isProduction\) throw err;[\s\S]{0,200}Database schema migration failed/, "Production must fail closed when schema migration fails");
+assert.match(server, /schemaReady = await verifyDatabaseSchema\(pool\)/, "Web startup must only verify the pre-deployed schema version");
+assert.doesNotMatch(server, /CREATE TABLE|ALTER TABLE|CREATE INDEX/, "Web startup must not execute schema DDL");
 assert.match(server, /!schemaReady/, "Health checks must reject half-migrated instances");
 assert.doesNotMatch(server, /else \{\s*await refreshFeeds\(\);\s*\}/, "Initial RSS refresh must never block HTTP startup");
-assert.match(server, /\.on\(["']error["'],[^\n]*pool|pool[^\n]*\.on\(["']error["']/, "PostgreSQL pool background errors must be observed");
+assert.match(migrationSource, /\.on\(["']error["'],|pool\.on\(["']error["']/, "PostgreSQL pool background errors must be observed");
 assert.match(server, /SIGTERM/, "Railway shutdown must drain the HTTP server and database pool");
 assert.match(server, /randomInt\(100000, 1000000\)/, "Authentication codes must use a cryptographic random source");
 assert.doesNotMatch(server, /Math\.floor\(100000 \+ Math\.random\(\) \* 900000\)/, "Authentication codes must not use Math.random");
@@ -536,9 +537,9 @@ assert.match(server, /canvasAgentConcurrencyMiddleware/, "Each canvas Agent must
 assert.match(server, /requestAbortController\.signal/, "Canvas Agent requests must cancel the upstream provider after disconnects");
 assert.match(server, /saved_articles WHERE id = \$14 AND user_id = \$2/, "Manual cards must only reference the current user's saved articles");
 assert.match(server, /articleSaveConcurrencyMiddleware/, "Concurrent article saves must be serialized per user and article");
-assert.match(server, /CREATE UNIQUE INDEX idx_saved_articles_content_hash_unique_v2/, "URL-less saved articles must have a per-user content hash identity constraint");
+assert.match(migrationSource, /CREATE UNIQUE INDEX(?: IF NOT EXISTS)? idx_saved_articles_content_hash_unique_v2/, "URL-less saved articles must have a per-user content hash identity constraint");
 assert.match(server, /ON CONFLICT \(user_id, content_hash\) WHERE content_hash IS NOT NULL/, "URL-less article writes must handle concurrent identity conflicts");
-assert.match(server, /UPDATE write_canvas_nodes n\s+SET ref_id = duplicates\.keep_id::text/, "Content-hash deduplication must preserve canvas article references");
+assert.match(migrationSource, /duplicates require an explicit backed-up maintenance migration/, "Unsafe duplicate cleanup must fail closed for an explicit maintenance window");
 assert.match(server, /canvasAgentConcurrencyGuard\.acquire\(`\$\{authenticatedUserKey\(req\)\}:\$\{agentId\}`\)/, "Canvas Agent locks must use the canonical numeric id");
 assert.match(server, /write_agent_templates WHERE user_id = \$1\) < 100/, "Agent template creation must match the list capacity");
 assert.match(securitySource, /requestPinnedPublicResource/, "Remote fetches must pin a validated address to the actual socket");
@@ -547,9 +548,9 @@ assert.doesNotMatch(server, /parser\.parseURL\(/, "Built-in RSS refreshes must n
 assert.match(server, /fetchBoundedPublicResource\(candidate,/, "Built-in RSS refreshes must use bounded, abortable fetches");
 assert.match(server, /getAllowedCanvasAgentModels/, "Canvas Agent models must be controlled by a server-side allowlist");
 assert.match(server, /isAllowedCanvasAgentModel/, "Canvas Agent model writes and runtime calls must enforce the allowlist");
-assert.match(server, /CREATE TABLE IF NOT EXISTS user_ai_usage_daily/, "Paid AI operations must have a shared daily budget ledger");
-assert.match(server, /CREATE TABLE IF NOT EXISTS ai_budget_reservations/, "generic paid routes must persist each budget reservation independently");
-assert.match(server, /state\s+TEXT NOT NULL DEFAULT 'pending'[\s\S]{0,180}pending[\s\S]{0,120}provider_started[\s\S]{0,120}refunded/, "durable reservations must record the provider billing boundary and refunds");
+assert.match(migrationSource, /CREATE TABLE IF NOT EXISTS user_ai_usage_daily/, "Paid AI operations must have a shared daily budget ledger");
+assert.match(migrationSource, /CREATE TABLE IF NOT EXISTS ai_budget_reservations/, "generic paid routes must persist each budget reservation independently");
+assert.match(migrationSource, /state\s+TEXT NOT NULL DEFAULT 'pending'[\s\S]{0,180}pending[\s\S]{0,120}provider_started[\s\S]{0,120}refunded/, "durable reservations must record the provider billing boundary and refunds");
 assert.match(server, /reserveDailyAiBudget/, "Paid AI routes must reserve durable daily budget before provider calls");
 assert.match(server, /const markDailyAiBudgetProviderStarted =/, "paid routes must explicitly commit their reservation at provider dispatch");
 assert.match(server, /markDailyAiBudgetProviderStarted[\s\S]{0,900}UPDATE ai_budget_reservations[\s\S]{0,240}state = 'provider_started'/, "provider dispatch must be persisted before a generic paid request reaches the upstream API");
@@ -566,12 +567,12 @@ assert.match(server, /onProviderStart/, "provider-backed graph runtimes must exp
 assert.match(server, /app\.get\("\/api\/favicon-proxy", requireAuth, remoteFetchLimiter/, "Favicon egress proxy must require authentication");
 assert.match(server, /invalidateUserSessions/, "Password changes and resets must invalidate prior sessions");
 assert.doesNotMatch(
-  server,
+  migrationSource,
   /write_canvas_nodes ALTER COLUMN (?:node_role|content_type|origin|status) SET NOT NULL/,
   "New canvas semantic columns must remain compatible with old instances during rolling deploys",
 );
 assert.match(
-  server,
+  migrationSource,
   /write_canvas_nodes ALTER COLUMN node_role DROP NOT NULL/,
   "Startup must relax semantic columns that an interrupted earlier rollout may already have tightened",
 );
@@ -590,9 +591,9 @@ assert.match(server, /app\.delete\("\/api\/saved-articles\/:id"[\s\S]{0,900}lock
 assert.match(server, /app\.delete\("\/api\/write\/agent\/threads\/:id", requireAuth/, "Users must be able to delete writing conversations");
 assert.match(server, /DELETE FROM verification_codes[\s\S]{0,120}expires_at/, "Expired verification records must be cleaned up");
 assert.match(server, /pg_try_advisory_xact_lock[\s\S]{0,800}DELETE FROM verification_codes/, "Verification cleanup must elect one bounded database worker");
-assert.match(server, /idx_vc_expires_at/, "Verification cleanup must have an expiry index");
-assert.match(server, /idx_session_user_id/, "Session invalidation must have a JSON user-id index");
-assert.match(server, /pg_advisory_lock/, "Schema initialization must be serialized across replicas");
+assert.match(migrationSource, /idx_vc_expires_at/, "Verification cleanup must have an expiry index");
+assert.match(migrationSource, /idx_session_user_id/, "Session invalidation must have a JSON user-id index");
+assert.match(migrationSource, /pg_advisory_lock/, "Schema initialization must be serialized across replicas");
 assert.match(server, /new Worker\(/, "Document parsing must run outside the main event loop");
 assert.match(server, /resourceLimits:/, "Document parser workers must have a memory limit");
 
@@ -601,8 +602,11 @@ const railwayConfig = JSON.parse(railway) as { deploy?: { drainingSeconds?: unkn
 const dockerfile = readFileSync(path.join(root, "Dockerfile"), "utf8");
 const nixpacks = readFileSync(path.join(root, "nixpacks.toml"), "utf8");
 const envExample = readFileSync(path.join(root, ".env.example"), "utf8");
-const agentsDoc = readFileSync(path.join(root, "AGENTS.md"), "utf8");
-const claudeDoc = readFileSync(path.join(root, "CLAUDE.md"), "utf8");
+const localAgentDocs = ["AGENTS.md", "CLAUDE.md"].flatMap(name => {
+  const filePath = path.join(root, name);
+  return existsSync(filePath) ? [[name, readFileSync(filePath, "utf8")] as const] : [];
+});
+const gitignore = readFileSync(path.join(root, ".gitignore"), "utf8");
 const deploymentDoc = readFileSync(path.join(root, "DEPLOYMENT.md"), "utf8");
 assert.match(railway, /"healthcheckPath"\s*:\s*"\/api\/health"/, "Railway must gate deployments on health");
 assert.match(railway, /"healthcheckTimeout"\s*:/, "Railway healthcheck timeout must be explicit");
@@ -653,7 +657,9 @@ for (const [variable, expected] of [
 ] as const) {
   assert.match(envExample, new RegExp(`^${variable}=${expected}$`, "m"), `.env.example ${variable} must match the server default`);
 }
-for (const [name, content] of [["AGENTS.md", agentsDoc], ["CLAUDE.md", claudeDoc]] as const) {
+assert.match(gitignore, /^AGENTS\.md$/m, "local AGENTS.md instructions must remain ignored");
+assert.match(gitignore, /^CLAUDE\.md$/m, "local CLAUDE.md instructions must remain ignored");
+for (const [name, content] of localAgentDocs) {
   assert.match(content, /## Production Security And Scale/, `${name} must document the production security contract`);
   assert.match(content, /GitHub auto-?deploy/i, `${name} must retain the GitHub to Railway deployment trigger`);
   assert.match(content, /Cloudflare|WAF/, `${name} must identify the edge protection launch gate`);

@@ -2,10 +2,13 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../context/AppContext';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut, Orbit, FileText, ChevronDown } from 'lucide-react';
+import { Sun, Moon, Plus, Folder, ChevronRight, Trash2, X, LogIn, LogOut, Orbit, FileText, ChevronDown, Headphones } from 'lucide-react';
 import { logger } from '../utils/logger';
 import { AtomFlowGalaxyIcon } from './AtomFlowGalaxyIcon';
 import { OFFICIAL_SOURCE_ICON_URLS } from '../data/sourceIcons';
+import type { AppTab } from '../types';
+import { requiresAuthenticatedAppTab } from '../utils/appTabs';
+import { getProxiedFaviconUrl } from '../utils/proxiedMedia';
 import { sourceMatches } from '../utils/articleDisplay';
 
 export function cn(...inputs: ClassValue[]) {
@@ -13,8 +16,8 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 interface NavProps {
-  activeTab: 'feed' | 'knowledge' | 'write' | 'discover';
-  setActiveTab: (tab: 'feed' | 'knowledge' | 'write' | 'discover') => void;
+  activeTab: AppTab;
+  setActiveTab: (tab: AppTab) => void;
 }
 
 type SourceEntry = {
@@ -86,11 +89,6 @@ const createSourceEntry = (name: string, color: string, rssUrl?: string, icon?: 
   rssUrl,
   icon: OFFICIAL_SOURCE_ICON_URLS[name] || icon
 });
-
-const getProxiedIconUrl = (icon?: string) => {
-  if (!icon) return undefined;
-  return `/api/favicon-proxy?url=${encodeURIComponent(icon)}`;
-};
 
 const createDefaultEntries = (): NavEntry[] => {
   // 创建默认的合集结构
@@ -281,6 +279,7 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     articles, savedCards, savedArticles, theme, toggleTheme, setActiveSource, showToast, reloadArticles, loadSourceArticles, activeSource,
 	    knowledgeTypeFilter, setKnowledgeTypeFilter, setKnowledgeSourceFilter,
 	    user, loginAndDo, logout, setShowProfileModal, syncPreferences,
+	    requestBillingIntent,
 	    writeWorkspaceMode, setWriteWorkspaceMode,
 	    assistantThreads, assistantThreadId, setAssistantThreadId, createAssistantThread
 	  } = useAppContext();
@@ -290,7 +289,11 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   useEffect(() => {
     const handler = () => setSourceEntries(loadEntriesFromStorage());
     window.addEventListener('atomflow:preferences-loaded', handler);
-    return () => window.removeEventListener('atomflow:preferences-loaded', handler);
+    window.addEventListener('atomflow:source-layout-changed', handler);
+    return () => {
+      window.removeEventListener('atomflow:preferences-loaded', handler);
+      window.removeEventListener('atomflow:source-layout-changed', handler);
+    };
   }, []);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropHint, setDropHint] = useState<{ targetId: string; position: 'before' | 'after' | 'inside' } | null>(null);
@@ -309,24 +312,16 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
   const pointerSessionRef = useRef<{ entryId: string; pointerId: number; startX: number; startY: number; active: boolean } | null>(null);
   const suppressClickRef = useRef(false);
   const [failedIconIds, setFailedIconIds] = useState<Set<string>>(() => new Set());
-  const [proxiedIconIds, setProxiedIconIds] = useState<Set<string>>(() => new Set());
   const unreadCount = articles.filter(a => !a.saved).length;
 
   const handleIconError = React.useCallback((source: SourceEntry) => {
-    if (source.icon && /^https?:\/\//i.test(source.icon) && !proxiedIconIds.has(source.id)) {
-      setProxiedIconIds(prev => new Set(prev).add(source.id));
-      return;
-    }
     setFailedIconIds(prev => new Set(prev).add(source.id));
-  }, [proxiedIconIds]);
+  }, []);
 
   const getSourceIconSrc = React.useCallback((source: SourceEntry) => {
     if (!source.icon) return undefined;
-    if (/^https?:\/\//i.test(source.icon) && proxiedIconIds.has(source.id)) {
-      return getProxiedIconUrl(source.icon);
-    }
-    return source.icon;
-  }, [proxiedIconIds]);
+    return getProxiedFaviconUrl(source.icon);
+  }, []);
 
   useEffect(() => {
     const sourceIconMap = new Map<string, string>();
@@ -366,7 +361,6 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
       return changed ? nextEntries : prev;
     });
     setFailedIconIds(prev => prev.size > 0 ? new Set() : prev);
-    setProxiedIconIds(prev => prev.size > 0 ? new Set() : prev);
   }, [articles]);
 
   useEffect(() => {
@@ -378,8 +372,12 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
     }
   }, [sourceEntries, user, syncPreferences]);
 
-  const handleTabClick = (tab: 'feed' | 'knowledge' | 'write' | 'discover') => {
-    if ((tab === 'knowledge' || tab === 'write') && !user) {
+  const handleTabClick = (tab: AppTab) => {
+    if (requiresAuthenticatedAppTab(tab) && !user) {
+      if (tab === 'write') {
+        requestBillingIntent({ kind: 'open_write' });
+        return;
+      }
       loginAndDo(() => setActiveTab(tab));
       return;
     }
@@ -425,7 +423,10 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
       ? sourceEntries[location.index] as SourceEntry
       : (sourceEntries[location.collectionIndex] as CollectionEntry).children[location.childIndex];
     try {
-      await fetch(`/api/sources/${encodeURIComponent(source.name)}`, { method: 'DELETE' });
+      const response = await fetch(`/api/sources/${encodeURIComponent(source.name)}`, { method: 'DELETE' });
+      if (!response.ok) {
+        throw new Error(`Delete source failed (${response.status})`);
+      }
       if (activeSource === source.name) {
         setActiveSource(null);
       }
@@ -1018,7 +1019,13 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
           发现订阅源
         </TabButton>
         <TabButton active={activeTab === 'knowledge'} onClick={() => handleTabClick('knowledge')} badge={savedCards.length} fullWidth>我的知识库</TabButton>
-        <TabButton active={activeTab === 'write'} onClick={() => handleTabClick('write')} fullWidth>魔法写作</TabButton>
+        <TabButton active={activeTab === 'write'} onClick={() => handleTabClick('write')} fullWidth>
+          <span className="flex items-center gap-2">魔法写作 <span className="rounded-full border border-[#C9A76A] bg-[#F6E7C8] px-1.5 py-0.5 text-[9px] font-bold leading-none tracking-wide text-[#8A5C20]">Pro</span></span>
+        </TabButton>
+        <TabButton active={activeTab === 'podcast'} onClick={() => handleTabClick('podcast')} fullWidth>
+          <Headphones size={14} className="inline mr-1" />
+          播客解读
+        </TabButton>
 
         {activeTab === 'feed' && (
           <div className="mt-6">
@@ -1463,7 +1470,12 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
             登录 / 注册
           </button>
         )}
-        <button onClick={toggleTheme} className="p-2 rounded-md text-text2 hover:bg-surface2 transition-colors shrink-0">
+        <button
+          onClick={toggleTheme}
+          className="p-2 rounded-md text-text2 hover:bg-surface2 transition-colors shrink-0"
+          aria-label={theme === 'dark' ? '切换至浅色主题' : '切换至深色主题'}
+          title={theme === 'dark' ? '切换至浅色主题' : '切换至深色主题'}
+        >
           {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
         </button>
       </div>

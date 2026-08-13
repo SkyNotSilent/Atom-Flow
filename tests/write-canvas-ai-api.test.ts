@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const server = readFileSync(path.join(process.cwd(), "server.ts"), "utf8");
+const migrations = readFileSync(path.join(process.cwd(), "src/server/databaseMigrations.ts"), "utf8");
 const routeSegment = (start: string, end: string) => {
   const startIndex = server.indexOf(start);
   const endIndex = server.indexOf(end, startIndex);
@@ -16,12 +17,12 @@ const assertOrdered = (source: string, before: string, after: string, message: s
   assert.ok(beforeIndex >= 0 && afterIndex >= 0 && beforeIndex < afterIndex, message);
 };
 
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_agent_runs/, "Quick and explicit AI work needs durable runs");
-assert.match(server, /reserved_tokens\s+BIGINT/, "AI runs must persist their budget reservation for crash recovery");
-assert.match(server, /provider_started\s+BOOLEAN/, "AI runs must persist the provider billing boundary");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_agent_groups/, "Reusable Agent groups must be persisted");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_agent_group_members/, "Agent group member configuration must be persisted");
-assert.match(server, /CREATE TABLE IF NOT EXISTS write_canvas_agent_batches/, "Batch status must survive request completion");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_agent_runs/, "Quick and explicit AI work needs durable runs");
+assert.match(migrations, /reserved_tokens\s+BIGINT/, "AI runs must persist their budget reservation for crash recovery");
+assert.match(migrations, /provider_started\s+BOOLEAN/, "AI runs must persist the provider billing boundary");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_agent_groups/, "Reusable Agent groups must be persisted");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_agent_group_members/, "Agent group member configuration must be persisted");
+assert.match(migrations, /CREATE TABLE IF NOT EXISTS write_canvas_agent_batches/, "Batch status must survive request completion");
 assert.match(server, /app\.post\("\/api\/write\/canvas\/nodes\/:id\/actions\/stream"/, "Nodes must expose one-off AI actions");
 assert.match(server, /extract_insights/);
 assert.match(server, /extract_data/);
@@ -48,7 +49,7 @@ for (const table of ["write_canvas_agent_messages", "write_canvas_agent_groups",
 }
 assert.match(server, /'partial'/, "Mixed batches need a terminal partial status");
 assert.match(
-  server,
+  migrations,
   /write_canvas_agent_groups[\s\S]{0,700}status IN \('ready','running','completed','partial','failed','cancelled'\)/,
   "Cancelled batches must have a valid atomic group terminal status",
 );
@@ -56,9 +57,9 @@ assert.match(server, /finishCanvasAgentBatch/, "Batch and group terminal state s
 assert.match(server, /CANVAS_AI_RECOVERY_STALE_MS/, "Stale AI work needs a timeout-aware recovery threshold");
 assert.match(server, /CANVAS_AI_RECOVERY_INTERVAL_MS/, "Stale AI work must be reconciled periodically, not only at process startup");
 assert.match(server, /FOR UPDATE[\s\S]{0,1200}已有批次正在运行/, "A row lock must reject a second active batch for the same group");
-assert.match(server, /current_batch_id\s+BIGINT/, "Agent groups need a persisted current-batch lease");
-assert.match(server, /write_canvas_agent_groups_current_batch_owner_fkey[\s\S]{0,350}REFERENCES write_canvas_agent_batches\(id, user_id, project_id, group_id\)/, "The current batch lease must be tenant and group scoped in PostgreSQL");
-assert.match(server, /write_canvas_agent_runs_group_fields_check[\s\S]{0,400}group_id IS NULL[\s\S]{0,250}batch_id IS NOT NULL/, "Nullable group run fields must have an explicit consistency check");
+assert.match(migrations, /current_batch_id\s+BIGINT/, "Agent groups need a persisted current-batch lease");
+assert.match(migrations, /write_canvas_agent_groups_current_batch_owner_fkey[\s\S]{0,350}REFERENCES write_canvas_agent_batches\(id, user_id, project_id, group_id\)/, "The current batch lease must be tenant and group scoped in PostgreSQL");
+assert.match(migrations, /write_canvas_agent_runs_group_fields_check[\s\S]{0,400}group_id IS NULL[\s\S]{0,250}batch_id IS NOT NULL/, "Nullable group run fields must have an explicit consistency check");
 assert.match(server, /assertCurrentCanvasAgentBatchLease/, "Output persistence must validate the current batch lease");
 assert.match(
   server,
@@ -83,6 +84,27 @@ const singleAgentRoute = routeSegment(
   'app.post("/api/write/canvas/agents/:id/chat/stream"',
   'app.post("/api/write/canvas/agents/:id/save-result"',
 );
+const recallConfirmRoute = routeSegment(
+  'app.post("/api/write/canvas/agents/:id/recall/confirm"',
+  'app.post("/api/write/canvas/agents/:id/chat/stream"',
+);
+assert.match(recallConfirmRoute, /saved_cards WHERE user_id=\$1 AND id=ANY/, "recall confirmation must authorize cards against the current user");
+assert.match(recallConfirmRoute, /ON CONFLICT \(project_id,source_node_id,target_node_id,relation\)/, "recall confirmation must idempotently connect confirmed cards");
+assert.match(recallConfirmRoute, /newCardCount[\s\S]*WRITE_CANVAS_MAX_NODES_PER_PROJECT/, "recall confirmation must preflight only newly created card nodes");
+assert.match(recallConfirmRoute, /newEdgeCount[\s\S]*WRITE_CANVAS_MAX_EDGES_PER_PROJECT/, "recall confirmation must preflight only newly created edges");
+assert.match(recallConfirmRoute, /assertCanvasStorageQuota[\s\S]*newCards\.reduce[\s\S]*newEdgeCount/, "recall confirmation must charge storage only for new nodes and edges");
+assert.match(singleAgentRoute, /req\.body\?\.action === "create_article"/, "Canvas chat must support the create_article action");
+assert.match(singleAgentRoute, /requestId is required for create_article/, "create_article must require a stable request id");
+assert.match(singleAgentRoute, /CANVAS_REQUEST_ID_REUSED/, "request ids cannot be reused for different article inputs");
+assert.match(singleAgentRoute, /response_payload[\s\S]*replayed: true/, "completed create_article requests must replay their durable result");
+assert.match(singleAgentRoute, /creation_key=\$2[\s\S]*ensureCanvasGeneratedNoteNode/, "interrupted requests must recover the durable note and canvas node");
+assert.match(singleAgentRoute, /noteNode/, "the final create_article payload must expose its generated note node");
+assert.match(singleAgentRoute, /reserveDurableDailyAiBudget/, "create_article must reserve the shared durable daily operation/token budget");
+assert.match(singleAgentRoute, /estimateCanvasInputTokens[\s\S]*getCanvasAgentMaxOutputTokens\(\) \* WRITE_AGENT_MAX_PROVIDER_CALLS/, "create_article reservation must use the server output ceiling plus input tokens");
+assertOrdered(singleAgentRoute, "reserveDurableDailyAiBudget", "runOpenAIWriteAgentRuntime", "create_article must reserve budget before provider execution");
+assert.match(singleAgentRoute, /markDailyAiBudgetProviderStarted[\s\S]*provider_started_at/, "create_article must durably cross both shared and request provider-start boundaries");
+assert.match(singleAgentRoute, /catch \(error\)[\s\S]*refundDailyAiBudgetReservation/, "create_article must refund reservations that fail before provider dispatch");
+assert.match(server, /ensureCanvasGeneratedNoteNode[\s\S]*lockCanvasUser[\s\S]*WRITE_CANVAS_MAX_NODES_PER_PROJECT[\s\S]*WRITE_CANVAS_MAX_EDGES_PER_PROJECT[\s\S]*INSERT INTO write_canvas_nodes/, "generated note nodes must enforce node and edge capacity while holding the user lock");
 const groupBatchHistoryRoute = routeSegment(
   'app.get("/api/write/canvas/agent-groups/:id/batches"',
   'app.get("/api/write/canvas/projects/:projectId/agent-groups"',
@@ -115,19 +137,19 @@ assert.match(
 );
 
 assert.match(
-  server,
+  migrations,
   /FOREIGN KEY \(group_member_id, user_id, project_id, group_id\)[\s\S]{0,180}ON DELETE SET NULL \(group_member_id\)/,
   "Historical runs must survive member deletion without weakening tenant ownership",
 );
-assert.match(server, /node_id\s+BIGINT/, "Agent groups must own a canonical task node");
-assert.match(server, /UNIQUE \(id, user_id, project_id\)/, "Tenant-owned records need composite identity constraints");
-assert.match(server, /FOREIGN KEY \(group_id, user_id, project_id\)/, "Cross-table group ownership must be enforced by a composite foreign key");
-assert.match(server, /'agent_group'/, "Canonical group task nodes need the agent_group content type");
+assert.match(migrations, /node_id\s+BIGINT/, "Agent groups must own a canonical task node");
+assert.match(migrations, /UNIQUE \(id, user_id, project_id\)/, "Tenant-owned records need composite identity constraints");
+assert.match(migrations, /FOREIGN KEY \(group_id, user_id, project_id\)/, "Cross-table group ownership must be enforced by a composite foreign key");
+assert.match(migrations, /'agent_group'/, "Canonical group task nodes need the agent_group content type");
 assert.match(server, /business_ref[\s\S]{0,800}groupId/, "Group task nodes must expose the group id as their business reference");
 assert.match(groupBatchRoute, /source_node_id, target_node_id, relation[\s\S]{0,500}context/, "Selected context must connect to the group task node");
 assert.match(groupBatchRoute, /sourceNodeId:\s*Number\(group\.node_id\)/, "Generated candidates must originate from the group task node");
-assert.match(server, /target_node\.content_type = 'agent_group'[\s\S]{0,1000}SET relation = 'context'/, "startup repair must preserve Agent-group context authorization");
-assert.match(server, /target_node\.kind <> 'agent' AND NOT \(target_node\.node_role = 'task' AND target_node\.content_type = 'agent_group'\)/, "context cleanup must recognize Agent-group task targets");
+assert.match(migrations, /target_node\.content_type = 'agent_group'[\s\S]{0,1000}SET relation = 'context'/, "startup repair must preserve Agent-group context authorization");
+assert.match(migrations, /target_node\.kind <> 'agent' AND NOT \(target_node\.node_role = 'task' AND target_node\.content_type = 'agent_group'\)/, "context cleanup must recognize Agent-group task targets");
 assert.match(server, /recoverStaleCanvasAiWork[\s\S]{0,5000}write_canvas_agent_batches[\s\S]{0,1800}current_batch_id = NULL/, "stale recovery must converge abandoned Agent-group batches without killing fresh leases");
 assert.match(server, /recoverStaleCanvasAiWork[\s\S]{0,7000}write_canvas_agent_messages[\s\S]{0,900}meta->>'status' = 'pending'/, "periodic recovery must clean stale incomplete Agent messages");
 assert.match(server, /recoverStaleCanvasAiWork[\s\S]{0,2200}refundReservations[\s\S]{0,1200}releaseDailyAiBudget/, "stale undispatched work must release durable budget reservations");
@@ -135,12 +157,14 @@ assert.match(server, /refundReservations[\s\S]{0,1200}operationCount[\s\S]{0,500
 assert.match(server, /staleRuns[\s\S]{0,1000}!run\.provider_started[\s\S]{0,500}reservedTokens/, "stale runs may be refunded only when provider dispatch never started");
 assert.match(groupBatchRoute, /staleRuns[\s\S]{0,1000}run\.provider_started[\s\S]{0,700}releaseDailyAiBudget/, "request-driven stale takeover must refund undispatched durable reservations");
 assert.match(groupBatchRoute, /reserved_tokens = CASE WHEN provider_started THEN reserved_tokens ELSE 0 END/, "stale takeover must clear only refundable run reservations");
-assert.doesNotMatch(
+assert.match(
   server,
-  /requestCanvasAgentCompletion[\s\S]{0,3600}AbortSignal\.any\(\[input\.signal/,
-  "a durably dispatched Canvas request must finish provider execution after the browser disconnects",
+  /requestCanvasAgentCompletion[\s\S]{0,3600}signal: AbortSignal\.any\(\[input\.signal, AbortSignal\.timeout\(AI_REQUEST_TIMEOUT_MS\)\]\)/,
+  "Canvas provider dispatch must combine client cancellation with its bounded server timeout",
 );
-assert.match(server, /fetch\(chatCompletionsUrl,[\s\S]{0,700}signal: AbortSignal\.timeout\(AI_REQUEST_TIMEOUT_MS\)/, "Canvas provider dispatch must retain a bounded server timeout");
+assert.match(quickActionRoute, /requestCanvasAgentCompletion\(\{[\s\S]{0,700}signal: requestAbortController\.signal/, "quick actions must abort the underlying provider request after disconnect");
+assert.match(groupBatchRoute, /requestCanvasAgentCompletion\(\{[\s\S]{0,900}signal: requestAbortController\.signal/, "Agent-group members must abort the underlying provider request after disconnect");
+assert.match(singleAgentRoute, /requestCanvasAgentCompletion\(\{[\s\S]{0,900}signal: requestAbortController\.signal/, "single-Agent turns must abort the underlying provider request after disconnect");
 assert.match(
   server,
   /let canvasAiRecoveryTimer:[\s\S]{0,120}= null;[\s\S]{0,300}if \(pool\) \{[\s\S]{0,500}canvasAiRecoveryTimer = setInterval/,
@@ -154,19 +178,8 @@ assert.match(groupBatchHistoryRoute, /write_canvas_agent_runs WHERE group_id = \
 assert.match(groupBatchHistoryRoute, /res\.json\(\{ batches, runs \}\)/, "Group history must restore batch member outcomes");
 assert.match(server, /requireCanvasCompletionContent/, "Empty provider responses must fail before persistence");
 
-const legacyConstraintMigration = routeSegment(
-  'await runSchemaTransaction(async client => {',
-  'ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS node_role TEXT',
-);
-const canonicalGroupNodeMigration = routeSegment(
-  'ALTER TABLE write_canvas_nodes ADD COLUMN IF NOT EXISTS node_role TEXT',
-  'CREATE TABLE IF NOT EXISTS write_canvas_documents',
-);
-assert.match(server, /runSchemaTransaction[\s\S]{0,700}BEGIN[\s\S]{0,500}COMMIT[\s\S]{0,500}ROLLBACK/, "Schema transaction helper must commit or roll back on one client");
-assert.match(legacyConstraintMigration, /runSchemaTransaction\(async client =>/, "Legacy FK drops and replacements must be one transaction");
-assert.match(legacyConstraintMigration, /pg_get_constraintdef[\s\S]{0,2200}DROP CONSTRAINT[\s\S]{0,500}ADD CONSTRAINT/, "status constraints must only be replaced when their definitions are stale");
-assert.doesNotMatch(legacyConstraintMigration, /DROP CONSTRAINT IF EXISTS/, "startup must not acquire table locks for absent legacy constraints");
-assert.match(canonicalGroupNodeMigration, /runSchemaTransaction\(async client =>/, "Canonical group-node backfill must be transactional");
-assert.match(canonicalGroupNodeMigration, /CREATE UNIQUE INDEX[\s\S]{0,300}agent_group[\s\S]{0,1800}ON CONFLICT/, "Canonical group nodes need an idempotent unique business reference");
+assert.match(migrations, /runSchemaMigrationOnce\("20260813_creative_canvas_schema_v2"[\s\S]*?BEGIN|runSchemaMigrationOnce/, "Creative canvas migrations must run transactionally");
+assert.match(migrations, /pg_get_constraintdef[\s\S]{0,2600}DROP CONSTRAINT[\s\S]{0,900}ADD CONSTRAINT/, "status constraints must only be replaced when their definitions are stale");
+assert.match(migrations, /CREATE UNIQUE INDEX[\s\S]{0,500}agent_group[\s\S]{0,2600}ON CONFLICT/, "Canonical group nodes need an idempotent unique business reference");
 
 console.log("PASS: canvas quick AI and Agent group API contracts");

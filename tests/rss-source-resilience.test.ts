@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { resolveFeedPageState } from "../src/utils/feedState.js";
 import type { Article } from "../src/types.js";
 import { sourceMatches } from "../src/utils/articleDisplay.js";
 import {
@@ -17,6 +18,8 @@ import {
 
 const root = process.cwd();
 const server = readFileSync(path.join(root, "server.ts"), "utf8");
+const rssCacheSource = readFileSync(path.join(root, "src/server/rssCache.ts"), "utf8");
+const migrationSource = readFileSync(path.join(root, "src/server/databaseMigrations.ts"), "utf8");
 const savedStateResolver = server.slice(
   server.indexOf("async function applyUserSavedStateToArticles"),
   server.indexOf("const SOURCE_PRIORITY"),
@@ -202,8 +205,8 @@ assert.match(server, /sanitizeGlobalArticleCache\(cachedArticles\)/, "Startup mu
 assert.match(server, /X-AtomFlow-RSS-Refreshing/, "The API must expose whether its initial refresh is still pending");
 assert.doesNotMatch(server, /refreshBuiltInSource/, "User requests must not mutate globally shared built-in sources");
 assert.match(server, /内置订阅源由服务器统一刷新/, "Built-in source refreshes must remain server-owned");
-assert.match(server, /createSerializedTaskQueue/, "Article cache writes must be serialized");
-assert.match(server, /fs\.rename\(/, "Article cache replacement must be atomic");
+assert.match(rssCacheSource, /writeQueue/, "Article cache writes must be serialized");
+assert.match(rssCacheSource, /fs\.rename\(/, "Article cache replacement must be atomic");
 assert.doesNotMatch(server, /article\.saved\s*=\s*true/, "One user's save must not mutate the process-global article state");
 assert.doesNotMatch(server, /article\.cards\s*=/, "One user's extraction must not mutate the process-global article state");
 assert.match(
@@ -217,22 +220,22 @@ assert.match(
   "Feed URLs must be normalized before matching saved state",
 );
 assert.match(
-  server,
+  migrationSource,
   /ADD COLUMN IF NOT EXISTS normalized_url TEXT/,
   "Saved articles must persist a canonical URL identity",
 );
 assert.match(
-  server,
+  migrationSource,
   /CREATE UNIQUE INDEX[^\n]+saved_articles[^\n]+\(user_id, normalized_url\)/,
   "Canonical saved-article URLs must be unique per user at the database layer",
 );
 assert.match(
-  server,
-  /runSchemaTransaction\(async client[\s\S]+LOCK TABLE saved_articles IN SHARE ROW EXCLUSIVE MODE/,
+  migrationSource,
+  /runSchemaMigrationOnce\("20260813_saved_articles_normalized_url_v1"[\s\S]+LOCK TABLE saved_articles IN SHARE ROW EXCLUSIVE MODE/,
   "Canonical URL backfill and deduplication must run in one locked schema transaction",
 );
 assert.match(
-  server,
+  migrationSource,
   /CHECK \(url IS NULL OR normalized_url IS NOT NULL\)/,
   "Old application instances must not bypass canonical URL identity during a rolling deploy",
 );
@@ -266,7 +269,11 @@ const retrySourceRoute = server.slice(
   server.indexOf('app.delete("/api/sources/:source"'),
 );
 assert.match(appContext, /articlesLoaded/, "Article loading must have an explicit terminal state even when the result is empty");
-assert.match(feedPage, /isInitialLoading\s*=\s*!articlesLoaded/, "The feed must stop loading after an empty API response");
+assert.equal(
+  resolveFeedPageState({ isLoading: false, error: null, itemCount: 0 }),
+  "empty",
+  "The feed must stop loading after an empty API response",
+);
 assert.match(appContext, /X-AtomFlow-RSS-Refreshing/, "An empty cold-start response must schedule an automatic retry");
 assert.match(
   appContext,
