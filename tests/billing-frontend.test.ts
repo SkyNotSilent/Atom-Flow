@@ -38,7 +38,9 @@ test('billing status normalizer accepts the canonical server DTO and legacy clie
     'Profile must display the scheduled cancellation date instead of an unrelated renewal date');
   assert.doesNotMatch(context, /localStorage\.setItem\(['"]atomflow:billing-sync/,
     'billing access synchronization must not persist account state in cleartext browser storage');
-  assert.match(context, /new BroadcastChannel\(BILLING_SYNC_CHANNEL\)/,
+  assert.match(context, /try\s*{[\s\S]*new BroadcastChannel\(BILLING_SYNC_CHANNEL\)[\s\S]*}\s*catch\s*{[\s\S]*return null;/,
+    'billing access synchronization must tolerate browsers that expose but cannot open BroadcastChannel');
+  assert.match(context, /openBillingSyncChannel\(\)/,
     'billing access synchronization should use an ephemeral cross-tab channel');
 });
 

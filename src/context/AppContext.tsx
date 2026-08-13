@@ -29,10 +29,19 @@ export type WriteGraphView = 'all' | 'activated';
 const RSS_REFRESH_RETRY_DELAYS_MS = [1500, 3000, 6000, 12000, 24000] as const;
 const BILLING_SYNC_CHANNEL = 'atomflow:billing-sync';
 
+const openBillingSyncChannel = (): BroadcastChannel | null => {
+  if (typeof BroadcastChannel !== 'function') return null;
+  try {
+    return new BroadcastChannel(BILLING_SYNC_CHANNEL);
+  } catch {
+    return null;
+  }
+};
+
 const notifyBillingAccessChanged = () => {
   window.dispatchEvent(new Event('atomflow:billing-access-changed'));
-  if (typeof BroadcastChannel !== 'function') return;
-  const channel = new BroadcastChannel(BILLING_SYNC_CHANNEL);
+  const channel = openBillingSyncChannel();
+  if (!channel) return;
   channel.postMessage({ type: 'billing-access-changed' });
   channel.close();
 };
@@ -980,9 +989,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   useEffect(() => {
     if (!user) return;
     const refresh = () => { void refreshBillingStatus(); };
-    const channel = typeof BroadcastChannel === 'function'
-      ? new BroadcastChannel(BILLING_SYNC_CHANNEL)
-      : null;
+    const channel = openBillingSyncChannel();
     const handleFocus = () => refresh();
     channel?.addEventListener('message', refresh);
     window.addEventListener('atomflow:billing-access-changed', refresh);
