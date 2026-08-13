@@ -602,8 +602,11 @@ const railwayConfig = JSON.parse(railway) as { deploy?: { drainingSeconds?: unkn
 const dockerfile = readFileSync(path.join(root, "Dockerfile"), "utf8");
 const nixpacks = readFileSync(path.join(root, "nixpacks.toml"), "utf8");
 const envExample = readFileSync(path.join(root, ".env.example"), "utf8");
-const agentsDoc = readFileSync(path.join(root, "AGENTS.md"), "utf8");
-const claudeDoc = readFileSync(path.join(root, "CLAUDE.md"), "utf8");
+const localAgentDocs = ["AGENTS.md", "CLAUDE.md"].flatMap(name => {
+  const filePath = path.join(root, name);
+  return existsSync(filePath) ? [[name, readFileSync(filePath, "utf8")] as const] : [];
+});
+const gitignore = readFileSync(path.join(root, ".gitignore"), "utf8");
 const deploymentDoc = readFileSync(path.join(root, "DEPLOYMENT.md"), "utf8");
 assert.match(railway, /"healthcheckPath"\s*:\s*"\/api\/health"/, "Railway must gate deployments on health");
 assert.match(railway, /"healthcheckTimeout"\s*:/, "Railway healthcheck timeout must be explicit");
@@ -654,7 +657,9 @@ for (const [variable, expected] of [
 ] as const) {
   assert.match(envExample, new RegExp(`^${variable}=${expected}$`, "m"), `.env.example ${variable} must match the server default`);
 }
-for (const [name, content] of [["AGENTS.md", agentsDoc], ["CLAUDE.md", claudeDoc]] as const) {
+assert.match(gitignore, /^AGENTS\.md$/m, "local AGENTS.md instructions must remain ignored");
+assert.match(gitignore, /^CLAUDE\.md$/m, "local CLAUDE.md instructions must remain ignored");
+for (const [name, content] of localAgentDocs) {
   assert.match(content, /## Production Security And Scale/, `${name} must document the production security contract`);
   assert.match(content, /GitHub auto-?deploy/i, `${name} must retain the GitHub to Railway deployment trigger`);
   assert.match(content, /Cloudflare|WAF/, `${name} must identify the edge protection launch gate`);
