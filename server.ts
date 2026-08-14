@@ -11790,6 +11790,9 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     app.use(express.static("dist"));
+    app.get(["/pricing", "/pricing/"], (_req, res) => {
+      res.sendFile(path.join(process.cwd(), "dist", "index.html"));
+    });
   }
 
   app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {

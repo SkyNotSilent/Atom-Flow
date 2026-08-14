@@ -1427,7 +1427,12 @@ export const Nav: React.FC<NavProps> = ({ activeTab, setActiveTab }) => {
         </div>
       )}
       
-      <div className="p-4 border-t border-border flex items-center justify-between shrink-0">
+      <div className="flex shrink-0 items-center justify-center gap-3 border-t border-border px-4 pt-3 text-[10px] text-text3">
+        <a href="/pricing" className="hover:text-accent">定价</a>
+        <a href="/legal/terms" target="_blank" rel="noreferrer" className="hover:text-accent">条款与联系</a>
+        <a href="/legal/privacy" target="_blank" rel="noreferrer" className="hover:text-accent">隐私</a>
+      </div>
+      <div className="p-4 pt-3 flex items-center justify-between shrink-0">
         {user ? (
           <div className="flex items-center gap-2 min-w-0">
             <button

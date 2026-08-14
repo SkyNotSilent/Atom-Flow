@@ -12,6 +12,9 @@ const canvasInspector = read("src/components/write-canvas/CanvasInspector.tsx");
 const discover = read("src/pages/DiscoverPage.tsx");
 const reader = read("src/components/ReaderModal.tsx");
 const inspiration = read("src/components/InspirationButton.tsx");
+const app = read("src/App.tsx");
+const pricing = read("src/pages/PricingPage.tsx");
+const nav = read("src/components/Nav.tsx");
 
 assert.match(server, /app\.get\("\/legal\/:document"/, "The deployed instance must serve its own legal documents");
 assert.match(server, /DEPLOYMENT_OPERATOR_NAME/, "Production legal documents must use deployment identity variables");
@@ -28,5 +31,15 @@ assert.match(canvasDrawer, /上传后将保存在当前实例/);
 assert.match(discover, /服务器将访问此地址/);
 assert.match(reader, /文本将发送给当前实例配置的翻译服务/);
 assert.match(inspiration, /音频将实时发送给当前实例配置的语音识别服务/);
+assert.match(server, /app\.get\(\["\/pricing", "\/pricing\/"\]/, "Production must serve the public pricing SPA route");
+assert.match(app, /pathname === '\/pricing'/, "The app must render a public pricing page without entering authenticated state");
+assert.match(pricing, /¥39|price: '39'/, "Public pricing must disclose the monthly price");
+assert.match(pricing, /¥399|price: '399'/, "Public pricing must disclose the yearly price");
+assert.match(pricing, /自动续费/);
+assert.match(pricing, /Paddle/);
+assert.match(pricing, /href="\/legal\/terms"/);
+assert.match(pricing, /href="\/legal\/privacy"/);
+assert.match(pricing, /href="\/legal\/refunds"/);
+assert.match(nav, /href="\/pricing"/, "The public app shell must expose the pricing page");
 
 console.log("PASS: deployment-owned legal notices and just-in-time disclosures");
