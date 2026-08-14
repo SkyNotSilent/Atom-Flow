@@ -25,6 +25,7 @@ import {
   type CanvasProjectsChangedDetail,
 } from "./utils/canvasProjectTarget";
 import { MagicWriteAccessGate } from "./components/billing/MagicWriteAccessGate";
+import { PricingPage } from "./pages/PricingPage";
 
 const WritePage = React.lazy(() => import("./pages/WritePage").then(module => ({ default: module.WritePage })));
 const PodcastPage = React.lazy(() => import("./pages/PodcastPage").then(module => ({ default: module.PodcastPage })));
@@ -467,6 +468,15 @@ function UserScopedPodcastPlayback() {
 }
 
 export default function App() {
+  const pathname = typeof window === 'undefined' ? '/' : window.location.pathname.replace(/\/+$/, '') || '/';
+  if (pathname === '/pricing') {
+    return (
+      <ErrorBoundary>
+        <PricingPage />
+      </ErrorBoundary>
+    );
+  }
+
   return (
     <ErrorBoundary>
       <AppProvider>
