@@ -38,10 +38,11 @@ AtomFlow 项目自有代码默认按根目录 [LICENSE](LICENSE) 的 MIT License
 | Resend / SMTP 服务商 | 验证码和账号邮件 | [Resend 隐私政策](https://resend.com/legal/privacy-policy)；SMTP 实际供应商政策 |
 | Railway | 应用和可选 PostgreSQL 托管 | [Railway 隐私政策](https://railway.com/legal/privacy)；[Railway DPA](https://railway.com/legal/dpa) |
 | PostgreSQL 托管方 | 用户账号、知识资产、画布、会话等持久化 | 以部署运营者选择的数据库供应商协议为准；PostgreSQL 本身是数据库软件而非必然的独立数据接收方 |
+| 支付宝开放平台 | 个人与团队订阅的付款、自动续费签约、周期扣款、取消和退款 | 以支付宝开放平台、商家平台及用户付款前展示的协议和隐私规则为准 |
 
 ## npm 依赖
 
-AtomFlow 还使用 React、Express、PostgreSQL 客户端、OpenAI Agents SDK、Readability、JSDOM、RSS Parser、Resend SDK、Nodemailer、Multer、Sharp 及其他 npm 软件包。其名称仅用于识别依赖，不表示供应商背书 AtomFlow。
+AtomFlow 还使用 React、Express、PostgreSQL 客户端、支付宝官方 Node SDK（`alipay-sdk`，MIT）、OpenAI Agents SDK、Readability、JSDOM、RSS Parser、Resend SDK、Nodemailer、Multer、Sharp 及其他 npm 软件包。其名称仅用于识别依赖，不表示供应商背书 AtomFlow。
 
 安装和分发者应：
 

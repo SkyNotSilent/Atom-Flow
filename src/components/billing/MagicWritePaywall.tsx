@@ -9,7 +9,7 @@ type Props = {
   busy: boolean;
   busyLabel?: string;
   error: string | null;
-  onCheckout: (planCode: BillingPlanCode) => void;
+  onCheckout: (planCode: BillingPlanCode, quantity?: number) => void;
   onRetryPlans: () => void;
   canRetryConfirmation?: boolean;
   onRetryConfirmation?: () => void;
@@ -31,7 +31,11 @@ export const MagicWritePaywall: React.FC<Props> = ({
 }) => {
   const available = catalogPhase === 'ready' ? plans : [];
   const [selected, setSelected] = useState<BillingPlanCode>('pro_yearly');
-  const plan = useMemo(() => available.find(item => item.code === selected) || available[0], [available, selected]);
+  const [audience, setAudience] = useState<'individual' | 'team'>('individual');
+  const [quantity, setQuantity] = useState(5);
+  const audiencePlans = useMemo(() => available.filter(item => (item.audience || (item.code.startsWith('team_') ? 'team' : 'individual')) === audience), [audience, available]);
+  const plan = useMemo(() => audiencePlans.find(item => item.code === selected) || audiencePlans[0], [audiencePlans, selected]);
+  const hasTeamPlans = available.some(item => item.code.startsWith('team_'));
 
   return (
     <main className="relative flex h-full min-h-0 overflow-y-auto bg-[#F3EEE4] text-[#2C2822]">
@@ -57,9 +61,14 @@ export const MagicWritePaywall: React.FC<Props> = ({
           </div>
 
           <div className="rounded-[28px] border border-[#D9CCB9] bg-[#FFFCF6] p-5 shadow-[0_28px_70px_rgba(101,79,49,0.16)] sm:p-7">
+            {hasTeamPlans ? (
+              <div className="mb-3 grid grid-cols-2 gap-2" aria-label="订阅类型">
+                {(['individual', 'team'] as const).map(kind => <button key={kind} type="button" onClick={() => { setAudience(kind); setSelected(kind === 'team' ? (available.some(item => item.code === 'team_yearly') ? 'team_yearly' : 'team_monthly') : 'pro_yearly'); }} className={`min-h-10 rounded-xl border text-xs font-semibold ${audience === kind ? 'border-[#2367AC] bg-[#EAF3FB] text-[#235F9E]' : 'border-[#DDD0BD] text-[#756B5E]'}`}>{kind === 'team' ? '团队订阅' : '个人订阅'}</button>)}
+              </div>
+            ) : null}
             {available.length > 0 ? (
               <div role="tablist" aria-label="付费周期" className="grid grid-cols-2 rounded-2xl bg-[#EEE6D9] p-1.5">
-                {available.map(item => (
+                {audiencePlans.map(item => (
                   <button key={item.code} role="tab" aria-selected={selected === item.code} type="button" onClick={() => setSelected(item.code)} className={`min-h-11 rounded-xl px-3 text-sm font-semibold transition ${selected === item.code ? 'bg-white text-[#235F9E] shadow-sm' : 'text-[#72685C] hover:text-[#39332C]'}`}>
                     {item.interval === 'year' ? '年付' : '月付'}{item.savingsCny ? <span className="ml-1 text-[10px] text-[#A25B2A]">省¥{item.savingsCny}</span> : null}
                   </button>
@@ -76,12 +85,13 @@ export const MagicWritePaywall: React.FC<Props> = ({
             {plan ? (
               <div className="mt-7 flex items-end gap-2">
                 <span className="font-serif text-5xl font-bold tracking-tight">¥{plan.priceCny}</span>
-                <span className="pb-1.5 text-sm text-[#7D7366]">/ {plan.interval === 'year' ? '年' : '月'}</span>
+                <span className="pb-1.5 text-sm text-[#7D7366]">/ {plan.interval === 'year' ? '年' : '月'}{audience === 'team' ? ' / 席位' : ''}</span>
               </div>
             ) : null}
-            <p className="mt-2 text-xs leading-5 text-[#8A8073]">自动续费，可随时在账单中取消下一周期。税费以 Paddle 结账页为准。</p>
-            <button type="button" disabled={busy || !plan || catalogPhase !== 'ready'} onClick={() => plan && onCheckout(plan.code)} className="mt-6 flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#2367AC] px-4 text-sm font-semibold text-white shadow-[0_10px_26px_rgba(35,103,172,0.25)] hover:bg-[#1D5997] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2367AC] focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-60">
-              {busy ? <Loader2 size={17} className="animate-spin" /> : <ShieldCheck size={17} />}{busy ? busyLabel || '正在准备安全结账…' : '开通魔法写作 Pro'}
+            {audience === 'team' ? <label className="mt-4 block text-xs font-semibold text-[#5E554B]">购买席位数（至少 2）<input type="number" min={2} max={1000} step={1} value={quantity} onChange={event => setQuantity(Math.min(1000, Math.max(2, Math.trunc(Number(event.target.value) || 2))))} className="mt-2 min-h-11 w-full rounded-xl border border-[#CFC0A8] bg-white px-3 text-sm" /></label> : null}
+            <p className="mt-2 text-xs leading-5 text-[#8A8073]">支付宝自动续费，可在会员与账单中取消下一周期。支付成功以支付宝验签通知或服务端查询为准。</p>
+            <button type="button" disabled={busy || !plan || catalogPhase !== 'ready'} onClick={() => plan && onCheckout(plan.code, audience === 'team' ? quantity : undefined)} className="mt-6 flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#2367AC] px-4 text-sm font-semibold text-white shadow-[0_10px_26px_rgba(35,103,172,0.25)] hover:bg-[#1D5997] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2367AC] focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-60">
+              {busy ? <Loader2 size={17} className="animate-spin" /> : <ShieldCheck size={17} />}{busy ? busyLabel || '正在准备安全结账…' : audience === 'team' ? `开通 ${quantity} 席团队订阅` : '开通魔法写作 Pro'}
             </button>
             {canRetryConfirmation && onRetryConfirmation ? (
               <button type="button" onClick={onRetryConfirmation} className="mt-2 min-h-11 w-full rounded-xl border border-[#C9B99F] bg-white px-4 text-sm font-semibold text-[#285F98]">重新检查开通状态</button>

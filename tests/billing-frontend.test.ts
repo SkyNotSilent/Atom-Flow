@@ -142,7 +142,8 @@ test('the write workspace waits for account-level billing and has explicit paywa
   assert.match(gate, /subscriptionStatus === null \|\| status\.subscriptionStatus === 'canceled'/, 'legacy and canceled read-only users need a new checkout path');
 
   assert.match(paywall, /自动续费/);
-  assert.match(paywall, /税费以 Paddle 结账页为准/);
+  assert.match(paywall, /支付宝自动续费/);
+  assert.match(paywall, /支付宝验签通知或服务端查询为准/);
   assert.match(paywall, /3 天内且 AI 写作操作不超过 5 次/);
   assert.match(paywall, /合理使用制/);
   assert.match(paywall, /href="\/legal\/terms"/);
@@ -210,6 +211,7 @@ test('billing recovery UX fails closed and always offers an explicit way forward
     priceCny: 39,
     interval: 'month',
     currency: 'CNY',
+    audience: 'individual',
   }]);
 });
 

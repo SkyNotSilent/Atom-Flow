@@ -193,5 +193,8 @@ test('account export includes minimal billing records but never webhook payloads
   assert.match(exportRoute, /billingSubscriptions/);
   assert.match(exportRoute, /billingCheckoutAttempts/);
   assert.match(exportRoute, /billingUsageEvents/);
-  assert.doesNotMatch(exportRoute, /billing_webhook_events|normalized_payload|paddle-signature/i);
+  assert.match(exportRoute, /alipayBillingSubscriptions/);
+  assert.match(exportRoute, /alipayBillingCheckoutAttempts/);
+  assert.match(exportRoute, /billingTeamMembers/);
+  assert.doesNotMatch(exportRoute, /billing_webhook_events|alipay_billing_notifications|normalized_payload|paddle-signature/i);
 });

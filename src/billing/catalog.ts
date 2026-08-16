@@ -7,8 +7,8 @@ export const normalizeBillingPlans = (payload: unknown): BillingPlan[] => {
     if (!item || typeof item !== 'object') return [];
     const plan = item as Record<string, unknown>;
     const code = plan.code ?? plan.planCode ?? plan.plan_code;
-    if (code !== 'pro_monthly' && code !== 'pro_yearly') return [];
-    const interval = code === 'pro_yearly' ? 'year' : 'month';
+    if (code !== 'pro_monthly' && code !== 'pro_yearly' && code !== 'team_monthly' && code !== 'team_yearly') return [];
+    const interval = code.endsWith('_yearly') ? 'year' : 'month';
     const amount = Number(plan.priceCny ?? plan.price_cny ?? plan.amountCny);
     if (!Number.isFinite(amount) || amount <= 0) return [];
     const savings = Number(plan.savingsCny ?? plan.savings_cny);
@@ -18,6 +18,8 @@ export const normalizeBillingPlans = (payload: unknown): BillingPlan[] => {
       priceCny: amount,
       interval,
       currency: 'CNY' as const,
+      audience: code.startsWith('team_') ? 'team' as const : 'individual' as const,
+      ...(code.startsWith('team_') ? { minimumQuantity: 2 } : {}),
       ...(interval === 'year' && Number.isFinite(savings) && savings > 0 ? { savingsCny: savings } : {}),
     } satisfies BillingPlan];
   });

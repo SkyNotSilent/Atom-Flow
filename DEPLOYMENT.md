@@ -83,20 +83,27 @@ VITE_TLDRAW_LICENSE_KEY=your-production-tldraw-license-key
 
 ```env
 BILLING_ENABLED=true
-PADDLE_ENVIRONMENT=production
-VITE_PADDLE_ENVIRONMENT=production
-PADDLE_API_KEY=pdl_live_apikey_...
-PADDLE_WEBHOOK_SECRET=pdl_ntfset_secret
-VITE_PADDLE_CLIENT_TOKEN=live_client_side_token
-PADDLE_MAGIC_WRITE_PRODUCT_ID=pro_...
-PADDLE_MAGIC_WRITE_MONTHLY_PRICE_ID=pri_...
-PADDLE_MAGIC_WRITE_YEARLY_PRICE_ID=pri_...
-# 可选：逗号分隔的历史 Price ID，仅用于继续授权已有订阅
-PADDLE_MAGIC_WRITE_LEGACY_PRICE_IDS=pri_legacy_...
+BILLING_PROVIDER=alipay
+ALIPAY_APP_ID=...
+ALIPAY_APP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+ALIPAY_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+ALIPAY_KEY_TYPE=PKCS8
+ALIPAY_APP_AUTH_TOKEN=...
+ALIPAY_NOTIFY_URL=https://www.atomflow.cloud/api/billing/webhooks/alipay
+ALIPAY_RETURN_URL=https://www.atomflow.cloud/?view=write&billing_return=alipay
+ALIPAY_MAGIC_WRITE_PRODUCT_ID=...
+ALIPAY_MAGIC_WRITE_MONTHLY_PRICE_ID=...
+ALIPAY_MAGIC_WRITE_YEARLY_PRICE_ID=...
+# 团队订阅全部配置后才会展示；商品必须配置 unit_label。
+ALIPAY_TEAM_PRODUCT_ID=...
+ALIPAY_TEAM_MONTHLY_PRICE_ID=...
+ALIPAY_TEAM_YEARLY_PRICE_ID=...
+ALIPAY_TEAM_MONTHLY_PRICE_CNY=...
+ALIPAY_TEAM_YEARLY_PRICE_CNY=...
 REFUND_CONTACT_EMAIL=refunds@your-domain.example
 ```
 
-`PADDLE_API_KEY` 和 `PADDLE_WEBHOOK_SECRET` 只能保存在 Railway Variables 中，不能进入浏览器、日志或仓库。`VITE_PADDLE_ENVIRONMENT` 必须与 `PADDLE_ENVIRONMENT` 一致；`VITE_PADDLE_CLIENT_TOKEN` 是 Paddle.js 使用的公开构建变量，但仍必须与环境匹配。Sandbox 和 Live 必须使用完全独立的 API key、Client Token、Product、Price 和 webhook。生产收费开启时，不得使用 `test_` Client Token 或 Sandbox API key。
+应用私钥、支付宝公钥和 `ALIPAY_APP_AUTH_TOKEN` 只能保存在 Railway Variables 中，不能进入浏览器、日志或仓库。支付宝周期订阅使用生产网关 `https://openapi.alipay.com`；本地验证也不能切换到虚构的 Sandbox 网关。新商户必须完成代调用授权，且应用网关和消息订阅缺一不可。
 
 ### 可选
 ```env
@@ -137,29 +144,18 @@ CANVAS_PDF_MAX_PAGES=100
 - 每用户每日付费操作和输出 token 预留额度已写入 PostgreSQL；分钟级限流、全局并发、RSS 缓存和任务协调仍有单进程状态，因此 Railway 先保持 1 个 Web 副本。公开发布前完成 Cloudflare/WAF、Redis、对象存储、后台队列、监控告警和数据库备份；共享状态迁移并压测后再扩到 2 个以上副本。
 - 本地或单进程内存限流只适合开发验证，不能替代多副本生产环境的共享限流和协调。
 
-### Paddle 上线顺序
+### 支付宝订阅上线顺序
 
-本地 UI 预检如需独立账号，可先运行 `npm run billing:setup:test-account`。命令只允许 loopback PostgreSQL，生成的账号凭据写入权限为 `0600` 的 `.env.billing.test-account`，不会输出密码，也不得用于生产。
+1. 完成支付宝商户账号、应用创建与上线，并开通 APP 支付或电脑网站支付能力；提交并通过周期订阅产品准入。新商户同时完成代调用授权。
+2. 创建个人订阅商品与月付、12 个月年付价格。个人创建请求不传 `quantity`。创建团队商品时配置 `unit_label`，再创建团队按席位月付/年付价格；团队创建请求的 `quantity` 必须大于 1。
+3. 配置 RSA2 密钥。将应用私钥与支付宝公钥仅放在 Railway Variables；代码默认 `PKCS8`，如密钥确为 PKCS1 才修改 `ALIPAY_KEY_TYPE`。
+4. 在应用详情 → 开发设置中，把**应用网关**配置为 `https://www.atomflow.cloud/api/billing/webhooks/alipay`，并在消息订阅中勾选 `alipay.trade.subscription.changed` 和退款相关通知。不要把授权回调地址误当成应用网关。
+5. 第一次发布与执行 `npm run migrate` 时保持 `BILLING_ENABLED=false`。确认新表、公开套餐页、登录门槛和已有写作数据的只读保护正常。
+6. 在 Railway 配置全部支付宝变量与真实法律/联系信息。先使用受控测试客户和明确的小额真实价格完成签约、生效通知、续费查询、周期末取消、退款、账户注销、团队扩容与缩容测试。
+7. 验证通知签名失败返回 `fail`，合法重复通知幂等返回 HTTP 200 + `success`；浏览器返回页不得直接开通权益，必须等验签通知或主动查询。
+8. 验证团队扩容立即生效、缩容下周期生效，并确认每次变更后的最新 `item_id` 已通过查询/通知保存。完成后再设置 `BILLING_ENABLED=true`。
 
-1. 在 Paddle Sandbox 创建一枚最小权限 API Key，并准备一个转发到本机 `/api/billing/webhooks/paddle` 的公网 HTTPS 地址。把两项放入被 git 忽略的 `.env.paddle.sandbox`：
-
-   ```env
-   PADDLE_API_KEY=pdl_sdbx_apikey_...
-   PADDLE_WEBHOOK_URL=https://your-temporary-tunnel.example/api/billing/webhooks/paddle
-   ```
-
-   运行 `npm run billing:setup:sandbox`。该命令只接受 Sandbox Key，并且只允许连接 loopback PostgreSQL；它会幂等创建/校验 `saas` 商品、`CNY amount=3900`（¥39/月）、`CNY amount=39900`（¥399/年）两档无试用自动续费价格、Client Token、精确事件 webhook 和本地隔离测试账号，再写入权限为 `0600`、被 git 忽略的 `.env.billing.sandbox`。可用 `npm run billing:verify:sandbox` 做只读 Paddle 复核；脚本不会设置 Live 资源或 Paddle Dashboard 的默认付款链接。
-2. 在 Paddle Sandbox Dashboard 把 Default payment link 设置到一个始终加载 AtomFlow 前端的 HTTPS 页面，并创建至少五个关联上述 webhook destination 的 simulations；自动创建的 webhook 会精确订阅订阅创建/更新/激活/欠费/暂停/恢复/取消的生命周期事件，以及 `transaction.completed`、`transaction.payment_failed`、`adjustment.updated`，且接收真实平台与 simulation 事件。
-3. 首次部署数据库与应用代码时保持 `BILLING_ENABLED=false`；确认旧用户数据、知识库和文章原子化没有受到 Pro 权限影响。
-4. 在 Paddle Live 创建完全独立且同构的商品、价格、凭据和 webhook。Live 资源 ID 不能复用 Sandbox 值。
-5. 在 Paddle 提交并获批 `www.atomflow.cloud`，把 `https://www.atomflow.cloud/?view=write` 设置为默认付款链接。Paddle 在 Live 创建交易前要求有效且已审批的付款链接域名。
-6. 在 Railway 配置 Live 变量，并确认真实运营者名称和地址、`REFUND_CONTACT_EMAIL`、服务邮箱、隐私联系人、适用法律、数据地区与保留期限均已填写。缺少法律身份或账单配置时不得开启收费。
-7. 验证 `/api/health`、生产 CSP、Paddle webhook 签名、未付款 Overlay Checkout、Customer Portal 和账户注销取消流程；随后再将 `BILLING_ENABLED=true`。
-8. 每次收费相关部署后继续监控 Railway 日志、webhook inbox 和订阅对账任务，确认公网健康检查与基本结账冒烟测试均通过。
-
-默认 `npm test` 不访问 Paddle，也不持有付款凭据。真实 Sandbox 测试必须显式设置 `RUN_REAL_BILLING_TESTS=true`，使用隔离测试账户和 Sandbox 凭据，覆盖成功卡、3DS、拒付、续费失败、Portal、取消、退款和 webhook。GitHub Actions 必须始终设置 `RUN_REAL_BILLING_TESTS=false`，不得注入本地或 Live 支付凭据。
-
-启动 Sandbox 服务使用 `npm run billing:dev:sandbox`。在 `.env.billing.sandbox` 中补入至少五个 `PADDLE_SANDBOX_SIMULATION_IDS` 并显式把 `RUN_REAL_BILLING_TESTS` 改为 `true` 后，运行 `npm run billing:test:sandbox`。该测试验证本地 checkout 幂等、状态、Portal，并运行成功、付款失败、续费失败、取消和退款 webhook simulations。Overlay 成功卡、3DS 与拒付卡仍需在 Sandbox 浏览器中完成，因为它们依赖 Paddle 托管的支付交互；测试结果必须与 AtomFlow webhook inbox、最终 `/api/billing/status` 权限和本地账单缓存一并核对，不能只以 Paddle simulation 显示 completed 作为通过。
+旧 Paddle 服务端与数据表暂时保留为一个发布周期的只读回滚路径；当 `BILLING_PROVIDER=alipay` 时不会加载 Paddle.js、创建 Paddle 结账或授予 Paddle 新订阅权限。确认支付宝生产闭环稳定后再单独清理旧依赖与历史运维脚本。
 
 ## 验证部署
 

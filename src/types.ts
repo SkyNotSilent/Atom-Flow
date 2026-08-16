@@ -10,14 +10,14 @@ export interface User {
 
 export type BillingAccess = 'full' | 'read_only' | 'none';
 
-export type PaddleSubscriptionStatus =
+export type BillingSubscriptionStatus =
   | 'active'
   | 'trialing'
   | 'past_due'
   | 'paused'
   | 'canceled';
 
-export type BillingPlanCode = 'pro_monthly' | 'pro_yearly';
+export type BillingPlanCode = 'pro_monthly' | 'pro_yearly' | 'team_monthly' | 'team_yearly';
 
 export interface BillingPlan {
   code: BillingPlanCode;
@@ -25,19 +25,24 @@ export interface BillingPlan {
   priceCny: number;
   interval: 'month' | 'year';
   currency: 'CNY';
+  audience?: 'individual' | 'team';
+  minimumQuantity?: number;
   savingsCny?: number;
 }
 
 export interface BillingStatus {
   enabled: boolean;
+  provider?: 'paddle' | 'alipay';
   access: BillingAccess;
-  subscriptionStatus: PaddleSubscriptionStatus | null;
+  subscriptionStatus: BillingSubscriptionStatus | null;
   planCode: BillingPlanCode | null;
   currentPeriodEnd: string | null;
   scheduledCancelAt: string | null;
   hasLegacyWriteData: boolean;
   hasBillingCustomer: boolean;
   paymentActionRequired: boolean;
+  quantity?: number;
+  pendingQuantity?: number | null;
 }
 
 export type BillingPendingIntent =

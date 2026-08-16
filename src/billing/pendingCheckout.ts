@@ -13,7 +13,9 @@ export type PendingCheckoutConfirmation = {
   expiresAt: number;
 };
 
-const isPlanCode = (value: unknown): value is BillingPlanCode => value === 'pro_monthly' || value === 'pro_yearly';
+const isPlanCode = (value: unknown): value is BillingPlanCode => (
+  value === 'pro_monthly' || value === 'pro_yearly' || value === 'team_monthly' || value === 'team_yearly'
+);
 
 export const storePendingCheckoutConfirmation = (
   input: Omit<PendingCheckoutConfirmation, 'version' | 'expiresAt' | 'mode'> & { mode?: PendingCheckoutConfirmation['mode'] },

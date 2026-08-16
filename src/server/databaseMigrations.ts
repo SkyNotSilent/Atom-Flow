@@ -1,9 +1,10 @@
 import pg from "pg";
 import type { Logger } from "pino";
 import { ensureBillingSchema } from "./billing/schema.js";
+import { ensureAlipayBillingSchema } from "./billing/alipaySchema.js";
 import { normalizeArticleUrl } from "./rss.js";
 
-export const DATABASE_SCHEMA_VERSION = "20260813_release_schema_v3";
+export const DATABASE_SCHEMA_VERSION = "20260816_alipay_subscription_v1";
 export const WRITE_CANVAS_AGENT_RUN_MAX_ATTEMPTS = 3;
 
 export const createDatabasePool = (logger?: Logger) => {
@@ -1604,6 +1605,9 @@ export const runDatabaseMigrations = async (pool: pg.Pool, logger: Logger) => {
   const billingStartedAt = Date.now();
   await runSchemaMigrationOnce("20260811_billing_schema_v1", async client => {
     await ensureBillingSchema(client);
+  });
+  await runSchemaMigrationOnce("20260816_alipay_subscription_v1", async client => {
+    await ensureAlipayBillingSchema(client);
   });
   logMigrationPhase(logger, "billing-schema", billingStartedAt);
 

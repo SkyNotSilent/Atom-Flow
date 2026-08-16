@@ -1,5 +1,6 @@
 import { Environment } from "@paddle/paddle-node-sdk";
 import type { BillingEnvironment, BillingPlan, BillingPlanCode } from "./types.js";
+import { getBillingProvider } from "./alipayConfig.js";
 
 export type BillingConfig = {
   enabled: boolean;
@@ -35,7 +36,7 @@ const PLANS: readonly BillingPlan[] = [
 const required = (name: string) => process.env[name]?.trim() || "";
 
 export const loadBillingConfig = (isProduction: boolean): BillingConfig => {
-  const enabled = required("BILLING_ENABLED").toLowerCase() === "true";
+  const enabled = required("BILLING_ENABLED").toLowerCase() === "true" && getBillingProvider() === "paddle";
   const environmentValue = required("PADDLE_ENVIRONMENT") || "sandbox";
   if (environmentValue !== "sandbox" && environmentValue !== "production") {
     throw new Error("PADDLE_ENVIRONMENT must be sandbox or production");

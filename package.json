@@ -23,7 +23,7 @@
     "test:rss:cache": "node --import tsx --test --test-concurrency=1 tests/rss-cache.test.ts",
     "lint": "tsc --noEmit",
     "test:migrations": "node --import tsx --test --test-concurrency=1 tests/database-migrations.test.ts tests/database-migrations.integration.test.ts",
-    "test": "node --import tsx --test --test-concurrency=1 tests/rss-runtime.test.ts tests/security-hardening.test.ts tests/compliance-disclosures.test.ts tests/billing-config.test.ts tests/billing-access.test.ts tests/billing-runtime.test.ts tests/billing-contract.test.ts tests/billing-frontend.test.ts tests/billing-sandbox-setup.test.ts tests/billing-sandbox.test.ts tests/reader-sanitization.test.ts tests/reading-article-race.test.ts tests/frontend-reliability.test.ts tests/logging.test.ts tests/rss-source-resilience.test.ts tests/avatar.test.ts tests/knowledge-deduplication.test.ts tests/agent-draft-export.test.ts tests/write-agent-intent.test.ts tests/write-agent-sse.test.ts tests/write-agent-api.test.ts tests/write-canvas-api.test.ts tests/write-canvas-ai-api.test.ts tests/write-canvas-ui.test.ts tests/canvas-document-validation.test.ts tests/canvas-create-article-requests.test.ts tests/canvas-project-target.test.ts tests/canvas-document-export.test.ts tests/canvas-agent-group-ui.test.ts tests/canvas-document-autosave.test.ts tests/write-focused-workspace.test.ts tests/podcast-preview.test.ts tests/podcast-playback-state.test.ts tests/podcast-interface.test.ts tests/podcast-page.test.ts tests/podcast-navigation.test.ts"
+    "test": "node --import tsx --test --test-concurrency=1 tests/rss-runtime.test.ts tests/security-hardening.test.ts tests/compliance-disclosures.test.ts tests/billing-config.test.ts tests/billing-access.test.ts tests/billing-runtime.test.ts tests/billing-contract.test.ts tests/billing-frontend.test.ts tests/alipay-subscription.test.ts tests/billing-sandbox-setup.test.ts tests/billing-sandbox.test.ts tests/reader-sanitization.test.ts tests/reading-article-race.test.ts tests/frontend-reliability.test.ts tests/logging.test.ts tests/rss-source-resilience.test.ts tests/avatar.test.ts tests/knowledge-deduplication.test.ts tests/agent-draft-export.test.ts tests/write-agent-intent.test.ts tests/write-agent-sse.test.ts tests/write-agent-api.test.ts tests/write-canvas-api.test.ts tests/write-canvas-ai-api.test.ts tests/write-canvas-ui.test.ts tests/canvas-document-validation.test.ts tests/canvas-create-article-requests.test.ts tests/canvas-project-target.test.ts tests/canvas-document-export.test.ts tests/canvas-agent-group-ui.test.ts tests/canvas-document-autosave.test.ts tests/write-focused-workspace.test.ts tests/podcast-preview.test.ts tests/podcast-playback-state.test.ts tests/podcast-interface.test.ts tests/podcast-page.test.ts tests/podcast-navigation.test.ts"
   },
   "dependencies": {
     "@langchain/core": "^1.1.44",
@@ -52,6 +52,7 @@
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^5.0.4",
     "agent-base": "^7.1.4",
+    "alipay-sdk": "^4.14.0",
     "bcryptjs": "^3.0.3",
     "clsx": "^2.1.1",
     "compression": "^1.8.1",
