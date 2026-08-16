@@ -20,7 +20,7 @@ assert.match(server, /app\.get\("\/legal\/:document"/, "The deployed instance mu
 assert.match(server, /DEPLOYMENT_OPERATOR_NAME/, "Production legal documents must use deployment identity variables");
 assert.match(server, /DATA_HOSTING_REGION/, "Production legal documents must identify their storage region");
 assert.match(server, /LEGAL_PLACEHOLDER_PATTERN/, "Production must reject unresolved legal placeholders");
-assert.match(server, /validateProductionLegalConfiguration\(appUrl, billingConfig\.enabled\)/, "Legal configuration must be gated by the live billing switch");
+assert.match(server, /validateProductionLegalConfiguration\(appUrl, billingEnabled\)/, "Legal configuration must be gated by the active provider's live billing switch");
 assert.match(server, /if \(!isProduction \|\| !billingEnabled\) return;/, "Billing-disabled production must remain deployable without live legal metadata");
 assert.match(server, /your-domain\\\.example\|replace-/, "Production must reject example public origins");
 assert.doesNotMatch(login, /github\.com\/SkyNotSilent\/Atom-Flow\/blob\/main\/(PRIVACY|TERMS)\.md/, "Login legal links must be instance-owned");
@@ -36,7 +36,7 @@ assert.match(app, /pathname === '\/pricing'/, "The app must render a public pric
 assert.match(pricing, /¥39|price: '39'/, "Public pricing must disclose the monthly price");
 assert.match(pricing, /¥399|price: '399'/, "Public pricing must disclose the yearly price");
 assert.match(pricing, /自动续费/);
-assert.match(pricing, /Paddle/);
+assert.match(pricing, /支付宝/);
 assert.match(pricing, /href="\/legal\/terms"/);
 assert.match(pricing, /href="\/legal\/privacy"/);
 assert.match(pricing, /href="\/legal\/refunds"/);

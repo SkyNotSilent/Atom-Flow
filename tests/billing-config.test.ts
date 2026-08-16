@@ -108,18 +108,23 @@ test('billing dependencies and deployment configuration are explicit', () => {
 
   assert.ok(packageJson.dependencies?.['@paddle/paddle-js'], 'Paddle.js must be a declared runtime dependency');
   assert.ok(packageJson.dependencies?.['@paddle/paddle-node-sdk'], 'the official Paddle Node SDK must be declared');
+  assert.ok(packageJson.dependencies?.['alipay-sdk'], 'the official Alipay Node SDK must be declared');
 
   for (const name of [
     'BILLING_ENABLED',
-    'PADDLE_ENVIRONMENT',
-    'VITE_PADDLE_ENVIRONMENT',
-    'PADDLE_API_KEY',
-    'PADDLE_WEBHOOK_SECRET',
-    'VITE_PADDLE_CLIENT_TOKEN',
-    'PADDLE_MAGIC_WRITE_PRODUCT_ID',
-    'PADDLE_MAGIC_WRITE_MONTHLY_PRICE_ID',
-    'PADDLE_MAGIC_WRITE_YEARLY_PRICE_ID',
-    'PADDLE_MAGIC_WRITE_LEGACY_PRICE_IDS',
+    'BILLING_PROVIDER',
+    'ALIPAY_APP_ID',
+    'ALIPAY_APP_PRIVATE_KEY',
+    'ALIPAY_PUBLIC_KEY',
+    'ALIPAY_APP_AUTH_TOKEN',
+    'ALIPAY_NOTIFY_URL',
+    'ALIPAY_RETURN_URL',
+    'ALIPAY_MAGIC_WRITE_PRODUCT_ID',
+    'ALIPAY_MAGIC_WRITE_MONTHLY_PRICE_ID',
+    'ALIPAY_MAGIC_WRITE_YEARLY_PRICE_ID',
+    'ALIPAY_TEAM_PRODUCT_ID',
+    'ALIPAY_TEAM_MONTHLY_PRICE_ID',
+    'ALIPAY_TEAM_YEARLY_PRICE_ID',
     'REFUND_CONTACT_EMAIL',
   ]) {
     assert.match(env, new RegExp(`^${name}=`, 'm'), `${name} must be documented in .env.example`);
@@ -127,7 +132,7 @@ test('billing dependencies and deployment configuration are explicit', () => {
   }
 
   assert.match(env, /^BILLING_ENABLED=false$/m, 'billing must default off for a safe staged rollout');
-  assert.match(env, /^PADDLE_ENVIRONMENT=sandbox$/m, 'shared local configuration must default to sandbox');
+  assert.match(env, /^BILLING_PROVIDER=alipay$/m, 'the current checkout provider must be explicit');
   assert.match(workflow, /^\s*RUN_REAL_BILLING_TESTS:\s*["']false["']\s*$/m, 'public CI must disable real billing tests');
   assert.doesNotMatch(workflow, /secrets\.(?:PADDLE|BILLING|VITE_PADDLE)/i, 'public CI must not receive Paddle credentials');
 });
@@ -138,27 +143,27 @@ test('billing legal documents disclose the complete purchase and retention polic
   const refunds = read('REFUNDS.md');
 
   for (const document of [terms, privacy, refunds]) {
-    assert.match(document, /Paddle/, 'each billing-facing policy must identify Paddle');
+    assert.match(document, /支付宝/, 'each billing-facing policy must identify Alipay');
   }
 
-  assert.match(terms, /Merchant of Record|名义销售方/);
+  assert.match(terms, /销售与履约主体/);
   assert.match(terms, /自动续费/);
   assert.match(terms, /月付人民币 39 元/);
   assert.match(terms, /年付人民币 399 元/);
   assert.match(terms, /合理使用制/);
-  assert.match(terms, /不接触或存储完整银行卡号/);
+  assert.match(terms, /不接触或存储支付密码或完整支付凭据/);
   assert.match(terms, /3 天内/);
   assert.match(terms, /不超过 5 次/);
   assert.match(terms, /\/legal\/refunds/);
 
-  assert.match(privacy, /Paddle Customer\/Subscription\/Transaction/);
-  assert.match(privacy, /最小化的非卡片账单审计记录/);
-  assert.match(privacy, /不保存完整卡号或 webhook 签名/);
+  assert.match(privacy, /支付宝 Customer\/Subscription\/Product\/Price\/Order/);
+  assert.match(privacy, /最小化的非支付凭据账单审计记录/);
+  assert.match(privacy, /不保存支付密码、应用私钥或通知签名/);
 
   assert.match(refunds, /首笔订阅付款完成后的 3 个自然日内/);
   assert.match(refunds, /不超过 5 次/);
   assert.match(refunds, /续费付款原则上不退款/);
   assert.match(refunds, /重复扣款/);
-  assert.match(refunds, /立即取消相关订阅/);
+  assert.match(refunds, /取消相关订阅/);
   assert.match(refunds, /\[REFUND_CONTACT_EMAIL\]/, 'refund requests must use a deployment-owned refund contact');
 });

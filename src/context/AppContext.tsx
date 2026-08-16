@@ -112,8 +112,10 @@ interface AppState {
   refreshBillingStatus: () => Promise<BillingStatus | null>;
   refreshBillingPlans: () => Promise<void>;
   retryBillingConfirmation: () => void;
-  startBillingCheckout: (planCode: BillingPlanCode) => Promise<void>;
+  startBillingCheckout: (planCode: BillingPlanCode, quantity?: number) => Promise<void>;
   openBillingPortal: () => Promise<void>;
+  cancelBillingSubscription: () => Promise<void>;
+  updateTeamBillingQuantity: (quantity: number) => Promise<void>;
   requestBillingIntent: (intent: BillingPendingIntent) => StoredBillingIntent;
   consumeBillingIntent: () => StoredBillingIntent | null;
   completeBillingIntent: (requestId: string) => void;
@@ -176,7 +178,7 @@ const normalizeBillingStatus = (payload: unknown): BillingStatus | null => {
     ? rawSubscriptionStatus as BillingStatus['subscriptionStatus']
     : null;
   const rawPlan = value.planCode ?? value.plan_code;
-  const planCode = rawPlan === 'pro_monthly' || rawPlan === 'pro_yearly' ? rawPlan : null;
+  const planCode = rawPlan === 'pro_monthly' || rawPlan === 'pro_yearly' || rawPlan === 'team_monthly' || rawPlan === 'team_yearly' ? rawPlan : null;
   const currentPeriodEnd = readNullableString(
     value.currentPeriodEnd
       ?? value.current_period_end
@@ -197,6 +199,7 @@ const normalizeBillingStatus = (payload: unknown): BillingStatus | null => {
   );
   return {
     enabled: value.enabled !== false,
+    provider: value.provider === 'alipay' ? 'alipay' : value.provider === 'paddle' ? 'paddle' : undefined,
     access,
     subscriptionStatus,
     planCode,
@@ -210,6 +213,10 @@ const normalizeBillingStatus = (payload: unknown): BillingStatus | null => {
     ),
     hasBillingCustomer: Boolean(value.hasBillingCustomer ?? value.has_billing_customer),
     paymentActionRequired: Boolean(value.paymentActionRequired ?? value.payment_action_required ?? subscriptionStatus === 'past_due'),
+    quantity: Number.isSafeInteger(Number(value.quantity)) && Number(value.quantity) > 0 ? Number(value.quantity) : undefined,
+    pendingQuantity: Number.isSafeInteger(Number(value.pendingQuantity ?? value.pending_quantity)) && Number(value.pendingQuantity ?? value.pending_quantity) > 0
+      ? Number(value.pendingQuantity ?? value.pending_quantity)
+      : null,
   };
 };
 
@@ -794,6 +801,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, [pollBillingConfirmation, updateCheckoutState]);
 
   useEffect(() => {
+    const returnProvider = new URL(window.location.href).searchParams.get('billing_return');
+    if (returnProvider !== 'alipay') return;
+    const url = new URL(window.location.href);
+    url.searchParams.delete('billing_return');
+    window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+    updateCheckoutState({ phase: 'confirming', error: null });
+    pollBillingConfirmation('subscription_purchase');
+  }, [pollBillingConfirmation, updateCheckoutState]);
+
+  useEffect(() => {
     const transactionId = readPaddlePaymentLinkTransactionId();
     if (!transactionId) return;
     let active = true;
@@ -854,7 +871,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
   }, [pollBillingConfirmation, showToast, updateCheckoutState]);
 
-  const startBillingCheckout = useCallback(async (planCode: BillingPlanCode) => {
+  const startBillingCheckout = useCallback(async (planCode: BillingPlanCode, quantity?: number) => {
     if (!userRef.current) {
       storeBillingIntent({ kind: 'open_write' }, null);
       setShowLoginModalState(true);
@@ -875,13 +892,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const response = await fetch('/api/billing/checkout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ planCode, requestId }),
+        body: JSON.stringify({ planCode, requestId, ...(planCode.startsWith('team_') ? { quantity } : {}) }),
       });
       if (!isAccountScopeCurrent(checkoutScope)) return;
-      const payload = await response.json().catch(() => null) as { transactionId?: string; transaction_id?: string; error?: string; code?: string } | null;
+      const payload = await response.json().catch(() => null) as { provider?: string; checkoutUrl?: string; checkout_url?: string; transactionId?: string; transaction_id?: string; error?: string; code?: string } | null;
       if (!isAccountScopeCurrent(checkoutScope)) return;
       if (!response.ok) {
-        if (payload?.code === 'BILLING_CHECKOUT_PENDING' || payload?.code === 'BILLING_ALREADY_ACTIVE') {
+        if (payload?.code === 'BILLING_CHECKOUT_PENDING' || payload?.code === 'BILLING_ALREADY_ACTIVE' || payload?.code === 'ALIPAY_API_UNAVAILABLE') {
           storePendingCheckoutConfirmation({ userId: checkoutScope.userId!, requestId, planCode, transactionId: null });
           updateCheckoutState({ phase: 'pending', error: '已有付款或结账正在确认中。请稍后重新检查，不要重复付款。' });
           pollBillingConfirmation();
@@ -889,6 +906,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         }
         if (payload?.code === 'BILLING_UNAVAILABLE') throw new Error('账单系统暂时不可用，请勿重复付款');
         throw new Error(payload?.error || '无法创建结账');
+      }
+      const checkoutUrl = payload?.checkoutUrl || payload?.checkout_url;
+      if (payload?.provider === 'alipay' || checkoutUrl) {
+        if (!checkoutUrl || !/^(https:|alipays:)/i.test(checkoutUrl)) throw new Error('支付宝签约链接无效');
+        storePendingCheckoutConfirmation({ userId: checkoutScope.userId!, requestId, planCode, transactionId: null });
+        updateCheckoutState({ phase: 'open', error: null });
+        window.location.assign(checkoutUrl);
+        return;
       }
       const transactionId = payload?.transactionId || payload?.transaction_id;
       if (!transactionId) throw new Error('结账交易数据异常');
@@ -964,13 +989,52 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (!isAccountScopeCurrent(portalScope)) return;
       if (!response.ok) throw new Error(payload?.error || '无法打开账单管理');
       const url = payload?.url || payload?.portalUrl;
-      if (!url || !/^https:\/\//i.test(url)) throw new Error('账单管理链接无效');
+      if (!url || (!/^https:\/\//i.test(url) && !/^\/?\?/.test(url))) throw new Error('账单管理链接无效');
+      if (payload && 'local' in payload) {
+        showToast('可在当前“会员与账单”卡片中管理支付宝订阅');
+        return;
+      }
       window.location.assign(url);
     } catch (error) {
       if (!isAccountScopeCurrent(portalScope)) return;
       showToast(error instanceof Error ? error.message : '无法打开账单管理');
     }
   }, [captureAccountScope, isAccountScopeCurrent]);
+
+  const cancelBillingSubscription = useCallback(async () => {
+    const scope = captureAccountScope();
+    if (scope.userId === null) return;
+    try {
+      const response = await fetch('/api/billing/subscription/cancel', { method: 'POST' });
+      const payload = await response.json().catch(() => null) as { error?: string } | null;
+      if (!isAccountScopeCurrent(scope)) return;
+      if (!response.ok) throw new Error(payload?.error || '无法取消订阅');
+      await refreshBillingStatus();
+      showToast('已申请在当前周期结束时取消自动续费');
+    } catch (error) {
+      if (isAccountScopeCurrent(scope)) showToast(error instanceof Error ? error.message : '无法取消订阅');
+    }
+  }, [captureAccountScope, isAccountScopeCurrent, refreshBillingStatus, showToast]);
+
+  const updateTeamBillingQuantity = useCallback(async (quantity: number) => {
+    const scope = captureAccountScope();
+    if (scope.userId === null) return;
+    try {
+      const response = await fetch('/api/billing/team/quantity', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ quantity }),
+      });
+      const payload = await response.json().catch(() => null) as { checkoutUrl?: string; error?: string } | null;
+      if (!isAccountScopeCurrent(scope)) return;
+      if (!response.ok) throw new Error(payload?.error || '无法调整团队席位');
+      if (payload?.checkoutUrl) window.location.assign(payload.checkoutUrl);
+      else {
+        await refreshBillingStatus();
+        showToast('团队席位变更已提交');
+      }
+    } catch (error) {
+      if (isAccountScopeCurrent(scope)) showToast(error instanceof Error ? error.message : '无法调整团队席位');
+    }
+  }, [captureAccountScope, isAccountScopeCurrent, refreshBillingStatus, showToast]);
 
   const requestBillingIntent = useCallback((intent: BillingPendingIntent) => {
     const stored = storeBillingIntent(intent, userRef.current?.id ?? null);
@@ -1712,6 +1776,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       updateProfile, updateAvatar, showProfileModal, setShowProfileModal,
       billingState, billingPlans, billingCatalogState, checkoutState,
       refreshBillingStatus, refreshBillingPlans, retryBillingConfirmation, startBillingCheckout, openBillingPortal,
+      cancelBillingSubscription, updateTeamBillingQuantity,
       requestBillingIntent, consumeBillingIntent, completeBillingIntent,
       notes, createNote, updateNote, deleteNote, syncPreferences,
       writeWorkspaceMode, setWriteWorkspaceMode,

@@ -114,7 +114,7 @@ export function PricingPage() {
                 ))}
               </div>
               <p className="mt-5 text-[11px] leading-5 text-[#655D53]">
-                不含免费试用。订阅将按所选周期自动续费，直至取消；可在“会员与账单”中取消下一周期。最终币种、适用税费与应付总额以付款前 Paddle 结账页为准。
+                不含免费试用。订阅将按所选周期通过支付宝自动续费，直至取消；可在“会员与账单”中取消下一周期。团队订阅按席位计费，实际开放套餐与应付总额以付款前支付宝签约页为准。
               </p>
             </div>
           </div>
@@ -149,7 +149,7 @@ export function PricingPage() {
           </div>
           <div className="grid gap-5 text-sm leading-7 text-[#665E54] sm:grid-cols-2">
             <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>月付按月、年付按年自动续费。普通取消在当前已付周期结束时生效。</p></div>
-            <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>付款由 Paddle 作为 Merchant of Record 处理；AtomFlow 不存储完整银行卡号。</p></div>
+            <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>付款与自动续费签约由支付宝处理；AtomFlow 不存储你的支付密码或完整支付凭据。</p></div>
             <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>首笔付款 3 个自然日内，且主动发起的魔法写作 AI 操作不超过 5 次，可申请全额退款。</p></div>
             <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>续费原则上不退款；重复扣款、可归责的重大故障及法律强制要求除外。</p></div>
           </div>

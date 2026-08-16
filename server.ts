@@ -62,6 +62,8 @@ import {
 } from "./src/server/rss.js";
 import { loadBillingConfig, isBillingPlanCode } from "./src/server/billing/config.js";
 import { BillingService } from "./src/server/billing/service.js";
+import { getBillingProvider, isAlipayPlanCode, loadAlipayBillingConfig } from "./src/server/billing/alipayConfig.js";
+import { AlipayBillingService } from "./src/server/billing/alipayService.js";
 import { BillingError } from "./src/server/billing/types.js";
 import {
   RSS_MAX_CONCURRENCY,
@@ -5362,12 +5364,15 @@ function buildHomepageTimeline(fullArticles: Article[]): Article[] {
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 1000);
-  const billingConfig = loadBillingConfig(isProduction);
   const appUrl = process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : undefined);
+  const billingProvider = getBillingProvider();
+  const billingConfig = loadBillingConfig(isProduction);
+  const alipayBillingConfig = loadAlipayBillingConfig(isProduction, appUrl);
+  const billingEnabled = billingProvider === "alipay" ? alipayBillingConfig.enabled : billingConfig.enabled;
   if (isProduction && (!appUrl || /your-domain\.example|replace-/i.test(appUrl))) {
     throw new Error("APP_URL or RAILWAY_PUBLIC_DOMAIN must identify the real production origin");
   }
-  validateProductionLegalConfiguration(appUrl, billingConfig.enabled);
+  validateProductionLegalConfiguration(appUrl, billingEnabled);
   app.set("trust proxy", 1);
   app.disable("x-powered-by");
 
@@ -5389,7 +5394,9 @@ async function startServer() {
     logger.warn({ err: error, module: "db" }, "Database unavailable; server will start without auth/persistence features");
   }
 
-  const billingService = pool && schemaReady ? new BillingService(pool, billingConfig, logger) : null;
+  const paddleBillingService = pool && schemaReady ? new BillingService(pool, billingConfig, logger) : null;
+  const alipayBillingService = pool && schemaReady ? new AlipayBillingService(pool, alipayBillingConfig, logger) : null;
+  const billingService = billingProvider === "alipay" ? alipayBillingService : paddleBillingService;
   billingService?.startWorkers();
 
   const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
@@ -5618,14 +5625,24 @@ async function startServer() {
   }));
   const jsonBodyLimitKb = readBoundedEnvNumber(process.env.JSON_BODY_LIMIT_KB, 256, 64, 1024);
   app.post("/api/billing/webhooks/paddle", express.raw({ type: "application/json", limit: "256kb" }), asyncHandler(async (req, res) => {
-    if (!billingService || !billingConfig.enabled) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务未启用" });
+    if (!paddleBillingService || !billingConfig.enabled) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "Paddle 账单服务未启用" });
     const signature = req.get("paddle-signature") || "";
     const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
     try {
-      await billingService.receiveWebhook(rawBody, signature);
+      await paddleBillingService.receiveWebhook(rawBody, signature);
       return res.status(200).json({ received: true });
     } catch (error) {
       if (error instanceof BillingError) return res.status(error.status).json({ code: error.code, error: error.message });
+      throw error;
+    }
+  }));
+  app.post("/api/billing/webhooks/alipay", express.urlencoded({ extended: false, limit: "128kb", parameterLimit: 100 }), asyncHandler(async (req, res) => {
+    if (!alipayBillingService || !alipayBillingConfig.enabled) return res.status(503).type("text/plain").send("fail");
+    try {
+      await alipayBillingService.receiveNotification(req.body as Record<string, unknown>);
+      return res.status(200).type("text/plain").send("success");
+    } catch (error) {
+      if (error instanceof BillingError) return res.status(error.status).type("text/plain").send("fail");
       throw error;
     }
   }));
@@ -6369,10 +6386,11 @@ async function startServer() {
 
   app.get("/api/billing/plans", asyncHandler(async (_req, res) => {
     res.setHeader("Cache-Control", "no-store");
-    if (!billingConfig.enabled) return res.json({ enabled: false, plans: billingConfig.plans });
+    const configuredPlans = billingProvider === "alipay" ? alipayBillingConfig.plans : billingConfig.plans;
+    if (!billingEnabled) return res.json({ enabled: false, provider: billingProvider, plans: configuredPlans });
     if (!billingService) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务暂时不可用" });
     try {
-      return res.json({ enabled: true, plans: await billingService.getValidatedPlans() });
+      return res.json({ enabled: true, provider: billingProvider, plans: await billingService.getValidatedPlans() });
     } catch (error) {
       return sendBillingError(res, error);
     }
@@ -6383,34 +6401,74 @@ async function startServer() {
     if (!billingService) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务暂时不可用" });
     try {
       const status = await billingService.resolveMagicWritingAccess(req.session.userId!);
-      return res.json({ enabled: billingConfig.enabled, ...status });
+      return res.json({ enabled: billingEnabled, provider: billingProvider, ...status });
     } catch (error) {
       return sendBillingError(res, error);
     }
   }));
 
   app.post("/api/billing/checkout", requireAuth, asyncHandler(async (req, res) => {
-    if (!billingService || !billingConfig.enabled) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务未启用" });
+    if (!billingService || !billingEnabled) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务未启用" });
     const planCode = req.body?.planCode;
-    if (!isBillingPlanCode(planCode)) return res.status(400).json({ code: "INVALID_BILLING_PLAN", error: "套餐无效" });
     try {
-      return res.json(await billingService.createCheckout(req.session.userId!, req.session.email || "", planCode, String(req.body?.requestId || "")));
+      if (billingProvider === "alipay") {
+        if (!isAlipayPlanCode(planCode) || !alipayBillingService) return res.status(400).json({ code: "INVALID_BILLING_PLAN", error: "套餐无效" });
+        return res.json(await alipayBillingService.createCheckout(req.session.userId!, req.session.email || "", planCode, String(req.body?.requestId || ""), req.body?.quantity));
+      }
+      if (!isBillingPlanCode(planCode) || !paddleBillingService) return res.status(400).json({ code: "INVALID_BILLING_PLAN", error: "套餐无效" });
+      return res.json(await paddleBillingService.createCheckout(req.session.userId!, req.session.email || "", planCode, String(req.body?.requestId || "")));
     } catch (error) {
       return sendBillingError(res, error);
     }
   }));
 
   app.post("/api/billing/portal", requireAuth, asyncHandler(async (req, res) => {
-    if (!billingService || !billingConfig.enabled) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务未启用" });
+    if (!billingService || !billingEnabled) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务未启用" });
     try {
-      return res.json(await billingService.createPortal(req.session.userId!));
+      return res.json(billingProvider === "alipay"
+        ? await alipayBillingService!.createPortal()
+        : await paddleBillingService!.createPortal(req.session.userId!));
     } catch (error) {
       return sendBillingError(res, error);
     }
   }));
 
+  app.post("/api/billing/subscription/cancel", requireAuth, asyncHandler(async (req, res) => {
+    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) {
+      return res.status(404).json({ code: "BILLING_ACTION_UNAVAILABLE", error: "当前支付渠道不支持此操作" });
+    }
+    try { return res.json(await alipayBillingService.cancelSubscription(req.session.userId!)); }
+    catch (error) { return sendBillingError(res, error); }
+  }));
+
+  app.post("/api/billing/team/quantity", requireAuth, asyncHandler(async (req, res) => {
+    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) {
+      return res.status(404).json({ code: "BILLING_ACTION_UNAVAILABLE", error: "当前支付渠道不支持此操作" });
+    }
+    try { return res.json(await alipayBillingService.changeTeamQuantity(req.session.userId!, Number(req.body?.quantity))); }
+    catch (error) { return sendBillingError(res, error); }
+  }));
+
+  app.get("/api/billing/team", requireAuth, asyncHandler(async (req, res) => {
+    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) return res.status(404).json({ code: "TEAM_UNAVAILABLE", error: "团队订阅暂未启用" });
+    try { return res.json(await alipayBillingService.getTeam(req.session.userId!)); }
+    catch (error) { return sendBillingError(res, error); }
+  }));
+
+  app.post("/api/billing/team/members", requireAuth, asyncHandler(async (req, res) => {
+    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) return res.status(404).json({ code: "TEAM_UNAVAILABLE", error: "团队订阅暂未启用" });
+    try { return res.json(await alipayBillingService.addTeamMember(req.session.userId!, String(req.body?.email || ""))); }
+    catch (error) { return sendBillingError(res, error); }
+  }));
+
+  app.delete("/api/billing/team/members/:userId", requireAuth, asyncHandler(async (req, res) => {
+    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) return res.status(404).json({ code: "TEAM_UNAVAILABLE", error: "团队订阅暂未启用" });
+    try { return res.json(await alipayBillingService.removeTeamMember(req.session.userId!, Number(req.params.userId))); }
+    catch (error) { return sendBillingError(res, error); }
+  }));
+
   const resolveMagicWritingGate = (requiredAccess: "read" | "full"): express.RequestHandler => asyncHandler(async (req, res, next) => {
-    if (!billingConfig.enabled) return next();
+    if (!billingEnabled) return next();
     if (!billingService) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "账单服务暂时不可用" });
     try {
       const status = await billingService.resolveMagicWritingAccess(req.session.userId!);
@@ -7215,6 +7273,10 @@ async function startServer() {
       billingSubscriptions,
       billingCheckoutAttempts,
       billingUsageEvents,
+      alipayBillingSubscriptions,
+      alipayBillingCheckoutAttempts,
+      billingTeams,
+      billingTeamMembers,
     ] = await Promise.all([
       rows(`SELECT id, email, nickname, avatar_url, created_at, (password_hash IS NOT NULL) AS has_password FROM users WHERE id = $1`),
       rows(`SELECT source_layout, theme, view_mode, updated_at FROM user_preferences WHERE user_id = $1`),
@@ -7246,6 +7308,10 @@ async function startServer() {
       rows(`SELECT paddle_subscription_id, product_id, price_id, plan_code, status, current_period_starts_at, current_period_ends_at, scheduled_change, created_at, updated_at FROM billing_subscriptions WHERE user_id = $1 ORDER BY created_at`),
       rows(`SELECT id, request_id, plan_code, paddle_transaction_id, status, error_code, created_at, updated_at FROM billing_checkout_attempts WHERE user_id = $1 ORDER BY created_at`),
       rows(`SELECT operation_key, operation_type, occurred_at FROM billing_usage_events WHERE user_id = $1 ORDER BY occurred_at`),
+      rows(`SELECT alipay_subscription_id, product_id, price_id, plan_code, status, quantity, pending_quantity, current_period_starts_at, current_period_ends_at, cancel_at_period_end, created_at, updated_at FROM alipay_billing_subscriptions WHERE user_id = $1 ORDER BY created_at`),
+      rows(`SELECT id, request_id, plan_code, quantity, subscription_id, order_no, status, error_code, created_at, updated_at FROM alipay_billing_checkout_attempts WHERE user_id = $1 ORDER BY created_at`),
+      rows(`SELECT id, name, owner_user_id, created_at, updated_at FROM billing_teams WHERE owner_user_id = $1 ORDER BY created_at`),
+      rows(`SELECT m.team_id, m.user_id, m.role, m.status, m.created_at, m.updated_at FROM billing_team_members m JOIN billing_teams t ON t.id=m.team_id WHERE t.owner_user_id=$1 OR m.user_id=$1 ORDER BY m.created_at`),
     ]);
     const payload = {
       format: "atomflow-account-export-v1",
@@ -7280,6 +7346,10 @@ async function startServer() {
         subscriptions: billingSubscriptions,
         checkoutAttempts: billingCheckoutAttempts,
         usageEvents: billingUsageEvents,
+        alipaySubscriptions: alipayBillingSubscriptions,
+        alipayCheckoutAttempts: alipayBillingCheckoutAttempts,
+        teams: billingTeams,
+        teamMembers: billingTeamMembers,
       },
     };
     await client.query("COMMIT");
