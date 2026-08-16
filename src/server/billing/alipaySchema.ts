@@ -108,4 +108,67 @@ export const ensureAlipayBillingSchema = async (client: SchemaClient) => {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
+  // AI 网页应用收款使用单笔电脑网站支付。旧订阅表暂时保留作回滚和
+  // 历史审计，但新的购买、对账和权益只写入以下两张表。
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS alipay_one_time_orders (
+      id UUID PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      request_id UUID NOT NULL,
+      plan_code TEXT NOT NULL CHECK (plan_code IN ('pro_monthly','pro_yearly')),
+      out_trade_no TEXT NOT NULL UNIQUE,
+      alipay_trade_no TEXT UNIQUE,
+      total_amount_cents INTEGER NOT NULL CHECK (total_amount_cents > 0),
+      checkout_url TEXT,
+      status TEXT NOT NULL DEFAULT 'creating'
+        CHECK (status IN ('creating','pending','paid','closed','refunded','failed')),
+      error_code TEXT,
+      paid_at TIMESTAMPTZ,
+      refund_amount_cents INTEGER CHECK (refund_amount_cents IS NULL OR refund_amount_cents > 0),
+      refunded_at TIMESTAMPTZ,
+      last_reconciled_at TIMESTAMPTZ,
+      entitlement_starts_at TIMESTAMPTZ,
+      entitlement_ends_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await client.query(`ALTER TABLE alipay_one_time_orders ADD COLUMN IF NOT EXISTS refund_amount_cents INTEGER`);
+  await client.query(`ALTER TABLE alipay_one_time_orders ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ`);
+  await client.query(`ALTER TABLE alipay_one_time_orders ADD COLUMN IF NOT EXISTS last_reconciled_at TIMESTAMPTZ`);
+  await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_alipay_one_time_request ON alipay_one_time_orders(user_id,request_id) WHERE user_id IS NOT NULL`);
+  await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_alipay_one_time_pending_user ON alipay_one_time_orders(user_id) WHERE user_id IS NOT NULL AND status IN ('creating','pending')`);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_alipay_one_time_user ON alipay_one_time_orders(user_id,created_at DESC) WHERE user_id IS NOT NULL`);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_alipay_one_time_reconcile ON alipay_one_time_orders(last_reconciled_at,paid_at) WHERE status = 'paid'`);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS alipay_one_time_entitlements (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      plan_code TEXT NOT NULL CHECK (plan_code IN ('pro_monthly','pro_yearly')),
+      access_starts_at TIMESTAMPTZ NOT NULL,
+      access_ends_at TIMESTAMPTZ NOT NULL,
+      last_order_id UUID NOT NULL REFERENCES alipay_one_time_orders(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CHECK (access_ends_at > access_starts_at)
+    )
+  `);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_alipay_entitlement_expiry ON alipay_one_time_entitlements(access_ends_at)`);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS alipay_payment_notifications (
+      notify_id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      out_trade_no TEXT,
+      trade_no TEXT,
+      occurred_at TIMESTAMPTZ NOT NULL,
+      normalized_payload JSONB NOT NULL,
+      processing_status TEXT NOT NULL DEFAULT 'processed'
+        CHECK (processing_status IN ('processed','ignored','quarantined','failed')),
+      error_message TEXT,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_alipay_payment_notification_order ON alipay_payment_notifications(out_trade_no,occurred_at DESC)`);
 };

@@ -19,17 +19,17 @@ const features = [
 
 const plans = [
   {
-    name: '月付',
+    name: '月度使用权',
     price: '39',
     interval: '月',
-    detail: '每月自动续费',
+    detail: '单次购买 1 个月',
     note: '适合灵活体验完整工作流',
   },
   {
-    name: '年付',
+    name: '年度使用权',
     price: '399',
     interval: '年',
-    detail: '每年自动续费',
+    detail: '单次购买 1 年',
     note: '相较连续月付一年节省 ¥69',
     recommended: true,
   },
@@ -114,7 +114,7 @@ export function PricingPage() {
                 ))}
               </div>
               <p className="mt-5 text-[11px] leading-5 text-[#655D53]">
-                不含免费试用。订阅将按所选周期通过支付宝自动续费，直至取消；可在“会员与账单”中取消下一周期。团队订阅按席位计费，实际开放套餐与应付总额以付款前支付宝签约页为准。
+                不含免费试用。每次通过支付宝单笔购买固定使用期，不签订自动扣款协议；到期后由你决定是否手动续费。提前续费会在当前到期日之后顺延。
               </p>
             </div>
           </div>
@@ -126,7 +126,7 @@ export function PricingPage() {
               <p className="text-[11px] font-bold tracking-[0.18em] text-[#8A6030]">PRO INCLUDES</p>
               <h2 className="mt-2 font-serif text-3xl font-bold tracking-tight">从素材召回到完成初稿</h2>
             </div>
-            <p className="max-w-sm text-xs leading-6 text-[#655D53]">知识库、收藏文章和文章原子化不因未订阅 Pro 而受限制；Pro 解锁魔法写作能力。</p>
+            <p className="max-w-sm text-xs leading-6 text-[#655D53]">知识库、收藏文章和文章原子化不因未购买 Pro 而受限制；Pro 使用期内解锁魔法写作能力。</p>
           </div>
           <div className="mt-8 grid gap-px overflow-hidden rounded-2xl border border-[#D7CCBA] bg-[#D7CCBA] sm:grid-cols-2 lg:grid-cols-4">
             {features.map(({ icon: Icon, title, detail }, index) => (
@@ -148,10 +148,10 @@ export function PricingPage() {
             <h2 className="mt-2 font-serif text-3xl font-bold">付款前，你应该知道</h2>
           </div>
           <div className="grid gap-5 text-sm leading-7 text-[#665E54] sm:grid-cols-2">
-            <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>月付按月、年付按年自动续费。普通取消在当前已付周期结束时生效。</p></div>
-            <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>付款与自动续费签约由支付宝处理；AtomFlow 不存储你的支付密码或完整支付凭据。</p></div>
+            <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>月包提供 1 个月、年包提供 1 年使用期；不会自动扣款，到期后可手动续费。</p></div>
+            <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>付款由支付宝处理；AtomFlow 不存储你的支付密码或完整支付凭据。</p></div>
             <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>首笔付款 3 个自然日内，且主动发起的魔法写作 AI 操作不超过 5 次，可申请全额退款。</p></div>
-            <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>续费原则上不退款；重复扣款、可归责的重大故障及法律强制要求除外。</p></div>
+            <div className="flex gap-3"><Check className="mt-1 shrink-0 text-[#2B6B45]" size={17} /><p>手动续费原则上不退款；重复付款、可归责的重大故障及法律强制要求除外。</p></div>
           </div>
         </section>
 

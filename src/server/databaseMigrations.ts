@@ -4,7 +4,7 @@ import { ensureBillingSchema } from "./billing/schema.js";
 import { ensureAlipayBillingSchema } from "./billing/alipaySchema.js";
 import { normalizeArticleUrl } from "./rss.js";
 
-export const DATABASE_SCHEMA_VERSION = "20260816_alipay_subscription_v1";
+export const DATABASE_SCHEMA_VERSION = "20260817_alipay_one_time_v2";
 export const WRITE_CANVAS_AGENT_RUN_MAX_ATTEMPTS = 3;
 
 export const createDatabasePool = (logger?: Logger) => {
@@ -1607,6 +1607,12 @@ export const runDatabaseMigrations = async (pool: pg.Pool, logger: Logger) => {
     await ensureBillingSchema(client);
   });
   await runSchemaMigrationOnce("20260816_alipay_subscription_v1", async client => {
+    await ensureAlipayBillingSchema(client);
+  });
+  await runSchemaMigrationOnce("20260817_alipay_one_time_v1", async client => {
+    await ensureAlipayBillingSchema(client);
+  });
+  await runSchemaMigrationOnce("20260817_alipay_one_time_v2", async client => {
     await ensureAlipayBillingSchema(client);
   });
   logMigrationPhase(logger, "billing-schema", billingStartedAt);

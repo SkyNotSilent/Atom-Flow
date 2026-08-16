@@ -85,25 +85,17 @@ VITE_TLDRAW_LICENSE_KEY=your-production-tldraw-license-key
 BILLING_ENABLED=true
 BILLING_PROVIDER=alipay
 ALIPAY_APP_ID=...
+ALIPAY_SELLER_ID=...
 ALIPAY_APP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
 ALIPAY_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
 ALIPAY_KEY_TYPE=PKCS8
 ALIPAY_APP_AUTH_TOKEN=...
 ALIPAY_NOTIFY_URL=https://www.atomflow.cloud/api/billing/webhooks/alipay
 ALIPAY_RETURN_URL=https://www.atomflow.cloud/?view=write&billing_return=alipay
-ALIPAY_MAGIC_WRITE_PRODUCT_ID=...
-ALIPAY_MAGIC_WRITE_MONTHLY_PRICE_ID=...
-ALIPAY_MAGIC_WRITE_YEARLY_PRICE_ID=...
-# 团队订阅全部配置后才会展示；商品必须配置 unit_label。
-ALIPAY_TEAM_PRODUCT_ID=...
-ALIPAY_TEAM_MONTHLY_PRICE_ID=...
-ALIPAY_TEAM_YEARLY_PRICE_ID=...
-ALIPAY_TEAM_MONTHLY_PRICE_CNY=...
-ALIPAY_TEAM_YEARLY_PRICE_CNY=...
 REFUND_CONTACT_EMAIL=refunds@your-domain.example
 ```
 
-应用私钥、支付宝公钥和 `ALIPAY_APP_AUTH_TOKEN` 只能保存在 Railway Variables 中，不能进入浏览器、日志或仓库。支付宝周期订阅使用生产网关 `https://openapi.alipay.com`；本地验证也不能切换到虚构的 Sandbox 网关。新商户必须完成代调用授权，且应用网关和消息订阅缺一不可。
+应用私钥、支付宝公钥和可选的 `ALIPAY_APP_AUTH_TOKEN` 只能保存在 Railway Variables 中，不能进入浏览器、日志或仓库。支付宝电脑网站支付使用生产网关 `https://openapi.alipay.com`。AtomFlow 不创建自动扣款协议：月包或年包均为一次付款、固定使用期，到期后由用户手动续费。
 
 ### 可选
 ```env
@@ -144,16 +136,15 @@ CANVAS_PDF_MAX_PAGES=100
 - 每用户每日付费操作和输出 token 预留额度已写入 PostgreSQL；分钟级限流、全局并发、RSS 缓存和任务协调仍有单进程状态，因此 Railway 先保持 1 个 Web 副本。公开发布前完成 Cloudflare/WAF、Redis、对象存储、后台队列、监控告警和数据库备份；共享状态迁移并压测后再扩到 2 个以上副本。
 - 本地或单进程内存限流只适合开发验证，不能替代多副本生产环境的共享限流和协调。
 
-### 支付宝订阅上线顺序
+### 支付宝单笔使用期上线顺序
 
-1. 完成支付宝商户账号、应用创建与上线，并开通 APP 支付或电脑网站支付能力；提交并通过周期订阅产品准入。新商户同时完成代调用授权。
-2. 创建个人订阅商品与月付、12 个月年付价格。个人创建请求不传 `quantity`。创建团队商品时配置 `unit_label`，再创建团队按席位月付/年付价格；团队创建请求的 `quantity` 必须大于 1。
-3. 配置 RSA2 密钥。将应用私钥与支付宝公钥仅放在 Railway Variables；代码默认 `PKCS8`，如密钥确为 PKCS1 才修改 `ALIPAY_KEY_TYPE`。
-4. 在应用详情 → 开发设置中，把**应用网关**配置为 `https://www.atomflow.cloud/api/billing/webhooks/alipay`，并在消息订阅中勾选 `alipay.trade.subscription.changed` 和退款相关通知。不要把授权回调地址误当成应用网关。
-5. 第一次发布与执行 `npm run migrate` 时保持 `BILLING_ENABLED=false`。确认新表、公开套餐页、登录门槛和已有写作数据的只读保护正常。
-6. 在 Railway 配置全部支付宝变量与真实法律/联系信息。先使用受控测试客户和明确的小额真实价格完成签约、生效通知、续费查询、周期末取消、退款、账户注销、团队扩容与缩容测试。
-7. 验证通知签名失败返回 `fail`，合法重复通知幂等返回 HTTP 200 + `success`；浏览器返回页不得直接开通权益，必须等验签通知或主动查询。
-8. 验证团队扩容立即生效、缩容下周期生效，并确认每次变更后的最新 `item_id` 已通过查询/通知保存。完成后再设置 `BILLING_ENABLED=true`。
+1. 完成支付宝商户账号、网页应用创建与上线，并通过“AI 网页应用收款/电脑网站支付”线上验证；无需申请 AI 自动续费订阅准入。
+2. 配置 RSA2 密钥。将应用私钥与支付宝公钥仅放在 Railway Variables；代码默认 `PKCS8`，如密钥确为 PKCS1 才修改 `ALIPAY_KEY_TYPE`。同时配置并核对真实 `ALIPAY_SELLER_ID`。
+3. 在应用详情 → 开发设置中，把应用网关配置为 `https://www.atomflow.cloud/api/billing/webhooks/alipay`，确保电脑网站支付异步通知可以到达。不要把同步回跳地址当作应用网关。
+4. 第一次发布与执行 `npm run migrate` 时保持 `BILLING_ENABLED=false`。此状态仅用于安全发布代码、迁移数据库和检查公开页面；它会旁路付费门槛，不能用于验证付费墙或到期只读。确认 `alipay_one_time_orders`、`alipay_one_time_entitlements` 和 `alipay_payment_notifications` 已建立后，再进入受控真实付款测试。
+5. 在 Railway 配置全部支付宝变量与真实法律/联系信息。以受控账号分别完成月包、年包及提前续费的小额真实测试，确认金额、商户、应用、订单号和交易号全部匹配。
+6. 验证通知签名失败返回 `fail`，合法重复通知幂等返回 HTTP 200 + `success`；浏览器回跳不得直接开通权益，必须等验签通知或 `alipay.trade.query` 主动查询确认。
+7. 验证提前续费从已有到期时间向后顺延，过期后进入只读、手动续费恢复、账户注销和退款流程。完成后再设置 `BILLING_ENABLED=true`。
 
 旧 Paddle 服务端与数据表暂时保留为一个发布周期的只读回滚路径；当 `BILLING_PROVIDER=alipay` 时不会加载 Paddle.js、创建 Paddle 结账或授予 Paddle 新订阅权限。确认支付宝生产闭环稳定后再单独清理旧依赖与历史运维脚本。
 

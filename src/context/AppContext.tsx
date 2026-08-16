@@ -28,6 +28,12 @@ export type WriteWorkspaceMode = 'graph' | 'articles' | 'skills';
 export type WriteGraphView = 'all' | 'activated';
 const RSS_REFRESH_RETRY_DELAYS_MS = [1500, 3000, 6000, 12000, 24000] as const;
 const BILLING_SYNC_CHANNEL = 'atomflow:billing-sync';
+const ALIPAY_CHECKOUT_STATUSES = new Set(['creating', 'pending', 'paid', 'closed', 'refunded', 'failed']);
+const ALIPAY_TERMINAL_CHECKOUT_ERRORS: Partial<Record<NonNullable<BillingStatus['latestCheckoutStatus']>, string>> = {
+  closed: '支付宝订单已关闭，未产生新的使用权。你可以重新发起付款。',
+  failed: '支付宝订单未创建成功或已失效，请重新发起付款。',
+  refunded: '该笔支付宝订单已退款，对应使用期已撤销。',
+};
 
 const openBillingSyncChannel = (): BroadcastChannel | null => {
   if (typeof BroadcastChannel !== 'function') return null;
@@ -61,7 +67,7 @@ export type CheckoutState =
   | { phase: 'pending'; error: string }
   | { phase: 'error'; error: string };
 
-type BillingConfirmationMode = 'subscription_purchase' | 'payment_recovery';
+type BillingConfirmationMode = 'term_purchase' | 'payment_recovery';
 
 interface AppState {
   articles: Article[];
@@ -114,8 +120,6 @@ interface AppState {
   retryBillingConfirmation: () => void;
   startBillingCheckout: (planCode: BillingPlanCode, quantity?: number) => Promise<void>;
   openBillingPortal: () => Promise<void>;
-  cancelBillingSubscription: () => Promise<void>;
-  updateTeamBillingQuantity: (quantity: number) => Promise<void>;
   requestBillingIntent: (intent: BillingPendingIntent) => StoredBillingIntent;
   consumeBillingIntent: () => StoredBillingIntent | null;
   completeBillingIntent: (requestId: string) => void;
@@ -200,10 +204,12 @@ const normalizeBillingStatus = (payload: unknown): BillingStatus | null => {
   return {
     enabled: value.enabled !== false,
     provider: value.provider === 'alipay' ? 'alipay' : value.provider === 'paddle' ? 'paddle' : undefined,
+    billingMode: value.billingMode === 'prepaid_term' || value.billing_mode === 'prepaid_term' ? 'prepaid_term' : 'subscription',
     access,
     subscriptionStatus,
     planCode,
     currentPeriodEnd,
+    entitlementEndsAt: readNullableString(value.entitlementEndsAt ?? value.entitlement_ends_at ?? currentPeriodEnd),
     scheduledCancelAt,
     hasLegacyWriteData: Boolean(
       value.hasLegacyWriteData
@@ -212,7 +218,13 @@ const normalizeBillingStatus = (payload: unknown): BillingStatus | null => {
         ?? value.has_writing_history,
     ),
     hasBillingCustomer: Boolean(value.hasBillingCustomer ?? value.has_billing_customer),
+    hasPurchaseHistory: Boolean(value.hasPurchaseHistory ?? value.has_purchase_history ?? value.hasBillingCustomer ?? value.has_billing_customer),
     paymentActionRequired: Boolean(value.paymentActionRequired ?? value.payment_action_required ?? subscriptionStatus === 'past_due'),
+    pendingCheckout: Boolean(value.pendingCheckout ?? value.pending_checkout),
+    latestCheckoutRequestId: readNullableString(value.latestCheckoutRequestId ?? value.latest_checkout_request_id),
+    latestCheckoutStatus: ALIPAY_CHECKOUT_STATUSES.has(String(value.latestCheckoutStatus ?? value.latest_checkout_status))
+      ? String(value.latestCheckoutStatus ?? value.latest_checkout_status) as BillingStatus['latestCheckoutStatus']
+      : null,
     quantity: Number.isSafeInteger(Number(value.quantity)) && Number(value.quantity) > 0 ? Number(value.quantity) : undefined,
     pendingQuantity: Number.isSafeInteger(Number(value.pendingQuantity ?? value.pending_quantity)) && Number(value.pendingQuantity ?? value.pending_quantity) > 0
       ? Number(value.pendingQuantity ?? value.pending_quantity)
@@ -276,7 +288,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const billingStatusRequestRef = useRef(0);
   const checkoutStateRef = useRef<CheckoutState>({ phase: 'idle', error: null });
   const billingPollRef = useRef<number | null>(null);
-  const billingConfirmationModeRef = useRef<BillingConfirmationMode>('subscription_purchase');
+  const billingConfirmationModeRef = useRef<BillingConfirmationMode>('term_purchase');
+  const billingConfirmationRequestIdRef = useRef<string | null>(null);
   const paddleUnsubscribeRef = useRef<(() => void) | null>(null);
   const restoredPendingUserRef = useRef<number | null>(null);
   const userRef = useRef<User | null>(null);
@@ -322,7 +335,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
     paddleUnsubscribeRef.current?.();
     paddleUnsubscribeRef.current = null;
-    billingConfirmationModeRef.current = 'subscription_purchase';
+    billingConfirmationModeRef.current = 'term_purchase';
+    billingConfirmationRequestIdRef.current = null;
     restoredPendingUserRef.current = null;
     billingStatusRequestRef.current += 1;
     setArticles([]);
@@ -740,12 +754,27 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const previousAccess = billingStatusRef.current?.access;
       billingStatusRef.current = status;
       setBillingState({ phase: 'ready', status });
-      const pendingIsConfirmed = status.access === 'full'
-        && (billingConfirmationModeRef.current === 'subscription_purchase' || !status.paymentActionRequired);
+      const pendingIsConfirmed = status.provider === 'alipay'
+        ? Boolean(billingConfirmationRequestIdRef.current
+          && status.latestCheckoutRequestId === billingConfirmationRequestIdRef.current
+          && status.latestCheckoutStatus === 'paid')
+        : status.access === 'full' && !status.pendingCheckout
+          && (billingConfirmationModeRef.current === 'term_purchase' || !status.paymentActionRequired);
       if (pendingIsConfirmed && checkoutStateRef.current.phase === 'pending') {
         clearPendingCheckoutConfirmation(scope.userId!);
+        billingConfirmationRequestIdRef.current = null;
         updateCheckoutState({ phase: 'idle', error: null });
         notifyBillingAccessChanged();
+      } else if (status.provider === 'alipay'
+        && billingConfirmationRequestIdRef.current
+        && status.latestCheckoutRequestId === billingConfirmationRequestIdRef.current
+        && status.latestCheckoutStatus
+        && ALIPAY_TERMINAL_CHECKOUT_ERRORS[status.latestCheckoutStatus]) {
+        const terminalError = ALIPAY_TERMINAL_CHECKOUT_ERRORS[status.latestCheckoutStatus]!;
+        clearPendingCheckoutConfirmation(scope.userId!);
+        billingConfirmationRequestIdRef.current = null;
+        updateCheckoutState({ phase: 'error', error: terminalError });
+        showToast(terminalError);
       }
       if (status.access !== 'none' && previousAccess === 'none') await loadNotes();
       return status;
@@ -762,7 +791,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, [captureAccountScope, isAccountScopeCurrent, showToast, updateCheckoutState]);
 
-  const pollBillingConfirmation = useCallback((mode: BillingConfirmationMode = 'subscription_purchase') => {
+  const pollBillingConfirmation = useCallback((mode: BillingConfirmationMode = 'term_purchase') => {
     if (billingPollRef.current !== null) window.clearTimeout(billingPollRef.current);
     billingConfirmationModeRef.current = mode;
     const scope = captureAccountScope();
@@ -771,11 +800,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (!isAccountScopeCurrent(scope) || scope.userId === null) return;
       const status = await refreshBillingStatus();
       if (!isAccountScopeCurrent(scope)) return;
-      const confirmed = status?.access === 'full'
-        && (mode === 'subscription_purchase' || !status.paymentActionRequired);
+      if (checkoutStateRef.current.phase === 'error') return;
+      const confirmed = status?.provider === 'alipay'
+        ? Boolean(billingConfirmationRequestIdRef.current
+          && status.latestCheckoutRequestId === billingConfirmationRequestIdRef.current
+          && status.latestCheckoutStatus === 'paid')
+        : status?.access === 'full' && !status.pendingCheckout
+          && (mode === 'term_purchase' || !status.paymentActionRequired);
       if (confirmed) {
         updateCheckoutState({ phase: 'idle', error: null });
         if (userRef.current) clearPendingCheckoutConfirmation(userRef.current.id);
+        billingConfirmationRequestIdRef.current = null;
         showToast(mode === 'payment_recovery' ? '付款信息已更新' : '魔法写作 Pro 已开通');
         notifyBillingAccessChanged();
         return;
@@ -807,7 +842,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     url.searchParams.delete('billing_return');
     window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
     updateCheckoutState({ phase: 'confirming', error: null });
-    pollBillingConfirmation('subscription_purchase');
+    pollBillingConfirmation('term_purchase');
   }, [pollBillingConfirmation, updateCheckoutState]);
 
   useEffect(() => {
@@ -878,7 +913,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return;
     }
     const checkoutScope = captureAccountScope();
-    if (billingStatusRef.current?.subscriptionStatus === 'paused') {
+    if (billingStatusRef.current?.provider !== 'alipay' && billingStatusRef.current?.subscriptionStatus === 'paused') {
       showToast('请通过账单管理恢复或更新原订阅');
       return;
     }
@@ -889,6 +924,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     updateCheckoutState({ phase: 'creating', error: null });
     try {
       const requestId = crypto.randomUUID();
+      billingConfirmationRequestIdRef.current = requestId;
       const response = await fetch('/api/billing/checkout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -898,9 +934,23 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const payload = await response.json().catch(() => null) as { provider?: string; checkoutUrl?: string; checkout_url?: string; transactionId?: string; transaction_id?: string; error?: string; code?: string } | null;
       if (!isAccountScopeCurrent(checkoutScope)) return;
       if (!response.ok) {
-        if (payload?.code === 'BILLING_CHECKOUT_PENDING' || payload?.code === 'BILLING_ALREADY_ACTIVE' || payload?.code === 'ALIPAY_API_UNAVAILABLE') {
-          storePendingCheckoutConfirmation({ userId: checkoutScope.userId!, requestId, planCode, transactionId: null });
+        if (payload?.code === 'BILLING_CHECKOUT_PENDING') {
+          const status = await refreshBillingStatus();
+          if (!isAccountScopeCurrent(checkoutScope)) return;
+          const pendingRequestId = status?.provider === 'alipay'
+            && status.pendingCheckout
+            && status.latestCheckoutRequestId
+            ? status.latestCheckoutRequestId
+            : requestId;
+          billingConfirmationRequestIdRef.current = pendingRequestId;
+          storePendingCheckoutConfirmation({ userId: checkoutScope.userId!, requestId: pendingRequestId, planCode, transactionId: null });
           updateCheckoutState({ phase: 'pending', error: '已有付款或结账正在确认中。请稍后重新检查，不要重复付款。' });
+          pollBillingConfirmation();
+          return;
+        }
+        if (payload?.code === 'BILLING_ALREADY_ACTIVE') {
+          storePendingCheckoutConfirmation({ userId: checkoutScope.userId!, requestId, planCode, transactionId: null });
+          updateCheckoutState({ phase: 'pending', error: '当前订阅状态正在同步，请稍后重新检查。' });
           pollBillingConfirmation();
           return;
         }
@@ -909,7 +959,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
       const checkoutUrl = payload?.checkoutUrl || payload?.checkout_url;
       if (payload?.provider === 'alipay' || checkoutUrl) {
-        if (!checkoutUrl || !/^(https:|alipays:)/i.test(checkoutUrl)) throw new Error('支付宝签约链接无效');
+        if (!checkoutUrl || !/^https:/i.test(checkoutUrl)) throw new Error('支付宝付款链接无效');
         storePendingCheckoutConfirmation({ userId: checkoutScope.userId!, requestId, planCode, transactionId: null });
         updateCheckoutState({ phase: 'open', error: null });
         window.location.assign(checkoutUrl);
@@ -955,15 +1005,22 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       updateCheckoutState({ phase: 'open', error: null });
     } catch (error) {
       if (!isAccountScopeCurrent(checkoutScope)) return;
+      billingConfirmationRequestIdRef.current = null;
       updateCheckoutState({ phase: 'error', error: error instanceof Error ? error.message : '结账暂时不可用' });
     }
-  }, [captureAccountScope, isAccountScopeCurrent, pollBillingConfirmation, updateCheckoutState]);
+  }, [captureAccountScope, isAccountScopeCurrent, pollBillingConfirmation, refreshBillingStatus, updateCheckoutState]);
 
   useEffect(() => {
     if (!user || billingState.phase !== 'ready') return;
-    if (billingState.status.access === 'full'
-      && (billingConfirmationModeRef.current === 'subscription_purchase' || !billingState.status.paymentActionRequired)) {
+    const trackedAlipayPurchaseConfirmed = billingState.status.provider === 'alipay'
+      && Boolean(billingConfirmationRequestIdRef.current
+        && billingState.status.latestCheckoutRequestId === billingConfirmationRequestIdRef.current
+        && billingState.status.latestCheckoutStatus === 'paid');
+    if (trackedAlipayPurchaseConfirmed || (billingState.status.provider !== 'alipay'
+      && billingState.status.access === 'full' && !billingState.status.pendingCheckout
+      && (billingConfirmationModeRef.current === 'term_purchase' || !billingState.status.paymentActionRequired))) {
       clearPendingCheckoutConfirmation(user.id);
+      billingConfirmationRequestIdRef.current = null;
       restoredPendingUserRef.current = null;
       return;
     }
@@ -971,6 +1028,19 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (!pending || restoredPendingUserRef.current === user.id) return;
     restoredPendingUserRef.current = user.id;
     billingConfirmationModeRef.current = pending.mode;
+    billingConfirmationRequestIdRef.current = pending.requestId;
+    const terminalStatus = billingState.status.provider === 'alipay'
+      && billingState.status.latestCheckoutRequestId === pending.requestId
+      && billingState.status.latestCheckoutStatus
+      ? billingState.status.latestCheckoutStatus
+      : null;
+    if (terminalStatus && ALIPAY_TERMINAL_CHECKOUT_ERRORS[terminalStatus]) {
+      const terminalError = ALIPAY_TERMINAL_CHECKOUT_ERRORS[terminalStatus]!;
+      clearPendingCheckoutConfirmation(user.id);
+      billingConfirmationRequestIdRef.current = null;
+      updateCheckoutState({ phase: 'error', error: terminalError });
+      return;
+    }
     updateCheckoutState({
       phase: 'pending',
       error: pending.mode === 'payment_recovery'
@@ -991,7 +1061,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const url = payload?.url || payload?.portalUrl;
       if (!url || (!/^https:\/\//i.test(url) && !/^\/?\?/.test(url))) throw new Error('账单管理链接无效');
       if (payload && 'local' in payload) {
-        showToast('可在当前“会员与账单”卡片中管理支付宝订阅');
+        showToast('可在当前“会员与账单”卡片中查看使用期并手动续费');
         return;
       }
       window.location.assign(url);
@@ -1000,41 +1070,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       showToast(error instanceof Error ? error.message : '无法打开账单管理');
     }
   }, [captureAccountScope, isAccountScopeCurrent]);
-
-  const cancelBillingSubscription = useCallback(async () => {
-    const scope = captureAccountScope();
-    if (scope.userId === null) return;
-    try {
-      const response = await fetch('/api/billing/subscription/cancel', { method: 'POST' });
-      const payload = await response.json().catch(() => null) as { error?: string } | null;
-      if (!isAccountScopeCurrent(scope)) return;
-      if (!response.ok) throw new Error(payload?.error || '无法取消订阅');
-      await refreshBillingStatus();
-      showToast('已申请在当前周期结束时取消自动续费');
-    } catch (error) {
-      if (isAccountScopeCurrent(scope)) showToast(error instanceof Error ? error.message : '无法取消订阅');
-    }
-  }, [captureAccountScope, isAccountScopeCurrent, refreshBillingStatus, showToast]);
-
-  const updateTeamBillingQuantity = useCallback(async (quantity: number) => {
-    const scope = captureAccountScope();
-    if (scope.userId === null) return;
-    try {
-      const response = await fetch('/api/billing/team/quantity', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ quantity }),
-      });
-      const payload = await response.json().catch(() => null) as { checkoutUrl?: string; error?: string } | null;
-      if (!isAccountScopeCurrent(scope)) return;
-      if (!response.ok) throw new Error(payload?.error || '无法调整团队席位');
-      if (payload?.checkoutUrl) window.location.assign(payload.checkoutUrl);
-      else {
-        await refreshBillingStatus();
-        showToast('团队席位变更已提交');
-      }
-    } catch (error) {
-      if (isAccountScopeCurrent(scope)) showToast(error instanceof Error ? error.message : '无法调整团队席位');
-    }
-  }, [captureAccountScope, isAccountScopeCurrent, refreshBillingStatus, showToast]);
 
   const requestBillingIntent = useCallback((intent: BillingPendingIntent) => {
     const stored = storeBillingIntent(intent, userRef.current?.id ?? null);
@@ -1776,7 +1811,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       updateProfile, updateAvatar, showProfileModal, setShowProfileModal,
       billingState, billingPlans, billingCatalogState, checkoutState,
       refreshBillingStatus, refreshBillingPlans, retryBillingConfirmation, startBillingCheckout, openBillingPortal,
-      cancelBillingSubscription, updateTeamBillingQuantity,
       requestBillingIntent, consumeBillingIntent, completeBillingIntent,
       notes, createNote, updateNote, deleteNote, syncPreferences,
       writeWorkspaceMode, setWriteWorkspaceMode,

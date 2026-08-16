@@ -114,17 +114,12 @@ test('billing dependencies and deployment configuration are explicit', () => {
     'BILLING_ENABLED',
     'BILLING_PROVIDER',
     'ALIPAY_APP_ID',
+    'ALIPAY_SELLER_ID',
     'ALIPAY_APP_PRIVATE_KEY',
     'ALIPAY_PUBLIC_KEY',
     'ALIPAY_APP_AUTH_TOKEN',
     'ALIPAY_NOTIFY_URL',
     'ALIPAY_RETURN_URL',
-    'ALIPAY_MAGIC_WRITE_PRODUCT_ID',
-    'ALIPAY_MAGIC_WRITE_MONTHLY_PRICE_ID',
-    'ALIPAY_MAGIC_WRITE_YEARLY_PRICE_ID',
-    'ALIPAY_TEAM_PRODUCT_ID',
-    'ALIPAY_TEAM_MONTHLY_PRICE_ID',
-    'ALIPAY_TEAM_YEARLY_PRICE_ID',
     'REFUND_CONTACT_EMAIL',
   ]) {
     assert.match(env, new RegExp(`^${name}=`, 'm'), `${name} must be documented in .env.example`);
@@ -147,23 +142,23 @@ test('billing legal documents disclose the complete purchase and retention polic
   }
 
   assert.match(terms, /销售与履约主体/);
-  assert.match(terms, /自动续费/);
-  assert.match(terms, /月付人民币 39 元/);
-  assert.match(terms, /年付人民币 399 元/);
+  assert.match(terms, /不会创建自动扣款协议/);
+  assert.match(terms, /一个月人民币 39 元/);
+  assert.match(terms, /一年人民币 399 元/);
   assert.match(terms, /合理使用制/);
   assert.match(terms, /不接触或存储支付密码或完整支付凭据/);
   assert.match(terms, /3 天内/);
   assert.match(terms, /不超过 5 次/);
   assert.match(terms, /\/legal\/refunds/);
 
-  assert.match(privacy, /支付宝 Customer\/Subscription\/Product\/Price\/Order/);
+  assert.match(privacy, /AtomFlow 订单号、支付宝交易号/);
   assert.match(privacy, /最小化的非支付凭据账单审计记录/);
   assert.match(privacy, /不保存支付密码、应用私钥或通知签名/);
 
-  assert.match(refunds, /首笔订阅付款完成后的 3 个自然日内/);
+  assert.match(refunds, /首次购买付款完成后的 3 个自然日内/);
   assert.match(refunds, /不超过 5 次/);
-  assert.match(refunds, /续费付款原则上不退款/);
+  assert.match(refunds, /手动续费付款原则上不退款/);
   assert.match(refunds, /重复扣款/);
-  assert.match(refunds, /取消相关订阅/);
+  assert.match(refunds, /撤销该笔购买增加的剩余使用期/);
   assert.match(refunds, /\[REFUND_CONTACT_EMAIL\]/, 'refund requests must use a deployment-owned refund contact');
 });

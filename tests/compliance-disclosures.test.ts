@@ -35,7 +35,8 @@ assert.match(server, /app\.get\(\["\/pricing", "\/pricing\/"\]/, "Production mus
 assert.match(app, /pathname === '\/pricing'/, "The app must render a public pricing page without entering authenticated state");
 assert.match(pricing, /¥39|price: '39'/, "Public pricing must disclose the monthly price");
 assert.match(pricing, /¥399|price: '399'/, "Public pricing must disclose the yearly price");
-assert.match(pricing, /自动续费/);
+assert.match(pricing, /不签订自动扣款协议/, "Public pricing must disclose that purchases do not authorize automatic debits");
+assert.match(pricing, /手动续费/, "Public pricing must disclose that renewal is initiated by the user");
 assert.match(pricing, /支付宝/);
 assert.match(pricing, /href="\/legal\/terms"/);
 assert.match(pricing, /href="\/legal\/privacy"/);

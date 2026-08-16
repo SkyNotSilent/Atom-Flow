@@ -124,7 +124,7 @@ test('Pro permission boundaries cover writing and Notes without gating the knowl
       `${name} reads must remain available in read-only mode`);
     assert.match(guard, /:\s*requireMagicWritingFullAccess/, `${name} mutations and AI calls must require full access`);
   }
-  assert.match(server, /status\.access === "read_only" \? "MAGIC_WRITE_READ_ONLY" : "MAGIC_WRITE_SUBSCRIPTION_REQUIRED"/);
+  assert.match(server, /status\.access === "read_only" \? "MAGIC_WRITE_READ_ONLY" : "MAGIC_WRITE_PURCHASE_REQUIRED"/);
   assert.match(server, /res\.status\(402\)/);
 
   const knowledgeRouteLines = server.split('\n').filter(line => (
@@ -185,6 +185,8 @@ test('refund-eligibility usage cannot be deduplicated with a client-controlled k
   }
   assert.match(canvasChat, /canvas-agent:\$\{req\.params\.id\}:\$\{runId\}/);
   assert.doesNotMatch(canvasChat, /recordUsage[\s\S]{0,200}req\.body\?\.requestId/);
+  assert.match(server, /billingService && billingEnabled[\s\S]{0,160}recordUsage/,
+    'the selected billing provider, including Alipay, must record refund-eligibility usage');
 });
 
 test('account export includes minimal billing records but never webhook payloads', () => {
@@ -195,6 +197,8 @@ test('account export includes minimal billing records but never webhook payloads
   assert.match(exportRoute, /billingUsageEvents/);
   assert.match(exportRoute, /alipayBillingSubscriptions/);
   assert.match(exportRoute, /alipayBillingCheckoutAttempts/);
+  assert.match(exportRoute, /alipayOneTimeOrders/);
+  assert.match(exportRoute, /alipayOneTimeEntitlements/);
   assert.match(exportRoute, /billingTeamMembers/);
   assert.doesNotMatch(exportRoute, /billing_webhook_events|alipay_billing_notifications|normalized_payload|paddle-signature/i);
 });
