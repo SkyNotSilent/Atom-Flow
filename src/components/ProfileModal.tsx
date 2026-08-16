@@ -23,8 +23,6 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
     retryBillingConfirmation,
     startBillingCheckout,
     openBillingPortal,
-    cancelBillingSubscription,
-    updateTeamBillingQuantity,
   } = useAppContext();
   const [nickname, setNickname] = useState('');
   const [saving, setSaving] = useState(false);
@@ -35,9 +33,6 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteConfirmation, setDeleteConfirmation] = useState('');
   const [deletePassword, setDeletePassword] = useState('');
-  const [teamQuantity, setTeamQuantity] = useState(5);
-  const [teamMemberEmail, setTeamMemberEmail] = useState('');
-  const [teamMembers, setTeamMembers] = useState<Array<{ userId: number; email: string; nickname?: string | null; role: 'owner' | 'member' }>>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -48,38 +43,11 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
       setUploadingAvatar(false);
       setExporting(false);
       setDeleting(false);
-      if (billingState.phase === 'ready' && billingState.status.quantity) setTeamQuantity(billingState.status.quantity);
       setShowDeleteConfirm(false);
       setDeleteConfirmation('');
       setDeletePassword('');
     }
   }, [isOpen, user, billingState]);
-
-  useEffect(() => {
-    if (!isOpen || billingState.phase !== 'ready' || !billingState.status.planCode?.startsWith('team_')) return;
-    void fetch('/api/billing/team', { cache: 'no-store' }).then(async response => {
-      if (!response.ok) return;
-      const team = await response.json() as { members?: Array<{ userId: number; email: string; nickname?: string | null; role: 'owner' | 'member' }> };
-      setTeamMembers(Array.isArray(team.members) ? team.members : []);
-    }).catch(() => undefined);
-  }, [billingState, isOpen]);
-
-  const addTeamMember = async () => {
-    const response = await fetch('/api/billing/team/members', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: teamMemberEmail }) });
-    const payload = await response.json().catch(() => null) as { members?: typeof teamMembers; error?: string } | null;
-    if (!response.ok) return showToast(payload?.error || '无法添加团队成员');
-    setTeamMembers(payload?.members || []);
-    setTeamMemberEmail('');
-    showToast('团队成员已添加');
-  };
-
-  const removeTeamMember = async (memberUserId: number) => {
-    const response = await fetch(`/api/billing/team/members/${memberUserId}`, { method: 'DELETE' });
-    const payload = await response.json().catch(() => null) as { members?: typeof teamMembers; error?: string } | null;
-    if (!response.ok) return showToast(payload?.error || '无法移除团队成员');
-    setTeamMembers(payload?.members || []);
-    showToast('团队成员已移除');
-  };
 
   const handleAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -286,14 +254,12 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
                     : !billingState.status.enabled ? '魔法写作当前开放使用，尚未启用收费'
                     : billingState.status.access === 'none' ? '尚未开通魔法写作 Pro'
                     : billingState.status.access === 'read_only' ? '魔法写作当前为只读模式'
-                    : billingState.status.planCode === 'team_yearly' ? `团队版 · 年付 · ${billingState.status.quantity || 1} 席`
-                      : billingState.status.planCode === 'team_monthly' ? `团队版 · 月付 · ${billingState.status.quantity || 1} 席`
-                    : billingState.status.planCode === 'pro_yearly' ? '魔法写作 Pro · 年付'
-                      : billingState.status.planCode === 'pro_monthly' ? '魔法写作 Pro · 月付' : '魔法写作 Pro'}
+                    : billingState.status.planCode === 'pro_yearly' ? '魔法写作 Pro · 年度使用权'
+                      : billingState.status.planCode === 'pro_monthly' ? '魔法写作 Pro · 月度使用权' : '魔法写作 Pro'}
                 </p>
                 {billingState.phase === 'ready' && billingState.status.enabled && billingState.status.currentPeriodEnd ? (
                   <p className="mt-1 text-[10px] text-[#918575]">
-                    {billingState.status.scheduledCancelAt ? '将于' : '下次续费'} {new Date(billingState.status.scheduledCancelAt ?? billingState.status.currentPeriodEnd).toLocaleDateString('zh-CN')}{billingState.status.scheduledCancelAt ? ' 到期' : ''}
+                    {billingState.status.provider === 'alipay' ? '使用权有效至' : billingState.status.scheduledCancelAt ? '将于' : '下次续费'} {new Date(billingState.status.scheduledCancelAt ?? billingState.status.currentPeriodEnd).toLocaleDateString('zh-CN')}{billingState.status.provider === 'alipay' ? '，不会自动续费' : billingState.status.scheduledCancelAt ? ' 到期' : ''}
                   </p>
                 ) : null}
                 {billingState.phase === 'ready' && billingState.status.enabled && billingState.status.paymentActionRequired ? <p className="mt-1 text-[11px] font-semibold text-[#A44835]">请更新付款方式</p> : null}
@@ -303,17 +269,16 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose }) =
             {billingState.phase === 'ready' && billingState.status.enabled && billingState.status.hasBillingCustomer ? (
               <div className="mt-3 space-y-2">
                 {billingState.status.provider === 'alipay' ? (
-                  <>
-                    {billingState.status.planCode?.startsWith('team_') ? <div className="space-y-2"><div className="flex gap-2"><input aria-label="团队席位数" type="number" min={2} max={1000} value={teamQuantity} onChange={event => setTeamQuantity(Math.min(1000, Math.max(2, Math.trunc(Number(event.target.value) || 2))))} className="min-h-11 min-w-0 flex-1 rounded-xl border border-[#CFC0A8] bg-white px-3 text-[12px]" /><button type="button" onClick={() => void updateTeamBillingQuantity(teamQuantity)} className="min-h-11 rounded-xl border border-[#CFC0A8] bg-white px-3 text-[12px] font-semibold text-[#285F98]">调整席位</button></div><div className="flex gap-2"><input aria-label="成员邮箱" type="email" value={teamMemberEmail} onChange={event => setTeamMemberEmail(event.target.value)} placeholder="成员已注册邮箱" className="min-h-11 min-w-0 flex-1 rounded-xl border border-[#CFC0A8] bg-white px-3 text-[12px]" /><button type="button" onClick={() => void addTeamMember()} className="min-h-11 rounded-xl border border-[#CFC0A8] bg-white px-3 text-[12px] font-semibold text-[#285F98]">添加</button></div><div className="max-h-28 space-y-1 overflow-y-auto">{teamMembers.map(member => <div key={member.userId} className="flex items-center justify-between rounded-lg bg-white/80 px-2 py-1.5 text-[10px]"><span className="truncate">{member.nickname || member.email}{member.role === 'owner' ? '（所有者）' : ''}</span>{member.role === 'member' ? <button type="button" onClick={() => void removeTeamMember(member.userId)} className="ml-2 shrink-0 text-[#A44835]">移除</button> : null}</div>)}</div></div> : null}
-                    {!billingState.status.scheduledCancelAt ? <button type="button" onClick={() => { if (window.confirm('确认在当前付费周期结束时取消自动续费？')) void cancelBillingSubscription(); }} className="flex min-h-11 w-full items-center justify-center rounded-xl border border-[#D7B7AA] bg-white text-[12px] font-semibold text-[#9A4939]">取消下一周期自动续费</button> : <p className="rounded-xl bg-white/70 p-2 text-center text-[11px] text-[#8A5B20]">已安排在当前周期结束时取消</p>}
-                  </>
+                  <div className="grid grid-cols-2 gap-2">
+                    {billingPlans.filter(plan => !plan.code.startsWith('team_')).map(plan => <button key={plan.code} type="button" onClick={() => void startBillingCheckout(plan.code)} disabled={['creating', 'open', 'confirming', 'pending'].includes(checkoutState.phase)} className="min-h-11 rounded-xl border border-[#CFC0A8] bg-white px-2 text-[11px] font-semibold text-[#285F98] disabled:opacity-60">{plan.interval === 'year' ? `续费一年 ¥${plan.priceCny}` : `续费一月 ¥${plan.priceCny}`}</button>)}
+                  </div>
                 ) : <button type="button" onClick={() => void openBillingPortal()} disabled={['creating', 'open', 'confirming', 'pending'].includes(checkoutState.phase)} className="flex min-h-11 w-full items-center justify-center gap-2 rounded-xl border border-[#CFC0A8] bg-white text-[12px] font-semibold text-[#285F98] hover:border-[#8EAED0] disabled:opacity-60"><CreditCard size={14} />管理付款、发票与恢复订阅</button>}
               </div>
             ) : null}
-            {billingState.phase === 'ready' && billingState.status.enabled && (billingState.status.access === 'none' || (billingState.status.access === 'read_only' && (billingState.status.subscriptionStatus === null || billingState.status.subscriptionStatus === 'canceled'))) ? (
+            {billingState.phase === 'ready' && billingState.status.enabled && !billingState.status.hasBillingCustomer && (billingState.status.access === 'none' || billingState.status.access === 'read_only') ? (
               billingCatalogState.phase === 'ready' ? (
                 <div className="mt-3 grid grid-cols-2 gap-2">
-                  {billingPlans.filter(plan => !plan.code.startsWith('team_')).map(plan => <button key={plan.code} type="button" onClick={() => void startBillingCheckout(plan.code)} disabled={['creating', 'open', 'confirming', 'pending'].includes(checkoutState.phase)} className="min-h-11 rounded-xl border border-[#CFC0A8] bg-white px-2 text-[11px] font-semibold text-[#285F98] disabled:opacity-60">{plan.interval === 'year' ? `年付 ¥${plan.priceCny}` : `月付 ¥${plan.priceCny}`}</button>)}
+                  {billingPlans.filter(plan => !plan.code.startsWith('team_')).map(plan => <button key={plan.code} type="button" onClick={() => void startBillingCheckout(plan.code)} disabled={['creating', 'open', 'confirming', 'pending'].includes(checkoutState.phase)} className="min-h-11 rounded-xl border border-[#CFC0A8] bg-white px-2 text-[11px] font-semibold text-[#285F98] disabled:opacity-60">{plan.interval === 'year' ? `购买一年 ¥${plan.priceCny}` : `购买一月 ¥${plan.priceCny}`}</button>)}
                 </div>
               ) : (
                 <div className="mt-3 rounded-xl border border-[#DED2C1] bg-white/70 p-3 text-center text-[11px] text-[#827667]">

@@ -138,11 +138,19 @@ test('the write workspace waits for account-level billing and has explicit paywa
   assert.match(gate, /paymentActionRequired/);
   assert.match(gate, /正在等待服务端确认开通/, 'Paddle client events must not unlock access directly');
   assert.match(context, /storePendingCheckoutConfirmation/, 'completed payments must survive a page refresh while webhooks settle');
-  assert.match(context, /subscriptionStatus === 'paused'/, 'only a paused subscription is forced through Portal recovery');
-  assert.match(gate, /subscriptionStatus === null \|\| status\.subscriptionStatus === 'canceled'/, 'legacy and canceled read-only users need a new checkout path');
+  assert.match(context, /provider !== 'alipay'[\s\S]*?subscriptionStatus === 'paused'/, 'fixed-term Alipay users must never be forced through subscription recovery');
+  assert.match(context, /BILLING_CHECKOUT_PENDING[\s\S]*?refreshBillingStatus\(\)[\s\S]*?latestCheckoutRequestId/,
+    'an existing Alipay payment must resume the server-owned request instead of polling a new client-only request id');
+  assert.doesNotMatch(context, /BILLING_CHECKOUT_PENDING[^}]+ALIPAY_API_UNAVAILABLE/,
+    'an Alipay API creation failure must remain retryable instead of being misreported as a payment awaiting confirmation');
+  assert.match(gate, /status\.provider === 'alipay'/, 'expired fixed-term users need a new manual purchase path');
+  assert.match(context, /ALIPAY_TERMINAL_CHECKOUT_ERRORS[\s\S]*?closed:[\s\S]*?failed:[\s\S]*?refunded:/,
+    'closed, failed and refunded Alipay checkouts must terminate local polling with an actionable error');
+  assert.match(context, /clearPendingCheckoutConfirmation\(scope\.userId!\)[\s\S]*?phase: 'error'/,
+    'server-owned terminal Alipay states must clear stale checkout recovery data');
 
-  assert.match(paywall, /自动续费/);
-  assert.match(paywall, /支付宝自动续费/);
+  assert.match(paywall, /不签约自动扣款/);
+  assert.match(paywall, /到期后可手动续费/);
   assert.match(paywall, /支付宝验签通知或服务端查询为准/);
   assert.match(paywall, /3 天内且 AI 写作操作不超过 5 次/);
   assert.match(paywall, /合理使用制/);

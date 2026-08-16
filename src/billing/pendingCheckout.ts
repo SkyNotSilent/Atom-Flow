@@ -9,7 +9,7 @@ export type PendingCheckoutConfirmation = {
   requestId: string;
   planCode: BillingPlanCode | null;
   transactionId: string | null;
-  mode: 'subscription_purchase' | 'payment_recovery';
+  mode: 'term_purchase' | 'payment_recovery';
   expiresAt: number;
 };
 
@@ -22,7 +22,7 @@ export const storePendingCheckoutConfirmation = (
 ) => {
   const stored: PendingCheckoutConfirmation = {
     ...input,
-    mode: input.mode ?? 'subscription_purchase',
+    mode: input.mode ?? 'term_purchase',
     version: 1,
     expiresAt: Date.now() + MAX_AGE_MS,
   };
@@ -43,7 +43,9 @@ export const readPendingCheckoutConfirmation = (userId: number): PendingCheckout
       window.sessionStorage.removeItem(STORAGE_KEY);
       return null;
     }
-    const mode = parsed.mode === 'payment_recovery' ? 'payment_recovery' : 'subscription_purchase';
+    // Treat the retired subscription value as a fixed-term purchase so an
+    // in-flight checkout from the previous release can still be confirmed.
+    const mode = parsed.mode === 'payment_recovery' ? 'payment_recovery' : 'term_purchase';
     return { ...parsed, planCode: parsed.planCode ?? null, mode } as PendingCheckoutConfirmation;
   } catch {
     window.sessionStorage.removeItem(STORAGE_KEY);

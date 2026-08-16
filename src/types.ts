@@ -33,14 +33,20 @@ export interface BillingPlan {
 export interface BillingStatus {
   enabled: boolean;
   provider?: 'paddle' | 'alipay';
+  billingMode?: 'subscription' | 'prepaid_term';
   access: BillingAccess;
   subscriptionStatus: BillingSubscriptionStatus | null;
   planCode: BillingPlanCode | null;
   currentPeriodEnd: string | null;
+  entitlementEndsAt?: string | null;
   scheduledCancelAt: string | null;
   hasLegacyWriteData: boolean;
   hasBillingCustomer: boolean;
+  hasPurchaseHistory?: boolean;
   paymentActionRequired: boolean;
+  pendingCheckout?: boolean;
+  latestCheckoutRequestId?: string | null;
+  latestCheckoutStatus?: 'creating' | 'pending' | 'paid' | 'closed' | 'refunded' | 'failed' | null;
   quantity?: number;
   pendingQuantity?: number | null;
 }

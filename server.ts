@@ -6413,7 +6413,7 @@ async function startServer() {
     try {
       if (billingProvider === "alipay") {
         if (!isAlipayPlanCode(planCode) || !alipayBillingService) return res.status(400).json({ code: "INVALID_BILLING_PLAN", error: "套餐无效" });
-        return res.json(await alipayBillingService.createCheckout(req.session.userId!, req.session.email || "", planCode, String(req.body?.requestId || ""), req.body?.quantity));
+        return res.json(await alipayBillingService.createCheckout(req.session.userId!, req.session.email || "", planCode, String(req.body?.requestId || "")));
       }
       if (!isBillingPlanCode(planCode) || !paddleBillingService) return res.status(400).json({ code: "INVALID_BILLING_PLAN", error: "套餐无效" });
       return res.json(await paddleBillingService.createCheckout(req.session.userId!, req.session.email || "", planCode, String(req.body?.requestId || "")));
@@ -6434,37 +6434,23 @@ async function startServer() {
   }));
 
   app.post("/api/billing/subscription/cancel", requireAuth, asyncHandler(async (req, res) => {
-    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) {
-      return res.status(404).json({ code: "BILLING_ACTION_UNAVAILABLE", error: "当前支付渠道不支持此操作" });
-    }
-    try { return res.json(await alipayBillingService.cancelSubscription(req.session.userId!)); }
-    catch (error) { return sendBillingError(res, error); }
+    return res.status(404).json({ code: "BILLING_ACTION_UNAVAILABLE", error: "支付宝使用期不会自动续费，无需取消" });
   }));
 
   app.post("/api/billing/team/quantity", requireAuth, asyncHandler(async (req, res) => {
-    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) {
-      return res.status(404).json({ code: "BILLING_ACTION_UNAVAILABLE", error: "当前支付渠道不支持此操作" });
-    }
-    try { return res.json(await alipayBillingService.changeTeamQuantity(req.session.userId!, Number(req.body?.quantity))); }
-    catch (error) { return sendBillingError(res, error); }
+    return res.status(404).json({ code: "BILLING_ACTION_UNAVAILABLE", error: "团队订阅暂未开放" });
   }));
 
   app.get("/api/billing/team", requireAuth, asyncHandler(async (req, res) => {
-    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) return res.status(404).json({ code: "TEAM_UNAVAILABLE", error: "团队订阅暂未启用" });
-    try { return res.json(await alipayBillingService.getTeam(req.session.userId!)); }
-    catch (error) { return sendBillingError(res, error); }
+    return res.status(404).json({ code: "TEAM_UNAVAILABLE", error: "团队订阅暂未开放" });
   }));
 
   app.post("/api/billing/team/members", requireAuth, asyncHandler(async (req, res) => {
-    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) return res.status(404).json({ code: "TEAM_UNAVAILABLE", error: "团队订阅暂未启用" });
-    try { return res.json(await alipayBillingService.addTeamMember(req.session.userId!, String(req.body?.email || ""))); }
-    catch (error) { return sendBillingError(res, error); }
+    return res.status(404).json({ code: "TEAM_UNAVAILABLE", error: "团队订阅暂未开放" });
   }));
 
   app.delete("/api/billing/team/members/:userId", requireAuth, asyncHandler(async (req, res) => {
-    if (billingProvider !== "alipay" || !alipayBillingService || !alipayBillingConfig.enabled) return res.status(404).json({ code: "TEAM_UNAVAILABLE", error: "团队订阅暂未启用" });
-    try { return res.json(await alipayBillingService.removeTeamMember(req.session.userId!, Number(req.params.userId))); }
-    catch (error) { return sendBillingError(res, error); }
+    return res.status(404).json({ code: "TEAM_UNAVAILABLE", error: "团队订阅暂未开放" });
   }));
 
   const resolveMagicWritingGate = (requiredAccess: "read" | "full"): express.RequestHandler => asyncHandler(async (req, res, next) => {
@@ -6473,8 +6459,8 @@ async function startServer() {
     try {
       const status = await billingService.resolveMagicWritingAccess(req.session.userId!);
       if (status.access === "full" || (requiredAccess === "read" && status.access === "read_only")) return next();
-      const code = status.access === "read_only" ? "MAGIC_WRITE_READ_ONLY" : "MAGIC_WRITE_SUBSCRIPTION_REQUIRED";
-      const error = status.access === "read_only" ? "当前魔法写作空间为只读" : "魔法写作需要 Pro 订阅";
+      const code = status.access === "read_only" ? "MAGIC_WRITE_READ_ONLY" : "MAGIC_WRITE_PURCHASE_REQUIRED";
+      const error = status.access === "read_only" ? "当前魔法写作空间为只读" : "魔法写作需要购买 Pro 使用期";
       return res.status(402).json({ code, error });
     } catch (error) {
       return sendBillingError(res, error);
@@ -7275,6 +7261,8 @@ async function startServer() {
       billingUsageEvents,
       alipayBillingSubscriptions,
       alipayBillingCheckoutAttempts,
+      alipayOneTimeOrders,
+      alipayOneTimeEntitlements,
       billingTeams,
       billingTeamMembers,
     ] = await Promise.all([
@@ -7310,6 +7298,8 @@ async function startServer() {
       rows(`SELECT operation_key, operation_type, occurred_at FROM billing_usage_events WHERE user_id = $1 ORDER BY occurred_at`),
       rows(`SELECT alipay_subscription_id, product_id, price_id, plan_code, status, quantity, pending_quantity, current_period_starts_at, current_period_ends_at, cancel_at_period_end, created_at, updated_at FROM alipay_billing_subscriptions WHERE user_id = $1 ORDER BY created_at`),
       rows(`SELECT id, request_id, plan_code, quantity, subscription_id, order_no, status, error_code, created_at, updated_at FROM alipay_billing_checkout_attempts WHERE user_id = $1 ORDER BY created_at`),
+      rows(`SELECT id, request_id, plan_code, out_trade_no, alipay_trade_no, total_amount_cents, status, error_code, paid_at, refund_amount_cents, refunded_at, entitlement_starts_at, entitlement_ends_at, created_at, updated_at FROM alipay_one_time_orders WHERE user_id = $1 ORDER BY created_at`),
+      rows(`SELECT plan_code, access_starts_at, access_ends_at, created_at, updated_at FROM alipay_one_time_entitlements WHERE user_id = $1`),
       rows(`SELECT id, name, owner_user_id, created_at, updated_at FROM billing_teams WHERE owner_user_id = $1 ORDER BY created_at`),
       rows(`SELECT m.team_id, m.user_id, m.role, m.status, m.created_at, m.updated_at FROM billing_team_members m JOIN billing_teams t ON t.id=m.team_id WHERE t.owner_user_id=$1 OR m.user_id=$1 ORDER BY m.created_at`),
     ]);
@@ -7348,6 +7338,8 @@ async function startServer() {
         usageEvents: billingUsageEvents,
         alipaySubscriptions: alipayBillingSubscriptions,
         alipayCheckoutAttempts: alipayBillingCheckoutAttempts,
+        alipayOneTimeOrders,
+        alipayOneTimeEntitlements,
         teams: billingTeams,
         teamMembers: billingTeamMembers,
       },
@@ -11049,7 +11041,7 @@ async function startServer() {
         res.locals.dailyAiBudgetReservationId = Number(budgetReservation.id);
         res.locals.dailyAiBudgetUserId = req.session.userId;
         res.locals.dailyAiBudgetProviderStarted = false;
-        if (billingService && billingConfig.enabled) await billingService.recordUsage(req.session.userId!, `canvas-agent:${agentId}:${requestId}:${activeRunId}`, "canvas_agent_create_article");
+        if (billingService && billingEnabled) await billingService.recordUsage(req.session.userId!, `canvas-agent:${agentId}:${requestId}:${activeRunId}`, "canvas_agent_create_article");
         sendCreateEvent("partial_status", { runId: activeRunId, message: `已连接 ${contexts.length} 个授权上下文节点` });
         const graphState = await runOpenAIWriteAgentRuntime(pool, {
           userId: req.session.userId, message, isCreateArticle: true, runId: activeRunId, creationKey, signal: abortController.signal,
@@ -11101,7 +11093,7 @@ async function startServer() {
     };
 
     const runId = randomUUID();
-    if (billingService && billingConfig.enabled) {
+    if (billingService && billingEnabled) {
       await billingService.recordUsage(req.session.userId!, `canvas-agent:${req.params.id}:${runId}`, "canvas_agent_chat");
     }
     let userMessageId: number | null = null;
@@ -11580,7 +11572,7 @@ async function startServer() {
 	    if (sampleText !== undefined && typeof sampleText !== "string") {
 	      return res.status(400).json({ error: "sampleText must be a string if provided" });
 	    }
-	    if (billingService && billingConfig.enabled) {
+	    if (billingService && billingEnabled) {
 	      await billingService.recordUsage(req.session.userId!, `skill-generate:${randomUUID()}`, "skill_generate");
 	    }
 
@@ -11764,7 +11756,7 @@ async function startServer() {
     if (!getOpenAIWriteAgentConfig()) {
       return res.status(500).json({ error: 'Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL' });
     }
-    if (billingService && billingConfig.enabled) {
+    if (billingService && billingEnabled) {
       await billingService.recordUsage(req.session.userId!, `write-agent:${runId}`, "write_agent_chat");
     }
 
@@ -11825,7 +11817,7 @@ async function startServer() {
     if (!getOpenAIWriteAgentConfig()) {
       return res.status(500).json({ error: 'Writing agent model is not configured: set OPENAI_API_KEY/OPENAI_MODEL or AI_API_KEY/AI_BASE_URL/AI_MODEL' });
     }
-    if (billingService && billingConfig.enabled) {
+    if (billingService && billingEnabled) {
       await billingService.recordUsage(req.session.userId!, `write-agent:${runId}`, "write_agent_chat");
     }
 
