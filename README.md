@@ -41,22 +41,22 @@
 
 ## 产品截图 · Product Screenshots
 
-### 今日推送 · Daily Feed
+### 文章聚合与全文阅读 · Feed & Full-text Reading
 
-将 AI、科技、商业、公众号、播客、YouTube 与自定义 RSS 汇入同一个阅读界面。<br />
-Bring AI, technology, business, WeChat, podcast, YouTube, and custom RSS sources into one focused reading feed.
+参考个人网站项目介绍的三栏阅读体验：左侧管理信息源，中间浏览文章，右侧查看 AI 总结与完整正文。<br />
+Manage sources on the left, browse articles in the center, and read AI summaries and full text on the right.
 
 <a href="https://www.atomflow.cloud/">
-  <img src="./docs/assets/readme/atomflow-feed.jpg" alt="AtomFlow 今日推送与 AI 资讯聚合界面 / AtomFlow daily AI news feed" width="100%" />
+  <img src="./docs/assets/readme/atomflow-reading.jpg" alt="AtomFlow 文章聚合、AI 总结与全文阅读界面 / AtomFlow article feed, AI summary, and full-text reader" width="100%" />
 </a>
 
-### 优质信息源 · Curated Sources
+### 原子知识库 · Atomic Knowledge Base
 
-从精选中英文来源开始，也可以添加自己的 RSS 或 RSSHub 路由。<br />
-Start with curated Chinese and English sources, then add your own RSS or RSSHub routes.
+把读过的文章拆解为观点、数据、金句和故事卡片，并保留标签、来源与原文上下文。<br />
+Turn articles into reusable viewpoint, data, quote, and story cards while keeping tags, sources, and original context.
 
 <a href="https://www.atomflow.cloud/">
-  <img src="./docs/assets/readme/atomflow-sources.jpg" alt="AtomFlow 优质信息源与公众号文章订阅 / AtomFlow curated sources and WeChat article feeds" width="100%" />
+  <img src="./docs/assets/readme/atomflow-knowledge.jpg" alt="AtomFlow 原子知识卡片与来源文章界面 / AtomFlow atomic knowledge cards with source article context" width="100%" />
 </a>
 
 ---
