@@ -1,85 +1,174 @@
-# AtomFlow（原子流）
+<div align="center">
+  <a href="https://www.atomflow.cloud/">
+    <img src="./public/atomflow-icon.svg" width="88" alt="AtomFlow logo" />
+  </a>
 
-**让每一篇看过的知识，都成为可复用的创作资产。**
+  <h1>AtomFlow · 原子流</h1>
 
-AtomFlow 是一个前后端一体的知识工作台，把 RSS 阅读、原文保存、原子卡片和 AI 辅助创作连接起来。当前写作体验是基于 tldraw 的**魔法写作无限画布**：用户把文章、卡片、笔记、文本、文件和图片放到画布上，通过连线明确授权给写作 Agent 的上下文，并自行决定哪些输出保存为新的画布资产。
+  <p><strong>Don't just consume. Flow!</strong></p>
+  <p><strong>别只是消费信息，让知识流动起来。</strong></p>
 
-## 核心链路
+  <p>
+    AI 资讯推送、公众号文章聚合与知识创作工作台<br />
+    AI news delivery, curated RSS & WeChat article feeds, and an AI-native knowledge workflow
+  </p>
 
-1. **输入**：聚合内置或自定义 RSS，抓取并阅读正文。
-2. **沉淀**：保存原文，通过 AI 或规则回退拆解为观点、数据、金句和故事卡片。
-3. **创作**：在无限画布中组合可见素材，连接写作 Agent，生成并保存可继续编辑的结果。
+  <p>
+    <a href="https://www.atomflow.cloud/"><strong>🚀 在线体验 · Live Demo</strong></a>
+    ·
+    <a href="https://www.atomflow.cloud/pricing">定价 · Pricing</a>
+    ·
+    <a href="#快速开始--quick-start">本地运行 · Run Locally</a>
+  </p>
 
-## 主要能力
+  <p>
+    <img alt="React 19" src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=white" />
+    <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5-3178C6?style=flat-square&logo=typescript&logoColor=white" />
+    <img alt="Node.js 22+" src="https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white" />
+    <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-14%2B-4169E1?style=flat-square&logo=postgresql&logoColor=white" />
+    <img alt="Railway" src="https://img.shields.io/badge/Deploy-Railway-7B2CBF?style=flat-square&logo=railway&logoColor=white" />
+    <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-2EA44F?style=flat-square" />
+  </p>
 
-### 今日推送
+  <p>
+    <a href="#中文">中文</a> · <a href="#english">English</a>
+  </p>
+</div>
 
-- RSS 聚合、来源筛选和自定义订阅
-- Readability + JSDOM 全文提取
-- 文章、图片、音频来源信息和发布时间解析
-- 稳定文章标识、去重和按用户持久化
+> **关键词 / Keywords**：AI 资讯推送 · AI news feed · 公众号 AI 文章聚合 · WeChat AI article feeds · 优质信息源 · curated sources · RSS 阅读器 · RSS reader · AI 知识库 · AI knowledge base · AI 写作 · AI writing assistant · 内容创作 · content creation
 
-### 知识库
+---
 
-- 保存原文、引用上下文和来源图片
-- 观点、数据、金句、故事四类原子卡片
-- AI 原子化失败时可回退到规则提取
-- 手动创建、编辑、删除和来源回溯
-- 为未来知识关系保留 `supports`、`conflicts`、`extends` 边
+## 产品截图 · Product Screenshots
 
-### 魔法写作无限画布
+### 文章聚合与全文阅读 · Feed & Full-text Reading
 
-- 基于 tldraw 的缩放、平移和节点布局
-- 画布节点支持收藏文章、原子卡、笔记、粘贴文本、文件、图片、Agent 和结果
-- 通过连线控制某个 Agent 可读取的上下文，而不是默认提交整个知识库
-- Agent 模板支持模型、系统提示词、`temperature`、`top_p` 和 `max_tokens`
-- 支持文本和可选视觉上下文；模型不支持图片时使用提取文本/用户说明回退
-- Agent 对话结果由用户手动保存回画布
-- 项目、节点、连线、视口、资产、Agent 配置和消息持久化到 PostgreSQL
+参考个人网站项目介绍的三栏阅读体验：左侧管理信息源，中间浏览文章，右侧查看 AI 总结与完整正文。<br />
+Manage sources on the left, browse articles in the center, and read AI summaries and full text on the right.
 
-> 生产环境启用无限画布必须遵守 tldraw 许可证并提供适当、有效的 `VITE_TLDRAW_LICENSE_KEY`。AtomFlow 的 MIT License 不会把 tldraw 重新许可为 MIT。参见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [`LICENSES/TLDRAW_LICENSE.md`](LICENSES/TLDRAW_LICENSE.md)。
+<a href="https://www.atomflow.cloud/">
+  <img src="./docs/assets/readme/atomflow-reading.jpg" alt="AtomFlow 文章聚合、AI 总结与全文阅读界面 / AtomFlow article feed, AI summary, and full-text reader" width="100%" />
+</a>
 
-### 用户和辅助服务
+### 原子知识库 · Atomic Knowledge Base
 
-- 邮箱验证码、密码登录、找回密码和 PostgreSQL Session
-- 昵称、头像、主题、视图和来源布局偏好
-- 可选百度翻译
-- 可选火山引擎 ASR 实时语音转文字
-- Resend 或 SMTP 验证码邮件
+把读过的文章拆解为观点、数据、金句和故事卡片，并保留标签、来源与原文上下文。<br />
+Turn articles into reusable viewpoint, data, quote, and story cards while keeping tags, sources, and original context.
 
-## 技术栈
+<a href="https://www.atomflow.cloud/">
+  <img src="./docs/assets/readme/atomflow-knowledge.jpg" alt="AtomFlow 原子知识卡片与来源文章界面 / AtomFlow atomic knowledge cards with source article context" width="100%" />
+</a>
 
-- Frontend：React、Vite、TypeScript、Tailwind、tldraw
-- Backend：Express、Node.js 22+、RSS Parser、Readability、JSDOM
-- Database：PostgreSQL（`pg` 参数化查询，无 ORM）；可选 pgvector
-- AI：MiMo Token Plan 的 OpenAI-compatible API；写作运行时使用 OpenAI Agents SDK，并可覆盖为官方 OpenAI 配置
-- Auth：`express-session`、`connect-pg-simple`、`bcryptjs`
-- Email：Resend 或 SMTP
-- Deploy：Railway + PostgreSQL
+---
 
-## 数据流概览
+<a id="中文"></a>
+
+## 中文
+
+### 信息太多太快，看不完、记不住、用不上
+
+AtomFlow 是面向内容创作者、产品经理和 AI 从业者的知识工作台。它把分散在 RSS、公众号、科技媒体、博客、YouTube 和播客里的优质内容汇入「今日推送」，再把阅读、收藏、知识沉淀和 AI 辅助创作连接成一条可追溯的工作流。
+
+**我们的目标：让每一篇看过的知识，都成为可复用的创作资产。**
+
+### 从信息流到创作流
+
+| 层级 | AtomFlow 做什么 | 你得到什么 |
+| :--- | :--- | :--- |
+| **输入** | 聚合 AI 资讯、公众号文章、国内外媒体、RSS/RSSHub、视频与播客来源 | 一个更干净、更高质量的信息入口 |
+| **沉淀** | 全文阅读、保存原文，并将内容拆解为观点、数据、金句和故事卡片 | 可检索、可回溯、可复用的个人知识库 |
+| **输出** | 在魔法写作无限画布中组合文章、卡片、笔记、文件、图片和写作 Agent | 带来源上下文、由你掌控的创作结果 |
+
+### 核心能力
+
+- **AI 资讯推送**：持续聚合中英文 AI、科技、产品和商业动态，减少跨平台刷新带来的信息焦虑。
+- **公众号文章聚合**：通过可用的 RSS/RSSHub 来源统一阅读公众号与其他内容渠道。
+- **优质信息源发现**：内置精选来源，并支持自定义 RSS、RSSHub、YouTube 与播客订阅。
+- **沉浸式全文阅读**：使用 Readability + JSDOM 提取正文，保留原文地址、来源和发布时间。
+- **原子知识库**：把文章沉淀为观点、数据、金句、故事四类卡片，并保留引用上下文。
+- **魔法写作画布**：在 tldraw 无限画布中显式连接素材与写作 Agent，决定 AI 可以读取哪些上下文。
+- **播客解读**：把可用的音频内容纳入同一套发现、理解和知识复用体验。
+- **可自托管**：React + Express + PostgreSQL 一体化部署，AI 模型使用 OpenAI-compatible 接口。
+
+### 适合谁
+
+- 需要持续追踪 AI 行业动态、公众号文章与海外科技内容的从业者
+- 想把日常阅读转成选题、素材和文章的内容创作者
+- 需要保留信息来源和推理上下文的产品经理、研究者与知识工作者
+- 希望掌控数据、模型供应商和部署环境的个人或小团队
+
+---
+
+<a id="english"></a>
+
+## English
+
+### Too much information. Too little usable knowledge.
+
+AtomFlow is a knowledge workspace for creators, product managers, and AI practitioners. It brings high-quality content from RSS, WeChat Official Accounts, technology media, blogs, YouTube, and podcasts into one daily feed—then connects reading, saving, knowledge extraction, and AI-assisted creation in a traceable workflow.
+
+**Our goal: turn everything you read into a reusable creative asset.**
+
+### From information flow to creation flow
+
+| Layer | What AtomFlow does | What you get |
+| :--- | :--- | :--- |
+| **Input** | Aggregates AI news, WeChat articles, global media, RSS/RSSHub, video, and podcast sources | One focused, higher-signal information feed |
+| **Knowledge** | Saves full articles and extracts viewpoints, data, quotes, and stories | A searchable, source-linked personal knowledge base |
+| **Creation** | Connects articles, cards, notes, files, images, and writing agents on an infinite canvas | Source-aware drafts with human-controlled context |
+
+### Key features
+
+- **AI news delivery** — Follow Chinese and English AI, technology, product, and business updates in one feed.
+- **WeChat article feeds** — Read supported WeChat Official Account sources through available RSS/RSSHub routes.
+- **Curated sources** — Start with selected feeds or add custom RSS, RSSHub, YouTube, and podcast subscriptions.
+- **Full-text reading** — Extract readable article content while preserving its original URL, source, and publication time.
+- **Atomic knowledge base** — Turn articles into reusable viewpoint, data, quote, and story cards with source context.
+- **Magic Writing Canvas** — Explicitly connect source material to writing agents and control exactly what context AI can access.
+- **Podcast insights** — Bring supported audio content into the same discovery and knowledge workflow.
+- **Self-hostable stack** — Run the React, Express, and PostgreSQL application with your preferred OpenAI-compatible model provider.
+
+---
+
+## 工作流 · Workflow
 
 ```text
-RSS / 网页
-    -> 今日推送与全文提取
-    -> 保存原文
-    -> AI 原子化或规则回退
-    -> 原子卡片 / 笔记
-    -> 魔法写作无限画布
-    -> 连接到写作 Agent
-    -> 用户确认后保存结果
+AI 资讯 / 公众号 / RSS / YouTube / 播客
+AI news / WeChat / RSS / YouTube / podcasts
+                    ↓
+             今日推送 · Daily Feed
+                    ↓
+       全文阅读与收藏 · Read & Save
+                    ↓
+      原子知识卡片 · Atomic Knowledge Cards
+                    ↓
+    魔法写作 / 播客解读 · Create & Explore
+                    ↓
+        可追溯输出 · Source-aware Output
 ```
 
-AI、翻译、语音和邮件功能会向部署实例配置的第三方供应商发送完成请求所需的数据。公开部署必须披露实际供应商并在功能发生前提供就地告知，详见 [PRIVACY.md](PRIVACY.md)。
+## 技术栈 · Tech Stack
 
-## 快速开始
+| Layer | Technology |
+| :--- | :--- |
+| Frontend | React 19, Vite, TypeScript, Tailwind CSS, tldraw |
+| Backend | Express, Node.js 22+, RSS Parser, Readability, JSDOM |
+| Database | PostgreSQL with parameterized `pg` queries; optional pgvector |
+| AI | OpenAI-compatible API, OpenAI Agents SDK |
+| Auth | `express-session`, `connect-pg-simple`, `bcryptjs` |
+| Optional services | Resend/SMTP, Baidu Translate, Volcengine ASR |
+| Deployment | Railway + PostgreSQL |
 
-### 环境要求
+<a id="快速开始--quick-start"></a>
+
+## 快速开始 · Quick Start
+
+### 环境要求 · Prerequisites
 
 - Node.js 22+
 - PostgreSQL 14+
 
-### 安装
+### 安装 · Installation
 
 ```bash
 git clone https://github.com/SkyNotSilent/Atom-Flow.git
@@ -88,25 +177,25 @@ npm ci
 cp .env.example .env
 ```
 
-至少配置：
+至少配置以下环境变量：
 
 ```env
 DATABASE_URL=postgresql://user:password@localhost:5432/atomflow
 SESSION_SECRET=replace-with-a-random-secret
 AI_API_KEY=your-api-key
-AI_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
-AI_MODEL=mimo-v2.5-pro
+AI_BASE_URL=https://your-openai-compatible-provider.example/v1
+AI_MODEL=your-model
 ```
 
-本地启动：
+启动开发环境：
 
 ```bash
 npm run dev
 ```
 
-本地固定访问 `http://localhost:1000`。如果端口被占用，先确认并停止旧的 AtomFlow 进程，不要临时修改项目端口。
+本地访问：[`http://localhost:1000`](http://localhost:1000)
 
-## AI 配置
+## AI 与可选服务 · AI & Optional Services
 
 知识原子化默认读取：
 
@@ -116,100 +205,95 @@ AI_BASE_URL
 AI_MODEL
 ```
 
-写作 Agent 默认复用以上 OpenAI-compatible 配置。要覆盖为官方 OpenAI，可设置：
+写作 Agent 默认复用 OpenAI-compatible 配置；如需单独使用官方 OpenAI，可配置：
 
 ```env
 OPENAI_API_KEY
 OPENAI_MODEL
 ```
 
-MiMo 模型 ID 会在请求前规范为小写。调试真实 AI 原子化时可临时设置 `DISABLE_AI_FALLBACK=true`；此时远端调用失败会返回 `502`，不会创建规则回退卡片。
-
-## 可选服务
+其他可选能力：
 
 ```env
-# 邮件（二选一）
+# Email: choose Resend or SMTP
 RESEND_API_KEY=...
 SMTP_USER=...
 SMTP_PASS=...
 
-# 翻译
+# Translation
 BAIDU_TRANSLATE_APPID=...
 BAIDU_TRANSLATE_KEY=...
 
-# 实时语音识别
+# Real-time speech recognition
 VOLCENGINE_ASR_APPID=...
 VOLCENGINE_ASR_TOKEN=...
 VOLCENGINE_ASR_CLUSTER=volcengine_streaming_common
 
-# 自定义 RSSHub
+# Custom RSSHub
 RSSHUB_BASE=https://rsshub.app
 
-# 生产无限画布
+# Production Magic Writing Canvas
 VITE_TLDRAW_LICENSE_KEY=...
 ```
 
-不要把真实密钥提交到仓库。
+不要把真实密钥提交到仓库。Never commit real credentials to the repository.
 
-## 数据库
+## 数据与架构 · Data & Architecture
 
-核心表包括：
+核心数据保存在 PostgreSQL：
 
-| 表 | 用途 |
-| --- | --- |
-| `users` / `verification_codes` / `session` | 账号、验证和登录会话 |
-| `user_subscriptions` / `user_articles` | 自定义 RSS 与用户文章 |
-| `saved_articles` / `saved_cards` | 保存原文与原子卡片 |
-| `notes` / `user_preferences` | 笔记与用户偏好 |
-| `write_style_skills` | 可复用写作/提取指令 |
-| `write_canvas_projects` / `write_canvas_nodes` / `write_canvas_edges` | 无限画布结构 |
-| `write_canvas_assets` | 画布文本、文件、图片和提取文本 |
-| `write_agent_templates` / `write_agent_instances` / `write_canvas_agent_messages` | 画布 Agent 配置与对话 |
+| Tables | Purpose |
+| :--- | :--- |
+| `users`, `verification_codes`, `session` | Accounts, verification, and sessions |
+| `user_subscriptions`, `user_articles` | Custom feeds and per-user article state |
+| `saved_articles`, `saved_cards` | Source articles and atomic knowledge cards |
+| `notes`, `user_preferences` | Notes and preferences |
+| `write_style_skills` | Reusable writing and extraction instructions |
+| `write_canvas_projects`, `write_canvas_nodes`, `write_canvas_edges` | Infinite-canvas structure |
+| `write_canvas_assets` | Canvas text, files, images, and extracted content |
+| `write_agent_templates`, `write_agent_instances`, `write_canvas_agent_messages` | Writing-agent configuration and conversations |
 
-数据库查询直接使用 `pool.query`，写入必须参数化并按 `user_id` 隔离。
+数据库写入使用参数化查询，并按 `user_id` 隔离用户数据。
 
-## 验证命令
+## 验证 · Validation
 
 ```bash
 npx tsc --noEmit
 npm run lint
+npm test
 npm run build
-npx tsx tests/subscriptions.test.ts
 ```
 
-涉及安全、上传、认证或部署的修改还应运行对应的定向测试。
+涉及 RSS 运行时或内存治理时，可额外运行：
 
-## Railway 部署
+```bash
+npm run test:rss:cache
+npm run test:rss:soak
+```
+
+## Railway 部署 · Deployment
 
 1. 从 GitHub 创建 Railway 服务并添加 PostgreSQL。
-2. 在 Railway Variables 中配置 `DATABASE_URL`、强随机 `SESSION_SECRET`、AI 配置、`APP_URL` 和精确的 `ALLOWED_ORIGINS`。
+2. 配置 `DATABASE_URL`、强随机 `SESSION_SECRET`、AI 配置、`APP_URL` 和精确的 `ALLOWED_ORIGINS`。
 3. 如启用魔法写作画布，配置与实际授权匹配的 `VITE_TLDRAW_LICENSE_KEY`。
-4. 使用 `railway.json` 的 `/api/health` 健康检查。每次推送或合并到远程仓库后，Railway 会自动部署；必须持续查看 Railway 部署状态和日志，确认部署成功、`/api/health` 通过并完成线上地址的基础烟测后，才算本次发布完成。GitHub CI 通过不能替代 Railway 部署验证。
-5. 公共发布前完成 WAF/边缘限流、监控告警、数据库备份恢复演练和供应商审查。
+4. 使用 `railway.json` 的 `/api/health` 健康检查，并在部署后验证日志与线上关键流程。
+5. 在共享状态、队列和全局限流迁移完成前保持单 Web 副本。
 
-当前进程内 RSS 状态、限流和任务协调不适合多副本共享。完成 Redis/队列/共享对象存储迁移和负载测试前，保持单 Web 副本。
+## 安全、隐私与许可证 · Security, Privacy & License
 
-## 公开部署前必做
+AI、翻译、语音和邮件功能可能向部署实例配置的第三方供应商发送完成请求所需的数据。公开部署前，请披露实际供应商并提供清晰的就地告知。
 
-- 替换 [SECURITY.md](SECURITY.md)、[PRIVACY.md](PRIVACY.md) 和 [TERMS.md](TERMS.md) 中的运营者、联系人、地区和保留期占位符。
-- 在 AI、翻译、语音、上传、邮件和自定义 RSS 操作前提供清晰的就地告知。
-- 只披露实际启用的供应商，并核对其数据保留、地区、子处理方和合同。
-- 建立账号删除/导出人工流程；当前代码没有完整自助账号注销入口。
-- 验证日志不会记录密钥、完整验证码、正文、音频或不必要的个人信息。
-- 取得适当的 tldraw 生产许可证密钥，不绕过其技术措施。
+- [安全政策 · Security](SECURITY.md)
+- [隐私说明 · Privacy](PRIVACY.md)
+- [服务条款 · Terms](TERMS.md)
+- [第三方声明 · Third-party notices](THIRD_PARTY_NOTICES.md)
+- [对外发布说明 · Public release notes](docs/README_PUBLIC.md)
 
-本项目不声称通过任何安全、隐私或合规认证。部署运营者应根据服务地区、用户和数据类型取得独立专业意见。
+AtomFlow 自有代码默认采用 [MIT License](LICENSE)。魔法写作无限画布使用 tldraw，生产环境必须遵守 tldraw 自有许可证并配置适当、有效的许可证密钥；AtomFlow 的 MIT License 不会重新许可 tldraw。详见 [`LICENSES/TLDRAW_LICENSE.md`](LICENSES/TLDRAW_LICENSE.md)。
 
-## 安全、隐私与条款
+---
 
-- [安全政策](SECURITY.md)
-- [隐私说明](PRIVACY.md)
-- [服务条款](TERMS.md)
-- [第三方声明](THIRD_PARTY_NOTICES.md)
-- [对外发布说明](docs/README_PUBLIC.md)
-
-## 许可证
-
-AtomFlow 项目自有代码默认按根目录 [LICENSE](LICENSE) 的 MIT License 提供，**明确标注为其他许可证的组件、文件和第三方依赖除外**。
-
-尤其是，魔法写作无限画布所用的 tldraw 受 tldraw 自有许可证约束；生产使用需要适当、有效的许可证密钥。AtomFlow 的 MIT License 不覆盖或重新许可 tldraw。完整信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [`LICENSES/TLDRAW_LICENSE.md`](LICENSES/TLDRAW_LICENSE.md)。
+<div align="center">
+  <strong>让阅读产生复利。Make your reading compound.</strong><br />
+  <a href="https://www.atomflow.cloud/">www.atomflow.cloud</a>
+</div>
