@@ -53,10 +53,15 @@ import {
 import {
   BUILTIN_RSS_FEEDS,
   type BuiltInRssFeedDefinition,
+  buildHomepageTimeline,
   createSerializedTaskQueue,
+  extractFeedIcon,
+  mergeArticles,
   mergeArticleSourceMemberships,
   mergeWithSourceFallback,
   normalizeArticleUrl,
+  normalizeFeedItems,
+  rankArticles,
   sanitizeGlobalArticleCache,
   stableArticleId,
 } from "./src/server/rss.js";
@@ -110,7 +115,6 @@ const isProduction = process.env.NODE_ENV === "production";
 const DEV_SESSION_SECRET = "atomflow-dev-secret-change-in-prod";
 const PUBLIC_WEB_PORTS = new Set(["", "80", "443"]);
 const PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS = 250_000;
-const RSS_FEED_EXCERPT_SOURCE_BUDGET_CHARS = 64_000;
 const LEGAL_PLACEHOLDER_PATTERN = /\[(?:DEPLOYMENT_OPERATOR_NAME|DEPLOYMENT_OPERATOR_ADDRESS|SERVICE_CONTACT_EMAIL|REFUND_CONTACT_EMAIL|PRIVACY_CONTACT_EMAIL|SECURITY_CONTACT_EMAIL|SERVICE_URL|DATA_HOSTING_REGION|TERMS_EFFECTIVE_DATE|GOVERNING_LAW|DISPUTE_FORUM|LOG_RETENTION_DAYS|BACKUP_RETENTION_DAYS|RIGHTS_REQUEST_RESPONSE_DAYS)\]/g;
 const LEGAL_DOCUMENTS = {
   privacy: "PRIVACY.md",
@@ -285,7 +289,10 @@ declare module "express-session" {
 const asyncHandler = (fn: (req: express.Request, res: express.Response, next: express.NextFunction) => Promise<any>): express.RequestHandler =>
   (req, res, next) => fn(req, res, next).catch(next);
 
-const parser = new Parser({
+// One parser per parse call: rss-parser keeps its xml2js instance, which retains the
+// last parse's full result graph — a shared module-level parser would permanently pin
+// one feed's parsed XML between refresh cycles.
+const createFeedParser = () => new Parser({
   headers: {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   }
@@ -354,7 +361,7 @@ async function parseBoundedFeedCandidate(candidate: string, timeoutMs: number, p
     if (resource.status < 200 || resource.status >= 300) {
       throw new Error(`RSS source returned ${resource.status}`);
     }
-    return parser.parseString(resource.body.toString("utf8"));
+    return createFeedParser().parseString(resource.body.toString("utf8"));
   });
 }
 
@@ -379,28 +386,6 @@ const ALLOWED_IMAGE_HOST_SUFFIXES = [
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function mergeArticles(previous: Article[], next: Article[]): Article[] {
-  const prevByUrl = new Map(previous.flatMap(article => {
-    const normalizedUrl = normalizeArticleUrl(article.url);
-    return normalizedUrl ? [[normalizedUrl, article] as const] : [];
-  }));
-  return next.map(article => {
-    const normalizedUrl = normalizeArticleUrl(article.url);
-    const prev = normalizedUrl ? prevByUrl.get(normalizedUrl) : undefined;
-    if (!prev) return article;
-    return {
-      ...article,
-      id: prev.id,
-      saved: prev.saved,
-      cards: prev.cards,
-      fullFetched: prev.fullFetched,
-      markdownContent: prev.markdownContent,
-      contentFormat: prev.contentFormat || article.contentFormat,
-      readabilityUsed: prev.readabilityUsed
-    };
-  });
 }
 
 async function loadArticlesCache() {
@@ -498,159 +483,6 @@ async function applyUserSavedStateToArticles(userId: number, articleList: Articl
   });
 }
 
-const SOURCE_PRIORITY: Record<string, number> = {
-  '36氪': 5.5,
-  'AI HOT 精选': 5.0,
-  'AI HOT 全部': 4.9,
-  'Lex Fridman': 4.8,
-  'Y Combinator': 4.6,
-  'Andrej Karpathy': 4.4,
-  'GitHub Blog': 4.2,
-  'Sam Altman': 4.0,
-  '张小珺商业访谈录': 3.8,
-  '数字生命卡兹克': 3.8,
-  '新智元': 3.8,
-  '人人都是产品经理': 2.5,
-  '即刻话题': 1.5,
-  '少数派': 1.2,
-  '虎嗅': 0
-};
-
-const LOW_PRIORITY_SOURCES = new Set(['少数派', '即刻话题']);
-
-function getPriority(article: Article) {
-  if (SOURCE_PRIORITY[article.source] !== undefined) return SOURCE_PRIORITY[article.source];
-  if (article.topic === '公众号') return 3.4;
-  return 2.5;
-}
-
-function rankArticles(articles: Article[]) {
-  const sorted = [...articles].sort((a, b) => {
-    const pa = getPriority(a);
-    const pb = getPriority(b);
-    if (pb !== pa) return pb - pa;
-    return (b.publishedAt ?? 0) - (a.publishedAt ?? 0);
-  });
-  const low = sorted.filter(item => LOW_PRIORITY_SOURCES.has(item.source));
-  const rest = sorted.filter(item => !LOW_PRIORITY_SOURCES.has(item.source));
-  const promotedLow = low.slice(0, 2);
-  const remainingLow = low.slice(2);
-  const positions = [2, 7];
-  const limit = Math.min(promotedLow.length, positions.length);
-  for (let i = 0; i < limit; i += 1) {
-    const pos = Math.min(positions[i], rest.length);
-    rest.splice(pos, 0, promotedLow[i]);
-  }
-  const combined = [...rest, ...remainingLow];
-
-  // 增加随机性：一半文章按优先级排序，一半随机打乱
-  const halfPoint = Math.floor(combined.length / 2);
-  const prioritized = combined.slice(0, halfPoint);
-  const randomized = combined.slice(halfPoint);
-
-  // Fisher-Yates 洗牌算法
-  for (let i = randomized.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [randomized[i], randomized[j]] = [randomized[j], randomized[i]];
-  }
-  
-  return [...prioritized, ...randomized];
-}
-
-function extractFeedIcon(parsed: Parser.Output<any>): string | undefined {
-  // 尝试从多个可能的字段提取图标
-  const feed = parsed as any;
-  
-  // iTunes podcast image
-  if (feed.itunes?.image) return feed.itunes.image;
-  
-  // Standard RSS image
-  if (feed.image?.url) return feed.image.url;
-  
-  // Atom feed icon
-  if (feed.icon) return feed.icon;
-  
-  // Feed logo
-  if (feed.logo) return feed.logo;
-  
-  // 从link提取favicon
-  if (feed.link) {
-    try {
-      const url = new URL(feed.link);
-      return `${url.origin}/favicon.ico`;
-    } catch {
-      // ignore
-    }
-  }
-  
-  return undefined;
-}
-
-function getDefaultFeedLimit(source: string) {
-  return source === '36氪' || source === '虎嗅' ? 8 : 12;
-}
-
-function normalizeFeedItems(
-  items: Parser.Item[],
-  source: string,
-  defaultTopic: string,
-  idOffset: number,
-  feedIcon?: string,
-  options?: { maxItems?: number | null }
-) {
-  const maxItems = options?.maxItems === undefined ? getDefaultFeedLimit(source) : options.maxItems;
-  const normalizedItems = maxItems === null ? items : items.slice(0, maxItems);
-  const excerptSourceCharsPerItem = Math.min(
-    512,
-    Math.max(64, Math.floor(RSS_FEED_EXCERPT_SOURCE_BUDGET_CHARS / Math.max(1, normalizedItems.length))),
-  );
-  return normalizedItems.map((item, index) => {
-    const rawContent = item['content:encoded'] || item.content || item.contentSnippet || '';
-    const excerptText = buildFeedExcerpt(
-      rawContent,
-      item.contentSnippet,
-      item.title,
-      excerptSourceCharsPerItem,
-      120,
-    );
-    const excerpt = excerptText ? `${excerptText}...` : "";
-    const topic = (item.categories && item.categories.length > 0) ? item.categories[0] : defaultTopic;
-    let timeStr = '刚刚';
-    const date = item.pubDate ? new Date(item.pubDate) : null;
-    if (date) {
-      const now = new Date();
-      if (date.toDateString() === now.toDateString()) {
-        timeStr = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-      } else {
-        timeStr = `${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')}`;
-      }
-    }
-    const publishedAt = date ? date.getTime() : Date.now() - index;
-    
-    // 提取音频信息（播客）
-    const enclosure = item.enclosure;
-    const audioUrl = enclosure?.url;
-    const audioDuration = (item as any).itunes?.duration;
-    
-    return {
-      id: stableArticleId(source, item, idOffset, index),
-      saved: false,
-      source,
-      sourceIcon: feedIcon,
-      topic,
-      time: timeStr,
-      publishedAt,
-      title: item.title || '无标题',
-      excerpt,
-      content: truncateUtf8(rawContent, RSS_ARTICLE_CONTENT_MAX_BYTES),
-      contentFormat: detectArticleContentFormat(rawContent),
-      url: item.link,
-      audioUrl,
-      audioDuration,
-      cards: []
-    };
-  });
-}
 
 const formatJikeContent = (rawContent: string) => {
   if (!rawContent.includes('热门评论')) return rawContent;
@@ -5312,13 +5144,6 @@ const get36KrArticleId = (url?: string) => {
   return match?.[1] || null;
 };
 
-function buildHomepageTimeline(fullArticles: Article[]): Article[] {
-  const selected = BUILTIN_RSS_FEEDS.flatMap(feed => fullArticles
-    .filter(article => article.source === feed.source || article.sourceAliases?.includes(feed.source))
-    .sort((a, b) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0))
-    .slice(0, getDefaultFeedLimit(feed.source)));
-  return rankArticles(mergeArticleSourceMemberships(selected));
-}
 
 async function startServer() {
   const app = express();
@@ -5955,7 +5780,7 @@ async function startServer() {
     }
   };
 
-  let rssRuntime: RssRuntimeController<BuiltInRssFeedDefinition, Parser.Output<Parser.Item>> | null = null;
+  let rssRuntime: RssRuntimeController<BuiltInRssFeedDefinition, Article[]> | null = null;
 
   app.get("/api/health", asyncHandler(async (_req, res) => {
     if (!pool || !schemaReady) return res.status(503).json({ status: "unhealthy", database: pool ? "schema-unavailable" : "unavailable" });
@@ -6009,10 +5834,17 @@ async function startServer() {
   let activeFeedRefresh: Promise<unknown> | null = null;
   let lastFeedRefreshAt = 0;
   const rssRefreshIntervalMs = readBoundedEnvNumber(process.env.RSS_REFRESH_INTERVAL_MINUTES, 30, 5, 360) * 60 * 1000;
-  rssRuntime = new RssRuntimeController<BuiltInRssFeedDefinition, Parser.Output<Parser.Item>>({
+  rssRuntime = new RssRuntimeController<BuiltInRssFeedDefinition, Article[]>({
     getSources: () => BUILTIN_RSS_FEEDS,
     getSourceId: source => source.key,
-    refreshSource: (source, signal) => withAbortTimeout(signal, 20_000, boundedSignal => parseFirstAvailable(source.urls, boundedSignal)),
+    // Normalize (and size-truncate) inside the per-source refresh so the cycle's
+    // results map holds small plain articles; the multi-megabyte xml2js parse graph
+    // becomes GC-eligible as soon as each source finishes instead of surviving the
+    // whole cycle plus the cache write.
+    refreshSource: async (source, signal) => {
+      const parsed = await withAbortTimeout(signal, 20_000, boundedSignal => parseFirstAvailable(source.urls, boundedSignal));
+      return normalizeFeedItems(parsed.items || [], source.source, source.topic, source.idOffset, extractFeedIcon(parsed));
+    },
     refreshIntervalMs: rssRefreshIntervalMs,
     concurrency: readBoundedEnvNumber(process.env.RSS_MAX_CONCURRENCY, RSS_MAX_CONCURRENCY, 1, 8),
     memoryWarningBytes: readBoundedEnvNumber(process.env.RSS_MEMORY_WARNING_MB, 600, 256, 4096) * 1024 * 1024,
@@ -6022,10 +5854,7 @@ async function startServer() {
     onEvent: (event: RssRuntimeEvent) => logger.info({ module: "rss-runtime", event: event.event, ...event.details }, "RSS runtime event"),
     onCycleComplete: async ({ results }) => {
       initialFeedRefreshPending = false;
-      const normalized: Article[] = BUILTIN_RSS_FEEDS.flatMap(feed => {
-        const parsed = results.get(feed.key);
-        return parsed ? normalizeFeedItems(parsed.items || [], feed.source, feed.topic, feed.idOffset, extractFeedIcon(parsed)) : [];
-      });
+      const normalized: Article[] = BUILTIN_RSS_FEEDS.flatMap(feed => results.get(feed.key) ?? []);
       lastSuccessfulFeedRefreshSources = new Set(normalized.flatMap(article => [article.source, ...(article.sourceAliases || [])]));
       if (normalized.length === 0) return;
       fullBuiltInArticles = mergeArticles(fullBuiltInArticles, mergeWithSourceFallback(fullBuiltInArticles, normalized)).slice(0, RSS_GLOBAL_ARTICLE_LIMIT);
@@ -7551,7 +7380,7 @@ async function startServer() {
         headers: { "User-Agent": "AtomFlow/1.0 RSS Reader", "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" },
       });
       if (resource.status < 200 || resource.status >= 300) throw new Error(`RSS source returned ${resource.status}`);
-      const parsed = await parser.parseString(resource.body.toString("utf8"));
+      const parsed = await createFeedParser().parseString(resource.body.toString("utf8"));
       const feedIcon = extractFeedIcon(parsed);
       const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon, {
         maxItems: fullFeed ? remoteRssMaxItems : undefined
@@ -7639,7 +7468,7 @@ async function startServer() {
         headers: { "User-Agent": "AtomFlow/1.0 RSS Reader", "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" },
       });
       if (resource.status < 200 || resource.status >= 300) throw new Error(`RSS source returned ${resource.status}`);
-      const parsed = await parser.parseString(resource.body.toString("utf8"));
+      const parsed = await createFeedParser().parseString(resource.body.toString("utf8"));
       const feedIcon = extractFeedIcon(parsed);
       const fetched = normalizeFeedItems(parsed.items || [], source, '自定义订阅', 900000, feedIcon, {
         maxItems: fullFeed ? remoteRssMaxItems : undefined

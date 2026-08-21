@@ -179,7 +179,7 @@ const pollutedCachedArticle = {
 };
 assert.deepEqual(
   sanitizeGlobalArticleCache([legacyMock, pollutedCachedArticle]),
-  [{ ...pollutedCachedArticle, saved: false, cards: [] }],
+  [{ ...pollutedCachedArticle, saved: false, cards: [], markdownContent: undefined, fullFetched: false }],
   "Startup must remove legacy prototypes and clear user-specific state from the global cache",
 );
 
