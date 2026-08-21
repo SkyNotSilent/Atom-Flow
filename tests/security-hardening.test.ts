@@ -422,6 +422,7 @@ await assert.rejects(
 
 const root = process.cwd();
 const server = readFileSync(path.join(root, "server.ts"), "utf8");
+const rssSource = readFileSync(path.join(root, "src/server/rss.ts"), "utf8");
 const securitySource = readFileSync(path.join(root, "src/server/security.ts"), "utf8");
 const migrationSource = readFileSync(path.join(root, "src/server/databaseMigrations.ts"), "utf8");
 const contentSecuritySource = readFileSync(path.join(root, "src/server/contentSecurity.ts"), "utf8");
@@ -465,8 +466,8 @@ assert.match(server, /app\.post\(["']\/api\/sources\/fetch["'], requireAuth, rem
 assert.match(server, /app\.post\(["']\/api\/sources\/retry["'], requireAuth, remoteFetchLimiter,/, "RSS retry must require authentication and remote-fetch limits");
 assert.match(server, /app\.post\(["']\/api\/sources\/fetch["'], requireAuth, remoteFetchLimiter, remoteFetchConcurrencyMiddleware,/, "Custom RSS fetches must have global and per-user concurrency limits");
 assert.match(server, /app\.post\(["']\/api\/sources\/retry["'], requireAuth, remoteFetchLimiter, remoteFetchConcurrencyMiddleware,/, "RSS retries must have global and per-user concurrency limits");
-assert.match(server, /RSS_FEED_EXCERPT_SOURCE_BUDGET_CHARS = 64_000/, "RSS excerpt parsing must have a refresh-level source budget");
-assert.match(server, /buildFeedExcerpt\([\s\S]{0,180}excerptSourceCharsPerItem/, "RSS excerpts must use the bounded structured fallback");
+assert.match(rssSource, /RSS_FEED_EXCERPT_SOURCE_BUDGET_CHARS = 64_000/, "RSS excerpt parsing must have a refresh-level source budget");
+assert.match(rssSource, /buildFeedExcerpt\([\s\S]{0,180}excerptSourceCharsPerItem/, "RSS excerpts must use the bounded structured fallback");
 assert.doesNotMatch(server, /source === '即刻话题' \? formatJikeContent\(rawContent\)/, "RSS refresh must defer expensive Jike formatting until a single article is opened");
 assert.match(server, /PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS = 250_000/, "Main-thread rich-text normalization must have a hard source bound");
 assert.match(server, /Math\.max\(boundedOutputChars \* 2, 2048\)[\s\S]{0,180}contentToPlainText\(\(content \|\| ''\)\.slice\(0, sourceLimit\)\)/, "General plain-text normalization must slice according to the requested output before parsing");

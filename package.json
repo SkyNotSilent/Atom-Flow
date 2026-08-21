@@ -19,7 +19,7 @@
     "billing:verify:sandbox": "tsx scripts/setup-paddle-sandbox.ts --verify-only",
     "billing:dev:sandbox": "node --env-file=.env --env-file=.env.billing.sandbox --import tsx server.ts",
     "billing:test:sandbox": "RUN_REAL_BILLING_TESTS=true node --env-file=.env --env-file=.env.billing.sandbox --import tsx --test --test-concurrency=1 tests/billing-sandbox.test.ts",
-    "test:rss:soak": "node --expose-gc --import tsx --test --test-concurrency=1 tests/rss-memory-soak.test.ts",
+    "test:rss:soak": "node --expose-gc --import tsx --test --test-concurrency=1 tests/rss-memory-soak.test.ts tests/rss-parse-memory-soak.test.ts",
     "test:rss:cache": "node --import tsx --test --test-concurrency=1 tests/rss-cache.test.ts",
     "lint": "tsc --noEmit",
     "test:migrations": "node --import tsx --test --test-concurrency=1 tests/database-migrations.test.ts tests/database-migrations.integration.test.ts",
