@@ -41,6 +41,7 @@ import {
   buildAllowedOrigins,
   createUserConcurrencyGuard,
   fetchBoundedPublicResource,
+  withAbortTimeout,
   isAuthenticationPath,
   isAllowedMutationOrigin,
   isAllowedUploadSignature,
@@ -52,7 +53,6 @@ import {
 import {
   BUILTIN_RSS_FEEDS,
   type BuiltInRssFeedDefinition,
-  collectSettledFeedArticles,
   createSerializedTaskQueue,
   mergeArticleSourceMemberships,
   mergeWithSourceFallback,
@@ -340,21 +340,22 @@ async function parseFirstAvailable(urls: readonly string[], parentSignal: AbortS
 }
 
 async function parseBoundedFeedCandidate(candidate: string, timeoutMs: number, parentSignal: AbortSignal) {
-  const signal = AbortSignal.any([parentSignal, AbortSignal.timeout(timeoutMs)]);
-  const resource = await fetchBoundedPublicResource(candidate, {
-    timeoutMs,
-    maxBytes: 3 * 1024 * 1024,
-    maxRedirects: 3,
-    signal,
-    headers: {
-      "User-Agent": "AtomFlow/1.0 RSS Reader",
-      "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
-    },
+  return withAbortTimeout(parentSignal, timeoutMs, async signal => {
+    const resource = await fetchBoundedPublicResource(candidate, {
+      timeoutMs,
+      maxBytes: 3 * 1024 * 1024,
+      maxRedirects: 3,
+      signal,
+      headers: {
+        "User-Agent": "AtomFlow/1.0 RSS Reader",
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+      },
+    });
+    if (resource.status < 200 || resource.status >= 300) {
+      throw new Error(`RSS source returned ${resource.status}`);
+    }
+    return parser.parseString(resource.body.toString("utf8"));
   });
-  if (resource.status < 200 || resource.status >= 300) {
-    throw new Error(`RSS source returned ${resource.status}`);
-  }
-  return parser.parseString(resource.body.toString("utf8"));
 }
 
 const ALLOWED_IMAGE_HOST_SUFFIXES = [
@@ -5311,48 +5312,6 @@ const get36KrArticleId = (url?: string) => {
   return match?.[1] || null;
 };
 
-async function fetchRSSFeeds(maxItems: number, parentSignal: AbortSignal): Promise<{
-  timelineArticles: Article[];
-  fullArticles: Article[];
-  refreshedSources: string[];
-}> {
-  try {
-    const results = await Promise.allSettled(
-      BUILTIN_RSS_FEEDS.map(feed => parseFirstAvailable(feed.urls, AbortSignal.any([
-        parentSignal,
-        AbortSignal.timeout(20_000),
-      ]))),
-    );
-    const collected = collectSettledFeedArticles(
-      BUILTIN_RSS_FEEDS,
-      results,
-      (parsed, feed) => normalizeFeedItems(
-        parsed.items,
-        feed.source,
-        feed.topic,
-        feed.idOffset,
-        extractFeedIcon(parsed),
-        { maxItems },
-      ),
-    );
-    logger.info({ module: "rss", counts: collected.counts }, "RSS feed counts");
-    collected.failures.forEach(({ definition, error }) => {
-      logger.error({ err: error, module: "rss", feed: definition.logName }, "Failed to fetch RSS feed");
-    });
-    const timelineArticles = buildHomepageTimeline(collected.articles);
-    return {
-      timelineArticles: rankArticles(timelineArticles),
-      fullArticles: collected.articles,
-      refreshedSources: BUILTIN_RSS_FEEDS
-        .filter(feed => (collected.articlesBySource[feed.key]?.length ?? 0) > 0)
-        .map(feed => feed.source),
-    };
-  } catch (error) {
-    logger.error({ err: error, module: "rss" }, "Failed to fetch RSS, keeping cached data");
-    return { timelineArticles: [], fullArticles: [], refreshedSources: [] };
-  }
-}
-
 function buildHomepageTimeline(fullArticles: Article[]): Article[] {
   const selected = BUILTIN_RSS_FEEDS.flatMap(feed => fullArticles
     .filter(article => article.source === feed.source || article.sourceAliases?.includes(feed.source))
@@ -6053,7 +6012,7 @@ async function startServer() {
   rssRuntime = new RssRuntimeController<BuiltInRssFeedDefinition, Parser.Output<Parser.Item>>({
     getSources: () => BUILTIN_RSS_FEEDS,
     getSourceId: source => source.key,
-    refreshSource: (source, signal) => parseFirstAvailable(source.urls, AbortSignal.any([signal, AbortSignal.timeout(20_000)])),
+    refreshSource: (source, signal) => withAbortTimeout(signal, 20_000, boundedSignal => parseFirstAvailable(source.urls, boundedSignal)),
     refreshIntervalMs: rssRefreshIntervalMs,
     concurrency: readBoundedEnvNumber(process.env.RSS_MAX_CONCURRENCY, RSS_MAX_CONCURRENCY, 1, 8),
     memoryWarningBytes: readBoundedEnvNumber(process.env.RSS_MEMORY_WARNING_MB, 600, 256, 4096) * 1024 * 1024,

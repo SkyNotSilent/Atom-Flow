@@ -200,7 +200,8 @@ await Promise.all([firstWrite, secondWrite]);
 assert.deepEqual(serializedEvents, ["start:first", "end:first", "start:second", "end:second"]);
 
 assert.doesNotMatch(server, /import \{ MOCK_ARTICLES \}/, "The production server must not depend on prototype feed data");
-assert.match(server, /collectSettledFeedArticles\(/, "The production refresh must use the behavior-tested collector");
+assert.match(server, /new RssRuntimeController</, "The production refresh must use the behavior-tested runtime controller");
+assert.doesNotMatch(server, /AbortSignal\.any\(\[(?:parentSignal|signal),/, "RSS refresh must not build composite abort signals (listener/timer retention leak)");
 assert.match(server, /sanitizeGlobalArticleCache\(cachedArticles\)/, "Startup must sanitize persisted global feed state");
 assert.match(server, /X-AtomFlow-RSS-Refreshing/, "The API must expose whether its initial refresh is still pending");
 assert.doesNotMatch(server, /refreshBuiltInSource/, "User requests must not mutate globally shared built-in sources");
