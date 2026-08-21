@@ -309,6 +309,8 @@ const openDevProxyTunnel = (
   read();
 });
 
+const swallowUnadoptedTunnelSocketError = () => {};
+
 class DevProxyTunnelAgent extends AgentBase {
   constructor(
     private readonly proxyUrl: URL,
@@ -340,6 +342,12 @@ class DevProxyTunnelAgent extends AgentBase {
         this.allowedProxyHostname,
         abortController.signal,
       );
+      // The tunnel promise detaches its own "error" listener on resolve; until the HTTP
+      // request adopts this socket there are no listeners, so a peer reset in that window
+      // becomes an unhandled 'error' event and crashes the process. The guard stays for
+      // the socket's lifetime (per-request agent, no keep-alive) and does not stop the
+      // adopted request's own error handling.
+      socket.on("error", swallowUnadoptedTunnelSocketError);
       connectionSocket = socket;
       if (request.destroyed) throw new DOMException("Development proxy request aborted", "AbortError");
 
@@ -347,6 +355,7 @@ class DevProxyTunnelAgent extends AgentBase {
         const servername = typeof options.servername === "string" ? options.servername : "";
         if (!servername) throw new Error("TLS servername is required for proxied HTTPS requests");
         connectionSocket = tlsConnect({ socket, servername, rejectUnauthorized: true });
+        connectionSocket.on("error", swallowUnadoptedTunnelSocketError);
       }
       if (request.destroyed) throw new DOMException("Development proxy request aborted", "AbortError");
       request.once("socket", connectedSocket => {
@@ -774,6 +783,36 @@ const settleBeforeDeadline = <T>(
       finishResolve(value);
     }, finishReject);
   });
+};
+
+// Bounded-lifetime replacement for `AbortSignal.any([parent, AbortSignal.timeout(ms)])`:
+// composite signals chain dependent listeners onto the long-lived parent and their timeout
+// timers pin the whole signal graph until GC, which accumulates across high-frequency call
+// sites (100+ per RSS refresh cycle). Here the timer and parent listener are always torn
+// down in `finally`, so nothing outlives the operation.
+export const withAbortTimeout = async <T>(
+  parentSignal: AbortSignal | undefined,
+  timeoutMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> => {
+  const controller = new AbortController();
+  const onParentAbort = () => {
+    controller.abort(parentSignal?.reason ?? new DOMException("Operation aborted", "AbortError"));
+  };
+  if (parentSignal?.aborted) {
+    onParentAbort();
+  } else {
+    parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException(`Operation timed out after ${timeoutMs}ms`, "TimeoutError"));
+  }, timeoutMs);
+  try {
+    return await operation(controller.signal);
+  } finally {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", onParentAbort);
+  }
 };
 
 export const fetchBoundedPublicResource = async (rawUrl: string, options: BoundedPublicFetchOptions) => {

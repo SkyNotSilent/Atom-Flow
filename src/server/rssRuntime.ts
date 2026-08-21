@@ -408,6 +408,7 @@ export class RssRuntimeController<TSource, TResult = void> {
     }
 
     const startedAt = this.clock.now();
+    const memoryAtStart = this.memoryUsage();
     this.lastStartedAt = toIso(startedAt);
     this.cyclesStarted += 1;
     this.maxObservedActiveSources = 0;
@@ -482,7 +483,9 @@ export class RssRuntimeController<TSource, TResult = void> {
       failureCount += 1;
       throw error;
     } finally {
+      results.clear();
       const completedAt = this.clock.now();
+      const memoryAtEnd = this.memoryUsage();
       this.lastCompletedAt = toIso(completedAt);
       this.lastDurationMs = Math.max(0, completedAt - startedAt);
       this.lastCycleFailureCount = failureCount;
@@ -498,6 +501,9 @@ export class RssRuntimeController<TSource, TResult = void> {
         failureCount,
         durationMs: this.lastDurationMs,
         failedSourceIds: Array.from(failedSourceIds),
+        heapUsedDeltaBytes: memoryAtEnd.heapUsed - memoryAtStart.heapUsed,
+        rssDeltaBytes: memoryAtEnd.rss - memoryAtStart.rss,
+        externalDeltaBytes: memoryAtEnd.external - memoryAtStart.external,
       });
     }
 
