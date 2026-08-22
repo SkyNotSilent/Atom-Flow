@@ -64,7 +64,7 @@
     "express-rate-limit": "^8.5.2",
     "express-session": "^1.19.0",
     "helmet": "^8.2.0",
-    "html-to-text": "^10.0.0",
+    "html-to-text": "^10.0.1",
     "jsdom": "^26.1.0",
     "jszip": "^3.10.1",
     "lucide-react": "^0.546.0",
