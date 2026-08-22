@@ -44,6 +44,9 @@ test("RSS runtime remains bounded across 200 real HTTP success, redirect, timeou
   const proxyServer = createServer(socket => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
+    // Timeout and shutdown cases deliberately make the client reset this socket.
+    // That reset is the behaviour under test, not a test-process failure.
+    socket.on("error", () => undefined);
     let stage: "connect" | "request" = "connect";
     let buffered = "";
     socket.on("data", chunk => {

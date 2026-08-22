@@ -16,8 +16,6 @@ import pg from "pg";
 import session from "express-session";
 import connectPgSimple from "connect-pg-simple";
 import bcrypt from "bcryptjs";
-import { Resend } from "resend";
-import nodemailer from "nodemailer";
 import sharp from "sharp";
 import { createServer, ServerResponse, type IncomingMessage } from "http";
 import { Worker } from "node:worker_threads";
@@ -50,6 +48,15 @@ import {
   validateDocxArchiveBounds,
   validatePublicHttpUrl,
 } from "./src/server/security.js";
+import {
+  createOperationalAlertSender,
+  sendViaEmailChannels,
+} from "./src/server/operationalAlerts.js";
+import { createConfiguredEmailChannels } from "./src/server/emailChannels.js";
+import {
+  ServiceHealthMonitor,
+  type ServiceHealthEvent,
+} from "./src/server/serviceHealthMonitor.js";
 import {
   BUILTIN_RSS_FEEDS,
   type BuiltInRssFeedDefinition,
@@ -115,6 +122,18 @@ const isProduction = process.env.NODE_ENV === "production";
 const DEV_SESSION_SECRET = "atomflow-dev-secret-change-in-prod";
 const PUBLIC_WEB_PORTS = new Set(["", "80", "443"]);
 const PLAIN_TEXT_NORMALIZATION_MAX_SOURCE_CHARS = 250_000;
+
+// Alert-delivery failures must stand out from routine refresh chatter, otherwise a
+// broken notification path looks identical to a healthy one in the logs.
+const RSS_EVENT_LOG_LEVEL: Record<RssRuntimeEvent["event"], "info" | "warn" | "error"> = {
+  "refresh-started": "info",
+  "refresh-completed": "info",
+  "refresh-skipped": "info",
+  "source-skipped": "info",
+  "source-failed": "warn",
+  "memory-sampled": "info",
+  "memory-alert-failed": "error",
+};
 const LEGAL_PLACEHOLDER_PATTERN = /\[(?:DEPLOYMENT_OPERATOR_NAME|DEPLOYMENT_OPERATOR_ADDRESS|SERVICE_CONTACT_EMAIL|REFUND_CONTACT_EMAIL|PRIVACY_CONTACT_EMAIL|SECURITY_CONTACT_EMAIL|SERVICE_URL|DATA_HOSTING_REGION|TERMS_EFFECTIVE_DATE|GOVERNING_LAW|DISPUTE_FORUM|LOG_RETENTION_DAYS|BACKUP_RETENTION_DAYS|RIGHTS_REQUEST_RESPONSE_DAYS)\]/g;
 const LEGAL_DOCUMENTS = {
   privacy: "PRIVACY.md",
@@ -219,6 +238,7 @@ const hashLogIdentifier = (value: string) => createHmac(
 const sanitizeLogString = (value: string) => value
   .replace(/https?:\/\/[^\s"']+/gi, "[url]")
   .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]")
+  .replace(/\b(?:re|sk|pk|rk)_[A-Za-z0-9_-]{8,}\b/g, "[token]")
   .slice(0, 2000);
 
 const safeRequestPath = (req: IncomingMessage) => {
@@ -5183,32 +5203,32 @@ async function startServer() {
   const billingService = billingProvider === "alipay" ? alipayBillingService : paddleBillingService;
   billingService?.startWorkers();
 
-  const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+  const emailChannels = createConfiguredEmailChannels();
 
-  // Gmail SMTP transporter (preferred over Resend for free usage)
-  const smtpTransporter = process.env.SMTP_USER && process.env.SMTP_PASS
-    ? nodemailer.createTransport({
-        service: 'gmail',
-        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-      })
-    : null;
+  const alertSender = createOperationalAlertSender({
+    channels: emailChannels,
+    recipient: process.env.SECURITY_CONTACT_EMAIL?.trim(),
+    maxPerHour: readBoundedEnvNumber(process.env.ALERT_MAX_PER_HOUR, 10, 1, 100),
+    onEvent: event => {
+      const level = event.event === "alert-failed" ? "error" : event.event === "alert-suppressed" ? "warn" : "info";
+      logger[level]({
+        module: "alerting",
+        event: event.event,
+        kind: event.kind,
+        channel: event.channel,
+        ...(event.error ? { error: sanitizeLogString(event.error) } : {}),
+      }, "Operational alert delivery");
+    },
+  });
 
   const sendRssRuntimeAlert = async (alert: RssRuntimeAlert) => {
-    const recipient = process.env.SECURITY_CONTACT_EMAIL?.trim();
-    if (!recipient) throw new Error("SECURITY_CONTACT_EMAIL is not configured for RSS memory alerts");
     const rssMegabytes = Math.round((alert.rssBytes / 1024 / 1024) * 10) / 10;
-    const subject = `[AtomFlow] ${alert.kind} (${rssMegabytes} MB)`;
-    const text = `${alert.message}\n\nRSS: ${rssMegabytes} MB\nTime: ${alert.occurredAt}`;
-    if (resend) {
-      const result = await resend.emails.send({ from: "AtomFlow <noreply@atomflow.cloud>", to: recipient, subject, text });
-      if (result.error) throw new Error(`Resend RSS alert failed: ${result.error.message}`);
-      return;
-    }
-    if (smtpTransporter) {
-      await smtpTransporter.sendMail({ from: `AtomFlow <${process.env.SMTP_USER}>`, to: recipient, subject, text });
-      return;
-    }
-    throw new Error("No email transport is configured for RSS memory alerts");
+    await alertSender.send({
+      kind: alert.kind,
+      subject: `[AtomFlow] ${alert.kind} (${rssMegabytes} MB)`,
+      message: `${alert.message}\n\nRSS: ${rssMegabytes} MB`,
+      occurredAt: alert.occurredAt,
+    });
   };
 
   // Avatar upload setup (memory storage → compress → base64 data URL stored in DB)
@@ -5407,6 +5427,22 @@ async function startServer() {
       return compression.filter(req, res);
     },
   }));
+  // Mounted before the webhook routes so their responses are counted too, and
+  // kept out of pino-http's customLogLevel, which is a log-level decision hook and
+  // is not guaranteed to run for every request.
+  let serviceHealthMonitor: ServiceHealthMonitor | null = null;
+  app.use((req, res, next) => {
+    res.on("finish", () => {
+      const pathname = safeRequestPath(req);
+      // /api/health is excluded on purpose: Railway probes it constantly, which
+      // would both dilute the denominator and double-report a database outage
+      // that already has its own alert.
+      if (!pathname.startsWith("/api/") || pathname === "/api/health") return;
+      serviceHealthMonitor?.recordResponse(res.statusCode);
+    });
+    next();
+  });
+
   const jsonBodyLimitKb = readBoundedEnvNumber(process.env.JSON_BODY_LIMIT_KB, 256, 64, 1024);
   app.post("/api/billing/webhooks/paddle", express.raw({ type: "application/json", limit: "256kb" }), asyncHandler(async (req, res) => {
     if (!paddleBillingService || !billingConfig.enabled) return res.status(503).json({ code: "BILLING_UNAVAILABLE", error: "Paddle 账单服务未启用" });
@@ -5787,10 +5823,21 @@ async function startServer() {
     await pool.query("SELECT 1 FROM users LIMIT 0");
     res.setHeader("Cache-Control", "no-store");
     const rssStatus = rssRuntime?.getStatus();
+    // Booleans and counts only: this endpoint is unauthenticated, and transport
+    // errors embed recipient addresses and infrastructure detail. The raw reason
+    // stays in the logs. `healthy: false` must never change the status code -
+    // railway.json gates deploys on this route, so a notification failure would
+    // otherwise restart the container and turn it into an outage.
+    const alertingStatus = alertSender.getStatus();
     return res.json({
       status: "ok",
       database: "connected",
       schemaVersion: DATABASE_SCHEMA_VERSION,
+      alerting: {
+        healthy: alertingStatus.healthy,
+        lastFailureAt: alertingStatus.lastFailureAt,
+        consecutiveFailures: alertingStatus.consecutiveFailures,
+      },
       rss: rssStatus ? {
         state: rssStatus.refresh.pausedForMemory ? "paused-memory" : rssStatus.refresh.inProgress ? "refreshing" : "active",
         lastCompletedAt: rssStatus.refresh.lastCompletedAt,
@@ -5851,7 +5898,10 @@ async function startServer() {
     memoryPauseBytes: readBoundedEnvNumber(process.env.RSS_MEMORY_PAUSE_MB, 700, 300, 6144) * 1024 * 1024,
     memoryResumeBytes: readBoundedEnvNumber(process.env.RSS_MEMORY_RESUME_MB, 550, 128, 4096) * 1024 * 1024,
     sendAlert: sendRssRuntimeAlert,
-    onEvent: (event: RssRuntimeEvent) => logger.info({ module: "rss-runtime", event: event.event, ...event.details }, "RSS runtime event"),
+    onEvent: (event: RssRuntimeEvent) => logger[RSS_EVENT_LOG_LEVEL[event.event]](
+      { module: "rss-runtime", event: event.event, ...event.details },
+      "RSS runtime event",
+    ),
     onCycleComplete: async ({ results }) => {
       initialFeedRefreshPending = false;
       const normalized: Article[] = BUILTIN_RSS_FEEDS.flatMap(feed => results.get(feed.key) ?? []);
@@ -5872,6 +5922,31 @@ async function startServer() {
     return activeFeedRefresh;
   };
   rssRuntime.start();
+
+  if (pool) {
+    const monitorPool = pool;
+    serviceHealthMonitor = new ServiceHealthMonitor({
+      // Deliberately no pg_try_advisory_xact_lock leader election here, unlike the
+      // periodic write jobs below: acquiring the lock is itself a database round
+      // trip, so an unreachable database would silently skip the very alert that
+      // exists to report it. Duplicate alerts across replicas are capped by
+      // ALERT_MAX_PER_HOUR instead.
+      probeDatabase: () => monitorPool.query("SELECT 1"),
+      sendAlert: alert => alertSender.send(alert),
+      probeIntervalMs: readBoundedEnvNumber(process.env.DB_PROBE_INTERVAL_SECONDS, 30, 10, 300) * 1000,
+      errorRateThreshold: readBoundedEnvNumber(process.env.ERROR_RATE_THRESHOLD_PERCENT, 10, 1, 100) / 100,
+      errorRateMinRequests: readBoundedEnvNumber(process.env.ERROR_RATE_MIN_REQUESTS, 20, 5, 1000),
+      onEvent: (event: ServiceHealthEvent) => {
+        const level = event.event === "probe-failed" || event.event === "alert-delivery-failed" ? "warn" : "info";
+        const reason = typeof event.details?.reason === "string" ? sanitizeLogString(event.details.reason) : undefined;
+        logger[level](
+          { module: "service-health", event: event.event, ...event.details, ...(reason ? { reason } : {}) },
+          "Service health event",
+        );
+      },
+    });
+    serviceHealthMonitor.start();
+  }
 
   const cleanupExpiredVerificationCodes = async () => {
     const client = await pool.connect();
@@ -5916,7 +5991,7 @@ async function startServer() {
     if (!email) {
       return res.status(400).json({ error: '请输入有效的邮箱地址' });
     }
-    if (!smtpTransporter && !resend) {
+    if (emailChannels.length === 0) {
       return res.status(500).json({ error: '邮件服务未配置' });
     }
 
@@ -5930,7 +6005,10 @@ async function startServer() {
 
     const code = randomInt(100000, 1000000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-    await pool.query('INSERT INTO verification_codes (email, code, expires_at) VALUES ($1, $2, $3)', [email, verificationCodeDigest(email, code), expiresAt]);
+    const verificationRecordId = (await pool.query(
+      'INSERT INTO verification_codes (email, code, expires_at) VALUES ($1, $2, $3) RETURNING id',
+      [email, verificationCodeDigest(email, code), expiresAt],
+    )).rows[0].id;
 
     logOtpEvent("login", email, code);
 
@@ -5944,23 +6022,19 @@ async function startServer() {
     `;
 
     try {
-      if (resend) {
-        await resend.emails.send({
-          from: 'AtomFlow <noreply@atomflow.cloud>',
-          to: email,
-          subject: '你的 AtomFlow 登录验证码',
-          html: htmlContent
-        });
-      } else if (smtpTransporter) {
-        await smtpTransporter.sendMail({
-          from: `AtomFlow <${process.env.SMTP_USER}>`,
-          to: email,
-          subject: '你的 AtomFlow 登录验证码',
-          html: htmlContent
-        });
-      }
+      await sendViaEmailChannels(emailChannels, {
+        to: email,
+        subject: '你的 AtomFlow 登录验证码',
+        html: htmlContent,
+      });
       return res.json({ success: true });
     } catch (error) {
+      await pool.query('DELETE FROM verification_codes WHERE id = $1', [verificationRecordId]).catch(cleanupError => {
+        logger.warn(
+          { err: cleanupError, module: "auth", verificationRecordId },
+          "Failed to remove an undeliverable verification code",
+        );
+      });
       logger.error({ err: error, module: "auth", emailHash: hashLogIdentifier(email) }, "Failed to send verification code");
       return res.status(500).json({ error: '发送验证码失败，请稍后再试' });
     }
@@ -6028,7 +6102,7 @@ async function startServer() {
     if (!password || password.length < 8) {
       return res.status(400).json({ error: '密码至少 8 个字符' });
     }
-    if (!smtpTransporter && !resend) {
+    if (emailChannels.length === 0) {
       return res.status(500).json({ error: '邮件服务未配置' });
     }
 
@@ -6048,10 +6122,10 @@ async function startServer() {
     const passwordHash = await bcrypt.hash(password, 10);
     const code = randomInt(100000, 1000000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-    await pool.query(
-      'INSERT INTO verification_codes (email, code, expires_at, password_hash) VALUES ($1, $2, $3, $4)',
+    const verificationRecordId = (await pool.query(
+      'INSERT INTO verification_codes (email, code, expires_at, password_hash) VALUES ($1, $2, $3, $4) RETURNING id',
       [email, verificationCodeDigest(email, code), expiresAt, passwordHash]
-    );
+    )).rows[0].id;
 
     logOtpEvent("registration", email, code);
 
@@ -6065,23 +6139,19 @@ async function startServer() {
     `;
 
     try {
-      if (resend) {
-        await resend.emails.send({
-          from: 'AtomFlow <noreply@atomflow.cloud>',
-          to: email,
-          subject: '你的 AtomFlow 注册验证码',
-          html: htmlContent
-        });
-      } else if (smtpTransporter) {
-        await smtpTransporter.sendMail({
-          from: `AtomFlow <${process.env.SMTP_USER}>`,
-          to: email,
-          subject: '你的 AtomFlow 注册验证码',
-          html: htmlContent
-        });
-      }
+      await sendViaEmailChannels(emailChannels, {
+        to: email,
+        subject: '你的 AtomFlow 注册验证码',
+        html: htmlContent,
+      });
       return res.json({ success: true });
     } catch (error) {
+      await pool.query('DELETE FROM verification_codes WHERE id = $1', [verificationRecordId]).catch(cleanupError => {
+        logger.warn(
+          { err: cleanupError, module: "auth", verificationRecordId },
+          "Failed to remove an undeliverable registration code",
+        );
+      });
       logger.error({ err: error, module: "auth", emailHash: hashLogIdentifier(email) }, "Failed to send registration code");
       return res.status(500).json({ error: '发送验证码失败，请稍后再试' });
     }
@@ -11998,6 +12068,7 @@ async function startServer() {
     shuttingDown = true;
     logger.info({ module: "server", signal }, "Graceful shutdown started");
     rssRuntime?.shutdown();
+    serviceHealthMonitor?.shutdown();
     clearInterval(verificationCleanupTimer);
     if (canvasAiRecoveryTimer) clearInterval(canvasAiRecoveryTimer);
     for (const client of wss.clients) client.close(1012, "Server restarting");
