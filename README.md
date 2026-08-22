@@ -215,10 +215,16 @@ OPENAI_MODEL
 其他可选能力：
 
 ```env
-# Email: choose Resend or SMTP
+# Email: Resend is tried first, SMTP is the fallback channel
 RESEND_API_KEY=...
 SMTP_USER=...
 SMTP_PASS=...
+
+# Service health alerts (sent to SECURITY_CONTACT_EMAIL)
+DB_PROBE_INTERVAL_SECONDS=30
+ERROR_RATE_THRESHOLD_PERCENT=10
+ERROR_RATE_MIN_REQUESTS=20
+ALERT_MAX_PER_HOUR=10
 
 # Translation
 BAIDU_TRANSLATE_APPID=...

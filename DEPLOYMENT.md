@@ -106,6 +106,10 @@ RSS_MAX_CONCURRENCY=4
 RSS_MEMORY_WARNING_MB=600
 RSS_MEMORY_PAUSE_MB=700
 RSS_MEMORY_RESUME_MB=550
+DB_PROBE_INTERVAL_SECONDS=30
+ERROR_RATE_THRESHOLD_PERCENT=10
+ERROR_RATE_MIN_REQUESTS=20
+ALERT_MAX_PER_HOUR=10
 NODE_OPTIONS=--max-old-space-size=768
 RESEND_API_KEY=your-resend-key
 SMTP_USER=your-gmail@gmail.com
@@ -135,6 +139,42 @@ CANVAS_PDF_MAX_PAGES=100
 - RSS 每轮完成后等待 30 分钟再刷新，单轮最多并发 4 个来源；连续三次达到 600 MB 会告警，首次达到 700 MB 会立即暂停刷新并向 `SECURITY_CONTACT_EMAIL` 告警。
 - 每用户每日付费操作和输出 token 预留额度已写入 PostgreSQL；分钟级限流、全局并发、RSS 缓存和任务协调仍有单进程状态，因此 Railway 先保持 1 个 Web 副本。公开发布前完成 Cloudflare/WAF、Redis、对象存储、后台队列、监控告警和数据库备份；共享状态迁移并压测后再扩到 2 个以上副本。
 - 本地或单进程内存限流只适合开发验证，不能替代多副本生产环境的共享限流和协调。
+
+### 监控与告警
+
+全部运维告警都发往 `SECURITY_CONTACT_EMAIL`，先尝试 Resend，失败或超时后自动改用 Gmail SMTP。投递失败或被小时上限压制的告警会进入一个上限 5 条的积压队列，随下一封成功送达的邮件补报，所以告警内容不会因为一次投递失败而丢失。
+
+| 监控 | 触发条件 | 检出时延 |
+|---|---|---|
+| RSS 内存 | 连续三次采样 ≥ 600 MB 告警；首次 ≥ 700 MB 暂停刷新 | 约 15 分钟 |
+| 数据库连通性 | 连续 3 次 `SELECT 1` 探针失败（含 5 秒超时） | 约 90 秒 |
+| 5xx 错误率 | 5 分钟窗口内 `/api/` 请求数 ≥ `ERROR_RATE_MIN_REQUESTS` 且 5xx 占比 ≥ `ERROR_RATE_THRESHOLD_PERCENT` | 约 30 秒 |
+
+`/api/health` 会返回 `alerting.healthy`，用于确认告警链路本身是通的。**它在告警投递失败时仍然返回 200** —— Railway 用这个路径做部署门禁，让通知故障改变状态码会导致容器被杀，把通知问题升级成服务中断。
+
+每次告警链路或邮件凭据变更后，应使用 Railway 注入的目标环境变量真实发送一封受控测试邮件：
+
+```bash
+ALLOW_LIVE_ALERT_TEST=true railway run --service atomflow --environment production npm run alert:test
+```
+
+脚本只向 `SECURITY_CONTACT_EMAIL` 发送一封主题为「告警链路真实测试」的邮件，并复用生产的 Resend → SMTP 通道；缺少显式开关时会拒绝执行，避免误发。
+
+#### Railway 平台侧能做什么，不能做什么
+
+Railway 没有基于日志的告警功能（任何套餐都没有），所以「告警投递失败」这类只体现在日志里的信号，平台侧无法直接推送。Observability 的 Monitors 只覆盖 CPU / RAM / 磁盘 / 出网流量的阈值告警，且**需要 Pro 套餐**，Hobby 用不了。
+
+平台侧唯一可用的机制是**项目 Webhook**（项目 → Settings → Webhooks），它在部署状态变化时 POST 一个 JSON 到指定 URL，事件类型包括 `Deployment.failed`（构建或部署失败）和 `Deployment.crashed`（运行中的部署异常退出）。它**不发邮件**——只有 Slack 和 Discord 的 webhook URL 会被 Railway 自动转换成对应格式（Muxer）。
+
+因此「进程没了要收到邮件」这一层，必须由 webhook 接收方把事件转成邮件，可选：
+
+- 把 webhook 指向 AtomFlow 自身的接收端点，复用现有的告警发信通道。能完整覆盖 `Deployment.failed`（此时旧部署仍在服务，进程活着，收得到也发得出），部分覆盖 `Deployment.crashed`（重启后的实例可能收到）。
+- 指向 Discord 或 Slack 的 incoming webhook，零代码，但通知落在聊天软件而不是邮箱。
+- 部署一个独立的接收服务（官方建议放在另一个项目，以免被监控项目自身的故障拖垮）。
+
+已知盲区：容器彻底消失且不再拉起、或进程存活但 Railway 边缘/DNS 层不可达时，任何自托管方案都无法自我上报——这一类只有进程外的独立探测能覆盖，本项目已明确不引入。
+
+数据库探针刻意不做 `pg_try_advisory_xact_lock` 选主 —— 拿锁本身要走数据库，不可达时会永久静默，恰好废掉这个监控；重复告警由 `ALERT_MAX_PER_HOUR` 封顶。
 
 ### 支付宝单笔使用期上线顺序
 
